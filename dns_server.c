@@ -1960,6 +1960,71 @@ static int txt_encode(const char *s,uint8_t *rd,int maxlen){
         if(out+1+chunk>maxlen)return -1;
         rd[out++]=(uint8_t)chunk;memcpy(rd+out,s,chunk);out+=chunk;s+=chunk;slen-=chunk;}
     return out;}
+/* RFC 1035 §4.1.4 DNS name compression.
+ *
+ * Per-response context tracks suffixes already emitted into the message and
+ * the absolute byte offset of each, so subsequent names that share a suffix
+ * can be replaced with a 2-byte back-pointer (0xC000 | offset).
+ *
+ * One context per outgoing DNS message; held in a thread-local so emit
+ * helpers like append_rr don't need a new parameter.  Callers reset the
+ * context at every message boundary (build_query_resp, AXFR message, NOTIFY,
+ * mDNS).  Pointer offsets are 14-bit (max 0x3FFF) — the lookup-and-register
+ * code below silently skips registration past that boundary, so names emitted
+ * deep in a >16KB message simply won't be compression sources.
+ *
+ * Compression is only safe where the spec permits it.  RRSIG signer's name
+ * (RFC 4034 §3.1.7) and a few NSEC next-owner contexts must remain
+ * uncompressed; those paths construct rdata via name_to_wire (uncompressed)
+ * and not via append_rr's owner-name emit, so they stay correct. */
+typedef struct {
+    int      count;
+    uint16_t offsets[128];
+    char     names[128][256];
+} compress_ctx_t;
+static __thread compress_ctx_t g_cc;
+static void compress_reset(void){ g_cc.count=0; }
+/* Emit `name` to buf+pos using g_cc.  `abs_off` is the absolute byte offset
+ * inside the final DNS message where buf+pos lands — required so registered
+ * pointers can be looked up by subsequent names.  For owner-name emission
+ * into the response buffer, buf=resp, pos=off, abs_off=off (they coincide).
+ * Returns bytes written, or -1 on overflow. */
+static int name_to_wire_c(const char *name,uint8_t *buf,int pos,int blen,int abs_off){
+    char work[256];strncpy(work,name,255);work[255]=0;
+    char *labels[64];int nlabels=0;
+    for(char *lbl=strtok(work,".");lbl&&nlabels<64;lbl=strtok(NULL,"."))
+        labels[nlabels++]=lbl;
+    int start=pos;
+    for(int i=0;i<nlabels;i++){
+        /* Compose suffix from label i onward */
+        char suffix[256];int sp=0;
+        for(int j=i;j<nlabels;j++){
+            int ll=(int)strlen(labels[j]);
+            if(sp+ll+1>=(int)sizeof(suffix))break;
+            if(j>i)suffix[sp++]='.';
+            memcpy(suffix+sp,labels[j],ll);sp+=ll;}
+        suffix[sp]=0;
+        /* Lookup existing offset */
+        for(int k=0;k<g_cc.count;k++){
+            if(strcasecmp(g_cc.names[k],suffix)==0){
+                if(pos+2>blen)return -1;
+                buf[pos++]=0xC0|(g_cc.offsets[k]>>8);
+                buf[pos++]=g_cc.offsets[k]&0xFF;
+                return pos-start;}}
+        /* Register this suffix at its absolute offset (14-bit max) */
+        int suffix_abs=abs_off+(pos-start);
+        if(g_cc.count<128&&suffix_abs<0x4000){
+            g_cc.offsets[g_cc.count]=(uint16_t)suffix_abs;
+            strncpy(g_cc.names[g_cc.count],suffix,255);
+            g_cc.names[g_cc.count][255]=0;
+            g_cc.count++;}
+        /* Emit this label */
+        int ll=(int)strlen(labels[i]);
+        if(pos+ll+1>=blen)return -1;
+        buf[pos++]=(uint8_t)ll;memcpy(buf+pos,labels[i],ll);pos+=ll;}
+    if(pos>=blen)return -1;
+    buf[pos++]=0;
+    return pos-start;}
 static int name_from_wire(const uint8_t *pkt,int plen,int off,char *out,int olen){
     int pos=off,opos=0,jumped=0,jret=-1,steps=0;
     while(steps++<128){if(pos>=plen)return -1;uint8_t c=pkt[pos];
@@ -1978,7 +2043,9 @@ static uint32_t get32(const uint8_t *b,int o){
 static int append_rr(uint8_t *buf,int off,int blen,const char *name,
                      uint16_t type,uint16_t cls,uint32_t ttl,
                      const uint8_t *rdata,uint16_t rdlen){
-    int n=name_to_wire(name,buf+off,blen-off);
+    /* Owner name uses compression (RFC 1035 §4.1.4); rdata is copied verbatim,
+     * so any names inside rdata were already encoded by their builder. */
+    int n=name_to_wire_c(name,buf,off,blen,off);
     if(n<0||off+n+10+(int)rdlen>blen)return -1;
     off+=n;put16(buf,off,type);off+=2;put16(buf,off,cls);off+=2;
     put32(buf,off,ttl);off+=4;put16(buf,off,rdlen);off+=2;
@@ -2337,6 +2404,7 @@ static int add_nsec3_denial(uint8_t *resp,int off,int resp_len,
 static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp_len,
                             int is_tcp, const struct in_addr *cip){
     if(qlen<12)return -1;
+    compress_reset();
     const dns_hdr_t *qh=(const dns_hdr_t*)query;
     dns_hdr_t *rh=(dns_hdr_t*)resp;
     /* RFC 9619 / 2181: QDCOUNT must be 1 for QUERY */
@@ -2990,7 +3058,7 @@ static void *axfr_thread(void *arg){
             /* Send: current SOA, del-SOA(old), adds, new-SOA */
             uint8_t mb[BUF_SIZE];int mo;
             /* Opening SOA */
-            memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
+            compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
             mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
             if(soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
             tcp_send_msg(c.fd,c.ssl,mb,mo);
@@ -3001,7 +3069,7 @@ static void *axfr_thread(void *arg){
              pthread_mutex_lock(&g_soa_mutex);g_soa_serial=c.ixfr_serial;pthread_mutex_unlock(&g_soa_mutex);
              old_soa_len=build_soa_rdata(old_soa,sizeof(old_soa));
              pthread_mutex_lock(&g_soa_mutex);g_soa_serial=saved;pthread_mutex_unlock(&g_soa_mutex);}
-            memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
+            compress_reset();memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
             if(old_soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,old_soa,(uint16_t)old_soa_len);
             tcp_send_msg(c.fd,c.ssl,mb,mo);
             /* Changes */
@@ -3011,7 +3079,7 @@ static void *axfr_thread(void *arg){
                 sscanf(e,"%u|%u|%c|%255[^|]|%255[^\n]",&fs,&ts,&op,ename,eval);
                 /* only A/AAAA for now; emit as ADD record */
                 struct in_addr a4;struct in6_addr a6;
-                memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
+                compress_reset();memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
                 if(inet_pton(AF_INET,eval,&a4)==1){
                     uint8_t rd[4];memcpy(rd,&a4,4);
                     mo=append_rr(mb,mo,sizeof(mb),ename,DNS_TYPE_A,DNS_CLASS_IN,DEFAULT_TTL,rd,4);
@@ -3022,7 +3090,7 @@ static void *axfr_thread(void *arg){
                 tcp_send_msg(c.fd,c.ssl,mb,mo);free(e);
             }
             /* Closing new SOA */
-            memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
+            compress_reset();memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
             if(soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
             tcp_send_msg(c.fd,c.ssl,mb,mo);
             dns_log(LOG_NOTICE,"[IXFR] Sent %d changes serial %u->%u to %s\n",ne,c.ixfr_serial,g_soa_serial,cip);
@@ -3031,7 +3099,7 @@ static void *axfr_thread(void *arg){
         dns_log(LOG_NOTICE,"[IXFR] Serial %u not in journal, falling back to AXFR\n",c.ixfr_serial);
     } else if(c.ixfr&&c.ixfr_serial==g_soa_serial){
         /* Already up to date — send just the current SOA */
-        uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
+        uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
         mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);int mo=12;
         if(soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
         tcp_send_msg(c.fd,c.ssl,mb,mo);
@@ -3042,7 +3110,7 @@ static void *axfr_thread(void *arg){
     /* ── AXFR full transfer ── */
     uint8_t buf[BUF_SIZE];
     /* First SOA */
-    memset(buf,0,12);dns_hdr_t *rh=(dns_hdr_t*)buf;
+    compress_reset();memset(buf,0,12);dns_hdr_t *rh=(dns_hdr_t*)buf;
     rh->flags=htons(DNS_QR|DNS_AA);rh->ancount=htons(1);
     int off=12;
     /* Question section: zone name, type AXFR */
@@ -3066,7 +3134,7 @@ static void *axfr_thread(void *arg){
         case DNS_TYPE_TXT:{int tl=txt_encode(r->rdata_str,rd,(int)sizeof(rd));
             if(tl<0)continue;rdlen=(uint16_t)tl;break;}
         default:continue;}
-        uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
+        uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
         mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
         int mo=12;mo=append_rr(mb,mo,sizeof(mb),r->name,r->type,DNS_CLASS_IN,r->ttl,rd,rdlen);
         tcp_send_msg(c.fd,c.ssl,mb,mo);}
@@ -3074,18 +3142,18 @@ static void *axfr_thread(void *arg){
     /* Send DNSKEY records */
     {uint8_t dkrd[68];
      if(g_zsk&&dnskey_rdata_ecdsa(g_zsk,dkrd,sizeof(dkrd))>0){
-         uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
+         uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
          mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
          int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,68);
          tcp_send_msg(c.fd,c.ssl,mb,mo);}
      if(g_zsk_ed&&dnskey_rdata_ed25519(g_zsk_ed,dkrd,sizeof(dkrd))>0){
-         uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
+         uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
          mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
          int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,36);
          tcp_send_msg(c.fd,c.ssl,mb,mo);}}
 
     /* Closing SOA */
-    {uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
+    {uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
      mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
      int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
      tcp_send_msg(c.fd,c.ssl,mb,mo);}
