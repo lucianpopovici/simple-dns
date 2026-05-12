@@ -1951,6 +1951,15 @@ static int name_to_wire(const char *name,uint8_t *buf,int blen){
     while(lbl){int ll=(int)strlen(lbl);if(pos+ll+1>=blen)return -1;
         buf[pos++]=(uint8_t)ll;memcpy(buf+pos,lbl,ll);pos+=ll;lbl=strtok(NULL,".");}
     if(pos>=blen)return -1;buf[pos++]=0;return pos;}
+/* RFC 1035 §3.3.14: TXT rdata is one or more <len><bytes> character strings,
+ * each up to 255 bytes.  Splits s across as many chunks as needed and writes
+ * them back-to-back.  Returns total rdata length, or -1 on overflow. */
+static int txt_encode(const char *s,uint8_t *rd,int maxlen){
+    int slen=(int)strlen(s),out=0;
+    while(slen>0){int chunk=slen>255?255:slen;
+        if(out+1+chunk>maxlen)return -1;
+        rd[out++]=(uint8_t)chunk;memcpy(rd+out,s,chunk);out+=chunk;s+=chunk;slen-=chunk;}
+    return out;}
 static int name_from_wire(const uint8_t *pkt,int plen,int off,char *out,int olen){
     int pos=off,opos=0,jumped=0,jret=-1,steps=0;
     while(steps++<128){if(pos>=plen)return -1;uint8_t c=pkt[pos];
@@ -2461,8 +2470,8 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         case DNS_TYPE_CNAME:case DNS_TYPE_NS:case DNS_TYPE_DNAME:{int n=name_to_wire(r->rdata_str,rd,sizeof(rd));if(n<0)continue;rdlen=(uint16_t)n;break;}
         case DNS_TYPE_MX:{rd[0]=r->rdata_pref>>8;rd[1]=r->rdata_pref&0xFF;
             int n=name_to_wire(r->rdata_str,rd+2,sizeof(rd)-2);if(n<0)continue;rdlen=(uint16_t)(2+n);break;}
-        case DNS_TYPE_TXT:{int sl=(int)strlen(r->rdata_str);if(sl>255)sl=255;
-            rd[0]=(uint8_t)sl;memcpy(rd+1,r->rdata_str,sl);rdlen=(uint16_t)(1+sl);break;}
+        case DNS_TYPE_TXT:{int tl=txt_encode(r->rdata_str,rd,(int)sizeof(rd));
+            if(tl<0)continue;rdlen=(uint16_t)tl;break;}
         default:continue;}
         off=emit_rr(resp,off,resp_len,r->name,r->type,r->ttl,rd,rdlen,dnssec_ok,&answers);
         if(any_minimal&&answers>0)goto finish_answer;}
@@ -2514,8 +2523,8 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
             if(sp){pref=(uint16_t)atoi(pipe);pipe=sp+1;}
             rd[0]=pref>>8;rd[1]=pref&0xFF;
             int n=name_to_wire(pipe,rd+2,sizeof(rd)-2);if(n<0)continue;rdlen=(uint16_t)(2+n);break;}
-        case DNS_TYPE_TXT:{int sl=(int)strlen(pipe);if(sl>255)sl=255;
-            rd[0]=(uint8_t)sl;memcpy(rd+1,pipe,sl);rdlen=(uint16_t)(1+sl);break;}
+        case DNS_TYPE_TXT:{int tl=txt_encode(pipe,rd,(int)sizeof(rd));
+            if(tl<0)continue;rdlen=(uint16_t)tl;break;}
         case DNS_TYPE_SRV:{/* ttl|prio|weight|port|target */
             uint16_t prio=0,weight=0,port=0;char target[256]="";
             char *p2=pipe;
@@ -2678,8 +2687,8 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
                 case DNS_TYPE_MX:{rd[0]=r->rdata_pref>>8;rd[1]=r->rdata_pref&0xFF;
                     int nw=name_to_wire(r->rdata_str,rd+2,sizeof(rd)-2);
                     if(nw<0)continue;rdlen=(uint16_t)(2+nw);break;}
-                case DNS_TYPE_TXT:{int sl=(int)strlen(r->rdata_str);if(sl>255)sl=255;
-                    rd[0]=(uint8_t)sl;memcpy(rd+1,r->rdata_str,sl);rdlen=(uint16_t)(1+sl);break;}
+                case DNS_TYPE_TXT:{int tl=txt_encode(r->rdata_str,rd,(int)sizeof(rd));
+                    if(tl<0)continue;rdlen=(uint16_t)tl;break;}
                 default:continue;}
                 /* Emit with synthesised owner name (qname, not wildcard) */
                 off=emit_rr(resp,off,resp_len,qname,r->type,r->ttl,rd,rdlen,dnssec_ok,&answers);
@@ -3054,8 +3063,8 @@ static void *axfr_thread(void *arg){
         case DNS_TYPE_CNAME:case DNS_TYPE_NS:{int nn=name_to_wire(r->rdata_str,rd,sizeof(rd));if(nn<0)continue;rdlen=(uint16_t)nn;break;}
         case DNS_TYPE_MX:{rd[0]=r->rdata_pref>>8;rd[1]=r->rdata_pref&0xFF;
             int nn=name_to_wire(r->rdata_str,rd+2,sizeof(rd)-2);if(nn<0)continue;rdlen=(uint16_t)(2+nn);break;}
-        case DNS_TYPE_TXT:{int sl=(int)strlen(r->rdata_str);if(sl>255)sl=255;
-            rd[0]=(uint8_t)sl;memcpy(rd+1,r->rdata_str,sl);rdlen=(uint16_t)(1+sl);break;}
+        case DNS_TYPE_TXT:{int tl=txt_encode(r->rdata_str,rd,(int)sizeof(rd));
+            if(tl<0)continue;rdlen=(uint16_t)tl;break;}
         default:continue;}
         uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
         mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
@@ -3401,8 +3410,8 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen,
                 if(n<0)continue; rdlen=(uint16_t)(6+n);
                 break;}
             case DNS_TYPE_TXT:{
-                int sl=(int)strlen(vptr); if(sl>255)sl=255;
-                rd[0]=(uint8_t)sl; memcpy(rd+1,vptr,sl); rdlen=(uint16_t)(1+sl);
+                int tl=txt_encode(vptr,rd,(int)sizeof(rd));
+                if(tl<0)continue;rdlen=(uint16_t)tl;
                 break;}
             case DNS_TYPE_CNAME:{
                 int n=name_to_wire(vptr,rd,sizeof(rd));
@@ -3553,7 +3562,7 @@ static void mdns_announce(void){
                     tok=strtok(NULL,"|");if(tok)strncpy(tg,tok,255);
                     rd[0]=pr>>8;rd[1]=pr&0xFF;rd[2]=wt>>8;rd[3]=wt&0xFF;rd[4]=po>>8;rd[5]=po&0xFF;
                     int n=name_to_wire(tg,rd+6,sizeof(rd)-6);if(n>0)rdlen=(uint16_t)(6+n);break;}
-                case DNS_TYPE_TXT:{int sl=(int)strlen(vptr);if(sl>255)sl=255;rd[0]=(uint8_t)sl;memcpy(rd+1,vptr,sl);rdlen=(uint16_t)(1+sl);break;}
+                case DNS_TYPE_TXT:{int tl=txt_encode(vptr,rd,(int)sizeof(rd));if(tl<0)break;rdlen=(uint16_t)tl;break;}
                 default: break;}
                 if(rdlen){
                     int no=mdns_put_rr(pkt,off,sizeof(pkt),rname,rt,
