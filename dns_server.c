@@ -155,6 +155,7 @@
 #define DNS_TYPE_NSEC3   50
 #define DNS_TYPE_NSEC3PARAM 51
 #define DNS_TYPE_TLSA    52
+#define DNS_TYPE_DS      43   /* RFC 4034 §5 — delegation signer */
 #define DNS_TYPE_CDS     59   /* RFC 7344 — child DS */
 #define DNS_TYPE_CDNSKEY 60   /* RFC 7344 — child DNSKEY */
 #define DNS_TYPE_URI     256  /* RFC 7553 */
@@ -202,6 +203,8 @@
 #define DNS_RCODE_NOTIMP   4
 #define DNS_RCODE_REFUSED  5
 #define DNS_RCODE_YXDOMAIN 6
+#define DNS_RCODE_YXRRSET  7   /* RFC 2136: RRset should not exist but does */
+#define DNS_RCODE_NXRRSET  8   /* RFC 2136: RRset should exist but does not */
 #define DNS_RCODE_NOTZONE  10
 #define DNS_RCODE_BADVERS  16
 #define DNS_RCODE_BADSIG   17
@@ -2091,7 +2094,7 @@ static const char *type2str(uint16_t t){
     case DNS_TYPE_SSHFP:return"SSHFP";case DNS_TYPE_RRSIG:return"RRSIG";
     case DNS_TYPE_NSEC:return"NSEC";case DNS_TYPE_DNSKEY:return"DNSKEY";
     case DNS_TYPE_NSEC3:return"NSEC3";case DNS_TYPE_TLSA:return"TLSA";
-    case DNS_TYPE_CAA:return"CAA";case DNS_TYPE_CDS:return"CDS";
+    case DNS_TYPE_DS:return"DS";case DNS_TYPE_CAA:return"CAA";case DNS_TYPE_CDS:return"CDS";
     case DNS_TYPE_CDNSKEY:return"CDNSKEY";case DNS_TYPE_URI:return"URI";
     case DNS_TYPE_IXFR:return"IXFR";case DNS_TYPE_AXFR:return"AXFR";
     case DNS_TYPE_ANY:return"ANY";
@@ -2104,7 +2107,7 @@ static uint16_t str2type(const char *s){
     if(!strcasecmp(s,"SRV"))return DNS_TYPE_SRV;if(!strcasecmp(s,"CAA"))return DNS_TYPE_CAA;
     if(!strcasecmp(s,"SSHFP"))return DNS_TYPE_SSHFP;if(!strcasecmp(s,"TLSA"))return DNS_TYPE_TLSA;
     if(!strcasecmp(s,"DNAME"))return DNS_TYPE_DNAME;if(!strcasecmp(s,"LOC"))return DNS_TYPE_LOC;
-    if(!strcasecmp(s,"CDS"))return DNS_TYPE_CDS;if(!strcasecmp(s,"CDNSKEY"))return DNS_TYPE_CDNSKEY;
+    if(!strcasecmp(s,"DS"))return DNS_TYPE_DS;if(!strcasecmp(s,"CDS"))return DNS_TYPE_CDS;if(!strcasecmp(s,"CDNSKEY"))return DNS_TYPE_CDNSKEY;
     if(!strcasecmp(s,"URI"))return DNS_TYPE_URI;
     return 0;}
 
@@ -2601,6 +2604,33 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         if(g_zsk_ed&&dnskey_rdata_ed25519(g_zsk_ed,dkrd,sizeof(dkrd))>0){found=1;
             off=emit_rr(resp,off,resp_len,qname,DNS_TYPE_CDNSKEY,3600,dkrd,36,dnssec_ok,&answers);}
     }
+    /* RFC 4034 §5: DS — Delegation Signer over the zone's KSKs.
+     * DS rdata = keytag(2) | alg(1) | digest_type=2(SHA-256)(1) | sha256(owner_wire||dnskey_rdata)(32)
+     * Only emitted at the zone apex where our KSKs live. */
+    if(qtype==DNS_TYPE_DS||qtype==DNS_TYPE_ANY){
+        uint8_t dkrd[68];
+        /* P-256 KSK */
+        if(g_ksk&&dnskey_rdata_ksk_ecdsa(g_ksk,dkrd,sizeof(dkrd))>0){
+            uint8_t dsrd[4+32];
+            dsrd[0]=g_ksk_tag>>8;dsrd[1]=g_ksk_tag&0xFF;
+            dsrd[2]=DNS_ALG_ECDSAP256SHA256;dsrd[3]=2;/* SHA-256 */
+            uint8_t hin[512];int hp=name_to_wire(qname,hin,sizeof(hin));
+            if(hp>0&&hp+68<=(int)sizeof(hin)){
+                memcpy(hin+hp,dkrd,68);sha256(hin,hp+68,dsrd+4);
+                int n2=emit_rr(resp,off,resp_len,qname,DNS_TYPE_DS,3600,
+                               dsrd,4+32,dnssec_ok,&answers);
+                if(n2>0){off=n2;found=1;}}}
+        /* Ed25519 KSK */
+        if(g_ksk_ed&&dnskey_rdata_ksk_ed25519(g_ksk_ed,dkrd,sizeof(dkrd))>0){
+            uint8_t dsrd[4+32];
+            dsrd[0]=g_ksk_ed_tag>>8;dsrd[1]=g_ksk_ed_tag&0xFF;
+            dsrd[2]=DNS_ALG_ED25519;dsrd[3]=2;/* SHA-256 */
+            uint8_t hin[512];int hp=name_to_wire(qname,hin,sizeof(hin));
+            if(hp>0&&hp+36<=(int)sizeof(hin)){
+                memcpy(hin+hp,dkrd,36);sha256(hin,hp+36,dsrd+4);
+                int n2=emit_rr(resp,off,resp_len,qname,DNS_TYPE_DS,3600,
+                               dsrd,4+32,dnssec_ok,&answers);
+                if(n2>0){off=n2;found=1;}}}}
     /* Static zone */
     for(int i=0;i<static_zone_sz;i++){
         dns_rec_t *r=&static_zone[i];if(!streq_ci(r->name,qname))continue;found=1;
@@ -2924,6 +2954,34 @@ finish_answer:
     return off;}
 
 /* ==========================================================================
+ * RFC 2136 §2.4 prerequisite helpers
+ * ======================================================================= */
+/* Returns 1 if at least one RR exists for `name` (any type, any namespace). */
+static int prereq_name_exists(const char *name){
+    char vk[512];char tmp[8];
+    const char *types[]={"A","AAAA","CNAME","MX","TXT","NS","SRV",
+                         "CAA","SSHFP","TLSA","DNAME","LOC",NULL};
+    for(int ti=0;types[ti];ti++){
+        snprintf(vk,sizeof(vk),"ddns:%s:%s",types[ti],name);
+        if(vk_get(vk,tmp,sizeof(tmp)))return 1;
+        snprintf(vk,sizeof(vk),"zone:%s:%s",types[ti],name);
+        if(vk_get(vk,tmp,sizeof(tmp)))return 1;}
+    for(int i=0;i<static_zone_sz;i++)
+        if(streq_ci(static_zone[i].name,name))return 1;
+    return 0;}
+/* Returns 1 if at least one RR of type `rtype` exists for `name`. */
+static int prereq_rrset_exists(const char *name,uint16_t rtype){
+    char vk[512];char tmp[8];
+    const char *ts=type2str(rtype);if(!ts)return 0;
+    snprintf(vk,sizeof(vk),"ddns:%s:%s",ts,name);
+    if(vk_get(vk,tmp,sizeof(tmp)))return 1;
+    snprintf(vk,sizeof(vk),"zone:%s:%s",ts,name);
+    if(vk_get(vk,tmp,sizeof(tmp)))return 1;
+    for(int i=0;i<static_zone_sz;i++)
+        if(streq_ci(static_zone[i].name,name)&&static_zone[i].type==rtype)return 1;
+    return 0;}
+
+/* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
 static int handle_update(const uint8_t *pkt,int plen,uint8_t *resp){
@@ -2945,8 +3003,27 @@ static int handle_update(const uint8_t *pkt,int plen,uint8_t *resp){
             rh->flags=htons(DNS_QR|DNS_OPCODE_UPDATE|DNS_RCODE_NOTZONE);
             return 12;}
         off=za+4;if(off>plen)goto formerr;}
-    for(int i=0;i<ntohs(h->ancount);i++){char nm[256];int a=name_from_wire(pkt,plen,off,nm,sizeof(nm));
-        if(a<0||a+9>plen)goto formerr;off=a+10+get16(pkt,a+8);if(off>plen)goto formerr;}
+    /* RFC 2136 §2.4 prerequisites */
+    for(int i=0;i<ntohs(h->ancount);i++){
+        char nm[256];int a=name_from_wire(pkt,plen,off,nm,sizeof(nm));
+        if(a<0||a+9>plen)goto formerr;
+        uint16_t rtype=get16(pkt,a),rclass=get16(pkt,a+2);
+        uint16_t rdlen=get16(pkt,a+8);
+        off=a+10+rdlen;if(off>plen)goto formerr;
+        uint16_t prereq_fail=0;
+        if(rclass==DNS_CLASS_ANY&&rtype==DNS_TYPE_ANY&&rdlen==0){
+            if(!prereq_name_exists(nm)) prereq_fail=DNS_RCODE_NXDOMAIN;}
+        else if(rclass==DNS_CLASS_ANY&&rtype!=DNS_TYPE_ANY&&rdlen==0){
+            if(!prereq_rrset_exists(nm,rtype)) prereq_fail=DNS_RCODE_NXRRSET;}
+        else if(rclass==DNS_CLASS_NONE&&rtype==DNS_TYPE_ANY&&rdlen==0){
+            if(prereq_name_exists(nm)) prereq_fail=DNS_RCODE_YXDOMAIN;}
+        else if(rclass==DNS_CLASS_NONE&&rtype!=DNS_TYPE_ANY&&rdlen==0){
+            if(prereq_rrset_exists(nm,rtype)) prereq_fail=DNS_RCODE_YXRRSET;}
+        /* class=IN rdata = exact RRset match — not implemented (RFC 2136 §3.2.5) */
+        if(prereq_fail){
+            rh->flags=htons(DNS_QR|DNS_OPCODE_UPDATE|prereq_fail);
+            {int o2=tsig_append(resp,12,BUF_SIZE,ntohs(h->id),0);return o2;}}
+    }
     for(int i=0;i<ntohs(h->nscount);i++){
         char un[256];int a=name_from_wire(pkt,plen,off,un,sizeof(un));
         if(a<0||a+9>plen)goto formerr;
