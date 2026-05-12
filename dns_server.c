@@ -2814,9 +2814,50 @@ static int handle_update(const uint8_t *pkt,int plen,uint8_t *resp){
                 {uint32_t prev=g_soa_serial;uint32_t next=serial_bump();
                  ixfr_journal_append(prev,next,'A',un,ip6);}
                 dns_log(LOG_NOTICE,"[DDNS] AAAA %s->%s\n",un,ip6);}
+            else if(ut==DNS_TYPE_TXT&&rdlen>=1){
+                uint8_t sl=rd[0];
+                if(sl>rdlen-1||sl>255)goto formerr;
+                char txt[256];memcpy(txt,rd+1,sl);txt[sl]=0;
+                char val[320];snprintf(val,sizeof(val),"%u|%s",uttl?uttl:DEFAULT_TTL,txt);
+                snprintf(k,sizeof(k),"zone:TXT:%s",un);vk_set(k,val,0);
+                serial_bump();
+                dns_log(LOG_NOTICE,"[UPDATE] TXT %s = %.60s%s\n",un,txt,sl>60?"...":"");}
+            else if(ut==DNS_TYPE_CNAME&&rdlen>=1){
+                char target[256];
+                int consumed=name_from_wire(pkt,plen,(int)(rd-pkt),target,sizeof(target));
+                if(consumed<0)goto formerr;
+                char val[320];snprintf(val,sizeof(val),"%u|%s",uttl?uttl:DEFAULT_TTL,target);
+                snprintf(k,sizeof(k),"zone:CNAME:%s",un);vk_set(k,val,0);
+                serial_bump();
+                dns_log(LOG_NOTICE,"[UPDATE] CNAME %s -> %s\n",un,target);}
+            else if(ut==DNS_TYPE_MX&&rdlen>=3){
+                uint16_t pref=(rd[0]<<8)|rd[1];
+                char target[256];
+                int consumed=name_from_wire(pkt,plen,(int)(rd-pkt)+2,target,sizeof(target));
+                if(consumed<0)goto formerr;
+                char val[384];snprintf(val,sizeof(val),"%u|%u|%s",uttl?uttl:DEFAULT_TTL,pref,target);
+                snprintf(k,sizeof(k),"zone:MX:%s",un);vk_set(k,val,0);
+                serial_bump();
+                dns_log(LOG_NOTICE,"[UPDATE] MX %s -> %u %s\n",un,pref,target);}
+            else if(ut==DNS_TYPE_SRV&&rdlen>=7){
+                uint16_t prio=(rd[0]<<8)|rd[1];
+                uint16_t weight=(rd[2]<<8)|rd[3];
+                uint16_t port=(rd[4]<<8)|rd[5];
+                char target[256];
+                int consumed=name_from_wire(pkt,plen,(int)(rd-pkt)+6,target,sizeof(target));
+                if(consumed<0)goto formerr;
+                char val[384];snprintf(val,sizeof(val),"%u|%u|%u|%u|%s",
+                                       uttl?uttl:DEFAULT_TTL,prio,weight,port,target);
+                snprintf(k,sizeof(k),"zone:SRV:%s",un);vk_set(k,val,0);
+                serial_bump();
+                dns_log(LOG_NOTICE,"[UPDATE] SRV %s -> %u %u %u %s\n",un,prio,weight,port,target);}
         }else if((uc==DNS_CLASS_ANY||uc==DNS_CLASS_NONE)&&rdlen==0){
             if(ut==DNS_TYPE_A||ut==DNS_TYPE_ANY){snprintf(k,sizeof(k),"ddns:A:%s",un);vk_del(k);}
             if(ut==DNS_TYPE_AAAA||ut==DNS_TYPE_ANY){snprintf(k,sizeof(k),"ddns:AAAA:%s",un);vk_del(k);}
+            if(ut==DNS_TYPE_TXT||ut==DNS_TYPE_ANY){snprintf(k,sizeof(k),"zone:TXT:%s",un);vk_del(k);}
+            if(ut==DNS_TYPE_CNAME||ut==DNS_TYPE_ANY){snprintf(k,sizeof(k),"zone:CNAME:%s",un);vk_del(k);}
+            if(ut==DNS_TYPE_MX||ut==DNS_TYPE_ANY){snprintf(k,sizeof(k),"zone:MX:%s",un);vk_del(k);}
+            if(ut==DNS_TYPE_SRV||ut==DNS_TYPE_ANY){snprintf(k,sizeof(k),"zone:SRV:%s",un);vk_del(k);}
             serial_bump();}}
     /* Append TSIG to response */
     {int off2=tsig_append(resp,12,BUF_SIZE,ntohs(h->id),0);return off2;}
