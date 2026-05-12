@@ -129,7 +129,8 @@
 #define MAX_AXFR_THREADS    8
 #define TSIG_ALG_HMAC_SHA256 "hmac-sha256."
 #define DNS_COOKIE_CLIENT_LEN 8
-#define DNS_COOKIE_SERVER_LEN 8
+#define DNS_COOKIE_SERVER_LEN 16  /* RFC 9018 §4.2: version|reserved|timestamp|hash */
+#define DNS_COOKIE_VALIDITY   3600 /* seconds */
 
 /* ==========================================================================
  * DNS type / class / opcode constants
@@ -204,6 +205,7 @@
 #define DNS_RCODE_NOTZONE  10
 #define DNS_RCODE_BADVERS  16
 #define DNS_RCODE_BADSIG   17
+#define DNS_RCODE_BADCOOKIE 23
 
 /* EDNS option codes */
 #define EDNS_OPT_NSID       3
@@ -1038,13 +1040,24 @@ static uint64_t siphash24(const uint8_t *in, int inlen, const uint8_t key[16]){
     SIPHASH_SIPROUND(v0,v1,v2,v3);SIPHASH_SIPROUND(v0,v1,v2,v3);
     return v0^v1^v2^v3;}
 
-/* Compute 8-byte server cookie: SipHash-2-4(client_cookie || client_ip, secret) */
+/* RFC 9018 §4.2: 16-byte server cookie = version(1) | reserved(3) |
+ * timestamp(4) | hash(8). The hash is SipHash-2-4 over
+ *   client_cookie(8) || version+reserved+timestamp(8) || client_ip(4)
+ * keyed with the server's secret. Timestamp = Unix seconds; cookies are
+ * accepted up to DNS_COOKIE_VALIDITY seconds old. */
 static void compute_server_cookie(const uint8_t *ccookie, const struct in_addr *cip,
+                                   uint32_t timestamp,
                                    uint8_t out[DNS_COOKIE_SERVER_LEN]){
-    uint8_t msg[12];
-    memcpy(msg,ccookie,8);memcpy(msg+8,&cip->s_addr,4);
-    uint64_t h=siphash24(msg,12,g_cookie_secret);
-    memcpy(out,&h,8);}
+    out[0]=1;                                  /* version */
+    out[1]=out[2]=out[3]=0;                    /* reserved */
+    out[4]=(timestamp>>24)&0xFF; out[5]=(timestamp>>16)&0xFF;
+    out[6]=(timestamp>>8)&0xFF;  out[7]=timestamp&0xFF;
+    uint8_t hin[8+8+4];
+    memcpy(hin,    ccookie,       8);
+    memcpy(hin+8,  out,           8);
+    memcpy(hin+16, &cip->s_addr,  4);
+    uint64_t h=siphash24(hin,sizeof(hin),g_cookie_secret);
+    memcpy(out+8,&h,8);}
 
 /* ==========================================================================
  * RESP / Valkey client (RFC 1459 RESP)
@@ -2181,6 +2194,9 @@ typedef struct {
     int      do_bit;
     uint8_t  client_cookie[8];
     int      has_client_cookie;
+    uint8_t  server_cookie[16];  /* RFC 9018: up to 16 bytes */
+    int      server_cookie_len;
+    int      has_server_cookie;
     char     nsid_req;     /* 1 if client requested NSID */
     int      has_padding;
     uint16_t padding_req;
@@ -2218,7 +2234,15 @@ static void edns_parse(const uint8_t *pkt,int plen,edns_info_t *ei){
                 uint16_t oc=get16(pkt,rp),ol=get16(pkt,rp+2);rp+=4;
                 if(oc==EDNS_OPT_NSID){ei->nsid_req=1;}
                 else if(oc==EDNS_OPT_COOKIE&&ol>=8){
-                    if(rp+8<=plen){memcpy(ei->client_cookie,pkt+rp,8);ei->has_client_cookie=1;}}
+                    if(rp+ol<=plen){
+                        memcpy(ei->client_cookie,pkt+rp,8);ei->has_client_cookie=1;
+                        /* RFC 9018: server cookie is the bytes after the 8-byte
+                         * client cookie, length 8..32.  Capture for verification. */
+                        if(ol>8&&ol<=8+(int)sizeof(ei->server_cookie)){
+                            int slen=ol-8;
+                            memcpy(ei->server_cookie,pkt+rp+8,slen);
+                            ei->server_cookie_len=slen;
+                            ei->has_server_cookie=1;}}}
                 else if(oc==EDNS_OPT_KEEPALIVE){ei->keepalive_req=1;}
                 else if(oc==EDNS_OPT_PADDING){ei->has_padding=1;ei->padding_req=ol;}
                 rp+=ol;}
@@ -2230,6 +2254,7 @@ static void edns_parse(const uint8_t *pkt,int plen,edns_info_t *ei){
 static int edns_append_opt(uint8_t *buf,int off,int blen,int is_tcp,
                            int do_bit,uint16_t rcode_ext,
                            const edns_info_t *req_ei,
+                           const struct in_addr *cip,
                            int ede_code,const char *ede_text){
     if(off+11>blen)return off;
     /* Name = root (1 byte 0) */
@@ -2255,14 +2280,17 @@ static int edns_append_opt(uint8_t *buf,int off,int blen,int is_tcp,
     /* Cookie option */
     if(req_ei&&req_ei->has_client_cookie){
         if(rdata_off+4+DNS_COOKIE_CLIENT_LEN+DNS_COOKIE_SERVER_LEN<blen){
-            uint8_t scookie[8];
-            struct in_addr dummy;dummy.s_addr=0; /* no client IP in this path */
-            compute_server_cookie(req_ei->client_cookie,&dummy,scookie);
+            uint8_t scookie[DNS_COOKIE_SERVER_LEN];
+            struct in_addr zero={0};
+            const struct in_addr *use_ip = cip?cip:&zero;
+            compute_server_cookie(req_ei->client_cookie,use_ip,
+                                  (uint32_t)time(NULL),scookie);
             put16(buf,rdata_off,EDNS_OPT_COOKIE);
             put16(buf,rdata_off+2,DNS_COOKIE_CLIENT_LEN+DNS_COOKIE_SERVER_LEN);
-            memcpy(buf+rdata_off+4,req_ei->client_cookie,8);
-            memcpy(buf+rdata_off+12,scookie,8);
-            rdata_off+=20;rdata_len+=20;}}
+            memcpy(buf+rdata_off+4,req_ei->client_cookie,DNS_COOKIE_CLIENT_LEN);
+            memcpy(buf+rdata_off+4+DNS_COOKIE_CLIENT_LEN,scookie,DNS_COOKIE_SERVER_LEN);
+            int total=4+DNS_COOKIE_CLIENT_LEN+DNS_COOKIE_SERVER_LEN;
+            rdata_off+=total;rdata_len+=total;}}
     /* TCP keepalive: suggest 30s */
     if(is_tcp&&req_ei&&req_ei->keepalive_req){
         if(rdata_off+6<blen){
@@ -2304,13 +2332,31 @@ static int edns_append_opt(uint8_t *buf,int off,int blen,int is_tcp,
     return off;}
 
 /* ==========================================================================
- * DNS Cookie verification (RFC 9018) — returns 1 if ok, 0 if bad
+ * DNS Cookie verification (RFC 9018)
+ *   Returns 1  = cookie ok (or no cookie present — unenforced).
+ *           0  = BADCOOKIE; caller must respond with rcode 23 plus a fresh
+ *                server cookie so the client can retry.
+ *
+ * Policy: clients that opt into cookies are required to complete the
+ * handshake. A client sending only the client cookie triggers BADCOOKIE so
+ * the server can return a freshly minted server cookie; the client then
+ * replays with both halves and the server validates the MAC + timestamp.
+ * Clients that don't send any cookie are unaffected.
  * ======================================================================= */
 static int cookie_verify(const edns_info_t *ei, const struct in_addr *cip){
-    if(!ei->has_client_cookie)return 1; /* not present, not required */
-    /* We don't require cookies, so we only validate when present */
-    /* A real server would reject responses without cookies from cookie-capable clients */
-    (void)cip; return 1; /* accept any valid client cookie presence */}
+    if(!ei->has_client_cookie)return 1;        /* no cookie, no requirement */
+    if(!ei->has_server_cookie)return 0;        /* client must echo our server cookie */
+    if(ei->server_cookie_len!=DNS_COOKIE_SERVER_LEN)return 0;
+    uint32_t ts =
+        ((uint32_t)ei->server_cookie[4]<<24)|
+        ((uint32_t)ei->server_cookie[5]<<16)|
+        ((uint32_t)ei->server_cookie[6]<<8) |
+                   ei->server_cookie[7];
+    uint32_t now=(uint32_t)time(NULL);
+    if(ts>now||now-ts>DNS_COOKIE_VALIDITY)return 0;  /* stale or future-dated */
+    uint8_t expected[DNS_COOKIE_SERVER_LEN];
+    compute_server_cookie(ei->client_cookie,cip,ts,expected);
+    return memcmp(expected,ei->server_cookie,DNS_COOKIE_SERVER_LEN)==0;}
 
 
 /* Forward declaration needed by NSEC functions */
@@ -2423,7 +2469,18 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
     memcpy(resp+off,query+off,qsec);
     uint16_t qtype=get16(query,after);off+=qsec;
     edns_info_t ei;edns_parse(query,qlen,&ei);
-    cookie_verify(&ei,cip);
+    if(!cookie_verify(&ei,cip)){
+        /* RFC 9018: emit BADCOOKIE with a fresh server cookie so the client
+         * can retry.  Header rcode = low 4 bits of 23; OPT TTL carries the
+         * high 8 bits per RFC 6891 §6.1.3. */
+        rh->flags=htons(DNS_QR|DNS_AA|(DNS_RCODE_BADCOOKIE&0xF));
+        rh->ancount=rh->nscount=htons(0);
+        off=edns_append_opt(resp,off,resp_len,is_tcp,0,
+                            (uint16_t)((DNS_RCODE_BADCOOKIE>>4)&0xFF),
+                            &ei,cip,-1,NULL);
+        dns_log(LOG_DEBUG,"[COOKIE] BADCOOKIE %s %s\n",
+                type2str(qtype),qname);
+        return off;}
     int dnssec_ok=ei.do_bit;
     /* RFC 1035 §4.3.1: return REFUSED for names outside our zone.
      * This prevents systemd-resolved (and other validators) from
@@ -2447,7 +2504,7 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
                 memcpy(resp+12,query+12,qsec2);
                 off=12+qsec2;
             } else off=12;
-            off=edns_append_opt(resp,off,resp_len,is_tcp,0,0,&ei,
+            off=edns_append_opt(resp,off,resp_len,is_tcp,0,0,&ei,cip,
                                 EDE_NOT_AUTH,"Not authoritative for this zone");
             dns_log(LOG_DEBUG,"[REFUSED] %s %s\n",type2str(qtype),qname);
             STAT_INC(g_stat_refused);
@@ -2470,7 +2527,7 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
             else
                 off=add_nsec_denial(resp,off,resp_len,qname,dnssec_ok,&ac2);
             rh->nscount=htons(ntohs(rh->nscount)+(uint16_t)ac2);}
-        off=edns_append_opt(resp,off,resp_len,is_tcp,dnssec_ok,0,&ei,EDE_NXDOMAIN,"Locally served zone");
+        off=edns_append_opt(resp,off,resp_len,is_tcp,dnssec_ok,0,&ei,cip,EDE_NXDOMAIN,"Locally served zone");
         return off;
     }
     /* DNSKEY — serve ZSK (flag 256) + KSK (flag 257), KSK signs DNSKEY RRset */
@@ -2845,7 +2902,7 @@ finish_answer:
         }
     }
     /* EDNS OPT in response */
-    off=edns_append_opt(resp,off,resp_len,is_tcp,dnssec_ok,0,&ei,ede_code,ede_text);
+    off=edns_append_opt(resp,off,resp_len,is_tcp,dnssec_ok,0,&ei,cip,ede_code,ede_text);
     return off;}
 
 /* ==========================================================================
