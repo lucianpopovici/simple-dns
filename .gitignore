@@ -1,4 +1,15 @@
 dns_server
+dns_server_debug
+
+# Secrets — never commit private keys / cert chains
+*.key
+*.pem
+*.crt
+*.p7
+
+# Logs and scratch
+*.log
+tmp/
 
 .env
 *.pyc
