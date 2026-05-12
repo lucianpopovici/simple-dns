@@ -80,7 +80,7 @@ PROD_FLAGS := -O2 \
               -fstack-protector-strong \
               -D_FORTIFY_SOURCE=2 \
               -fPIE \
-              -Wl,-pie,-z,relro,-z,now
+              -pie -Wl,-z,relro,-z,now
 
 # ── Debug flags ──────────────────────────────────────────────────────────────
 #   -Og          : optimise for debugging (readable code, no inlining)

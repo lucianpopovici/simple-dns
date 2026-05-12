@@ -321,13 +321,13 @@ static int zone_upsert(const char *name,const char *mname,const char *rname,
     if(idx<0){if(g_zone_count>=MAX_ZONES){pthread_mutex_unlock(&g_zones_mutex);return -1;}
               idx=g_zone_count++;}
     zone_entry_t *z=&g_zones[idx];
-    strncpy(z->name,name,255);
-    strncpy(z->soa_mname,mname&&mname[0]?mname:"",255);
-    strncpy(z->soa_rname,rname&&rname[0]?rname:"",255);
+    strncpy(z->name,name,255);z->name[255]=0;
+    strncpy(z->soa_mname,mname&&mname[0]?mname:"",255);z->soa_mname[255]=0;
+    strncpy(z->soa_rname,rname&&rname[0]?rname:"",255);z->soa_rname[255]=0;
     z->soa_serial=serial;z->soa_refresh=refresh;z->soa_retry=retry;
     z->soa_expire=expire;z->soa_minimum=minimum;
-    strncpy(z->axfr_allow,axfr_allow?axfr_allow:"127.0.0.1",1023);
-    strncpy(z->notify_targets,notify_targets?notify_targets:"",1023);
+    strncpy(z->axfr_allow,axfr_allow?axfr_allow:"127.0.0.1",1023);z->axfr_allow[1023]=0;
+    strncpy(z->notify_targets,notify_targets?notify_targets:"",1023);z->notify_targets[1023]=0;
     pthread_mutex_unlock(&g_zones_mutex);
     return idx;}
 
@@ -335,7 +335,7 @@ static int zone_upsert(const char *name,const char *mname,const char *rname,
 static void zone_save(int idx){
     if(idx<0||idx>=g_zone_count)return;
     zone_entry_t *z=&g_zones[idx];
-    char key[300],val[2048];
+    char key[300],val[4096];
     snprintf(key,sizeof(key),"zone_table:%s",z->name);
     snprintf(val,sizeof(val),"%s|%s|%u|%u|%u|%u|%u|%s|%s",
         z->soa_mname,z->soa_rname,z->soa_serial,
@@ -689,6 +689,7 @@ static int rsyslog_format(char *buf, int bufsz,
  * Attempts one reconnect on failure.
  */
 static void rsyslog_send_raw(const char *msg, int msglen) {
+    if (msglen <= 0) return;
     if (g_rsyslog_fd < 0) {
         if (rsyslog_connect() < 0) return;
     }
@@ -923,9 +924,7 @@ static int is_local_zone(const char *qname){
  * Utility helpers
  * ======================================================================= */
 static void strlower(char *s){for(;*s;s++)if(*s>='A'&&*s<='Z')*s+=32;}
-static int  streq_ci(const char *a,const char *b){
-    char la[256],lb[256];strncpy(la,a,255);la[255]=0;strlower(la);
-    strncpy(lb,b,255);lb[255]=0;strlower(lb);return strcmp(la,lb)==0;}
+static int  streq_ci(const char *a,const char *b){return strcasecmp(a,b)==0;}
 static const char *cfgenv(const char *k,const char *def){
     const char *v=getenv(k);return v?v:def;}
 /* RFC 2181 §8: TTL values MUST be clamped to [0, 2^31-1]. */
@@ -982,11 +981,11 @@ static int b64url_enc(const uint8_t *in,int ilen,char *out,int olen){
     if(o<olen)out[o]=0;return o;}
 
 static void sha256(const uint8_t *in,int n,uint8_t out[32]){
-    EVP_MD_CTX *ctx=EVP_MD_CTX_new();unsigned int dl=32;
+    EVP_MD_CTX *ctx=EVP_MD_CTX_new();if(!ctx)return;unsigned int dl=32;
     EVP_DigestInit_ex(ctx,EVP_sha256(),NULL);EVP_DigestUpdate(ctx,in,n);
     EVP_DigestFinal_ex(ctx,out,&dl);EVP_MD_CTX_free(ctx);}
 static void sha1(const uint8_t *in,int n,uint8_t out[20]){
-    EVP_MD_CTX *ctx=EVP_MD_CTX_new();unsigned int dl=20;
+    EVP_MD_CTX *ctx=EVP_MD_CTX_new();if(!ctx)return;unsigned int dl=20;
     EVP_DigestInit_ex(ctx,EVP_sha1(),NULL);EVP_DigestUpdate(ctx,in,n);
     EVP_DigestFinal_ex(ctx,out,&dl);EVP_MD_CTX_free(ctx);}
 
@@ -1085,7 +1084,7 @@ static int resp_parse(resp_conn_t *c,resp_reply_t *r){
         if(resp_readbytes(c,r->str,take)<0)return -1;
         /* if the server sent more bytes than we want, drain the remainder */
         int excess=bl-take;
-        while(excess>0){char drain[256];int d=excess>(int)sizeof(drain)?(int)sizeof(drain):excess;
+        while(excess>0){char drain[257];int d=excess>(int)(sizeof(drain)-1)?(int)(sizeof(drain)-1):excess;
             if(resp_readbytes(c,drain,d)<0)return -1;excess-=d;}
         r->str[take]=0;return 0;}
     case '*':r->type=5;r->count=atoi(line+1);return 0;
@@ -1587,16 +1586,21 @@ static int make_rrsig(const char *owner,uint16_t rrtype,uint32_t ttl,
     hdr[hp++]=t_inc>>24;hdr[hp++]=(t_inc>>16)&0xFF;hdr[hp++]=(t_inc>>8)&0xFF;hdr[hp++]=t_inc&0xFF;
     hdr[hp++]=tag>>8;hdr[hp++]=tag&0xFF;
     /* Signer name wire */
-    char sn[256];strncpy(sn,owner,255);strlower(sn);
-    {char tmp[256];strncpy(tmp,sn,255);char *lbl=strtok(tmp,".");
-     while(lbl){int ll=(int)strlen(lbl);hdr[hp++]=(uint8_t)ll;
+    char sn[256];strncpy(sn,owner,255);sn[255]=0;strlower(sn);
+    {char tmp[256];strncpy(tmp,sn,255);tmp[255]=0;char *lbl=strtok(tmp,".");
+     while(lbl){int ll=(int)strlen(lbl);
+         if(hp+ll+2>(int)sizeof(hdr)){return -1;}
+         hdr[hp++]=(uint8_t)ll;
          memcpy(hdr+hp,lbl,ll);hp+=ll;lbl=strtok(NULL,".");}hdr[hp++]=0;}
     /* Canonical RR */
     uint8_t own_w[256];int ow=0;
-    {char tmp[256];strncpy(tmp,sn,255);char *lbl=strtok(tmp,".");
+    {char tmp[256];strncpy(tmp,sn,255);tmp[255]=0;char *lbl=strtok(tmp,".");
      while(lbl){int ll=(int)strlen(lbl);own_w[ow++]=(uint8_t)ll;
          memcpy(own_w+ow,lbl,ll);ow+=ll;lbl=strtok(NULL,".");}own_w[ow++]=0;}
-    uint8_t rr[2048];int rp=0;
+    int rr_need=ow+10+rrdata_len;
+    uint8_t *rr=malloc(rr_need);
+    if(!rr)return -1;
+    int rp=0;
     memcpy(rr,own_w,ow);rp+=ow;rr[rp++]=rrtype>>8;rr[rp++]=rrtype&0xFF;
     rr[rp++]=0;rr[rp++]=DNS_CLASS_IN;
     rr[rp++]=ttl>>24;rr[rp++]=(ttl>>16)&0xFF;rr[rp++]=(ttl>>8)&0xFF;rr[rp++]=ttl&0xFF;
@@ -1604,9 +1608,11 @@ static int make_rrsig(const char *owner,uint16_t rrtype,uint32_t ttl,
     memcpy(rr+rp,rrdata,rrdata_len);rp+=rrdata_len;
     /* Sign */
     EVP_MD_CTX *mc=EVP_MD_CTX_new();
+    if(!mc){free(rr);return -1;}
     const EVP_MD *md=(alg==DNS_ALG_ED25519)?NULL:EVP_sha256();
     EVP_DigestSignInit(mc,NULL,md,NULL,zsk);
     EVP_DigestSignUpdate(mc,hdr,hp);EVP_DigestSignUpdate(mc,rr,rp);
+    free(rr);
     size_t sl=0;EVP_DigestSignFinal(mc,NULL,&sl);
     if(sl==0){EVP_MD_CTX_free(mc);return -1;}
     uint8_t *der=malloc(sl);
@@ -1806,7 +1812,7 @@ static const uint8_t *tsig_find(const uint8_t *pkt,int plen,tsig_rr_t *t){
                         ((uint64_t)pkt[rp+2]<<8)|pkt[rp+3];rp+=4;
             t->fudge=((uint16_t)pkt[rp]<<8)|pkt[rp+1];rp+=2;
             t->mac_len=((uint16_t)pkt[rp]<<8)|pkt[rp+1];rp+=2;
-            if(t->mac_len>32||rp+t->mac_len>plen)return NULL;
+            if(t->mac_len>64||rp+t->mac_len>plen)return NULL;
             memcpy(t->mac,pkt+rp,t->mac_len);rp+=t->mac_len;
             if(rp+6>plen)return NULL;
             t->orig_id=((uint16_t)pkt[rp]<<8)|pkt[rp+1];rp+=2;
@@ -1860,19 +1866,22 @@ static int tsig_verify(const uint8_t *pkt,int plen){
     vars[vp++]=t.fudge>>8;vars[vp++]=t.fudge&0xFF;
     vars[vp++]=t.error>>8;vars[vp++]=t.error&0xFF;
     vars[vp++]=0;vars[vp++]=0; /* other len = 0 */
-    /* Compute HMAC-SHA256 */
-    unsigned int mlen=64;uint8_t mac[64];
-    {EVP_MAC *evp_mac=EVP_MAC_fetch(NULL,"HMAC",NULL);
-     EVP_MAC_CTX *mctx=EVP_MAC_CTX_new(evp_mac);
-     OSSL_PARAM params[2];
-     const char *digest=tsig_alg_to_digest(t.alg_name);
-     params[0]=OSSL_PARAM_construct_utf8_string("digest",(char*)digest,0);
-     params[1]=OSSL_PARAM_construct_end();
-     EVP_MAC_init(mctx,g_tsig_secret,g_tsig_secret_len,params);
-     EVP_MAC_update(mctx,tmp,pkt_minus_tsig_len);
-     EVP_MAC_update(mctx,vars,vp);
-     size_t ml2=64;EVP_MAC_final(mctx,mac,&ml2,sizeof(mac));mlen=(unsigned)ml2;
-     EVP_MAC_CTX_free(mctx);EVP_MAC_free(evp_mac);}free(tmp);
+    /* Compute HMAC */
+    unsigned int mlen=0;uint8_t mac[64];
+    EVP_MAC *evp_mac=EVP_MAC_fetch(NULL,"HMAC",NULL);
+    if(!evp_mac){free(tmp);return 0;}
+    EVP_MAC_CTX *mctx=EVP_MAC_CTX_new(evp_mac);
+    if(!mctx){EVP_MAC_free(evp_mac);free(tmp);return 0;}
+    OSSL_PARAM params[2];
+    const char *digest=tsig_alg_to_digest(t.alg_name);
+    params[0]=OSSL_PARAM_construct_utf8_string("digest",(char*)digest,0);
+    params[1]=OSSL_PARAM_construct_end();
+    EVP_MAC_init(mctx,g_tsig_secret,g_tsig_secret_len,params);
+    EVP_MAC_update(mctx,tmp,pkt_minus_tsig_len);
+    EVP_MAC_update(mctx,vars,vp);
+    free(tmp);
+    size_t ml2=64;EVP_MAC_final(mctx,mac,&ml2,sizeof(mac));mlen=(unsigned)ml2;
+    EVP_MAC_CTX_free(mctx);EVP_MAC_free(evp_mac);
     return (mlen==(unsigned)t.mac_len)&&(memcmp(mac,t.mac,mlen)==0);}
 
 /* Append TSIG RR to a response */
@@ -2865,8 +2874,15 @@ static int ixfr_journal_fetch(uint32_t from_serial,
         if(er.type!=2)continue;
         uint32_t fs=0;sscanf(er.str,"%u|",&fs);
         if(fs==from_serial)found=i;
-        if(found>=0&&n<max_entries){
-            out_entries[n++]=strdup(er.str);
+        if(found>=0){
+            if(n<max_entries){
+                char *dup=strdup(er.str);
+                if(!dup){pthread_mutex_unlock(&g_vk_mutex);
+                    for(int j=0;j<n;j++)free(out_entries[j]);
+                    return -1;}
+                out_entries[n++]=dup;
+            }
+            /* else: entry beyond max_entries is intentionally skipped */
         }
     }
     pthread_mutex_unlock(&g_vk_mutex);
@@ -3703,7 +3719,8 @@ static char *https_req_mtls(const char *host,int port,
             "Content-Type: %s\r\nContent-Length: %zu\r\n\r\n%s",ct,strlen(body),body);
     } else { rp+=snprintf(req+rp,sizeof(req)-rp,"Connection: close\r\n\r\n"); }
     SSL_write(ssl,req,rp);
-    char *rbuf=malloc(HTTP_BUF);int rtotal=0,cap=HTTP_BUF;
+    char *rbuf=malloc(HTTP_BUF);if(!rbuf){SSL_shutdown(ssl);SSL_free(ssl);SSL_CTX_free(cctx);close(fd);return NULL;}
+    int rtotal=0,cap=HTTP_BUF;
     for(;;){if(rtotal>=cap-1){char *nbuf=realloc(rbuf,cap*2);
         if(!nbuf){break;}rbuf=nbuf;cap*=2;}
         int n=SSL_read(ssl,rbuf+rtotal,cap-rtotal-1);if(n<=0)break;rtotal+=n;}
@@ -3712,7 +3729,9 @@ static char *https_req_mtls(const char *host,int port,
     char *sep=strstr(rbuf,"\r\n\r\n");
     if(!sep){free(rbuf);return NULL;}
     if(resp_hdrs&&hl>0){int nn=(int)(sep-rbuf);if(nn>=hl)nn=hl-1;memcpy(resp_hdrs,rbuf,nn);resp_hdrs[nn]=0;}
-    char *ret=strdup(sep+4);free(rbuf);return ret;}
+    char *ret=strdup(sep+4);free(rbuf);
+    if(!ret)return NULL;
+    return ret;}
 
 static char *https_req(const char *host,int port,const char *method,const char *path,
                        const char *body,int *code,char *resp_hdrs,int hl){
@@ -3926,9 +3945,10 @@ static char *est_enroll(const char *host,int port,const char *domain,
     uint8_t *csr=make_csr_der(domain,&dk,&derlen);
     if(!csr){dns_log(LOG_ERR,"[EST] CSR generation failed\n");return NULL;}
     /* Standard base64 (RFC 7030 requires non-URL-safe base64) */
-    char *b64=malloc(derlen*2+4);
+    int b64sz=(derlen/3+1)*4+2;
+    char *b64=malloc(b64sz);
     if(!b64){free(csr);EVP_PKEY_free(dk);return NULL;}
-    b64url_enc(csr,derlen,b64,derlen*2+4); free(csr);
+    b64url_enc(csr,derlen,b64,b64sz); free(csr);
     for(char *p=b64;*p;p++){if(*p=='-')*p='+'; else if(*p=='_')*p='/';}
     char path[128]; snprintf(path,sizeof(path),"/.well-known/est/%s",op);
     int code=0; char rhdrs[2048]={0};
@@ -3941,11 +3961,12 @@ static char *est_enroll(const char *host,int port,const char *domain,
         int delay=ra[0]?atoi(ra):30; if(delay>120)delay=120;
         dns_log(LOG_NOTICE,"[EST] Deferred — retrying in %ds\n",delay);
         free(body); sleep(delay);
-        char *b64b=malloc(derlen*2+4);
+        int b64bsz=(derlen/3+1)*4+2;
+        char *b64b=malloc(b64bsz);
         if(b64b){
             uint8_t *csr2=make_csr_der(domain,&dk,&derlen);
             if(csr2){
-                b64url_enc(csr2,derlen,b64b,derlen*2+4); free(csr2);
+                b64url_enc(csr2,derlen,b64b,b64bsz); free(csr2);
                 for(char *p=b64b;*p;p++){if(*p=='-')*p='+';else if(*p=='_')*p='/';}
                 body=https_req_mtls(host,port,"POST",path,b64b,cc,ck,ca,
                                     "application/pkcs10",&code,NULL,0);
@@ -4000,7 +4021,7 @@ static int est_needs_renewal(void){
 
 /* pki_renewal_thread — unified renewal: EST first, ACME fallback */
 static void *pki_renewal_thread(void *arg){
-    (void)arg; sleep(30);
+    (void)arg; sleep(5); /* short delay so DNS sockets are open before first ACME attempt */
     for(;;){
         if(est_needs_renewal()||acme_needs_renewal()){
             dns_log(LOG_WARNING,"[PKI] Certificate renewal needed\n");
@@ -4461,9 +4482,9 @@ int main(int argc,char **argv){
     /* Phase 3: DNSSEC (both algorithms) */
     dnssec_init();
 
-    /* Phase 4: Certificate (ACME if needed) */
-    if(!g_tls_cert_pem[0]&&g_acme_domain[0]){
-        dns_log(LOG_INFO,"[Boot] No cert in Valkey — running ACME for %s\n",g_acme_domain);acme_issue();}
+    /* Phase 4: Load cert if already in Valkey; ACME initial issuance is handled
+     * by pki_renewal_thread after DNS sockets are open (DNS-01 requires the
+     * server to be listening before Let's Encrypt can validate the challenge). */
     tls_reload();
 
     /* Phase 5a: EST initial enrollment if no cert yet */
@@ -4556,30 +4577,7 @@ int main(int argc,char **argv){
     setsockopt(https_sock,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
     {struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(g_https_port),.sin_addr.s_addr=INADDR_ANY};
      if(bind(https_sock,(struct sockaddr*)&sa,sizeof(sa))<0){perror("https bind");return 1;}listen(https_sock,32);}
-    /* ── IPv6 sockets (IPV6_V6ONLY=1 avoids clash with IPv4) ── */
-    /* tcp_dns_sock + dns6_sock + dot6_sock declared and initialized above */
-    {
-        int v6s=socket(AF_INET6,SOCK_DGRAM,0);
-        if(v6s>=0){
-            setsockopt(v6s,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-            int v6o=1;setsockopt(v6s,IPPROTO_IPV6,IPV6_V6ONLY,&v6o,sizeof(v6o));
-            struct sockaddr_in6 sa6={.sin6_family=AF_INET6,.sin6_port=htons(g_dns_port)};
-            if(bind(v6s,(struct sockaddr*)&sa6,sizeof(sa6))<0)
-                {perror("[IPv6] DNS UDP bind (non-fatal)");close(v6s);}
-            else{dns6_sock=v6s;
-                dns_log(LOG_INFO,"[IPv6] DNS UDP :[]::%d\n",g_dns_port);}}
-    }
-    {
-        int v6t=socket(AF_INET6,SOCK_STREAM,0);
-        if(v6t>=0){
-            setsockopt(v6t,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-            int v6o=1;setsockopt(v6t,IPPROTO_IPV6,IPV6_V6ONLY,&v6o,sizeof(v6o));
-            struct sockaddr_in6 sa6={.sin6_family=AF_INET6,.sin6_port=htons(g_dot_port)};
-            if(bind(v6t,(struct sockaddr*)&sa6,sizeof(sa6))<0||listen(v6t,32)<0)
-                {perror("[IPv6] DoT TCP bind (non-fatal)");close(v6t);}
-            else{dot6_sock=v6t;
-                dns_log(LOG_INFO,"[IPv6] DoT TCP :[]::%d\n",g_dot_port);}}
-    }
+    /* IPv6 sockets already created above */
 
     dns_log(LOG_INFO,"\n╔═══════════════════════════════════════════════════════════════════╗\n");
     dns_log(LOG_INFO,"║  DNS  UDP plain + RFC2136 UPDATE + NOTIFY  :%d                   ║\n",g_dns_port);
@@ -4697,34 +4695,37 @@ int main(int argc,char **argv){
             int cfd=accept(tcp_dns_sock,(struct sockaddr*)&cli,&clen);
             if(cfd>=0){
                 dot_conn_t *c=malloc(sizeof(dot_conn_t));
+                if(!c){close(cfd);}else{
                 c->fd=cfd;c->addr=cli;
                 /* dot_thread handles ssl==NULL via plain send/recv */
                 pthread_t tid;pthread_attr_t attr;pthread_attr_init(&attr);
                 pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid,&attr,dot_thread,c);pthread_attr_destroy(&attr);}}
+                pthread_create(&tid,&attr,dot_thread,c);pthread_attr_destroy(&attr);}}}
 
         /* IPv4 DoT */
         if(FD_ISSET(dot_sock,&fds)){
             struct sockaddr_in cli;socklen_t clen=sizeof(cli);
             int cfd=accept(dot_sock,(struct sockaddr*)&cli,&clen);
-            if(cfd>=0){dot_conn_t *c=malloc(sizeof(dot_conn_t));c->fd=cfd;c->addr=cli;
+            if(cfd>=0){dot_conn_t *c=malloc(sizeof(dot_conn_t));
+                if(!c){close(cfd);}else{c->fd=cfd;c->addr=cli;
                 pthread_t tid;pthread_attr_t attr;pthread_attr_init(&attr);
                 pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid,&attr,dot_thread,c);pthread_attr_destroy(&attr);}}
+                pthread_create(&tid,&attr,dot_thread,c);pthread_attr_destroy(&attr);}}}
 
         /* IPv6 DoT */
         if(dot6_sock>=0&&FD_ISSET(dot6_sock,&fds)){
             struct sockaddr_in6 cli6;socklen_t cl6=sizeof(cli6);
             int cfd6=accept(dot6_sock,(struct sockaddr*)&cli6,&cl6);
             if(cfd6>=0){
-                dot_conn_t *c6=malloc(sizeof(dot_conn_t));c6->fd=cfd6;
+                dot_conn_t *c6=malloc(sizeof(dot_conn_t));
+                if(!c6){close(cfd6);}else{c6->fd=cfd6;
                 memset(&c6->addr,0,sizeof(c6->addr));c6->addr.sin_family=AF_INET;
                 if(IN6_IS_ADDR_V4MAPPED(&cli6.sin6_addr))
                     memcpy(&c6->addr.sin_addr,((uint8_t*)&cli6.sin6_addr)+12,4);
                 c6->addr.sin_port=cli6.sin6_port;
                 pthread_t tid6;pthread_attr_t attr6;pthread_attr_init(&attr6);
                 pthread_attr_setdetachstate(&attr6,PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid6,&attr6,dot_thread,c6);pthread_attr_destroy(&attr6);}}
+                pthread_create(&tid6,&attr6,dot_thread,c6);pthread_attr_destroy(&attr6);}}}
 
         if(FD_ISSET(http_sock,&fds)){
             struct sockaddr_in cli;socklen_t clen=sizeof(cli);

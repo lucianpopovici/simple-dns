@@ -1,1 +1,4 @@
 dns_server
+
+.env
+*.pyc
