@@ -1766,6 +1766,13 @@ typedef struct {
     uint16_t error;
 } tsig_rr_t;
 
+/* RFC 8945 §5.4.2: a response's MAC input is prepended with the request's MAC
+ * (length-prefixed).  tsig_verify stashes the request MAC here on success;
+ * tsig_append consumes (and clears) it when computing the response MAC.
+ * Per-thread because each request runs on its own worker. */
+static __thread uint8_t g_tsig_req_mac[64];
+static __thread int     g_tsig_req_mac_len;
+
 /* Find and parse a TSIG RR from the additional section.
    Returns pointer to start of TSIG record in pkt, fills t, or NULL if absent. */
 static const uint8_t *tsig_find(const uint8_t *pkt,int plen,tsig_rr_t *t){
@@ -1849,6 +1856,7 @@ static const char *tsig_alg_to_digest(const char *alg_name){
 }
 
 static int tsig_verify(const uint8_t *pkt,int plen){
+    g_tsig_req_mac_len=0;                /* clear any stale state */
     if(g_tsig_secret_len==0)return 1; /* TSIG not configured: accept all */
     tsig_rr_t t;memset(&t,0,sizeof(t));
     const uint8_t *tsig_rr=tsig_find(pkt,plen,&t);
@@ -1895,7 +1903,11 @@ static int tsig_verify(const uint8_t *pkt,int plen){
     free(tmp);
     size_t ml2=64;EVP_MAC_final(mctx,mac,&ml2,sizeof(mac));mlen=(unsigned)ml2;
     EVP_MAC_CTX_free(mctx);EVP_MAC_free(evp_mac);
-    return (mlen==(unsigned)t.mac_len)&&(memcmp(mac,t.mac,mlen)==0);}
+    int ok=(mlen==(unsigned)t.mac_len)&&(memcmp(mac,t.mac,mlen)==0);
+    if(ok&&t.mac_len>0&&t.mac_len<=(int)sizeof(g_tsig_req_mac)){
+        memcpy(g_tsig_req_mac,t.mac,t.mac_len);
+        g_tsig_req_mac_len=t.mac_len;}
+    return ok;}
 
 /* Append TSIG RR to a response */
 static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t error){
@@ -1924,9 +1936,15 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
      params[0]=OSSL_PARAM_construct_utf8_string("digest",(char*)digest,0);
      params[1]=OSSL_PARAM_construct_end();
      EVP_MAC_init(mctx,g_tsig_secret,g_tsig_secret_len,params);
+     /* RFC 8945 §5.4.2: response MACs prepend the request's MAC (length-prefixed). */
+     if(g_tsig_req_mac_len>0){
+         uint8_t pre[2]={(uint8_t)(g_tsig_req_mac_len>>8),(uint8_t)(g_tsig_req_mac_len&0xFF)};
+         EVP_MAC_update(mctx,pre,2);
+         EVP_MAC_update(mctx,g_tsig_req_mac,g_tsig_req_mac_len);}
      EVP_MAC_update(mctx,buf,off);EVP_MAC_update(mctx,vars,vp);
      size_t ml2=64;EVP_MAC_final(mctx,mac,&ml2,sizeof(mac));mlen=(unsigned)ml2;
-     EVP_MAC_CTX_free(mctx);EVP_MAC_free(evp_mac);}
+     EVP_MAC_CTX_free(mctx);EVP_MAC_free(evp_mac);
+     g_tsig_req_mac_len=0;  /* consumed — clear so a stray future call won't reuse it */}
     /* Encode TSIG RR */
     if(off+200>blen)return off;
     /* key name */
