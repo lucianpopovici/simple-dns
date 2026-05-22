@@ -13,7 +13,8 @@
  *   2931       SIG(0) transaction signatures (stub – reject unsigned updates)
  *   3007       Secure DNS Dynamic Update (TSIG prerequisite)
  *   3596       AAAA records
- *   3597       Unknown RR type handling (\# hex wire format)
+ *   3597       Unknown RR type pass-through (zone:TYPE:name keys are served as-is;
+ *              the \# presentation-format parser is not implemented)
  *   4033-4035  DNSSEC – ZSK, DNSKEY, RRSIG, NSEC, Algorithm 13
  *   4255/6594  SSHFP records
  *   4592       Wildcard records (*.label synthesis)
@@ -971,6 +972,20 @@ static int b64std_dec(const char *in,uint8_t *out,int olen){
         if(c>=0&&o<olen)out[o++]=(uint8_t)((b<<4)|(c>>2));
         if(d>=0&&o<olen)out[o++]=(uint8_t)((c<<6)|d);}
     return o;}
+
+/* RFC 8484 §4.1.1: DoH GET uses base64url (RFC 4648 §5): chars -_ instead of +/,
+ * no padding.  Translate to standard base64 then call b64std_dec. */
+static int b64url_dec(const char *in,uint8_t *out,int olen){
+    char tmp[4096];int n=(int)strlen(in);
+    if(n>=(int)sizeof(tmp)-4)return -1;
+    for(int i=0;i<n;i++){
+        char c=in[i];
+        if(c=='-')tmp[i]='+';
+        else if(c=='_')tmp[i]='/';
+        else tmp[i]=c;}
+    while(n%4!=0)tmp[n++]='=';
+    tmp[n]=0;
+    return b64std_dec(tmp,out,olen);}
 
 /* base64url (for ACME/DNSSEC) */
 static const char B64U[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -1977,6 +1992,114 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     return off;}
 
 /* ==========================================================================
+ * TSIG AXFR multi-message MAC chaining (RFC 8945 §5.3.1)
+ * ======================================================================= */
+
+/* Init HMAC context keyed with g_tsig_secret.  Caller frees ctx + em. */
+static EVP_MAC_CTX *tsig_hmac_new(EVP_MAC **em_out){
+    EVP_MAC *em=EVP_MAC_fetch(NULL,"HMAC",NULL);if(!em)return NULL;
+    EVP_MAC_CTX *ctx=EVP_MAC_CTX_new(em);if(!ctx){EVP_MAC_free(em);return NULL;}
+    OSSL_PARAM p[2];const char *dg=tsig_alg_to_digest(g_tsig_key_name);
+    p[0]=OSSL_PARAM_construct_utf8_string("digest",(char*)dg,0);
+    p[1]=OSSL_PARAM_construct_end();
+    if(EVP_MAC_init(ctx,g_tsig_secret,g_tsig_secret_len,p)!=1){
+        EVP_MAC_CTX_free(ctx);EVP_MAC_free(em);return NULL;}
+    *em_out=em;return ctx;}
+
+/* Feed [2-byte mac_len || mac] into ctx for RFC 8945 MAC chaining. */
+static void tsig_hmac_prepend(EVP_MAC_CTX *ctx,const uint8_t *mac,int mlen){
+    if(mlen<=0)return;
+    uint8_t pre[2]={(uint8_t)(mlen>>8),(uint8_t)(mlen&0xFF)};
+    EVP_MAC_update(ctx,pre,2);EVP_MAC_update(ctx,mac,mlen);}
+
+/* Encode TSIG signing variables into vars[512].  Returns byte count. */
+static int tsig_vars_build(uint8_t vars[512],time_t now,uint16_t error){
+    int vp=0;
+    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *l=strtok(tmp,".");
+     while(l){int ll=(int)strlen(l);vars[vp++]=(uint8_t)ll;
+         memcpy(vars+vp,l,ll);vp+=ll;l=strtok(NULL,".");}vars[vp++]=0;}
+    vars[vp++]=0;vars[vp++]=255;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;
+    const char *aw="\x0bhmac-sha256\x00";memcpy(vars+vp,aw,13);vp+=13;
+    vars[vp++]=0;vars[vp++]=0;
+    vars[vp++]=(uint8_t)((now>>24)&0xFF);vars[vp++]=(uint8_t)((now>>16)&0xFF);
+    vars[vp++]=(uint8_t)((now>>8)&0xFF);vars[vp++]=(uint8_t)(now&0xFF);
+    vars[vp++]=0;vars[vp++]=5;
+    vars[vp++]=error>>8;vars[vp++]=error&0xFF;
+    vars[vp++]=0;vars[vp++]=0;
+    return vp;}
+
+/* Write a TSIG RR into buf at off; increments arcount.  Returns updated off. */
+static int tsig_rr_write(uint8_t *buf,int off,int blen,uint16_t orig_id,
+                          uint16_t error,time_t now,const uint8_t *mac,int mlen){
+    if(off+200>blen)return off;
+    const char *aw="\x0bhmac-sha256\x00";
+    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *l=strtok(tmp,".");
+     while(l){int ll=(int)strlen(l);buf[off++]=(uint8_t)ll;
+         memcpy(buf+off,l,ll);off+=ll;l=strtok(NULL,".");}buf[off++]=0;}
+    buf[off++]=0;buf[off++]=250;buf[off++]=0;buf[off++]=255;
+    buf[off++]=0;buf[off++]=0;buf[off++]=0;buf[off++]=0;
+    uint8_t rd[200];int rp=0;
+    memcpy(rd+rp,aw,13);rp+=13;
+    rd[rp++]=0;rd[rp++]=0;
+    rd[rp++]=(uint8_t)((now>>24)&0xFF);rd[rp++]=(uint8_t)((now>>16)&0xFF);
+    rd[rp++]=(uint8_t)((now>>8)&0xFF);rd[rp++]=(uint8_t)(now&0xFF);
+    rd[rp++]=0;rd[rp++]=5;
+    rd[rp++]=(uint8_t)(mlen>>8);rd[rp++]=(uint8_t)(mlen&0xFF);
+    memcpy(rd+rp,mac,mlen);rp+=mlen;
+    rd[rp++]=orig_id>>8;rd[rp++]=orig_id&0xFF;
+    rd[rp++]=error>>8;rd[rp++]=error&0xFF;
+    rd[rp++]=0;rd[rp++]=0;
+    buf[off++]=0;buf[off++]=(uint8_t)rp;
+    memcpy(buf+off,rd,rp);off+=rp;
+    ((dns_hdr_t*)buf)->arcount=htons(ntohs(((dns_hdr_t*)buf)->arcount)+1);
+    return off;}
+
+/* Sign and append TSIG to the first AXFR/IXFR response message.
+ * Prepends the verified request MAC (g_tsig_req_mac) per §5.4.2.
+ * Stores the computed MAC in out_mac[]/out_mac_len for subsequent chaining.
+ * No-op (returns off unchanged) if TSIG not configured or request had no TSIG. */
+static int tsig_axfr_first(uint8_t *buf,int off,int blen,uint16_t qid,
+                            uint8_t out_mac[64],int *out_mac_len){
+    *out_mac_len=0;
+    if(g_tsig_secret_len==0||g_tsig_req_mac_len==0)return off;
+    time_t now=time(NULL);
+    uint8_t vars[512];int vp=tsig_vars_build(vars,now,0);
+    EVP_MAC *em;EVP_MAC_CTX *ctx=tsig_hmac_new(&em);if(!ctx)return off;
+    tsig_hmac_prepend(ctx,g_tsig_req_mac,g_tsig_req_mac_len);
+    EVP_MAC_update(ctx,buf,off);EVP_MAC_update(ctx,vars,vp);
+    size_t ml=64;EVP_MAC_final(ctx,out_mac,&ml,64);*out_mac_len=(int)ml;
+    EVP_MAC_CTX_free(ctx);EVP_MAC_free(em);
+    g_tsig_req_mac_len=0;
+    return tsig_rr_write(buf,off,blen,qid,0,now,out_mac,*out_mac_len);}
+
+/* Update MAC chain for an intermediate AXFR/IXFR message (no TSIG RR emitted).
+ * Computes HMAC([prior_mac_len||prior_mac||msg_bytes]) and updates prior_mac.
+ * No-op if chaining not active (out_mac_len==0). */
+static void tsig_axfr_mid(const uint8_t *msg,int msg_len,
+                           uint8_t prior_mac[64],int *prior_mac_len){
+    if(g_tsig_secret_len==0||*prior_mac_len==0)return;
+    EVP_MAC *em;EVP_MAC_CTX *ctx=tsig_hmac_new(&em);if(!ctx)return;
+    tsig_hmac_prepend(ctx,prior_mac,*prior_mac_len);
+    EVP_MAC_update(ctx,msg,msg_len);
+    size_t ml=64;uint8_t mac[64];EVP_MAC_final(ctx,mac,&ml,64);
+    EVP_MAC_CTX_free(ctx);EVP_MAC_free(em);
+    memcpy(prior_mac,mac,(size_t)ml);*prior_mac_len=(int)ml;}
+
+/* Sign and append TSIG to the final AXFR/IXFR message using the chained MAC.
+ * No-op if chaining not active (prior_mac_len==0). Returns updated off. */
+static int tsig_axfr_last(uint8_t *buf,int off,int blen,uint16_t qid,
+                           const uint8_t *prior_mac,int prior_mac_len){
+    if(g_tsig_secret_len==0||prior_mac_len==0)return off;
+    time_t now=time(NULL);
+    uint8_t vars[512];int vp=tsig_vars_build(vars,now,0);
+    EVP_MAC *em;EVP_MAC_CTX *ctx=tsig_hmac_new(&em);if(!ctx)return off;
+    tsig_hmac_prepend(ctx,prior_mac,prior_mac_len);
+    EVP_MAC_update(ctx,buf,off);EVP_MAC_update(ctx,vars,vp);
+    size_t ml=64;uint8_t mac[64];EVP_MAC_final(ctx,mac,&ml,64);
+    EVP_MAC_CTX_free(ctx);EVP_MAC_free(em);
+    return tsig_rr_write(buf,off,blen,qid,0,now,mac,(int)ml);}
+
+/* ==========================================================================
  * DNS wire helpers
  * ======================================================================= */
 static int name_to_wire(const char *name,uint8_t *buf,int blen){
@@ -2490,6 +2613,15 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
     memcpy(resp+off,query+off,qsec);
     uint16_t qtype=get16(query,after);off+=qsec;
     edns_info_t ei;edns_parse(query,qlen,&ei);
+    /* RFC 6891 §6.1.3: respond with BADVERS for any EDNS version != 0.
+     * Extended rcode = 1 (value 16, low nibble 0 in header, high byte 1 in OPT). */
+    if(ei.present&&ei.version!=0){
+        rh->flags=htons(DNS_QR|DNS_AA|(DNS_RCODE_BADVERS&0xF));
+        rh->ancount=rh->nscount=htons(0);
+        off=edns_append_opt(resp,off,resp_len,is_tcp,0,
+                            (uint16_t)((DNS_RCODE_BADVERS>>4)&0xFF),
+                            &ei,cip,-1,NULL);
+        return off;}
     if(!cookie_verify(&ei,cip)){
         /* RFC 9018: emit BADCOOKIE with a fresh server cookie so the client
          * can retry.  Header rcode = low 4 bits of 23; OPT TTL carries the
@@ -3162,7 +3294,7 @@ static int ixfr_journal_fetch(uint32_t from_serial,
 /* ==========================================================================
  * AXFR / IXFR zone transfer (RFC 5936 / 1995)
  * ======================================================================= */
-typedef struct{int fd;SSL *ssl;struct sockaddr_in addr;int ixfr;uint32_t ixfr_serial;}axfr_conn_t;
+typedef struct{int fd;SSL *ssl;struct sockaddr_in addr;int ixfr;uint32_t ixfr_serial;uint16_t query_id;}axfr_conn_t;
 
 static int axfr_ip_allowed(const struct in_addr *cip){
     char allow[1024];strncpy(allow,g_axfr_allow,sizeof(allow)-1);
@@ -3209,10 +3341,12 @@ static void *axfr_thread(void *arg){
         if(ne>0){
             /* Send: current SOA, del-SOA(old), adds, new-SOA */
             uint8_t mb[BUF_SIZE];int mo;
+            uint8_t ixfr_mac[64];int ixfr_mac_len=0;
             /* Opening SOA */
             compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
             mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
             if(soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+            mo=tsig_axfr_first(mb,mo,sizeof(mb),c.query_id,ixfr_mac,&ixfr_mac_len);
             tcp_send_msg(c.fd,c.ssl,mb,mo);
             /* Old SOA (the one being replaced) */
             uint8_t old_soa[512];int old_soa_len=0;
@@ -3223,6 +3357,7 @@ static void *axfr_thread(void *arg){
              pthread_mutex_lock(&g_soa_mutex);g_soa_serial=saved;pthread_mutex_unlock(&g_soa_mutex);}
             compress_reset();memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
             if(old_soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,old_soa,(uint16_t)old_soa_len);
+            tsig_axfr_mid(mb,mo,ixfr_mac,&ixfr_mac_len);
             tcp_send_msg(c.fd,c.ssl,mb,mo);
             /* Changes */
             for(int ei=0;ei<ne;ei++){
@@ -3239,11 +3374,13 @@ static void *axfr_thread(void *arg){
                     uint8_t rd[16];memcpy(rd,&a6,16);
                     mo=append_rr(mb,mo,sizeof(mb),ename,DNS_TYPE_AAAA,DNS_CLASS_IN,DEFAULT_TTL,rd,16);
                 }else{free(e);continue;}
+                tsig_axfr_mid(mb,mo,ixfr_mac,&ixfr_mac_len);
                 tcp_send_msg(c.fd,c.ssl,mb,mo);free(e);
             }
             /* Closing new SOA */
             compress_reset();memset(mb,0,12);mh=(dns_hdr_t*)mb;mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);mo=12;
             if(soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+            mo=tsig_axfr_last(mb,mo,sizeof(mb),c.query_id,ixfr_mac,ixfr_mac_len);
             tcp_send_msg(c.fd,c.ssl,mb,mo);
             dns_log(LOG_NOTICE,"[IXFR] Sent %d changes serial %u->%u to %s\n",ne,c.ixfr_serial,g_soa_serial,cip);
             goto done;
@@ -3254,6 +3391,7 @@ static void *axfr_thread(void *arg){
         uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
         mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);int mo=12;
         if(soa_len>0)mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+        mo=tsig_append(mb,mo,sizeof(mb),c.query_id,0);
         tcp_send_msg(c.fd,c.ssl,mb,mo);
         dns_log(LOG_NOTICE,"[IXFR] Already current serial %u for %s\n",g_soa_serial,cip);
         goto done;
@@ -3261,6 +3399,7 @@ static void *axfr_thread(void *arg){
 
     /* ── AXFR full transfer ── */
     uint8_t buf[BUF_SIZE];
+    uint8_t axfr_mac[64];int axfr_mac_len=0; /* TSIG chaining state (RFC 8945 §5.3.1) */
     /* First SOA */
     compress_reset();memset(buf,0,12);dns_hdr_t *rh=(dns_hdr_t*)buf;
     rh->flags=htons(DNS_QR|DNS_AA);rh->ancount=htons(1);
@@ -3270,6 +3409,7 @@ static void *axfr_thread(void *arg){
     if(n>0){off+=n;put16(buf,off,252);off+=2;put16(buf,off,DNS_CLASS_IN);off+=2;}
     rh->qdcount=htons(1);
     if(soa_len>0)off=append_rr(buf,off,sizeof(buf),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+    off=tsig_axfr_first(buf,off,sizeof(buf),c.query_id,axfr_mac,&axfr_mac_len);
     tcp_send_msg(c.fd,c.ssl,buf,off);
 
     /* Send all static zone records */
@@ -3289,6 +3429,7 @@ static void *axfr_thread(void *arg){
         uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
         mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
         int mo=12;mo=append_rr(mb,mo,sizeof(mb),r->name,r->type,DNS_CLASS_IN,r->ttl,rd,rdlen);
+        tsig_axfr_mid(mb,mo,axfr_mac,&axfr_mac_len);
         tcp_send_msg(c.fd,c.ssl,mb,mo);}
 
     /* Send DNSKEY records */
@@ -3297,17 +3438,20 @@ static void *axfr_thread(void *arg){
          uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
          mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
          int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,68);
+         tsig_axfr_mid(mb,mo,axfr_mac,&axfr_mac_len);
          tcp_send_msg(c.fd,c.ssl,mb,mo);}
      if(g_zsk_ed&&dnskey_rdata_ed25519(g_zsk_ed,dkrd,sizeof(dkrd))>0){
          uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
          mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
          int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,36);
+         tsig_axfr_mid(mb,mo,axfr_mac,&axfr_mac_len);
          tcp_send_msg(c.fd,c.ssl,mb,mo);}}
 
     /* Closing SOA */
     {uint8_t mb[BUF_SIZE];compress_reset();memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
      mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
      int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+     mo=tsig_axfr_last(mb,mo,sizeof(mb),c.query_id,axfr_mac,axfr_mac_len);
      tcp_send_msg(c.fd,c.ssl,mb,mo);}
     dns_log(LOG_NOTICE,"[AXFR] Complete to %s\n",cip);
     STAT_INC(g_stat_axfr);
@@ -3411,6 +3555,8 @@ static void *dot_thread(void *arg){
                     sc=ra+10+rdl2;
                 }
             }
+            ac->query_id=ntohs(((dns_hdr_t*)pkt)->id);
+            tsig_verify(pkt,ml); /* stash request MAC into g_tsig_req_mac for response signing */
             axfr_thread(ac);return NULL;}
         char qn[256]="?";uint16_t qt=0;
         {int a=name_from_wire(pkt,ml,12,qn,sizeof(qn));if(a>=0&&a+1<ml)qt=get16(pkt,a);}
@@ -4458,7 +4604,7 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
             handle_doh(fd,ssl,(uint8_t*)bdy,blen,cip);}
         else{/* GET with dns= parameter */
             char dns_b64[4096]={0};qs_get(qs,"dns",dns_b64,sizeof(dns_b64));
-            uint8_t pkt[BUF_SIZE];int plen=b64std_dec(dns_b64,pkt,sizeof(pkt));
+            uint8_t pkt[BUF_SIZE];int plen=b64url_dec(dns_b64,pkt,sizeof(pkt));
             handle_doh(fd,ssl,pkt,plen,cip);}
         return;}
 
