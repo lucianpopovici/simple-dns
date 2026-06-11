@@ -14,14 +14,15 @@ Run the same binary in two roles:
   writes from anyone except the master.
 
 Related work plans (independent of the two-role deployment):
-`CLAUDE-loadbalance.md` (A/AAAA rotation + health checks) and
-`CLAUDE-forwarder.md` (out-of-zone forwarding to upstream resolvers).
+`CLAUDE-loadbalance.md` (A/AAAA rotation + health checks),
+`CLAUDE-forwarder.md` (out-of-zone forwarding to upstream resolvers) and
+`CLAUDE-discovery.md` (automatic FQDN registration for VMs/containers).
 
 ## What already works (verified in source, 5173 lines)
 
 | Feature | Where | Status |
 |---------|-------|--------|
-| AXFR over TCP and TLS (RFC 5936/7858) | `axfr_thread` 3323, `dot_thread` 3509 | done — DoT listener dispatches qtype 252/251 to `axfr_thread`, `tcp_send_msg` 3317 writes via `SSL_write` when TLS |
+| AXFR over TCP and TLS (RFC 5936/7858) | `axfr_thread` 3323, `dot_thread` 3509 | transport done — DoT listener dispatches qtype 252/251 to `axfr_thread`, `tcp_send_msg` 3317 writes via `SSL_write` when TLS.  **Content incomplete:** only `static_zone[]` + DNSKEYs + SOA are sent (3415–3448); runtime `zone:*`/`ddns:*` records are missing — see `CLAUDE-discovery.md` Gap 1, fix before Gap 3 below |
 | IXFR with journal + AXFR fallback (RFC 1995) | journal 3240–3293, IXFR path 3337 | done |
 | TSIG multi-message MAC chaining (RFC 8945 §5.3.1) | `tsig_axfr_first/mid/last` 2061/2078/2090 | done (server side only) |
 | TSIG verification of requests | `tsig_verify` 1876 | done (server side only) |
