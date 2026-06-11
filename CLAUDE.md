@@ -13,6 +13,10 @@ Run the same binary in two roles:
   presenting a client certificate and signing requests with TSIG.  Accept no
   writes from anyone except the master.
 
+Related work plans (independent of the two-role deployment):
+`CLAUDE-loadbalance.md` (A/AAAA rotation + health checks) and
+`CLAUDE-forwarder.md` (out-of-zone forwarding to upstream resolvers).
+
 ## What already works (verified in source, 5173 lines)
 
 | Feature | Where | Status |
