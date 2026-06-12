@@ -1,305 +1,453 @@
-# dns_server.c — hidden-master / public-secondary deployment: gap analysis
+# CLAUDE.md — Target architecture for the dns_server project
 
-## Deployment goal
+This document describes the **target** architecture and the migration path to
+reach it. The current code is a single ~5000-line `dns_server.c` that bundles
+the authoritative server, an mDNS responder, ACME and EST PKI clients, an
+embedded HTTP/HTTPS management plane, a DoH endpoint, and a first-boot config
+portal. Those concerns have different trust models, lifecycles, and failure
+modes and must be separated.
 
-Run the same binary in two roles:
+Use this file to guide refactoring. Do not attempt the whole split in one pass —
+follow the migration order at the bottom. Each step must leave the system
+buildable and passing `make check`.
 
-- **Hidden master** — not listed in NS, not reachable by clients.  Receives
-  all provisioning (RFC 2136 UPDATE, management API, ACME DNS-01) and serves
-  zone transfers to the public instances only, authenticated with
-  **TSIG + mTLS**.
-- **Public secondaries** — listed in NS, answer client queries (UDP/TCP/DoT/
-  DoH).  Pull the zone from the hidden master via AXFR/IXFR over TLS,
-  presenting a client certificate and signing requests with TSIG.  Accept no
-  writes from anyone except the master.
+> A companion file, `CLAUDE-fixes.md`, lists concrete defects to fix first
+> (DNSSEC validation, `strtok` thread-safety, etc.). Do those before or
+> alongside step 1 below. `CLAUDE-migration.md` is the step-by-step tracker.
 
-Related work plans (independent of the two-role deployment):
-`CLAUDE-loadbalance.md` (A/AAAA rotation + health checks),
-`CLAUDE-forwarder.md` (out-of-zone forwarding to upstream resolvers) and
-`CLAUDE-discovery.md` (automatic FQDN registration for VMs/containers).
-
-## What already works (verified in source, 5173 lines)
-
-| Feature | Where | Status |
-|---------|-------|--------|
-| AXFR over TCP and TLS (RFC 5936/7858) | `axfr_thread` 3323, `dot_thread` 3509 | transport done — DoT listener dispatches qtype 252/251 to `axfr_thread`, `tcp_send_msg` 3317 writes via `SSL_write` when TLS.  **Content incomplete:** only `static_zone[]` + DNSKEYs + SOA are sent (3415–3448); runtime `zone:*`/`ddns:*` records are missing — see `CLAUDE-discovery.md` Gap 1, fix before Gap 3 below |
-| IXFR with journal + AXFR fallback (RFC 1995) | journal 3240–3293, IXFR path 3337 | done |
-| TSIG multi-message MAC chaining (RFC 8945 §5.3.1) | `tsig_axfr_first/mid/last` 2061/2078/2090 | done (server side only) |
-| TSIG verification of requests | `tsig_verify` 1876 | done (server side only) |
-| mTLS client-cert verification machinery | `tls_ctx_from_pem` 1500 (`ca_pem`/`verify_client` args), CA loaded from `config:mtls_ca_pem` 1427 | done — but only wired to the mgmt/DoH context (`g_mgmt_ctx`, 1550), **not** to the DoT context |
-| NOTIFY sender (RFC 1996) | `notify_send` 3465, targets from `config:notify_targets` | done (UDP, IPv4, unsigned, no retry) |
-| NOTIFY receiver | `dns_process` 3496–3501 | **ACK-only — takes no action** |
-| AXFR IP allowlist | `axfr_ip_allowed` 3299, `config:axfr_allow` | done |
-
-Everything below is missing and is required for the two-role deployment.
+> Feature work plans (independent of the process split, but coordinate with
+> it): `CLAUDE-hidden-master.md` (hidden-master / public-secondary deployment
+> gap analysis), `CLAUDE-loadbalance.md` (A/AAAA rotation + health checks),
+> `CLAUDE-forwarder.md` (out-of-zone forwarding), `CLAUDE-discovery.md`
+> (automatic FQDN registration for VMs/containers).
 
 ---
 
-## Gap 1 — mTLS on the DoT/transfer listener (master side)
+# Working in this repo (read first)
 
-### What's wrong
+## Prerequisites
 
-`tls_reload` (line 1522) builds the DoT context **without** client-cert
-verification:
+- **OpenSSL 3.0+ is required.** The crypto uses 3.x-only APIs (`EVP_MAC_fetch`,
+  `OSSL_PARAM_construct_*`, `EVP_PKEY_fromdata`, `EVP_PKEY_CTX_new_from_name`).
+  Building against 1.1.x fails with confusing errors. Verify with
+  `openssl version` before debugging a build.
+- A running **Valkey** for anything beyond compiling (default
+  `127.0.0.1:6379`, no password): `valkey-server &`.
+- `gcc` or `clang`, `make`, `pkg-config`, and for tests `dig` (dnsutils).
 
-```c
-g_dot_ctx = tls_ctx_from_pem(g_tls_cert_pem, g_tls_key_pem, NULL, 0);   /* 1526 */
-```
+## Build / run / test (canonical commands)
 
-while the mgmt context right below it (line 1550) gets the CA and
-`verify_client=1`.  Any TLS client can therefore reach the AXFR/IXFR path;
-the only gates are `axfr_allow` and TSIG.
-
-### Fix overview
-
-Add `config:dot_require_client_cert` (0/1, default 0).  When 1 and
-`g_mtls_ca_pem` is non-empty, build the DoT context with verification:
-
-```c
-g_dot_ctx = tls_ctx_from_pem(g_tls_cert_pem, g_tls_key_pem,
-                             g_dot_mtls ? g_mtls_ca_pem : NULL,
-                             g_dot_mtls);
-```
-
-This must remain **off by default**: a public-facing instance uses the same
-DoT port for regular client queries (RFC 7858 clients don't present certs).
-On the hidden master it can be switched on globally because nothing but the
-secondaries connects there.
-
-Optional hardening: in `dot_thread` (3509), when a transfer is requested and
-mTLS is on, log `SSL_get_peer_certificate` CN next to the `axfr_allow` check
-(the mgmt path already does CN extraction at line 4854 — reuse that pattern).
-
-Estimated change: ~20 lines + config plumbing in `load_config` (~1364).
-
-### Test
+The `Makefile` derives `OSSL_INC`/`OSSL_LIB` via `pkg-config` (correct
+per-platform: Debian multiarch, Fedora `/usr/lib64`, Homebrew, …) and fails
+fast with a clear message if the paths are wrong, so a bare `make` works on a
+fresh checkout. Override only for a non-standard OpenSSL:
+`make OSSL_INC=/opt/openssl/include OSSL_LIB=/opt/openssl/lib`.
 
 ```bash
-# without client cert — handshake must fail when dot_require_client_cert=1
-kdig +tls @master -p 8853 AXFR corp.local            # expect TLS failure
-# with client cert + TSIG — transfer must succeed
-kdig +tls +tls-keyfile=sec.key +tls-certfile=sec.crt \
-     -y hmac-sha256:tsig-key:<b64> @master -p 8853 AXFR corp.local
+# Debug build — ASan + UBSan, full symbols. Use this while iterating.
+make debug
+
+# Production binary WITHOUT signing (no GPG key needed; for local/CI builds).
+make dns_server
+
+# Full production build (optimised, stripped, GPG-signed). Needs a signing key.
+make
+
+# Run (binds 5353/udp+tcp, 8853 DoT, 8443 DoH/mgmt, 8053 HTTP). Valkey must be up.
+./dns_server
+
+# Smoke test (needs Valkey + dig).
+make check
+
+# DNSSEC known-answer + negative unit tests.
+make check-dnssec
+
+# Run under sanitizers with leak detection.
+ASAN_OPTIONS=detect_leaks=1 ./dns_server_debug
 ```
 
+(The CI workflow hardcodes Debian/Ubuntu paths because the runner image is
+fixed; for local work rely on the Makefile's `pkg-config` derivation.)
+
+Relevant env vars: `DNS_VALKEY_HOST`, `DNS_VALKEY_PORT`, `DNS_VALKEY_PASSWORD`,
+`CONFIG_PORT` (first-boot portal), `LISTEN_PORT`. On first boot with Valkey
+unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
+
+## Repository map
+
+| Path | What it is |
+|---|---|
+| `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
+| `dns_server.c` | The monolith authoritative server (~5000 lines). Will be decomposed — see architecture below. |
+| `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC **validation**. Becomes `resolverd`. |
+| `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
+| `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
+| `fuzz/` | libFuzzer harness + corpus: `make fuzz-wire` (60s smoke; needs clang). |
+| `dashboard/app.py` | Flask control-plane UI; talks to Valkey directly. |
+| `Makefile` | Build/sign/install. |
+| `keys/` | Code-signing key material. **Do not read, modify, or commit anything here.** |
+
+Source-of-truth specs — ground protocol decisions in these, do not guess:
+- RFC-coverage list and the full Valkey schema: header comment at `dns_server.c:1`.
+- Valkey namespace ownership (who may write what): the table in this file.
+
+## Do NOT
+
+- **Do not edit the three parser copies independently.** Fix wire helpers once,
+  in `libdnswire` (migration Step 1). Diverging copies are how past bugs spread.
+- **Do not weaken or remove a bounds check** while refactoring. Preserve the
+  `-1`-on-overflow convention in every wire helper and check it at call sites.
+- **Do not introduce `strtok`** (use `strtok_r`) or any bare fixed-buffer copy
+  (use `safe_strcpy` with a real `sizeof`). See `CLAUDE-fixes.md` Tasks 2 and 6.
+- **Do not continue on a parse/alloc/crypto failure.** Fail closed: drop the
+  request or return SERVFAIL; never serve partially-parsed data.
+- **Do not write a Valkey namespace you do not own** (see the ownership table).
+- **Do not generate, echo, commit, or hard-code signing keys or secrets**, and
+  do not touch `keys/`. Secrets live in Valkey and are provisioned out of band.
+- **Do not reformat unrelated code** inside a logic change. The clang-format
+  reflow is a single isolated no-logic commit.
+- **Do not claim a task is done on a clean compile alone** — run the
+  verification protocol below.
+
+## Verification protocol (run before reporting any task complete)
+
+1. `make debug …` builds with no new warnings.
+2. Run the relevant check and **show its output**, do not just assert success:
+   - parser/wire change → the `libdnswire` unit tests + the `name_from_wire`
+     fuzz target for ≥60s, and add the case to `fuzz/corpus` if it found one;
+   - crypto change (TSIG/DNSSEC) → known-answer tests **and** the negative test
+     (flipped byte must fail);
+   - anything else → `make check`.
+
+   > The targets (created in migration Step 1): `make check-wire` (parser unit
+   > tests), `make fuzz-wire` (60s libFuzzer smoke on `name_from_wire`; needs
+   > clang), `make check-dnssec` (DNSSEC/TSIG known-answer + negative tests).
+3. Confirm the relevant **Acceptance** boxes in `CLAUDE-migration.md` (or
+   `CLAUDE-fixes.md`) are satisfied.
+4. Update any spec that changed: RFC list, Valkey schema, ownership table.
+
+## When working on… read first
+
+| Change type | Read |
+|---|---|
+| Wire parsing / record encoding | `libdnswire` (`dns_wire.*`), `CLAUDE-fixes.md` Tasks 1 & 5 |
+| TSIG / DNSSEC | the crypto sections of `dns_server.c` / `dns_client.c`, `CLAUDE-fixes.md` Task 1 |
+| Process split / new daemon | this file (architecture + Valkey boundary), `CLAUDE-migration.md` |
+| Config / control plane | Valkey ownership table, `dashboard/app.py`, README schema |
+| Build / CI | `Makefile`, `.github/workflows/ci.yml`, `CLAUDE-fixes.md` Task 4 |
+
 ---
 
-## Gap 2 — role configuration
+## Design principles
 
-There is no concept of a role.  Add:
-
-| Key | Meaning |
-|-----|---------|
-| `config:zone_role` | `primary` (default) or `secondary` |
-| `config:primary_host` / `config:primary_port` | where a secondary pulls from |
-| `config:primary_tls` | 0/1 — use TLS for the transfer connection |
-| `config:xfr_client_cert_pem` / `config:xfr_client_key_pem` | client identity the secondary presents (mTLS) |
-| `config:xfr_ca_pem` | CA to verify the master's server cert |
-| `config:dot_require_client_cert` | Gap 1 |
-
-Globals + `load_config` plumbing next to the existing TLS/TSIG keys
-(1410–1427).  TSIG reuses the existing `config:tsig_secret_b64` /
-`config:tsig_key_name` — same key on master and secondaries.
+1. **One responsibility per process.** A bug in a low-trust path (mDNS, an HTTP
+   parser, an ACME JSON response) must not be a bug in the privileged
+   authoritative daemon.
+2. **Valkey is the integration bus.** Processes do not call each other
+   directly. They communicate by reading and writing well-defined Valkey
+   namespaces. This is the only contract between components.
+3. **The authoritative daemon is the trusted core and stays small.** Everything
+   that can live outside it, does.
+4. **Least privilege.** Bind privileged resources, then drop. Sandbox the
+   request-handling paths.
+5. **One wire-format implementation.** No duplicated parsers.
 
 ---
 
-## Gap 3 — transfer client (secondary pulls AXFR/IXFR over TLS)
+## Target process topology
 
-### What's wrong
-
-There is **no client-side transfer code at all**.  The server can only be
-the sending side of AXFR/IXFR.  A secondary needs `xfr_pull()`:
-
-1. TCP connect to `primary_host:primary_port`; if `primary_tls`, wrap in
-   OpenSSL with SNI, ALPN `dot`, server-cert verification against
-   `xfr_ca_pem`, and the client cert/key from Gap 2.  The outbound-TLS
-   pattern already exists in the rsyslog client (617–650) and the HTTPS/mTLS
-   client (4080–4120) — reuse it.
-2. Build an IXFR query (current serial in the authority-section SOA, as
-   parsed today by the server at 3532–3539) or AXFR if no local zone yet.
-3. TSIG-sign the **request** with `tsig_append` (1931).
-4. Read length-prefixed messages in a loop; parse RRs; detect the closing
-   SOA (second occurrence of the apex SOA for AXFR; RFC 1995 framing for
-   IXFR, falling back to full-zone semantics when the response turns out to
-   be an AXFR-style answer).
-5. Apply to the local Valkey store using the existing schema
-   (`zone:<TYPE>:<name>` with the value formats documented in the file
-   header, lines 56–70), then set `config:zone_serial` to the master's
-   serial — serials must never be generated locally on a secondary.
-6. On any failure of IXFR semantics: retry as AXFR (RFC 1995 §4).
-
-The RR-parsing side can reuse `name_from_wire`/`get16`/`get32`; rdata →
-store-string conversion is the inverse of the per-type emit code in
-`build_query_resp` (2645 ff.) and needs ~one case per supported type.
-
-Estimated change: ~250–350 lines.  This is the largest single piece.
-
-### Test
-
-```bash
-# secondary with empty store pulls full zone:
-vk-cli set config:zone_role secondary; vk-cli set config:primary_host 10.0.0.1 ...
-/tmp/dns_server &   # expect "[XFR] AXFR from 10.0.0.1 serial 0 -> N, M records"
-dig @secondary corp.local SOA   # serial matches master
-# incremental: update master, send NOTIFY, expect IXFR with only the diff
+```
+                         ┌─────────────────────────────┐
+                         │           Valkey             │
+                         │   (source of truth + bus)    │
+                         └─────────────────────────────┘
+        writes/reads          ▲     ▲     ▲     ▲          reads/writes
+   ┌──────────────────────────┘     │     │     └──────────────────────────┐
+   │                                 │     │                                 │
+┌──┴───────┐   ┌──────────┐   ┌──────┴──┐  │   ┌──────────────┐   ┌──────────┴───┐
+│  dnsd    │   │  mdnsd   │   │  certd  │  │   │  dashboard   │   │  resolverd   │
+│ (auth.)  │   │ (mDNS)   │   │ (PKI)   │  │   │  (Flask UI)  │   │ (recursive)  │
+└──────────┘   └──────────┘   └─────────┘  │   └──────────────┘   └──────────────┘
+   ▲  ▲                                     │          ▲
+   │  │ DoH / mgmt (optional)               │          │ authenticated
+   │  └──────────── reverse proxy (nginx/envoy) ───────┘
+   │ DNS / DoT (53, 853)
+ clients
 ```
 
----
-
-## Gap 4 — client-side TSIG verification of the chained response
-
-`tsig_verify` (1876) verifies a single signed message.  A transfer response
-is a **chain**: TSIG RR on first and last message only, intermediate
-messages covered by the running HMAC (RFC 8945 §5.3.1).  The secondary must
-verify what `tsig_axfr_first/mid/last` (2061/2078/2090) produce — same
-hashing rules, verify side:
-
-- seed the digest with the **request** MAC (length-prefixed),
-- fold every intermediate message into the accumulator,
-- on each received TSIG RR, compare the computed MAC and re-seed the chain
-  with the received MAC,
-- reject the whole transfer if the final message carries no TSIG RR, if any
-  MAC mismatches, or if more than 99 unsigned messages arrive in a row
-  (RFC 8945 §5.3.1 limit).
-
-Mirror-image of the three existing functions, sharing `tsig_hmac_ctx_init`
-(1998).  Estimated ~80 lines.
+Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) linked by `dnsd`,
+`mdnsd`, and `resolverd`.
 
 ---
 
-## Gap 5 — NOTIFY must trigger a refresh on the secondary
+## Components and ownership
 
-### What's wrong
+### `dnsd` — authoritative DNS server (trusted core)
 
-The receiver at `dns_process` 3496–3501 acknowledges and does nothing:
+The minimal authoritative daemon. This is what `dns_server.c` becomes after the
+other concerns are extracted.
 
-```c
-if(op==DNS_OPCODE_NOTIFY){
-    /* Accept and acknowledge NOTIFY */
-    ...
-    dns_log(LOG_NOTICE,"[NOTIFY] Received NOTIFY\n");return 12;}
-```
+Owns:
+- UDP + TCP listeners (53), DNS-over-TLS (853).
+- Query resolution against zone data, wildcards (4592), minimal-ANY (8482),
+  QDCOUNT enforcement (9619).
+- DNSSEC **signing** (ZSK/KSK, alg 13 + 15), NSEC/NSEC3 authenticated denial.
+- Dynamic UPDATE (2136) + TSIG (8945) + zone-authority check (3007).
+- AXFR/IXFR (5936/1995, journal-based) + NOTIFY (1996).
+- EDNS (6891), cookies (9018), padding, EDE (8914), NSID.
 
-It does not check the source, does not verify TSIG, does not compare
-serials, and does not schedule a transfer (RFC 1996 §3.11, §4.7).
+Does **not** contain: mDNS, ACME, EST, the embedded HTTP/HTTPS management API,
+the config portal, or DoH HTTP parsing.
 
-### Fix overview
+Reads from Valkey: `config:*`, `zone:*`, `ddns:*`, DNSSEC key material, current
+TLS `cert:*` blobs. Hot-reloads on Valkey keyspace notifications (see below).
 
-When `zone_role=secondary`:
-1. verify TSIG if present (`tsig_verify` already handles this — just call it
-   on the NOTIFY path; today only UPDATE goes through it);
-2. accept only from `primary_host` (RFC 1996 §3.10);
-3. signal the refresh thread (Gap 6) to do an immediate SOA check / IXFR
-   instead of waiting for the refresh timer — `pthread_cond_signal` on a
-   condition the refresh loop waits on with a timeout.
+Privilege: bind sockets as root, then `setuid`/`setgid` to an unprivileged
+service account; `chroot` or mount-namespace the working dir; apply a `seccomp`
+filter to worker threads. No outbound network except to Valkey.
 
-Sender side (`notify_send` 3465) improvements for master→secondary auth:
-TSIG-sign the NOTIFY (append via `tsig_append`), and retry per RFC 1996 §3.6
-(currently fire-and-forget UDP, IPv4-only).  Estimated ~60 lines total.
+### `mdnsd` — mDNS / DNS-SD responder (link-local, low trust)
 
----
+Separate process. Joins IPv4/IPv6 multicast groups, answers `.local` queries
+and `_services._dns-sd._udp.local` browse requests.
 
-## Gap 6 — SOA refresh / retry / expire loop (secondary maintenance)
+Reads from Valkey: `mdns:*`, `config:mdns_*`.
+Never touches the authoritative zone or DNSSEC keys. Runs only on interfaces it
+is explicitly configured for — not implicitly "all interfaces."
 
-No periodic zone-maintenance thread exists.  The SOA timer values are
-already parsed and stored (`g_soa_refresh/retry/expire`, 434–436) but are
-only ever *served*, never *obeyed*.
+### `certd` — certificate manager sidecar (network-facing, low trust)
 
-Add `xfr_refresh_thread` (started from `main` next to `pki_renewal_thread`,
-4912) running only when `zone_role=secondary`:
+Extracts all ACME and EST client code out of `dnsd`.
 
-```c
-for(;;){
-    timedwait(notify_cond, g_soa_refresh);
-    uint32_t master_serial = soa_query(primary);       /* plain SOA query  */
-    if(serial_gt(master_serial, g_soa_serial))         /* RFC 1982 compare */
-        if(xfr_pull() != 0) sleep_retry(g_soa_retry);
-    if(now - last_success > g_soa_expire) zone_expired = 1;  /* answer
-        SERVFAIL, stop answering authoritatively, RFC 1035 §5 */
-}
-```
+Owns: ACME directory/JWS/order flow, DNS-01 challenge orchestration, EST
+mTLS enrollment, CSR generation, renewal scheduling.
 
-`serial_gt` must be RFC 1982 serial-space arithmetic, not plain `>`:
-`(int32_t)(a - b) > 0`.  Estimated ~80 lines.
+Integration is entirely through Valkey:
+- For ACME DNS-01: writes the challenge as a normal zone record
+  (`zone:TXT:_acme-challenge.<domain>`), waits, then deletes it.
+- On success: writes the issued cert + key to `cert:current` (PEM).
+- `dnsd` watches `cert:current` and hot-reloads — it never speaks ACME/EST.
 
----
+This is the change that removes the most attacker-adjacent parser code from the
+trusted core. `certd` is the only component (besides `resolverd`) that makes
+arbitrary outbound connections.
 
-## Gap 7 — refuse writes on the secondary
+### `resolverd` — recursive/forwarding resolver (separate role)
 
-`handle_update` (3119) applies RFC 2136 UPDATE directly to the store on any
-instance, and the management API write endpoints (4724, 4732) bump the
-serial and send NOTIFY.  On a secondary this would fork the zone from the
-master and corrupt IXFR history.
+This is `dns_client.c`. Keep it a distinct daemon — authoritative and recursive
+are different DNS roles and must not share a process. Owns upstream UDP/TCP/DoT/
+DoH, the cache, and DNSSEC **validation** (note: validation must cover the
+RRset, not just the RRSIG header — see `CLAUDE-fixes.md` Task 1).
 
-When `zone_role=secondary`:
-- `handle_update` returns RCODE NOTAUTH (9) immediately (optionally: forward
-  to the primary per RFC 2136 §6 — out of scope for the first pass; document
-  that ACME/DDNS clients must point at the hidden master);
-- mgmt-API zone-write endpoints return 403;
-- `serial_bump` (1495) must never run — the master's serial is authoritative.
+Reads/writes Valkey: its persisted cache namespace only. It does not read the
+authoritative zone.
 
-Estimated ~25 lines.
+### Control plane: reverse proxy + `dashboard`
 
----
+- A real reverse proxy (nginx or envoy) terminates TLS and HTTP for the DoH
+  endpoint and for any management/metrics surface, forwarding cleanly to the
+  daemons. This removes the hand-rolled HTTP/HTTPS/mTLS server, `url_decode`,
+  and `qs_get` from the C code.
+- `dashboard/app.py` (Flask) remains the control-plane UI but **must gain
+  authentication** before exposure. Today it has none, and its Valkey Explorer
+  can set/delete arbitrary keys — which means unauthenticated full compromise
+  (zone data, TSIG secret, cookie secret all live in Valkey).
+- `dnsd` exposes only a tiny read-only `/health` + `/metrics` (Prometheus),
+  ideally bound to localhost and scraped through the proxy. All write
+  operations go through Valkey, not an embedded API.
 
-## Gap 8 — DNSSEC key distribution (operational, plus a guard)
+### `libdnswire` — shared wire-format library
 
-This server does **online signing**: every instance signs responses with
-the ZSK/KSK held in its own Valkey (`dnssec:zsk`, `dnssec:zsk_ed25519`,
-`dnssec:ksk`, `dnssec:ksk_ed25519` — generated on first boot if absent,
-`dnssec_init_key` 1660).  A freshly booted secondary would therefore invent
-**its own keys**, the DNSKEY/DS it serves would not match the DS published
-at the parent, and validation would fail for clients hitting that secondary.
+Factor the duplicated primitives (`name_from_wire`, `name_to_wire`,
+`append_rr`, `get16/put16/get32/put32`, `txt_encode`, hex/base64 helpers) out of
+`dns_server.c`, `dns_client.c`, and `simple_dns.c` into one module. All three
+binaries link it. This eliminates the divergence-bug class (e.g. a parser fix
+applied to one copy but not the others).
 
-AXFR carries the DNSKEY RRs (3435–3447) but — correctly — not private keys,
-so transfers cannot fix this.
-
-Two pieces:
-1. **Operational (document in README / provisioning script):** replicate the
-   four `dnssec:*` PEM values from the master's Valkey into each secondary's
-   Valkey *before first start*.
-2. **Code guard:** on `zone_role=secondary`, `dnssec_init` (1690) must
-   **load-only, never generate** — if the keys are absent, log LOUDLY and
-   serve unsigned rather than minting a divergent trust anchor.
-   ~10 lines in `dnssec_init_key`.
-
-The same consideration applies to `config:tls_cert_pem`/`key` (each instance
-can have its own cert — secondaries verify the master via `xfr_ca_pem`, the
-master verifies secondaries via `config:mtls_ca_pem`; one private CA for the
-transfer mesh is the simplest setup).
+`simple_dns.c`: if it is a teaching/reference artifact, label it as such and
+exclude it from the production build. If it is live, it must also use
+`libdnswire` rather than its own copies.
 
 ---
 
-## Suggested implementation order
+## The Valkey boundary (integration contract)
 
-1. Gap 1 (mTLS on DoT) — small, independently testable against `kdig`.
-2. Gap 2 (role config) — scaffolding for everything else.
-3. Gap 3 + Gap 4 (transfer client + chain verification) — the core; test
-   secondary-pull against this same server as master.
-4. Gap 6 then Gap 5 (refresh loop, then NOTIFY hooks into it).
-5. Gap 7 + Gap 8 guards.
+Each namespace has exactly one writer category. Define and enforce this.
 
-End-to-end test: master + two secondaries on one host (distinct ports +
-Valkey DBs); provision a record on the master via RFC 2136; verify both
-secondaries serve it within one NOTIFY round-trip, with `dig +dnssec`
-validating against the shared keys, and that a third TLS client without a
-cert cannot even complete a handshake to the master's DoT port.
+| Namespace | Writer | Readers | Purpose |
+|---|---|---|---|
+| `config:*` | dashboard | dnsd, mdnsd, resolverd, certd | Runtime configuration |
+| `zone:*` | dashboard, certd (challenge TXT only) | dnsd | Authoritative records |
+| `ddns:*` | dnsd (UPDATE) | dnsd | Dynamic records |
+| `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |
+| `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |
+| `cert:current` | certd | dnsd (hot-reload) | Active TLS cert + key |
+| `acme:*` | certd | certd | ACME account key, order state |
+| `cache:*` | resolverd | resolverd | Persisted resolver cache |
+| `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
+
+**Live reload:** enable Valkey keyspace notifications and have each daemon
+subscribe to the prefixes it owns, so dashboard edits and `cert:current` updates
+take effect without a restart. This replaces the current "restart or
+`POST /config`" requirement.
 
 ---
 
-## Build command
+## Trust boundaries
 
-```bash
-gcc -O2 -Wall \
-    -Wno-missing-field-initializers -Wno-misleading-indentation \
-    -Wno-unused-result -Wno-unused-function -Wno-format-truncation \
-    -Wno-stringop-truncation -Wno-unused-variable -Wno-implicit-fallthrough \
-    -Wno-deprecated-declarations \
-    -I/tmp/ossl-inc \
-    -o /tmp/dns_server dns_server.c \
-    -L/usr/local/lib -lssl -lcrypto -lpthread \
-    -Wl,-rpath,/usr/local/lib
-```
+- **Internet-facing, untrusted input:** `dnsd` (DNS wire), `resolverd`
+  (upstream responses), the reverse proxy (HTTP/TLS). These get the strongest
+  sandboxing.
+- **Outbound network:** only `certd` (to the CA / EST server) and `resolverd`
+  (to upstreams). `dnsd` should reach nothing but Valkey.
+- **Link-local:** `mdnsd` only.
+- **Privileged secrets** (TSIG key, cookie secret, DNSSEC private keys) live in
+  Valkey and are read by `dnsd` only. The control plane must authenticate before
+  it can read or write them.
 
-Current source is 5173 lines.  The build must produce zero errors; warnings
-suppressed by the flags above are pre-existing and intentional.
+---
+
+## Multi-zone (functional gap to close)
+
+The current design is single-zone (`config:zone_name`). The target supports
+multiple authoritative zones:
+- Key zones as `zone:<zonename>:<type>:<name>` and config as
+  `config:zone:<zonename>:*`.
+- `dnsd` selects the most specific configured zone for each query.
+- Consider catalog zones (RFC 9432) for provisioning many zones from one
+  catalog. Add automated DNSSEC key rollover (RFC 6781) per zone, paired with
+  the existing CDS/CDNSKEY publication.
+
+Do this after the process split — it is easier to add in the slimmed-down
+`dnsd` than in the monolith.
+
+---
+
+## Migration order
+
+Each step is independently shippable and must pass `make debug`, `make`, and
+`make check`.
+
+1. **Extract `libdnswire`.** Move the shared wire helpers into `dns_wire.{c,h}`;
+   point all three `.c` files at it. No behavior change. (Also lets the
+   `CLAUDE-fixes.md` items — `name_from_wire` hardening, `strtok_r` — be made
+   once instead of three times.)
+2. **Split out `certd`.** Move ACME + EST + renewal thread into a new binary
+   that talks only through Valkey (`zone:TXT:_acme-challenge.*` and
+   `cert:current`). Make `dnsd` watch `cert:current` and hot-reload. Remove the
+   ACME/EST code from `dns_server.c`.
+3. **Split out `mdnsd`.** Move the mDNS responder into its own binary reading
+   `mdns:*`. Remove multicast handling from `dnsd`.
+4. **Front the HTTP surfaces with a reverse proxy** and reduce `dnsd` to a
+   localhost-only read-only `/health` + `/metrics`. Remove the embedded
+   management API, config portal, and DoH HTTP parsing from the C core.
+5. **Add control-plane authentication** to the dashboard; restrict or remove the
+   raw Valkey Explorer write path.
+6. **Enable Valkey keyspace-notification live reload** across daemons.
+7. **Add multi-zone support** in the now-minimal `dnsd`.
+
+After step 4, `dnsd` should be a substantially smaller, single-purpose,
+sandboxable daemon — the trusted core this architecture is designed to produce.
+
+---
+
+## Build system implications
+
+- `libdnswire` builds first; `dnsd`, `mdnsd`, `resolverd` link it.
+- Each daemon gets its own `make` target and its own signed production binary.
+- `make check` should bring up Valkey, start `dnsd` (plus `certd`/`mdnsd` where
+  relevant), and smoke-test each independently.
+- Keep the existing hardening flags (`-fstack-protector-strong`,
+  `_FORTIFY_SOURCE=2`, PIE, RELRO/now) for every binary, and fix the
+  `OSSL_INC` default noted in `CLAUDE-fixes.md`.
+
+---
+
+## Development process & code quality
+
+These practices exist because of the bug classes already found in this codebase:
+a parser duplicated across three files (fixes diverge), a constant silently
+written wrong (`fudge=300` encoded as 5) that dense one-line-per-many-statements
+style hid, and crypto verification that compiled and "passed" while covering the
+wrong bytes. The daemon parses untrusted input from the internet, so the bar is
+correctness under hostile input, not just working on a happy-path `dig`.
+
+### Testing (highest-leverage gap)
+
+`make check` is a single happy-path smoke test. That is not enough.
+
+- **Unit tests for `libdnswire`.** Every wire helper (`name_from_wire`,
+  `name_to_wire`, `append_rr`, `txt_encode`, hex/base64) gets table-driven tests
+  including malformed input: truncated packets, oversized labels, names >255,
+  compression pointers that loop, point forward, or point out of bounds.
+- **Fuzzing is mandatory for the parser surface.** Add libFuzzer/AFL++ targets
+  built against the ASan+UBSan toolchain for: `name_from_wire`, the full DNS
+  message parser, TSIG RR parsing, and (until removed) the DoH/HTTP and ACME
+  JSON parsers. Keep a seed corpus and a regression corpus. Every parser bug
+  fixed must add the triggering input to the corpus.
+- **Crypto correctness tests.** DNSSEC verify and TSIG must have known-answer
+  tests *and* negative tests (one flipped byte → fail). A verifier that only
+  ever sees valid input is untested. (Ties to `CLAUDE-fixes.md` Task 1.)
+- **Differential testing.** Compare `dnsd` responses to a reference resolver
+  (`dig`, or Knot/BIND) over a query matrix; diffs are either bugs or documented
+  intentional deviations.
+
+### Continuous integration
+
+CI must run on every change and block merge on failure:
+- [ ] Build all targets with `-Werror` (promote the current warning set; do not
+      silently carry `-Wno-*` suppressions into new code)
+- [ ] ASan + UBSan build, then run the unit + smoke tests under it
+- [ ] A short fuzz smoke run (e.g. 60s per target) plus full replay of the
+      regression corpus
+- [ ] Static analysis: `clang --analyze` (scan-build), `clang-tidy`, `cppcheck`
+- [ ] `make verify` — confirm the production binary signatures validate
+- [ ] (Periodic) Valgrind over the smoke test for leak/uninit detection
+
+### Code style & reviewability
+
+- Add a `.clang-format` and run it on all new and changed code. Existing files
+  can be reformatted in a single isolated "no-logic-change" commit so it does
+  not pollute future diffs.
+- **One statement per line; one declaration per line.** The dense style is how
+  the `fudge` byte error and similar slips survive review. This rule applies to
+  new and modified code regardless of the surrounding style.
+- Magic protocol constants get named `#define`s (fudge, ports, type numbers,
+  buffer sizes), defined once and shared — never repeated as bare literals at
+  multiple emit sites.
+
+### Memory-safety & error-handling conventions
+
+- No bare fixed-buffer copies. Use the `safe_strcpy` helper
+  (`CLAUDE-fixes.md` Task 6); pass real `sizeof` sizes, never hardcoded lengths.
+- Wire helpers return `-1` on overflow/error and callers must check it before
+  advancing offsets — preserve this convention everywhere.
+- **Fail closed.** On parse error, allocation failure, or crypto failure, drop
+  the request / return SERVFAIL; never serve partially-parsed data.
+- Check return values of `setsockopt`, `bind`, allocation, and OpenSSL calls.
+  Several socket-option and verify calls currently ignore their result — new and
+  touched code must not.
+
+### Security-sensitive change gate
+
+Changes to any of these get a second reviewer and explicit test evidence in the
+PR: DNS wire parsing, TSIG/DNSSEC crypto, the privilege-drop / sandbox path, the
+Valkey trust boundary (namespace ownership), and TLS/cert handling. The PR must
+state what hostile inputs were considered and which tests/fuzz cases cover them.
+
+### Definition of Done (per change)
+
+- [ ] Tests added/updated (unit + fuzz corpus entry for any parser change)
+- [ ] `make debug` (ASan/UBSan) and `make` build clean with `-Werror`
+- [ ] CI green (analysis + sanitizers + corpus replay)
+- [ ] `clang-format` applied to touched code; no new bare `strtok`/fixed-buffer copies
+- [ ] Docs in sync: RFC-coverage list, Valkey schema, and the `CLAUDE.md`
+      topology/ownership table reflect the change
+- [ ] Security-sensitive gate satisfied if applicable
+
+### Documentation hygiene
+
+The README's RFC-coverage list and the Valkey schema are the project's
+contract. Update them in the same change that alters behavior, and keep the
+namespace ownership table in this file authoritative — if code writes a
+namespace not listed there, one of them is wrong.
