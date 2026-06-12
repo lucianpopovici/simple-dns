@@ -1,0 +1,38 @@
+# .clang-format — place at repo root.
+# Enforces the readability rules in CLAUDE.md: one statement per line, no
+# collapsed one-liners (the dense style is how the fudge=300-as-5 slip survived
+# review). C is handled under the Cpp language id.
+---
+Language: Cpp
+Standard: c++11            # parser standard only; project is C99
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+IndentCaseLabels: true
+
+# Layout
+ColumnLimit: 100
+BreakBeforeBraces: Attach   # K&R: opening brace on same line
+AlignAfterOpenBracket: Align
+PointerAlignment: Right
+SpaceAfterCStyleCast: true
+SpacesBeforeTrailingComments: 2
+
+# The rules that actually expand the dense code — do NOT relax these.
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowAllArgumentsOnNextLine: false
+
+# Includes: do NOT reorder — C system-header order can be load-bearing.
+SortIncludes: false
+
+# Misc
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+SpaceBeforeParens: ControlStatements

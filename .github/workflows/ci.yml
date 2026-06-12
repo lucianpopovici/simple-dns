@@ -1,0 +1,127 @@
+# .github/workflows/ci.yml
+#
+# Minimal CI scaffold for the dns_server project. Place at
+# .github/workflows/ci.yml in the repo.
+#
+# Jobs that pass against the current tree are blocking. Jobs that require a
+# clean baseline (formatting, static analysis, -Werror) run as ADVISORY
+# (continue-on-error) so they surface problems without blocking merges until the
+# baseline is fixed — flip continue-on-error to false once each is clean. The
+# fuzz job self-activates once migration Step 1 (dns_wire.c) and the harness
+# exist.
+#
+# OpenSSL paths: libssl-dev on Ubuntu puts headers in /usr/include and the
+# libraries in /usr/lib/x86_64-linux-gnu. These override the broken
+# OSSL_INC=/tmp/ossl-inc default (see CLAUDE-fixes.md Task 4).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  OSSL_INC: /usr/include
+  OSSL_LIB: /usr/lib/x86_64-linux-gnu
+
+jobs:
+  build-test:
+    name: Build + sanitizer compile + smoke test
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev clang dnsutils
+
+      - name: Build debug (ASan + UBSan) — compile/link check
+        run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Build production binary (unsigned)
+        # Build the binary target directly, not `prod`, to skip GPG signing
+        # (no signing key in CI; signing belongs to the release pipeline).
+        run: make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Smoke test against Valkey
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: |
+          ./dns_server &
+          SRV=$!
+          sleep 2
+          dig @127.0.0.1 -p 5353 example.local A +time=2 +tries=1 +short || true
+          kill "$SRV" 2>/dev/null || true
+
+      # Once unit tests exist (migration Step 1), add:
+      #   - name: Unit tests (under ASan/UBSan)
+      #     run: make test
+
+  warnings:
+    name: Warnings as errors (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # flip to false once the tree is warning-clean
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - name: Build with -Werror
+        run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB WARN="-Wall -Wextra -Werror"
+
+  static-analysis:
+    name: Static analysis (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # flip to false once baselines are clean
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tools clang-tidy cppcheck libssl-dev
+      - name: clang static analyzer (scan-build)
+        run: scan-build --status-bugs make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+      - name: cppcheck
+        run: cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 *.c
+
+  format:
+    name: clang-format (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # flip to false after the one-time format commit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Check formatting
+        run: |
+          files=$(git ls-files '*.c' '*.h')
+          [ -z "$files" ] || clang-format --dry-run --Werror $files
+
+  fuzz-smoke:
+    name: Fuzz smoke (name_from_wire)
+    runs-on: ubuntu-latest
+    # Self-activates once libdnswire and the harness exist (migration Step 1).
+    if: ${{ hashFiles('dns_wire.c', 'fuzz/fuzz_name_from_wire.c') != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build fuzzer
+        run: |
+          clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
+                fuzz/fuzz_name_from_wire.c dns_wire.c -o fuzz_name_from_wire
+      - name: Run 60s smoke + replay regression corpus
+        run: |
+          mkdir -p fuzz/corpus
+          ./fuzz_name_from_wire -max_total_time=60 fuzz/corpus
