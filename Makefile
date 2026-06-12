@@ -27,7 +27,10 @@
 # =============================================================================
 
 # ── Source & output names ────────────────────────────────────────────────────
-SRC        := dns_server.c
+# libdnswire (dns_wire.c/h) is the single shared wire-format implementation
+# (migration Step 1); every binary compiles it in.
+WIRE_SRC   := dns_wire.c
+SRC        := dns_server.c $(WIRE_SRC)
 BIN        := dns_server
 BIN_DEBUG  := dns_server_debug
 SIG_GPG    := $(BIN).asc
@@ -46,8 +49,12 @@ CSTD        = -std=c99 -D_GNU_SOURCE
 
 # ── OpenSSL paths (override on the command line if non-standard) ─────────────
 #   Example: make OSSL_INC=/opt/openssl/include OSSL_LIB=/opt/openssl/lib
-OSSL_INC   ?= /tmp/ossl-inc
-OSSL_LIB   ?= /usr/local/lib
+# Defaults are derived via pkg-config so they are correct per-platform
+# (Debian multiarch, Fedora /usr/lib64, Homebrew, …). A world-writable or
+# bogus default is a build-integrity risk — the sanity check below fails the
+# build with a clear message rather than searching the wrong place.
+OSSL_INC   ?= $(shell pkg-config --variable=includedir openssl 2>/dev/null || echo /usr/include)
+OSSL_LIB   ?= $(shell pkg-config --variable=libdir openssl 2>/dev/null || echo /usr/lib)
 
 # ── Signing ──────────────────────────────────────────────────────────────────
 # GPG key fingerprint / email to sign with.
@@ -101,7 +108,20 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check gen-signing-key help
+        check check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity
+
+# Fail fast, with an actionable message, if the OpenSSL paths are wrong —
+# instead of a wall of confusing compiler/linker errors.
+ossl-sanity:
+	@test -f "$(OSSL_INC)/openssl/ssl.h" || { \
+	    echo "error: OpenSSL headers not found at $(OSSL_INC)/openssl/ssl.h."; \
+	    echo "       Install the OpenSSL 3.x dev package (openssl-devel /"; \
+	    echo "       libssl-dev) or pass OSSL_INC=<include-dir>."; \
+	    exit 1; }
+	@ls "$(OSSL_LIB)"/libcrypto.* >/dev/null 2>&1 || { \
+	    echo "error: OpenSSL libraries not found in $(OSSL_LIB)."; \
+	    echo "       Install the OpenSSL 3.x dev package or pass OSSL_LIB=<lib-dir>."; \
+	    exit 1; }
 
 # Default → production
 all: prod
@@ -111,10 +131,10 @@ all: prod
 # =============================================================================
 prod: $(BIN) sign
 
-$(BIN): $(SRC)
+$(BIN): $(SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
 	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $^ $(LIBS)
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
 	@echo "  STRIP      $@"
 	strip --strip-unneeded \
 	      --remove-section=.comment \
@@ -130,10 +150,10 @@ $(BIN): $(SRC)
 # =============================================================================
 debug: $(BIN_DEBUG)
 
-$(BIN_DEBUG): $(SRC)
+$(BIN_DEBUG): $(SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $^ $(LIBS)
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
@@ -234,6 +254,39 @@ uninstall:
 	@rmdir --ignore-fail-on-non-empty $(SIGDIR) 2>/dev/null || true
 
 # =============================================================================
+# Unit tests
+# =============================================================================
+# DNSSEC known-answer + negative tests (CLAUDE-fixes.md Task 1).
+# Includes dns_client.c with -DUNIT_TEST, so it inherits that file's (dense,
+# pre-clang-format) style — suppress the indentation warning for now.
+check-dnssec: tests/test_dnssec_verify.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_dnssec_verify"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_dnssec_verify \
+	      tests/test_dnssec_verify.c $(WIRE_SRC) $(LIBS)
+	./tests/test_dnssec_verify
+
+# name_from_wire compression-handling tests (CLAUDE-fixes.md Task 5).
+# -Wno-unused-function: -DUNIT_TEST compiles out dns_client.c's main(), which
+# is the only caller of some helpers.
+check-wire: tests/test_name_from_wire.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_name_from_wire"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
+	      $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_name_from_wire \
+	      tests/test_name_from_wire.c $(WIRE_SRC) $(LIBS)
+	./tests/test_name_from_wire
+
+# libFuzzer smoke target for the name parser (requires clang).
+fuzz-wire: fuzz/fuzz_name_from_wire.c $(WIRE_SRC) dns_wire.h
+	@echo "  CC [FUZZ]  fuzz_name_from_wire (clang, ASan+UBSan+libFuzzer)"
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
+	      -o fuzz/fuzz_name_from_wire \
+	      fuzz/fuzz_name_from_wire.c $(WIRE_SRC)
+	mkdir -p fuzz/corpus
+	./fuzz/fuzz_name_from_wire -max_total_time=60 fuzz/corpus
+
+# =============================================================================
 # Smoke test
 # =============================================================================
 check: $(BIN_DEBUG)
@@ -250,7 +303,9 @@ check: $(BIN_DEBUG)
 # =============================================================================
 clean:
 	@echo "  CLEAN"
-	rm -f $(BIN) $(BIN_DEBUG) $(SIG_GPG) $(SIG_OSSL)
+	rm -f $(BIN) $(BIN_DEBUG) $(SIG_GPG) $(SIG_OSSL) \
+	      tests/test_dnssec_verify tests/test_name_from_wire \
+	      fuzz/fuzz_name_from_wire
 	@echo "  done"
 
 # =============================================================================

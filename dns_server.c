@@ -106,6 +106,7 @@
 #include <openssl/rand.h>
 #include <openssl/bn.h>
 #include <openssl/bio.h>
+#include "dns_wire.h"
 
 /* ==========================================================================
  * Compile-time defaults
@@ -129,6 +130,10 @@
 #define EDNS_MAX_UDP        1232     /* current BCP 2020 recommendation */
 #define MAX_AXFR_THREADS    8
 #define TSIG_ALG_HMAC_SHA256 "hmac-sha256."
+/* TSIG time window in seconds (RFC 8945 §5.2.3 recommends 300). Emitted as
+ * two big-endian bytes in BOTH the digest input and the TSIG RDATA — keep
+ * every emit site on this constant so the two cannot drift apart. */
+#define TSIG_FUDGE 300
 #define DNS_COOKIE_CLIENT_LEN 8
 #define DNS_COOKIE_SERVER_LEN 16  /* RFC 9018 §4.2: version|reserved|timestamp|hash */
 #define DNS_COOKIE_VALIDITY   3600 /* seconds */
@@ -246,8 +251,8 @@ static uint16_t  g_ksk_tag = 0;
 static EVP_PKEY *g_ksk_ed = NULL;   /* KSK Ed25519 */
 static uint16_t  g_ksk_ed_tag = 0;
 
+
 /* Forward declarations for helpers used before their definitions */
-static void strlower(char *s);
 static void ixfr_journal_append(uint32_t,uint32_t,char,const char*,const char*);
 static int  acme_issue(void);
 static int  acme_needs_renewal(void);
@@ -255,8 +260,6 @@ static void notify_send(void);
 static void mdns_announce(void);
 static int  mdns_build_response(const uint8_t*,int,uint8_t*,int,int);
 /* Wire + Valkey helpers used by early code (multi-zone, NSEC) */
-static int  name_to_wire(const char*,uint8_t*,int);
-static void put32(uint8_t*,int,uint32_t);
 static int  vk_set(const char*,const char*,uint32_t);
 static int  vk_get(const char*,char*,int);
 static int  emit_rr(uint8_t*,int,int,const char*,uint16_t,uint32_t,
@@ -327,13 +330,13 @@ static int zone_upsert(const char *name,const char *mname,const char *rname,
     if(idx<0){if(g_zone_count>=MAX_ZONES){pthread_mutex_unlock(&g_zones_mutex);return -1;}
               idx=g_zone_count++;}
     zone_entry_t *z=&g_zones[idx];
-    strncpy(z->name,name,255);z->name[255]=0;
-    strncpy(z->soa_mname,mname&&mname[0]?mname:"",255);z->soa_mname[255]=0;
-    strncpy(z->soa_rname,rname&&rname[0]?rname:"",255);z->soa_rname[255]=0;
+    safe_strcpy(z->name,name,sizeof(z->name));
+    safe_strcpy(z->soa_mname,mname&&mname[0]?mname:"",sizeof(z->soa_mname));
+    safe_strcpy(z->soa_rname,rname&&rname[0]?rname:"",sizeof(z->soa_rname));
     z->soa_serial=serial;z->soa_refresh=refresh;z->soa_retry=retry;
     z->soa_expire=expire;z->soa_minimum=minimum;
-    strncpy(z->axfr_allow,axfr_allow?axfr_allow:"127.0.0.1",1023);z->axfr_allow[1023]=0;
-    strncpy(z->notify_targets,notify_targets?notify_targets:"",1023);z->notify_targets[1023]=0;
+    safe_strcpy(z->axfr_allow,axfr_allow?axfr_allow:"127.0.0.1",sizeof(z->axfr_allow));
+    safe_strcpy(z->notify_targets,notify_targets?notify_targets:"",sizeof(z->notify_targets));
     pthread_mutex_unlock(&g_zones_mutex);
     return idx;}
 
@@ -915,7 +918,7 @@ static const char *g_local_zones[] = {
 /* Returns 1 if qname is exactly one of the locally served zones or
  * is a subdomain of one (e.g. "1.0.0.127.in-addr.arpa"). */
 static int is_local_zone(const char *qname){
-    char lq[256];strncpy(lq,qname,255);lq[255]=0;strlower(lq);
+    char lq[256];safe_strcpy(lq,qname,sizeof(lq));strlower(lq);
     for(int i=0;g_local_zones[i];i++){
         const char *z=g_local_zones[i];
         size_t zl=strlen(z),ql=strlen(lq);
@@ -929,7 +932,6 @@ static int is_local_zone(const char *qname){
 /* ==========================================================================
  * Utility helpers
  * ======================================================================= */
-static void strlower(char *s){for(;*s;s++)if(*s>='A'&&*s<='Z')*s+=32;}
 static int  streq_ci(const char *a,const char *b){return strcasecmp(a,b)==0;}
 static const char *cfgenv(const char *k,const char *def){
     const char *v=getenv(k);return v?v:def;}
@@ -938,67 +940,6 @@ static uint32_t ttl_clamp(uint32_t ttl){
     return ttl>DNS_TTL_MAX ? DNS_TTL_MAX : ttl;}
 
 /* hex encode/decode */
-static void hex_enc(const uint8_t *in,int n,char *out){
-    static const char H[]="0123456789abcdef";
-    for(int i=0;i<n;i++){out[2*i]=H[in[i]>>4];out[2*i+1]=H[in[i]&0xF];}
-    out[2*n]=0;}
-static int hex_dec(const char *in,uint8_t *out,int maxlen){
-    int n=0;
-    while(in[0]&&in[1]&&n<maxlen){
-        char h[3]={in[0],in[1],0};out[n++]=(uint8_t)strtol(h,NULL,16);in+=2;}
-    return n;}
-
-/* base64 standard (for TSIG) */
-static const char B64S[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static int b64std_dec(const char *in,uint8_t *out,int olen){
-    int inlen=(int)strlen(in),o=0;
-    static const int8_t rev[256]={
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,-1, 0, 1, 2, 3, 4, 5, 6,
-         7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
-        49,50,51,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1};
-    for(int i=0;i+3<inlen&&o+2<olen;i+=4){
-        int8_t a=rev[(uint8_t)in[i]],b=rev[(uint8_t)in[i+1]],
-               c=rev[(uint8_t)in[i+2]],d=rev[(uint8_t)in[i+3]];
-        if(a<0||b<0)break;
-        out[o++]=(uint8_t)((a<<2)|(b>>4));
-        if(c>=0&&o<olen)out[o++]=(uint8_t)((b<<4)|(c>>2));
-        if(d>=0&&o<olen)out[o++]=(uint8_t)((c<<6)|d);}
-    return o;}
-
-/* RFC 8484 §4.1.1: DoH GET uses base64url (RFC 4648 §5): chars -_ instead of +/,
- * no padding.  Translate to standard base64 then call b64std_dec. */
-static int b64url_dec(const char *in,uint8_t *out,int olen){
-    char tmp[4096];int n=(int)strlen(in);
-    if(n>=(int)sizeof(tmp)-4)return -1;
-    for(int i=0;i<n;i++){
-        char c=in[i];
-        if(c=='-')tmp[i]='+';
-        else if(c=='_')tmp[i]='/';
-        else tmp[i]=c;}
-    while(n%4!=0)tmp[n++]='=';
-    tmp[n]=0;
-    return b64std_dec(tmp,out,olen);}
-
-/* base64url (for ACME/DNSSEC) */
-static const char B64U[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-static int b64url_enc(const uint8_t *in,int ilen,char *out,int olen){
-    int i=0,o=0;
-    for(;i+2<ilen&&o+3<olen;i+=3){
-        out[o++]=B64U[in[i]>>2];out[o++]=B64U[((in[i]&3)<<4)|(in[i+1]>>4)];
-        out[o++]=B64U[((in[i+1]&0xF)<<2)|(in[i+2]>>6)];out[o++]=B64U[in[i+2]&0x3F];}
-    if(i<ilen&&o+1<olen){out[o++]=B64U[in[i]>>2];
-        if(i+1<ilen&&o+1<olen){out[o++]=B64U[((in[i]&3)<<4)|(in[i+1]>>4)];
-            if(o<olen)out[o++]=B64U[(in[i+1]&0xF)<<2];}
-        else if(o<olen)out[o++]=B64U[(in[i]&3)<<4];}
-    if(o<olen)out[o]=0;return o;}
 
 static void sha256(const uint8_t *in,int n,uint8_t out[32]){
     EVP_MD_CTX *ctx=EVP_MD_CTX_new();if(!ctx)return;unsigned int dl=32;
@@ -1106,8 +1047,8 @@ static int resp_parse(resp_conn_t *c,resp_reply_t *r){
     char line[512];if(resp_readline(c,line,sizeof(line))<0)return -1;
     memset(r,0,sizeof(*r));
     switch(line[0]){
-    case '+':r->type=0;strncpy(r->str,line+1,sizeof(r->str)-1);return 0;
-    case '-':r->type=1;strncpy(r->str,line+1,sizeof(r->str)-1);return 0;
+    case '+':r->type=0;safe_strcpy(r->str,line+1,sizeof(r->str));return 0;
+    case '-':r->type=1;safe_strcpy(r->str,line+1,sizeof(r->str));return 0;
     case ':':r->type=3;r->integer=atol(line+1);return 0;
     case '$':{int bl=atoi(line+1);if(bl<0){r->type=4;return 0;}r->type=2;
         /* clamp bl so we never write past r->str */
@@ -1173,7 +1114,7 @@ static int vk_get(const char *key,char *out,int olen){
         if(valkey_ensure(&vk)>=0){
             resp_reply_t rs;
             if(resp_cmd(&vk,&rs,2,"GET",skey)>=0&&rs.type==2){
-                strncpy(out,rs.str,olen-1);out[olen-1]=0;
+                safe_strcpy(out,rs.str,olen);
                 pthread_mutex_unlock(&g_vk_mutex);
                 dns_log(LOG_DEBUG,"[RFC8767] Serving stale data for %s\n",key);
                 return 1;}}
@@ -1183,7 +1124,7 @@ static int vk_get(const char *key,char *out,int olen){
     if(resp_cmd(&vk,&r,2,"GET",key)<0){vk.fd=-1;pthread_mutex_unlock(&g_vk_mutex);return 0;}
     pthread_mutex_unlock(&g_vk_mutex);
     if(r.type!=2)return 0;
-    strncpy(out,r.str,olen-1);out[olen-1]=0;
+    safe_strcpy(out,r.str,olen);
     /* Write stale shadow key: 7-day TTL — used when Valkey is unreachable */
     {
         char skey[640];snprintf(skey,sizeof(skey),"stale:%s",key);
@@ -1221,14 +1162,14 @@ static void zones_load_from_valkey(void){
     for(int i=0;i<count;i++){
         resp_reply_t kr;resp_parse(&vk,&kr);
         if(kr.type==2&&nk<MAX_ZONES)
-            strncpy(zkeys[nk++],kr.str,511);}
+            {safe_strcpy(zkeys[nk],kr.str,sizeof(zkeys[nk]));nk++;}}
     pthread_mutex_unlock(&g_vk_mutex);
     /* Now fetch each zone entry */
     for(int i=0;i<nk;i++){
         const char *zname=zkeys[i]+11; /* skip "zone_table:" */
         char val[2048]="";
         if(!vk_get(zkeys[i],val,sizeof(val)))continue;
-        char buf[2048];strncpy(buf,val,2047);
+        char buf[2048];safe_strcpy(buf,val,sizeof(buf));
         char *f[9]={0};char *p=buf;int fi=0;
         while(fi<9){f[fi++]=p;char *n=strchr(p,'|');if(!n)break;*n=0;p=n+1;}
         zone_upsert(zname,
@@ -1250,18 +1191,18 @@ static long vk_incr(const char *key){
  * Boot file
  * ======================================================================= */
 static void boot_load(void){
-    strncpy(g_valkey_host,cfgenv("DNS_VALKEY_HOST","127.0.0.1"),sizeof(g_valkey_host)-1);
+    safe_strcpy(g_valkey_host,cfgenv("DNS_VALKEY_HOST","127.0.0.1"),sizeof(g_valkey_host));
     g_valkey_port=atoi(cfgenv("DNS_VALKEY_PORT","6379"));
-    strncpy(g_valkey_pass,cfgenv("DNS_VALKEY_PASSWORD",""),sizeof(g_valkey_pass)-1);
+    safe_strcpy(g_valkey_pass,cfgenv("DNS_VALKEY_PASSWORD",""),sizeof(g_valkey_pass));
     g_config_port=atoi(cfgenv("CONFIG_PORT","8080"));
     FILE *f=fopen(BOOT_FILE,"r");if(!f)return;
     char line[512];
     while(fgets(line,sizeof(line),f)){
         line[strcspn(line,"\r\n")]=0;char *eq=strchr(line,'=');if(!eq)continue;*eq=0;
         char *k=line,*v=eq+1;
-        if(!strcmp(k,"VALKEY_HOST"))strncpy(g_valkey_host,v,sizeof(g_valkey_host)-1);
+        if(!strcmp(k,"VALKEY_HOST"))safe_strcpy(g_valkey_host,v,sizeof(g_valkey_host));
         else if(!strcmp(k,"VALKEY_PORT"))g_valkey_port=atoi(v);
-        else if(!strcmp(k,"VALKEY_PASSWORD"))strncpy(g_valkey_pass,v,sizeof(g_valkey_pass)-1);}
+        else if(!strcmp(k,"VALKEY_PASSWORD"))safe_strcpy(g_valkey_pass,v,sizeof(g_valkey_pass));}
     fclose(f);}
 static void boot_save(void){
     FILE *f=fopen(BOOT_FILE,"w");if(!f){perror("boot_save");return;}
@@ -1334,12 +1275,12 @@ static void config_portal(void){
             form_field(body,"host",host,sizeof(host));
             form_field(body,"port",portstr,sizeof(portstr));
             form_field(body,"pass",pass,sizeof(pass));
-            if(!host[0])strncpy(host,"127.0.0.1",sizeof(host)-1);
+            if(!host[0])safe_strcpy(host,"127.0.0.1",sizeof(host));
             int port=portstr[0]?atoi(portstr):6379;
             resp_conn_t test;memset(&test,0,sizeof(test));test.fd=-1;
             if(valkey_connect_to(&test,host,port,pass)==0){
-                strncpy(g_valkey_host,host,sizeof(g_valkey_host)-1);
-                g_valkey_port=port;strncpy(g_valkey_pass,pass,sizeof(g_valkey_pass)-1);
+                safe_strcpy(g_valkey_host,host,sizeof(g_valkey_host));
+                g_valkey_port=port;safe_strcpy(g_valkey_pass,pass,sizeof(g_valkey_pass));
                 close(test.fd);boot_save();
                 char page[512];int pl=snprintf(page,sizeof(page),
                     "<html><body style=\"font-family:sans-serif;margin:60px auto;max-width:520px\">"
@@ -1361,7 +1302,7 @@ static void config_portal(void){
  * ======================================================================= */
 static void config_load_from_valkey(void){
     char val[MAX_PEM];
-    #define G(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])strncpy(d,val,sizeof(d)-1);}while(0)
+    #define G(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])safe_strcpy(d,val,sizeof(d));}while(0)
     #define GI(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=atoi(val);}while(0)
     #define GU(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=(uint32_t)atol(val);}while(0)
     G("ddns_secret",g_ddns_secret);G("acme_domain",g_acme_domain);
@@ -1377,7 +1318,7 @@ static void config_load_from_valkey(void){
     if(vk_get("config:mdns_enabled",val,sizeof(val))&&val[0])
         g_mdns_enabled=atoi(val);
     if(vk_get("config:mdns_hostname",val,sizeof(val))&&val[0])
-        strncpy(g_mdns_hostname,val,sizeof(g_mdns_hostname)-1);
+        safe_strcpy(g_mdns_hostname,val,sizeof(g_mdns_hostname));
     /* Default mdns_hostname to <zone_name without trailing dot> if not set */
     if(!g_mdns_hostname[0]&&g_zone_name[0]){
         snprintf(g_mdns_hostname,sizeof(g_mdns_hostname),"%s",g_zone_name);
@@ -1398,7 +1339,7 @@ static void config_load_from_valkey(void){
     /* Query log */
     {char qlpath[512];
      if(vk_get("config:query_log_path",qlpath,sizeof(qlpath))&&qlpath[0]){
-         strncpy(g_query_log_path,qlpath,sizeof(g_query_log_path)-1);
+         safe_strcpy(g_query_log_path,qlpath,sizeof(g_query_log_path));
          qlog_open();}}
     /* RRL */
     {char rrl_val[16];
@@ -1415,7 +1356,7 @@ static void config_load_from_valkey(void){
     else RAND_bytes(g_cookie_secret,16);
     /* NSEC3 params */
     if(vk_get("config:nsec3_iters",val,sizeof(val))&&val[0])g_nsec3_iters=atoi(val);
-    if(vk_get("config:nsec3_salt",val,sizeof(val))&&val[0])strncpy(g_nsec3_salt,val,sizeof(g_nsec3_salt)-1);
+    if(vk_get("config:nsec3_salt",val,sizeof(val))&&val[0])safe_strcpy(g_nsec3_salt,val,sizeof(g_nsec3_salt));
     {char nmode[16];
      if(vk_get("config:dnssec_nsec_mode",nmode,sizeof(nmode)))
          g_dnssec_use_nsec3=(strcasecmp(nmode,"nsec")==0)?0:1;}
@@ -1434,10 +1375,10 @@ static void config_load_from_valkey(void){
     if(vk_get("config:syslog_level",val,sizeof(val))&&val[0])
         g_syslog_level = syslog_level_from_str(val);
     if(vk_get("config:syslog_ident",val,sizeof(val))&&val[0])
-        strncpy(g_syslog_ident,val,sizeof(g_syslog_ident)-1);
+        safe_strcpy(g_syslog_ident,val,sizeof(g_syslog_ident));
     /* Remote syslog config */
     if(vk_get("config:syslog_remote_host",val,sizeof(val))&&val[0])
-        strncpy(g_rsyslog_host,val,sizeof(g_rsyslog_host)-1);
+        safe_strcpy(g_rsyslog_host,val,sizeof(g_rsyslog_host));
     if(vk_get("config:syslog_remote_port",val,sizeof(val))&&val[0])
         g_rsyslog_port = atoi(val);
     else if(g_rsyslog_host[0] && g_rsyslog_port==0)
@@ -1469,8 +1410,8 @@ static void config_set(const char *key,const char *val){
     if(!strcmp(key,"syslog_enabled")){g_syslog_enabled=atoi(val);syslog_init();}
     else if(!strcmp(key,"syslog_facility")){g_syslog_facility=syslog_facility_from_str(val);syslog_init();}
     else if(!strcmp(key,"syslog_level")){g_syslog_level=syslog_level_from_str(val);syslog_init();}
-    else if(!strcmp(key,"syslog_ident")){strncpy(g_syslog_ident,val,sizeof(g_syslog_ident)-1);syslog_init();}
-    else if(!strcmp(key,"syslog_remote_host")){strncpy(g_rsyslog_host,val,sizeof(g_rsyslog_host)-1);syslog_init();}
+    else if(!strcmp(key,"syslog_ident")){safe_strcpy(g_syslog_ident,val,sizeof(g_syslog_ident));syslog_init();}
+    else if(!strcmp(key,"syslog_remote_host")){safe_strcpy(g_rsyslog_host,val,sizeof(g_rsyslog_host));syslog_init();}
     else if(!strcmp(key,"syslog_remote_port")){g_rsyslog_port=atoi(val);syslog_init();}
     else if(!strcmp(key,"syslog_remote_proto")){
         if(!strcasecmp(val,"tcp"))      g_rsyslog_proto=RSYSLOG_TCP;
@@ -1617,17 +1558,17 @@ static int make_rrsig(const char *owner,uint16_t rrtype,uint32_t ttl,
     hdr[hp++]=t_inc>>24;hdr[hp++]=(t_inc>>16)&0xFF;hdr[hp++]=(t_inc>>8)&0xFF;hdr[hp++]=t_inc&0xFF;
     hdr[hp++]=tag>>8;hdr[hp++]=tag&0xFF;
     /* Signer name wire */
-    char sn[256];strncpy(sn,owner,255);sn[255]=0;strlower(sn);
-    {char tmp[256];strncpy(tmp,sn,255);tmp[255]=0;char *lbl=strtok(tmp,".");
+    char sn[256];safe_strcpy(sn,owner,sizeof(sn));strlower(sn);
+    {char *sp1=NULL;char tmp[256];safe_strcpy(tmp,sn,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp1);
      while(lbl){int ll=(int)strlen(lbl);
          if(hp+ll+2>(int)sizeof(hdr)){return -1;}
          hdr[hp++]=(uint8_t)ll;
-         memcpy(hdr+hp,lbl,ll);hp+=ll;lbl=strtok(NULL,".");}hdr[hp++]=0;}
+         memcpy(hdr+hp,lbl,ll);hp+=ll;lbl=strtok_r(NULL,".",&sp1);}hdr[hp++]=0;}
     /* Canonical RR */
     uint8_t own_w[256];int ow=0;
-    {char tmp[256];strncpy(tmp,sn,255);tmp[255]=0;char *lbl=strtok(tmp,".");
+    {char *sp2=NULL;char tmp[256];safe_strcpy(tmp,sn,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp2);
      while(lbl){int ll=(int)strlen(lbl);own_w[ow++]=(uint8_t)ll;
-         memcpy(own_w+ow,lbl,ll);ow+=ll;lbl=strtok(NULL,".");}own_w[ow++]=0;}
+         memcpy(own_w+ow,lbl,ll);ow+=ll;lbl=strtok_r(NULL,".",&sp2);}own_w[ow++]=0;}
     int rr_need=ow+10+rrdata_len;
     uint8_t *rr=malloc(rr_need);
     if(!rr)return -1;
@@ -1701,29 +1642,19 @@ static void dnssec_init(void){
  * ======================================================================= */
 
 /* RFC 5155 Sec 5: base32hex encoding */
-static const char B32H[]="0123456789ABCDEFGHIJKLMNOPQRSTUV";
-static int base32hex_enc(const uint8_t *in,int ilen,char *out,int olen){
-    int i=0,o=0;
-    while(i<ilen&&o+7<olen){
-        uint64_t v=0;int take=ilen-i<5?ilen-i:5;
-        for(int j=0;j<take;j++)v|=(uint64_t)in[i+j]<<(32-j*8);
-        int bits=take*8;
-        for(int j=0;j<8&&bits>0;j++){out[o++]=B32H[(v>>(35-j*5))&0x1F];bits-=5;}
-        i+=take;}
-    out[o]=0;return o;}
 
 /* Compute NSEC3 owner name for a given qname */
 static void nsec3_hash_name(const char *name,const uint8_t *salt,int saltlen,
                              int iters,char *out_b32hex,int out_len){
     /* Wire-encode the name (lowercase); RFC 1035 max wire length = 255 bytes */
-    char lname[256];strncpy(lname,name,255);strlower(lname);
+    char lname[256];safe_strcpy(lname,name,sizeof(lname));strlower(lname);
     uint8_t wire[257];int wlen=0;   /* 257 = 255 payload + 1 root + guard */
-    char tmp[256];strncpy(tmp,lname,255);
-    char *lbl=strtok(tmp,".");
+    char tmp[256];safe_strcpy(tmp,lname,sizeof(tmp));
+    char *sp3=NULL;char *lbl=strtok_r(tmp,".",&sp3);
     while(lbl){int ll=(int)strlen(lbl);
         if(ll>63||wlen+ll+1>255)break;   /* enforce label and total limits */
         wire[wlen++]=(uint8_t)ll;
-        memcpy(wire+wlen,lbl,ll);wlen+=ll;lbl=strtok(NULL,".");}
+        memcpy(wire+wlen,lbl,ll);wlen+=ll;lbl=strtok_r(NULL,".",&sp3);}
     if(wlen<256)wire[wlen++]=0;   /* root label */
     /* Iterative SHA-1: H(x) = SHA-1(x || salt), repeated iters+1 times */
     uint8_t h[20];
@@ -1745,11 +1676,11 @@ static int nsec3_rdata(const char *name, uint16_t covered_type,
     uint8_t nexthash[20];
     /* Next hash = hash of the zone apex (simplified — in production use sorted order) */
     uint8_t zone_wire[257];int zw=0;
-    {char ztmp[256];strncpy(ztmp,g_zone_name,255);char *zl=strtok(ztmp,".");
+    {char *sp4=NULL;char ztmp[256];safe_strcpy(ztmp,g_zone_name,sizeof(ztmp));char *zl=strtok_r(ztmp,".",&sp4);
      while(zl){int ll=(int)strlen(zl);
          if(ll>63||zw+ll+1>255)break;
          zone_wire[zw++]=(uint8_t)ll;
-         memcpy(zone_wire+zw,zl,ll);zw+=ll;zl=strtok(NULL,".");}
+         memcpy(zone_wire+zw,zl,ll);zw+=ll;zl=strtok_r(NULL,".",&sp4);}
      if(zw<256)zone_wire[zw++]=0;}
     {uint8_t ib[256+64];int ib_len=zw;memcpy(ib,zone_wire,zw);
      if(saltlen){memcpy(ib+zw,salt,saltlen);ib_len+=saltlen;}
@@ -1890,9 +1821,9 @@ static int tsig_verify(const uint8_t *pkt,int plen){
     /* TSIG variables */
     uint8_t vars[512];int vp=0;
     /* key name wire */
-    {char tmp2[256];strncpy(tmp2,t.key_name,255);char *lbl=strtok(tmp2,".");
+    {char *sp5=NULL;char tmp2[256];safe_strcpy(tmp2,t.key_name,sizeof(tmp2));char *lbl=strtok_r(tmp2,".",&sp5);
      while(lbl){int ll=(int)strlen(lbl);vars[vp++]=(uint8_t)ll;
-         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok(NULL,".");}vars[vp++]=0;}
+         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok_r(NULL,".",&sp5);}vars[vp++]=0;}
     /* class=ANY, ttl=0 */
     vars[vp++]=0;vars[vp++]=255;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;
     /* alg name: hmac-sha256. */
@@ -1934,16 +1865,16 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     time_t now=time(NULL);
     uint8_t vars[512];int vp=0;
     /* key name wire */
-    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *lbl=strtok(tmp,".");
+    {char *sp6=NULL;char tmp[256];safe_strcpy(tmp,g_tsig_key_name,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp6);
      while(lbl){int ll=(int)strlen(lbl);vars[vp++]=(uint8_t)ll;
-         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok(NULL,".");}vars[vp++]=0;}
+         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok_r(NULL,".",&sp6);}vars[vp++]=0;}
     vars[vp++]=0;vars[vp++]=255;/* class ANY */
     vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;/* ttl=0 */
     const char *alg_wire="\x0bhmac-sha256\x00";memcpy(vars+vp,alg_wire,13);vp+=13;
     vars[vp++]=0;vars[vp++]=0;/* time high */
     vars[vp++]=(uint8_t)((now>>24)&0xFF);vars[vp++]=(uint8_t)((now>>16)&0xFF);
     vars[vp++]=(uint8_t)((now>>8)&0xFF);vars[vp++]=(uint8_t)(now&0xFF);
-    vars[vp++]=0;vars[vp++]=5;/* fudge=300 */
+    vars[vp++]=TSIG_FUDGE>>8;vars[vp++]=TSIG_FUDGE&0xFF;
     vars[vp++]=error>>8;vars[vp++]=error&0xFF;
     vars[vp++]=0;vars[vp++]=0;
     unsigned int mlen=64;uint8_t mac[64];
@@ -1966,9 +1897,9 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     /* Encode TSIG RR */
     if(off+200>blen)return off;
     /* key name */
-    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *lbl=strtok(tmp,".");
+    {char *sp7=NULL;char tmp[256];safe_strcpy(tmp,g_tsig_key_name,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp7);
      while(lbl){int ll=(int)strlen(lbl);buf[off++]=(uint8_t)ll;
-         memcpy(buf+off,lbl,ll);off+=ll;lbl=strtok(NULL,".");}buf[off++]=0;}
+         memcpy(buf+off,lbl,ll);off+=ll;lbl=strtok_r(NULL,".",&sp7);}buf[off++]=0;}
     buf[off++]=0;buf[off++]=250;/* type TSIG=250 */
     buf[off++]=0;buf[off++]=255;/* class ANY */
     buf[off++]=0;buf[off++]=0;buf[off++]=0;buf[off++]=0;/* ttl=0 */
@@ -1978,7 +1909,7 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     rdata[rp++]=0;rdata[rp++]=0;/* time high */
     rdata[rp++]=(uint8_t)((now>>24)&0xFF);rdata[rp++]=(uint8_t)((now>>16)&0xFF);
     rdata[rp++]=(uint8_t)((now>>8)&0xFF);rdata[rp++]=(uint8_t)(now&0xFF);
-    rdata[rp++]=0;rdata[rp++]=5;/* fudge */
+    rdata[rp++]=TSIG_FUDGE>>8;rdata[rp++]=TSIG_FUDGE&0xFF;
     rdata[rp++]=(uint8_t)(mlen>>8);rdata[rp++]=(uint8_t)(mlen&0xFF);
     memcpy(rdata+rp,mac,mlen);rp+=mlen;
     rdata[rp++]=orig_id>>8;rdata[rp++]=orig_id&0xFF;
@@ -2015,9 +1946,9 @@ static void tsig_hmac_prepend(EVP_MAC_CTX *ctx,const uint8_t *mac,int mlen){
 /* Encode TSIG signing variables into vars[512].  Returns byte count. */
 static int tsig_vars_build(uint8_t vars[512],time_t now,uint16_t error){
     int vp=0;
-    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *l=strtok(tmp,".");
+    {char *sp8=NULL;char tmp[256];safe_strcpy(tmp,g_tsig_key_name,sizeof(tmp));char *l=strtok_r(tmp,".",&sp8);
      while(l){int ll=(int)strlen(l);vars[vp++]=(uint8_t)ll;
-         memcpy(vars+vp,l,ll);vp+=ll;l=strtok(NULL,".");}vars[vp++]=0;}
+         memcpy(vars+vp,l,ll);vp+=ll;l=strtok_r(NULL,".",&sp8);}vars[vp++]=0;}
     vars[vp++]=0;vars[vp++]=255;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;
     const char *aw="\x0bhmac-sha256\x00";memcpy(vars+vp,aw,13);vp+=13;
     vars[vp++]=0;vars[vp++]=0;
@@ -2033,9 +1964,9 @@ static int tsig_rr_write(uint8_t *buf,int off,int blen,uint16_t orig_id,
                           uint16_t error,time_t now,const uint8_t *mac,int mlen){
     if(off+200>blen)return off;
     const char *aw="\x0bhmac-sha256\x00";
-    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *l=strtok(tmp,".");
+    {char *sp9=NULL;char tmp[256];safe_strcpy(tmp,g_tsig_key_name,sizeof(tmp));char *l=strtok_r(tmp,".",&sp9);
      while(l){int ll=(int)strlen(l);buf[off++]=(uint8_t)ll;
-         memcpy(buf+off,l,ll);off+=ll;l=strtok(NULL,".");}buf[off++]=0;}
+         memcpy(buf+off,l,ll);off+=ll;l=strtok_r(NULL,".",&sp9);}buf[off++]=0;}
     buf[off++]=0;buf[off++]=250;buf[off++]=0;buf[off++]=255;
     buf[off++]=0;buf[off++]=0;buf[off++]=0;buf[off++]=0;
     uint8_t rd[200];int rp=0;
@@ -2102,111 +2033,6 @@ static int tsig_axfr_last(uint8_t *buf,int off,int blen,uint16_t qid,
 /* ==========================================================================
  * DNS wire helpers
  * ======================================================================= */
-static int name_to_wire(const char *name,uint8_t *buf,int blen){
-    int pos=0;char tmp[256];strncpy(tmp,name,255);tmp[255]=0;
-    char *lbl=strtok(tmp,".");
-    while(lbl){int ll=(int)strlen(lbl);if(pos+ll+1>=blen)return -1;
-        buf[pos++]=(uint8_t)ll;memcpy(buf+pos,lbl,ll);pos+=ll;lbl=strtok(NULL,".");}
-    if(pos>=blen)return -1;buf[pos++]=0;return pos;}
-/* RFC 1035 §3.3.14: TXT rdata is one or more <len><bytes> character strings,
- * each up to 255 bytes.  Splits s across as many chunks as needed and writes
- * them back-to-back.  Returns total rdata length, or -1 on overflow. */
-static int txt_encode(const char *s,uint8_t *rd,int maxlen){
-    int slen=(int)strlen(s),out=0;
-    while(slen>0){int chunk=slen>255?255:slen;
-        if(out+1+chunk>maxlen)return -1;
-        rd[out++]=(uint8_t)chunk;memcpy(rd+out,s,chunk);out+=chunk;s+=chunk;slen-=chunk;}
-    return out;}
-/* RFC 1035 §4.1.4 DNS name compression.
- *
- * Per-response context tracks suffixes already emitted into the message and
- * the absolute byte offset of each, so subsequent names that share a suffix
- * can be replaced with a 2-byte back-pointer (0xC000 | offset).
- *
- * One context per outgoing DNS message; held in a thread-local so emit
- * helpers like append_rr don't need a new parameter.  Callers reset the
- * context at every message boundary (build_query_resp, AXFR message, NOTIFY,
- * mDNS).  Pointer offsets are 14-bit (max 0x3FFF) — the lookup-and-register
- * code below silently skips registration past that boundary, so names emitted
- * deep in a >16KB message simply won't be compression sources.
- *
- * Compression is only safe where the spec permits it.  RRSIG signer's name
- * (RFC 4034 §3.1.7) and a few NSEC next-owner contexts must remain
- * uncompressed; those paths construct rdata via name_to_wire (uncompressed)
- * and not via append_rr's owner-name emit, so they stay correct. */
-typedef struct {
-    int      count;
-    uint16_t offsets[128];
-    char     names[128][256];
-} compress_ctx_t;
-static __thread compress_ctx_t g_cc;
-static void compress_reset(void){ g_cc.count=0; }
-/* Emit `name` to buf+pos using g_cc.  `abs_off` is the absolute byte offset
- * inside the final DNS message where buf+pos lands — required so registered
- * pointers can be looked up by subsequent names.  For owner-name emission
- * into the response buffer, buf=resp, pos=off, abs_off=off (they coincide).
- * Returns bytes written, or -1 on overflow. */
-static int name_to_wire_c(const char *name,uint8_t *buf,int pos,int blen,int abs_off){
-    char work[256];strncpy(work,name,255);work[255]=0;
-    char *labels[64];int nlabels=0;
-    for(char *lbl=strtok(work,".");lbl&&nlabels<64;lbl=strtok(NULL,"."))
-        labels[nlabels++]=lbl;
-    int start=pos;
-    for(int i=0;i<nlabels;i++){
-        /* Compose suffix from label i onward */
-        char suffix[256];int sp=0;
-        for(int j=i;j<nlabels;j++){
-            int ll=(int)strlen(labels[j]);
-            if(sp+ll+1>=(int)sizeof(suffix))break;
-            if(j>i)suffix[sp++]='.';
-            memcpy(suffix+sp,labels[j],ll);sp+=ll;}
-        suffix[sp]=0;
-        /* Lookup existing offset */
-        for(int k=0;k<g_cc.count;k++){
-            if(strcasecmp(g_cc.names[k],suffix)==0){
-                if(pos+2>blen)return -1;
-                buf[pos++]=0xC0|(g_cc.offsets[k]>>8);
-                buf[pos++]=g_cc.offsets[k]&0xFF;
-                return pos-start;}}
-        /* Register this suffix at its absolute offset (14-bit max) */
-        int suffix_abs=abs_off+(pos-start);
-        if(g_cc.count<128&&suffix_abs<0x4000){
-            g_cc.offsets[g_cc.count]=(uint16_t)suffix_abs;
-            strncpy(g_cc.names[g_cc.count],suffix,255);
-            g_cc.names[g_cc.count][255]=0;
-            g_cc.count++;}
-        /* Emit this label */
-        int ll=(int)strlen(labels[i]);
-        if(pos+ll+1>=blen)return -1;
-        buf[pos++]=(uint8_t)ll;memcpy(buf+pos,labels[i],ll);pos+=ll;}
-    if(pos>=blen)return -1;
-    buf[pos++]=0;
-    return pos-start;}
-static int name_from_wire(const uint8_t *pkt,int plen,int off,char *out,int olen){
-    int pos=off,opos=0,jumped=0,jret=-1,steps=0;
-    while(steps++<128){if(pos>=plen)return -1;uint8_t c=pkt[pos];
-        if((c&0xC0)==0xC0){if(pos+1>=plen)return -1;
-            int ptr=((c&0x3F)<<8)|pkt[pos+1];if(!jumped){jret=pos+2;jumped=1;}pos=ptr;continue;}
-        if(c==0){pos++;break;}int ll=c;pos++;
-        if(pos+ll>plen||opos+ll+1>=olen)return -1;
-        if(opos)out[opos++]='.';memcpy(out+opos,pkt+pos,ll);opos+=ll;pos+=ll;}
-    out[opos]=0;strlower(out);return jumped?jret:pos;}
-static void put16(uint8_t *b,int o,uint16_t v){b[o]=v>>8;b[o+1]=v&0xFF;}
-static void put32(uint8_t *b,int o,uint32_t v){
-    b[o]=v>>24;b[o+1]=(v>>16)&0xFF;b[o+2]=(v>>8)&0xFF;b[o+3]=v&0xFF;}
-static uint16_t get16(const uint8_t *b,int o){return((uint16_t)b[o]<<8)|b[o+1];}
-static uint32_t get32(const uint8_t *b,int o){
-    return((uint32_t)b[o]<<24)|((uint32_t)b[o+1]<<16)|((uint32_t)b[o+2]<<8)|b[o+3];}
-static int append_rr(uint8_t *buf,int off,int blen,const char *name,
-                     uint16_t type,uint16_t cls,uint32_t ttl,
-                     const uint8_t *rdata,uint16_t rdlen){
-    /* Owner name uses compression (RFC 1035 §4.1.4); rdata is copied verbatim,
-     * so any names inside rdata were already encoded by their builder. */
-    int n=name_to_wire_c(name,buf,off,blen,off);
-    if(n<0||off+n+10+(int)rdlen>blen)return -1;
-    off+=n;put16(buf,off,type);off+=2;put16(buf,off,cls);off+=2;
-    put32(buf,off,ttl);off+=4;put16(buf,off,rdlen);off+=2;
-    if(rdlen)memcpy(buf+off,rdata,rdlen);return off+rdlen;}
 
 static const char *type2str(uint16_t t){
     switch(t){case DNS_TYPE_A:return"A";case DNS_TYPE_NS:return"NS";
@@ -2791,10 +2617,10 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         if(vk_get(k,val,sizeof(val))){found=1;
             uint32_t ttl=DEFAULT_TTL;char *pipe=strchr(val,'|');
             if(pipe){ttl=(uint32_t)atoi(val);pipe++;}else pipe=val;
-            char *ip=strtok(pipe,"|");while(ip){struct in_addr a4;if(inet_pton(AF_INET,ip,&a4)==1){
+            char *sp12=NULL;char *ip=strtok_r(pipe,"|",&sp12);while(ip){struct in_addr a4;if(inet_pton(AF_INET,ip,&a4)==1){
                 uint8_t rd[4];memcpy(rd,&a4,4);
                 off=emit_rr(resp,off,resp_len,qname,DNS_TYPE_A,ttl,rd,4,dnssec_ok,&answers);}
-                ip=strtok(NULL,"|");}}}
+                ip=strtok_r(NULL,"|",&sp12);}}}
     /* Dynamic AAAA */
     if(qtype==DNS_TYPE_AAAA||qtype==DNS_TYPE_ANY){
         char val[256],k[512];
@@ -2806,10 +2632,10 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         if(vk_get(k,val,sizeof(val))){found=1;
             uint32_t ttl=DEFAULT_TTL;char *pipe=strchr(val,'|');
             if(pipe){ttl=(uint32_t)atoi(val);pipe++;}else pipe=val;
-            char *ip=strtok(pipe,"|");while(ip){struct in6_addr a6;if(inet_pton(AF_INET6,ip,&a6)==1){
+            char *sp13=NULL;char *ip=strtok_r(pipe,"|",&sp13);while(ip){struct in6_addr a6;if(inet_pton(AF_INET6,ip,&a6)==1){
                 uint8_t rd[16];memcpy(rd,&a6,16);
                 off=emit_rr(resp,off,resp_len,qname,DNS_TYPE_AAAA,ttl,rd,16,dnssec_ok,&answers);}
-                ip=strtok(NULL,"|");}}}
+                ip=strtok_r(NULL,"|",&sp13);}}}
     /* Provisioned record types from Valkey */
     {uint16_t pts[]={DNS_TYPE_CNAME,DNS_TYPE_MX,DNS_TYPE_TXT,DNS_TYPE_NS,
                      DNS_TYPE_SRV,DNS_TYPE_CAA,DNS_TYPE_SSHFP,DNS_TYPE_TLSA,
@@ -2833,45 +2659,45 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         case DNS_TYPE_SRV:{/* ttl|prio|weight|port|target */
             uint16_t prio=0,weight=0,port=0;char target[256]="";
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok){prio=(uint16_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok){weight=(uint16_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok){port=(uint16_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok)strncpy(target,tok,255);
+            char *sp14=NULL;char *tok=strtok_r(p2,"|",&sp14);if(tok){prio=(uint16_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp14);if(tok){weight=(uint16_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp14);if(tok){port=(uint16_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp14);if(tok)safe_strcpy(target,tok,sizeof(target));
             rd[0]=prio>>8;rd[1]=prio&0xFF;rd[2]=weight>>8;rd[3]=weight&0xFF;
             rd[4]=port>>8;rd[5]=port&0xFF;
             int n=name_to_wire(target,rd+6,sizeof(rd)-6);if(n<0)continue;rdlen=(uint16_t)(6+n);break;}
         case DNS_TYPE_CAA:{/* ttl|flags|tag|value */
             uint8_t flags=0;char tag[64]="",caaval[256]="";
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok){flags=(uint8_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok)strncpy(tag,tok,63);
-            tok=strtok(NULL,"|");if(tok)strncpy(caaval,tok,255);
+            char *sp15=NULL;char *tok=strtok_r(p2,"|",&sp15);if(tok){flags=(uint8_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp15);if(tok)safe_strcpy(tag,tok,sizeof(tag));
+            tok=strtok_r(NULL,"|",&sp15);if(tok)safe_strcpy(caaval,tok,sizeof(caaval));
             rd[0]=flags;rd[1]=(uint8_t)strlen(tag);memcpy(rd+2,tag,strlen(tag));
             int tl=(int)strlen(tag);memcpy(rd+2+tl,caaval,strlen(caaval));
             rdlen=(uint16_t)(2+tl+(int)strlen(caaval));break;}
         case DNS_TYPE_SSHFP:{/* ttl|alg|fptype|fingerprint_hex */
             uint8_t alg=0,fptype=0;uint8_t fp[64];int fplen=0;
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok)alg=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)fptype=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)fplen=hex_dec(tok,fp,sizeof(fp));
+            char *sp16=NULL;char *tok=strtok_r(p2,"|",&sp16);if(tok)alg=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp16);if(tok)fptype=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp16);if(tok)fplen=hex_dec(tok,fp,sizeof(fp));
             rd[0]=alg;rd[1]=fptype;memcpy(rd+2,fp,fplen);rdlen=(uint16_t)(2+fplen);break;}
         case DNS_TYPE_TLSA:{/* ttl|usage|selector|mtype|data_hex */
             uint8_t usage=0,sel=0,mtype=0;uint8_t data[512];int dlen=0;
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok)usage=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)sel=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)mtype=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)dlen=hex_dec(tok,data,sizeof(data));
+            char *sp17=NULL;char *tok=strtok_r(p2,"|",&sp17);if(tok)usage=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp17);if(tok)sel=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp17);if(tok)mtype=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp17);if(tok)dlen=hex_dec(tok,data,sizeof(data));
             rd[0]=usage;rd[1]=sel;rd[2]=mtype;memcpy(rd+3,data,dlen);rdlen=(uint16_t)(3+dlen);break;}
         case DNS_TYPE_LOC:{/* stored as raw hex of wire rdata */
             int lo=hex_dec(pipe,rd,sizeof(rd));rdlen=(uint16_t)lo;break;}
         case DNS_TYPE_URI:{/* ttl|priority|weight|target */
             uint16_t prio=0,weight=0;
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok)prio=(uint16_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)weight=(uint16_t)atoi(tok);
-            tok=strtok(NULL,"|");if(!tok)tok="";
+            char *sp18=NULL;char *tok=strtok_r(p2,"|",&sp18);if(tok)prio=(uint16_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp18);if(tok)weight=(uint16_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp18);if(!tok)tok="";
             /* RFC 7553: priority(2)+weight(2)+target(variable, no length prefix) */
             int tlen=(int)strlen(tok);if(tlen>255)tlen=255;
             rd[0]=prio>>8;rd[1]=prio&0xFF;rd[2]=weight>>8;rd[3]=weight&0xFF;
@@ -2880,12 +2706,12 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
             /* stored as raw packed value: order|pref|flags|service|regexp|replacement */
             uint16_t order2=0,pref2=0;char flags2[64]="",svc2[64]="",re2[256]="",repl2[256]="";
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok)order2=(uint16_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)pref2=(uint16_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)strncpy(flags2,tok,63);
-            tok=strtok(NULL,"|");if(tok)strncpy(svc2,tok,63);
-            tok=strtok(NULL,"|");if(tok)strncpy(re2,tok,255);
-            tok=strtok(NULL,"|");if(tok)strncpy(repl2,tok,255);
+            char *sp19=NULL;char *tok=strtok_r(p2,"|",&sp19);if(tok)order2=(uint16_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp19);if(tok)pref2=(uint16_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp19);if(tok)safe_strcpy(flags2,tok,sizeof(flags2));
+            tok=strtok_r(NULL,"|",&sp19);if(tok)safe_strcpy(svc2,tok,sizeof(svc2));
+            tok=strtok_r(NULL,"|",&sp19);if(tok)safe_strcpy(re2,tok,sizeof(re2));
+            tok=strtok_r(NULL,"|",&sp19);if(tok)safe_strcpy(repl2,tok,sizeof(repl2));
             int rp2=0;
             rd[rp2++]=order2>>8;rd[rp2++]=order2&0xFF;
             rd[rp2++]=pref2>>8;rd[rp2++]=pref2&0xFF;
@@ -2913,7 +2739,7 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
                 off=emit_rr(resp,off,resp_len,qname,DNS_TYPE_CNAME,cname_ttl,
                             crd,(uint16_t)crlen,dnssec_ok,&answers);
                 /* Follow chain within zone — up to 8 hops */
-                char cur[256];strncpy(cur,cname_target,255);
+                char cur[256];safe_strcpy(cur,cname_target,sizeof(cur));
                 for(int hop=0;hop<8&&cur[0];hop++){
                     size_t zl=strlen(g_zone_name),nl=strlen(cur);
                     int in_zone=(nl==zl&&strcasecmp(cur,g_zone_name)==0)||
@@ -2927,14 +2753,14 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
                         if(vk_get(ck,cv,sizeof(cv))){
                             uint32_t t2=DEFAULT_TTL;char *pp=strchr(cv,'|');
                             char *ip=pp?pp+1:cv;if(pp)t2=(uint32_t)atoi(cv);
-                            char cbuf[256];strncpy(cbuf,ip,255);
-                            char *tok=strtok(cbuf,"|");
+                            char cbuf[256];safe_strcpy(cbuf,ip,sizeof(cbuf));
+                            char *sp20=NULL;char *tok=strtok_r(cbuf,"|",&sp20);
                             while(tok){struct in_addr a4;
                                 if(inet_pton(AF_INET,tok,&a4)==1){
                                     uint8_t rd4[4];memcpy(rd4,&a4,4);
                                     off=emit_rr(resp,off,resp_len,cur,DNS_TYPE_A,
                                                 t2,rd4,4,dnssec_ok,&answers);}
-                                tok=strtok(NULL,"|");}}}
+                                tok=strtok_r(NULL,"|",&sp20);}}}
                     /* AAAA records */
                     if(qtype==DNS_TYPE_AAAA||qtype==DNS_TYPE_ANY){
                         char ck[512];snprintf(ck,sizeof(ck),"zone:AAAA:%s",cur);
@@ -2942,14 +2768,14 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
                         if(vk_get(ck,cv,sizeof(cv))){
                             uint32_t t2=DEFAULT_TTL;char *pp=strchr(cv,'|');
                             char *ip=pp?pp+1:cv;if(pp)t2=(uint32_t)atoi(cv);
-                            char cbuf[256];strncpy(cbuf,ip,255);
-                            char *tok=strtok(cbuf,"|");
+                            char cbuf[256];safe_strcpy(cbuf,ip,sizeof(cbuf));
+                            char *sp21=NULL;char *tok=strtok_r(cbuf,"|",&sp21);
                             while(tok){struct in6_addr a6;
                                 if(inet_pton(AF_INET6,tok,&a6)==1){
                                     uint8_t rd6[16];memcpy(rd6,&a6,16);
                                     off=emit_rr(resp,off,resp_len,cur,DNS_TYPE_AAAA,
                                                 t2,rd6,16,dnssec_ok,&answers);}
-                                tok=strtok(NULL,"|");}}}
+                                tok=strtok_r(NULL,"|",&sp21);}}}
                     /* Next CNAME hop? */
                     snprintf(cname_key,sizeof(cname_key),"zone:CNAME:%s",cur);
                     if(answers==0&&vk_get(cname_key,cname_val,sizeof(cname_val))){
@@ -2960,7 +2786,7 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
                         if(crlen>0)
                             off=emit_rr(resp,off,resp_len,cur,DNS_TYPE_CNAME,
                                         t_hop,crd,(uint16_t)crlen,dnssec_ok,&answers);
-                        strncpy(cur,cname_target,255);
+                        safe_strcpy(cur,cname_target,sizeof(cur));
                     } else break;
                 }
             }
@@ -3297,8 +3123,8 @@ static int ixfr_journal_fetch(uint32_t from_serial,
 typedef struct{int fd;SSL *ssl;struct sockaddr_in addr;int ixfr;uint32_t ixfr_serial;uint16_t query_id;}axfr_conn_t;
 
 static int axfr_ip_allowed(const struct in_addr *cip){
-    char allow[1024];strncpy(allow,g_axfr_allow,sizeof(allow)-1);
-    char *tok=strtok(allow,",");
+    char allow[1024];safe_strcpy(allow,g_axfr_allow,sizeof(allow));
+    char *sp22=NULL;char *tok=strtok_r(allow,",",&sp22);
     while(tok){while(*tok==' ')tok++;
         /* Simple exact match or /8-/32 CIDR */
         char *slash=strchr(tok,'/');
@@ -3310,7 +3136,7 @@ static int axfr_ip_allowed(const struct in_addr *cip){
             if(bits==32)mask=0xFFFFFFFFu;
             if((cip->s_addr&mask)==(net.s_addr&mask))return 1;
         }else{struct in_addr a;if(inet_pton(AF_INET,tok,&a)==1&&a.s_addr==cip->s_addr)return 1;}
-        tok=strtok(NULL,",");}
+        tok=strtok_r(NULL,",",&sp22);}
     return 0;}
 
 /* Send one DNS message over TCP (2-byte length prefix) */
@@ -3464,15 +3290,15 @@ done:
  * ======================================================================= */
 static void notify_send(void){
     if(!g_notify_targets[0])return;
-    char targets[1024];strncpy(targets,g_notify_targets,sizeof(targets)-1);
-    char *tok=strtok(targets,",");
+    char targets[1024];safe_strcpy(targets,g_notify_targets,sizeof(targets));
+    char *sp23=NULL;char *tok=strtok_r(targets,",",&sp23);
     while(tok){while(*tok==' ')tok++;
         char host[256]="";int port=53;
         char *col=strchr(tok,':');
-        if(col){*col=0;port=atoi(col+1);}strncpy(host,tok,255);
-        int fd=socket(AF_INET,SOCK_DGRAM,0);if(fd<0){tok=strtok(NULL,",");continue;}
+        if(col){*col=0;port=atoi(col+1);}safe_strcpy(host,tok,sizeof(host));
+        int fd=socket(AF_INET,SOCK_DGRAM,0);if(fd<0){tok=strtok_r(NULL,",",&sp23);continue;}
         struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(port)};
-        if(inet_pton(AF_INET,host,&sa.sin_addr)!=1){close(fd);tok=strtok(NULL,",");continue;}
+        if(inet_pton(AF_INET,host,&sa.sin_addr)!=1){close(fd);tok=strtok_r(NULL,",",&sp23);continue;}
         uint8_t pkt[64]={0};dns_hdr_t *h=(dns_hdr_t*)pkt;
         h->id=htons((uint16_t)rand());
         h->flags=htons(DNS_QR&0?0:0|DNS_OPCODE_NOTIFY|DNS_AA);
@@ -3481,7 +3307,7 @@ static void notify_send(void){
         if(n>0){off+=n;put16(pkt,off,DNS_TYPE_SOA);off+=2;put16(pkt,off,DNS_CLASS_IN);off+=2;}
         sendto(fd,pkt,off,0,(struct sockaddr*)&sa,sizeof(sa));
         dns_log(LOG_NOTICE,"[NOTIFY] Sent to %s:%d\n",host,port);close(fd);
-        tok=strtok(NULL,",");}}
+        tok=strtok_r(NULL,",",&sp23);}}
 
 /* ==========================================================================
  * DNS packet dispatch (shared by UDP / DoT / DoH)
@@ -3606,17 +3432,17 @@ dot_done:
 
 /* Append a name in DNS wire format to buf[off].  Returns new offset, -1 on overflow. */
 static int mdns_put_name(uint8_t *buf, int off, int blen, const char *name){
-    char tmp[256]; strncpy(tmp,name,255); tmp[255]=0;
+    char tmp[256]; safe_strcpy(tmp,name,sizeof(tmp));
     /* strip trailing dot */
     int tl=(int)strlen(tmp);
     if(tl>0&&tmp[tl-1]=='.') tmp[--tl]=0;
-    char *lbl=strtok(tmp,".");
+    char *sp24=NULL;char *lbl=strtok_r(tmp,".",&sp24);
     while(lbl){
         int ll=(int)strlen(lbl);
         if(off+ll+1>=blen) return -1;
         buf[off++]=(uint8_t)ll;
         memcpy(buf+off,lbl,ll); off+=ll;
-        lbl=strtok(NULL,".");
+        lbl=strtok_r(NULL,".",&sp24);
     }
     if(off>=blen) return -1;
     buf[off++]=0;
@@ -3731,7 +3557,7 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen,
             switch(qt){
             case DNS_TYPE_A:{
                 struct in_addr a4;
-                char *ip=strtok(vptr,"|");
+                char *sp25=NULL;char *ip=strtok_r(vptr,"|",&sp25);
                 while(ip){
                     if(inet_pton(AF_INET,ip,&a4)==1){
                         memcpy(rd,&a4,4); rdlen=4;
@@ -3740,12 +3566,12 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen,
                         if(off<0)goto done;
                         (*ancount)++;
                     }
-                    ip=strtok(NULL,"|");}
+                    ip=strtok_r(NULL,"|",&sp25);}
                 rdlen=0; /* already appended per-IP */
                 break;}
             case DNS_TYPE_AAAA:{
                 struct in6_addr a6;
-                char *ip=strtok(vptr,"|");
+                char *sp26=NULL;char *ip=strtok_r(vptr,"|",&sp26);
                 while(ip){
                     if(inet_pton(AF_INET6,ip,&a6)==1){
                         memcpy(rd,&a6,16); rdlen=16;
@@ -3754,7 +3580,7 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen,
                         if(off<0)goto done;
                         (*ancount)++;
                     }
-                    ip=strtok(NULL,"|");}
+                    ip=strtok_r(NULL,"|",&sp26);}
                 rdlen=0;
                 break;}
             case DNS_TYPE_PTR:{
@@ -3765,10 +3591,10 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen,
             case DNS_TYPE_SRV:{
                 /* ttl|priority|weight|port|target */
                 uint16_t prio=0,weight=0,port=0; char target[256]="";
-                char *tok=strtok(vptr,"|"); if(tok)prio=(uint16_t)atoi(tok);
-                tok=strtok(NULL,"|"); if(tok)weight=(uint16_t)atoi(tok);
-                tok=strtok(NULL,"|"); if(tok)port=(uint16_t)atoi(tok);
-                tok=strtok(NULL,"|"); if(tok)strncpy(target,tok,255);
+                char *sp27=NULL;char *tok=strtok_r(vptr,"|",&sp27); if(tok)prio=(uint16_t)atoi(tok);
+                tok=strtok_r(NULL,"|",&sp27); if(tok)weight=(uint16_t)atoi(tok);
+                tok=strtok_r(NULL,"|",&sp27); if(tok)port=(uint16_t)atoi(tok);
+                tok=strtok_r(NULL,"|",&sp27); if(tok)safe_strcpy(target,tok,sizeof(target));
                 rd[0]=prio>>8; rd[1]=prio&0xFF;
                 rd[2]=weight>>8; rd[3]=weight&0xFF;
                 rd[4]=port>>8; rd[5]=port&0xFF;
@@ -3905,7 +3731,7 @@ static void mdns_announce(void){
                 resp_reply_t kr; resp_parse(&vk,&kr);
                 if(kr.type!=2)continue;
                 /* parse key: prefix:TYPE:name */
-                char kbuf[512]; strncpy(kbuf,kr.str,511);
+                char kbuf[512]; safe_strcpy(kbuf,kr.str,sizeof(kbuf));
                 char *p1=strchr(kbuf,':'); if(!p1)continue; *p1++=0;
                 char *p2=strchr(p1,':');   if(!p2)continue; *p2++=0;
                 char *tname=p1, *rname=p2;
@@ -3922,10 +3748,10 @@ static void mdns_announce(void){
                 case DNS_TYPE_AAAA:{struct in6_addr a6;if(inet_pton(AF_INET6,vptr,&a6)==1){memcpy(rd,&a6,16);rdlen=16;}break;}
                 case DNS_TYPE_PTR:{int n=name_to_wire(vptr,rd,sizeof(rd));if(n>0)rdlen=(uint16_t)n;break;}
                 case DNS_TYPE_SRV:{uint16_t pr=0,wt=0,po=0;char tg[256]="";
-                    char *tok=strtok(vptr,"|");if(tok)pr=(uint16_t)atoi(tok);
-                    tok=strtok(NULL,"|");if(tok)wt=(uint16_t)atoi(tok);
-                    tok=strtok(NULL,"|");if(tok)po=(uint16_t)atoi(tok);
-                    tok=strtok(NULL,"|");if(tok)strncpy(tg,tok,255);
+                    char *sp28=NULL;char *tok=strtok_r(vptr,"|",&sp28);if(tok)pr=(uint16_t)atoi(tok);
+                    tok=strtok_r(NULL,"|",&sp28);if(tok)wt=(uint16_t)atoi(tok);
+                    tok=strtok_r(NULL,"|",&sp28);if(tok)po=(uint16_t)atoi(tok);
+                    tok=strtok_r(NULL,"|",&sp28);if(tok)safe_strcpy(tg,tok,sizeof(tg));
                     rd[0]=pr>>8;rd[1]=pr&0xFF;rd[2]=wt>>8;rd[3]=wt&0xFF;rd[4]=po>>8;rd[5]=po&0xFF;
                     int n=name_to_wire(tg,rd+6,sizeof(rd)-6);if(n>0)rdlen=(uint16_t)(6+n);break;}
                 case DNS_TYPE_TXT:{int tl=txt_encode(vptr,rd,(int)sizeof(rd));if(tl<0)break;rdlen=(uint16_t)tl;break;}
@@ -4159,7 +3985,7 @@ static void parse_url(const char *url,char *host,int *port,char *path,int plen){
     *port=443;strcpy(path,"/");const char *p=url;
     if(strncmp(p,"https://",8)==0)p+=8;else if(strncmp(p,"http://",7)==0){p+=7;*port=80;}
     const char *sl=strchr(p,'/');int hl=sl?(int)(sl-p):(int)strlen(p);
-    memcpy(host,p,hl);host[hl]=0;if(sl)strncpy(path,sl,plen-1);
+    memcpy(host,p,hl);host[hl]=0;if(sl)safe_strcpy(path,sl,plen);
     char *col=strchr(host,':');if(col){*port=atoi(col+1);*col=0;}}
 static void acme_jwk(EVP_PKEY *k,char *out,int olen){
     uint8_t xy[64];if(!ec_pub_xy(k,xy)){snprintf(out,olen,"{}");return;}
@@ -4262,8 +4088,8 @@ static void cert_post_issue(const char *domain,
                             const char *key_pem){
     vk_set("config:tls_cert_pem",cert_pem,0);
     vk_set("config:tls_key_pem", key_pem, 0);
-    strncpy(g_tls_cert_pem,cert_pem,sizeof(g_tls_cert_pem)-1);
-    strncpy(g_tls_key_pem, key_pem, sizeof(g_tls_key_pem)-1);
+    safe_strcpy(g_tls_cert_pem,cert_pem,sizeof(g_tls_cert_pem));
+    safe_strcpy(g_tls_key_pem,key_pem,sizeof(g_tls_key_pem));
     dns_log(LOG_NOTICE,"[PKI] Certificate stored in Valkey for %s\n",domain);
     tls_reload();
     /* TLSA */
@@ -4512,7 +4338,7 @@ static int acme_issue(void){
     {char *p=az_body;while((p=strstr(p,"\"dns-01\""))!=NULL){
         char *obj=p-300;if(obj<az_body)obj=az_body;
         char tok2[256]={0},uv[512]={0};json_str(obj,"token",tok2,sizeof(tok2));json_str(obj,"url",uv,sizeof(uv));
-        if(tok2[0]&&uv[0]){strncpy(ch_tok,tok2,255);strncpy(ch_url,uv,511);}p+=8;break;}}
+        if(tok2[0]&&uv[0]){safe_strcpy(ch_tok,tok2,sizeof(ch_tok));safe_strcpy(ch_url,uv,sizeof(ch_url));}p+=8;break;}}
     free(az_body);if(!ch_tok[0]){dns_log(LOG_ERR,"[ACME] No dns-01 challenge\n");return -1;}
     char thumb[256];acme_thumbprint(g_acme_key,thumb,sizeof(thumb));
     char kauth[512];snprintf(kauth,sizeof(kauth),"%s.%s",ch_tok,thumb);
@@ -4738,13 +4564,13 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
         qs_get(bdy,"key",cfgkey,sizeof(cfgkey));qs_get(bdy,"value",cfgval,sizeof(cfgval));
         if(!cfgkey[0]){api_send(fd,ssl,400,"missing key\n");return;}
         config_set(cfgkey,cfgval);
-        if(!strcmp(cfgkey,"ddns_secret"))strncpy(g_ddns_secret,cfgval,sizeof(g_ddns_secret)-1);
-        else if(!strcmp(cfgkey,"acme_domain"))strncpy(g_acme_domain,cfgval,sizeof(g_acme_domain)-1);
-        else if(!strcmp(cfgkey,"tls_cert_pem")){strncpy(g_tls_cert_pem,cfgval,sizeof(g_tls_cert_pem)-1);tls_reload();}
-        else if(!strcmp(cfgkey,"tls_key_pem")){strncpy(g_tls_key_pem,cfgval,sizeof(g_tls_key_pem)-1);tls_reload();}
-        else if(!strcmp(cfgkey,"mtls_ca_pem")){strncpy(g_mtls_ca_pem,cfgval,sizeof(g_mtls_ca_pem)-1);tls_reload();}
+        if(!strcmp(cfgkey,"ddns_secret"))safe_strcpy(g_ddns_secret,cfgval,sizeof(g_ddns_secret));
+        else if(!strcmp(cfgkey,"acme_domain"))safe_strcpy(g_acme_domain,cfgval,sizeof(g_acme_domain));
+        else if(!strcmp(cfgkey,"tls_cert_pem")){safe_strcpy(g_tls_cert_pem,cfgval,sizeof(g_tls_cert_pem));tls_reload();}
+        else if(!strcmp(cfgkey,"tls_key_pem")){safe_strcpy(g_tls_key_pem,cfgval,sizeof(g_tls_key_pem));tls_reload();}
+        else if(!strcmp(cfgkey,"mtls_ca_pem")){safe_strcpy(g_mtls_ca_pem,cfgval,sizeof(g_mtls_ca_pem));tls_reload();}
         else if(!strcmp(cfgkey,"query_log_path")){
-            strncpy(g_query_log_path,cfgval,sizeof(g_query_log_path)-1);
+            safe_strcpy(g_query_log_path,cfgval,sizeof(g_query_log_path));
             qlog_open();
             dns_log(LOG_NOTICE,"[QLog] Log path updated: %s\n",g_query_log_path);}
         char rb[128];snprintf(rb,sizeof(rb),"ok: config:%s updated\n",cfgkey);api_send(fd,ssl,200,rb);return;}

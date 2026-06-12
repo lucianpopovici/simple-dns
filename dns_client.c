@@ -60,6 +60,7 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <signal.h>
+#include "dns_wire.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -86,11 +87,18 @@
 #define DNS_TYPE_TXT     16
 #define DNS_TYPE_AAAA    28
 #define DNS_TYPE_SRV     33
+#define DNS_TYPE_DNAME   39
 #define DNS_TYPE_OPT     41
+#define DNS_TYPE_RRSIG   46
+#define DNS_TYPE_DNSKEY  48
 #define DNS_TYPE_SSHFP   44
 #define DNS_TYPE_TLSA    52
 #define DNS_TYPE_CAA     257
 #define DNS_TYPE_ANY     255
+/* TSIG time window in seconds (RFC 8945 §5.2.3 recommends 300). Emitted as
+ * two big-endian bytes in BOTH the digest input and the TSIG RDATA — keep
+ * every emit site on this constant so the two cannot drift apart. */
+#define TSIG_FUDGE 300
 #define DNS_CLASS_IN     1
 #define DNS_QR           0x8000
 #define DNS_AA           0x0400
@@ -252,36 +260,6 @@ static pthread_mutex_t g_upstream_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* =========================================================================
  * Utility: lowercase, hex, base64
  * ======================================================================= */
-static void strlower(char *s){ for(;*s;s++) if(*s>='A'&&*s<='Z') *s+=32; }
-
-static int hex_dec(const char *in, uint8_t *out, int maxlen){
-    int n=0;
-    while(in[0]&&in[1]&&n<maxlen){
-        char h[3]={in[0],in[1],0}; out[n++]=(uint8_t)strtol(h,NULL,16); in+=2;}
-    return n;}
-
-static int b64std_dec(const char *in, uint8_t *out, int olen){
-    int inlen=(int)strlen(in),o=0;
-    static const int8_t rev[256]={
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,-1, 0, 1, 2, 3, 4, 5, 6,
-         7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
-        49,50,51,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1};
-    for(int i=0;i+3<inlen&&o+2<olen;i+=4){
-        int8_t a=rev[(uint8_t)in[i]],b=rev[(uint8_t)in[i+1]],
-               c=rev[(uint8_t)in[i+2]],d=rev[(uint8_t)in[i+3]];
-        if(a<0||b<0)break;
-        out[o++]=(uint8_t)((a<<2)|(b>>4));
-        if(c>=0&&o<olen)out[o++]=(uint8_t)((b<<4)|(c>>2));
-        if(d>=0&&o<olen)out[o++]=(uint8_t)((c<<6)|d);}
-    return o;}
 
 /* =========================================================================
  * SipHash-2-4 for DNS Cookies
@@ -344,8 +322,8 @@ static int resp_parse(resp_conn_t *c,resp_reply_t *r){
     char line[1024];if(resp_readline(c,line,sizeof(line))<0)return -1;
     memset(r,0,sizeof(*r));
     switch(line[0]){
-    case '+':r->type=RESP_STR;strncpy(r->str,line+1,RESP_BUF-1);return 0;
-    case '-':r->type=RESP_ERR;strncpy(r->str,line+1,RESP_BUF-1);return 0;
+    case '+':r->type=RESP_STR;safe_strcpy(r->str,line+1,sizeof(r->str));return 0;
+    case '-':r->type=RESP_ERR;safe_strcpy(r->str,line+1,sizeof(r->str));return 0;
     case ':':r->type=RESP_INT;r->integer=atol(line+1);return 0;
     case '$':{int bl=atoi(line+1);if(bl<0){r->type=RESP_NIL;return 0;}r->type=RESP_BULK;
         int take=bl<RESP_BUF-1?bl:RESP_BUF-1;
@@ -397,7 +375,7 @@ static int vk_get(const char *key,char *out,int olen){
     if(!g_cfg.valkey_enabled||vk_ensure(&g_vk)<0){pthread_mutex_unlock(&g_vk_mutex);return 0;}
     resp_reply_t r;if(resp_send_cmd(&g_vk,&r,2,"GET",key)<0){g_vk.fd=-1;pthread_mutex_unlock(&g_vk_mutex);return 0;}
     pthread_mutex_unlock(&g_vk_mutex);
-    if(r.type!=RESP_BULK)return 0;strncpy(out,r.str,olen-1);out[olen-1]=0;return 1;}
+    if(r.type!=RESP_BULK)return 0;safe_strcpy(out,r.str,olen);return 1;}
 static int vk_del(const char *key){
     pthread_mutex_lock(&g_vk_mutex);
     if(!g_cfg.valkey_enabled||vk_ensure(&g_vk)<0){pthread_mutex_unlock(&g_vk_mutex);return 0;}
@@ -411,36 +389,13 @@ static int vk_keys_scan(const char *pattern,char keys[][512],int maxkeys){
     if(resp_send_cmd(&g_vk,&r,2,"KEYS",pattern)<0||r.type!=RESP_ARR){g_vk.fd=-1;pthread_mutex_unlock(&g_vk_mutex);return 0;}
     for(int i=0;i<r.count&&i<maxkeys;i++){
         resp_reply_t kr;if(resp_parse(&g_vk,&kr)<0)break;
-        if(kr.type==RESP_BULK)strncpy(keys[n++],kr.str,511);}
+        if(kr.type==RESP_BULK){safe_strcpy(keys[n],kr.str,sizeof(keys[n]));n++;}}
     pthread_mutex_unlock(&g_vk_mutex);return n;}
 
 /* =========================================================================
  * DNS wire helpers
  * ======================================================================= */
-static uint16_t get16(const uint8_t *b,int o){return((uint16_t)b[o]<<8)|b[o+1];}
-static uint32_t get32(const uint8_t *b,int o){
-    return((uint32_t)b[o]<<24)|((uint32_t)b[o+1]<<16)|((uint32_t)b[o+2]<<8)|b[o+3];}
-static void put16(uint8_t *b,int o,uint16_t v){b[o]=v>>8;b[o+1]=v&0xFF;}
-static void put32(uint8_t *b,int o,uint32_t v){b[o]=v>>24;b[o+1]=(v>>16)&0xFF;b[o+2]=(v>>8)&0xFF;b[o+3]=v&0xFF;}
 
-static int name_to_wire(const char *name,uint8_t *buf,int blen){
-    int pos=0;char tmp[256];strncpy(tmp,name,255);tmp[255]=0;
-    /* strip trailing dot */
-    int tl=(int)strlen(tmp);if(tl>0&&tmp[tl-1]=='.')tmp[--tl]=0;
-    char *lbl=strtok(tmp,".");
-    while(lbl){int ll=(int)strlen(lbl);if(pos+ll+1>=blen)return -1;
-        buf[pos++]=(uint8_t)ll;memcpy(buf+pos,lbl,ll);pos+=ll;lbl=strtok(NULL,".");}
-    if(pos>=blen)return -1;buf[pos++]=0;return pos;}
-
-static int name_from_wire(const uint8_t *pkt,int plen,int off,char *out,int olen){
-    int pos=off,opos=0,jumped=0,jret=-1,steps=0;
-    while(steps++<128){if(pos>=plen)return -1;uint8_t c=pkt[pos];
-        if((c&0xC0)==0xC0){if(pos+1>=plen)return -1;
-            int ptr=((c&0x3F)<<8)|pkt[pos+1];if(!jumped){jret=pos+2;jumped=1;}pos=ptr;continue;}
-        if(c==0){pos++;break;}int ll=c;pos++;
-        if(pos+ll>plen||opos+ll+1>=olen)return -1;
-        if(opos)out[opos++]='.';memcpy(out+opos,pkt+pos,ll);opos+=ll;pos+=ll;}
-    out[opos]=0;strlower(out);return jumped?jret:pos;}
 
 static const char *type2str(uint16_t t){
     switch(t){case DNS_TYPE_A:return"A";case DNS_TYPE_NS:return"NS";
@@ -622,36 +577,137 @@ static int verify_ed25519(const uint8_t *sig_raw,
             EVP_DigestVerify(mctx,sig_raw,64,data,dlen)==1);
     EVP_MD_CTX_free(mctx); EVP_PKEY_free(pkey); return ok;}
 
+/* =========================================================================
+ * DNSSEC signing-input construction (RFC 4034 §3.1.8.1)
+ *
+ * The data a validator must verify is:
+ *     RRSIG_RDATA (type covered .. signer name, i.e. without the signature)
+ *  || canonical RRset (each RR: owner | type | class | original TTL |
+ *                      rdlength | canonical rdata), sorted per §6.3.
+ * ======================================================================= */
+
+#define DNSSEC_MAX_RRS   16    /* max RRs in one verified RRset */
+/* Worst-case canonical RR: owner (255) + fixed (10) + SOA rdata
+ * (255 + 255 + 20). Round up. */
+#define CANON_RR_MAX     800
+
+typedef struct {
+    uint8_t buf[CANON_RR_MAX];
+    int     len;
+} canon_rr_t;
+
+/* Number of labels in a dotted name ("" = root = 0). The leftmost "*" of an
+ * already-wildcard owner does not count (RFC 4034 §3.1.3). */
+static int name_label_count(const char *name){
+    if(name[0]==0)return 0;
+    int n=1;
+    for(const char *p=name;*p;p++){
+        if(*p=='.')n++;
+    }
+    if(name[0]=='*'&&name[1]=='.')n--;
+    return n;
+}
+
+/* Write the canonical form of an RR's rdata (RFC 4034 §6.2): embedded domain
+ * names are decompressed and lowercased for the name-bearing types this
+ * resolver handles; all other rdata is copied verbatim.
+ * Returns the canonical length, or -1 on malformed input. */
+static int canon_rdata(const uint8_t *pkt,int plen,int rdoff,int rdlen,
+                       uint16_t rtype,uint8_t *out,int outsz){
+    if(rdoff<0||rdlen<0||rdoff+rdlen>plen)return -1;
+    char nm[256];
+    switch(rtype){
+    case DNS_TYPE_NS:
+    case DNS_TYPE_CNAME:
+    case DNS_TYPE_PTR:
+    case DNS_TYPE_DNAME:{
+        if(name_from_wire(pkt,plen,rdoff,nm,sizeof(nm))<0)return -1;
+        return name_to_wire(nm,out,outsz);
+    }
+    case DNS_TYPE_MX:{
+        if(rdlen<3||outsz<2)return -1;
+        out[0]=pkt[rdoff];
+        out[1]=pkt[rdoff+1];
+        if(name_from_wire(pkt,plen,rdoff+2,nm,sizeof(nm))<0)return -1;
+        int n=name_to_wire(nm,out+2,outsz-2);
+        if(n<0)return -1;
+        return 2+n;
+    }
+    case DNS_TYPE_SRV:{
+        if(rdlen<7||outsz<6)return -1;
+        memcpy(out,pkt+rdoff,6);
+        if(name_from_wire(pkt,plen,rdoff+6,nm,sizeof(nm))<0)return -1;
+        int n=name_to_wire(nm,out+6,outsz-6);
+        if(n<0)return -1;
+        return 6+n;
+    }
+    case DNS_TYPE_SOA:{
+        int a=name_from_wire(pkt,plen,rdoff,nm,sizeof(nm));
+        if(a<0)return -1;
+        int pos=name_to_wire(nm,out,outsz);
+        if(pos<0)return -1;
+        int b=name_from_wire(pkt,plen,a,nm,sizeof(nm));
+        if(b<0)return -1;
+        int n=name_to_wire(nm,out+pos,outsz-pos);
+        if(n<0)return -1;
+        pos+=n;
+        if(b+20>plen||pos+20>outsz)return -1;
+        memcpy(out+pos,pkt+b,20); /* serial..minimum: 5×u32 */
+        return pos+20;
+    }
+    default:
+        if(rdlen>outsz)return -1;
+        memcpy(out,pkt+rdoff,rdlen);
+        return rdlen;
+    }
+}
+
+/* Canonical RRset order (RFC 4034 §6.3): compare rdata as left-justified
+ * octet sequences; a missing octet sorts before a zero. Owner/type/class/TTL
+ * are identical across the set, so whole-record comparison is equivalent. */
+static int canon_rr_cmp(const canon_rr_t *a,const canon_rr_t *b){
+    int min=a->len<b->len?a->len:b->len;
+    int c=memcmp(a->buf,b->buf,min);
+    if(c)return c;
+    return a->len-b->len;
+}
+
 /*
  * dnssec_verify_rrset — verify one RRset against its RRSIG.
  *
- * pkt:    full response packet (for name decompression)
- * rr_off: offset of the first RR in the RRset
- * rr_count: number of RRs in the set (all same name+type)
+ * pkt, plen:   full response packet (for name decompression)
+ * rr_offs:     packet offsets of each RR in the set (start of owner name)
+ * rr_count:    number of RRs in the set (same owner+type+class)
  * rrsig_rdata: the RRSIG rdata bytes
  * rrsig_rdlen: length of rrsig_rdata
  * dnskey_rdata: the DNSKEY rdata of the signing key
- * dklen: length of dnskey_rdata
+ * dklen:       length of dnskey_rdata
  *
  * Returns 1 if valid, 0 if invalid, -1 if unsupported algorithm.
  */
 static int dnssec_verify_rrset(const uint8_t *pkt, int plen,
+                                const int *rr_offs, int rr_count,
                                 const uint8_t *rrsig_rdata, int rrsig_rdlen,
                                 const uint8_t *dnskey_rdata, int dklen){
     if(rrsig_rdlen<18)return 0;
-    uint8_t alg=rrsig_rdata[3];
+    if(rr_count<1||rr_count>DNSSEC_MAX_RRS)return 0;
+    /* RRSIG RDATA layout (RFC 4034 §3.1): covered(2) alg(1) labels(1) ... */
+    uint8_t alg=rrsig_rdata[2];
     if(alg!=13&&alg!=15)return -1; /* unsupported */
-    /* RRSIG signing data = RRSIG header (type through signer name) + canonical RR(s) */
-    /* For simplicity we use the raw rrsig_rdata as the header up to signer name */
-    /* Find end of signer name in rrsig_rdata */
+    uint16_t covered=get16(rrsig_rdata,0);
+    uint8_t sig_labels=rrsig_rdata[3];
+    uint32_t orig_ttl=get32(rrsig_rdata,4);
+    /* Locate the end of the signer name inside the RRSIG rdata. */
     int snoff=18; /* type(2)+alg(1)+labels(1)+orig_ttl(4)+sig_exp(4)+sig_inc(4)+key_tag(2) */
     if(snoff>=rrsig_rdlen)return 0;
-    /* walk the signer name */
-    const uint8_t *sn=rrsig_rdata+snoff;int sn_end=0;
+    const uint8_t *sn=rrsig_rdata+snoff;
+    int sn_end=0;
     while(snoff+sn_end<rrsig_rdlen){
-        uint8_t l=sn[sn_end];if(l==0){sn_end++;break;}
-        if((l&0xC0)==0xC0){sn_end+=2;break;}
-        sn_end+=l+1;}
+        uint8_t l=sn[sn_end];
+        if(l==0){sn_end++;break;}
+        if((l&0xC0)==0xC0)return 0; /* signer name must not be compressed (RFC 4034 §3.1.7) */
+        sn_end+=l+1;
+    }
     int hdr_len=snoff+sn_end;
     /* Signature bytes follow the header */
     if(hdr_len>=rrsig_rdlen)return 0;
@@ -661,17 +717,79 @@ static int dnssec_verify_rrset(const uint8_t *pkt, int plen,
     if(dklen<4)return 0;
     const uint8_t *pubkey=dnskey_rdata+4;
     int pklen=dklen-4;
-    /* Build the data to verify: RRSIG header bytes (without signature) */
-    /* In production this would also include the canonical RR bytes;   */
-    /* we verify the header only as a structural check — sufficient for */
-    /* detecting tampering when the server signs its own responses.     */
-    if(alg==13){
-        if(siglen!=64||pklen!=64)return 0;
-        return verify_ecdsa_p256(sig,rrsig_rdata,hdr_len,pubkey);}
-    if(alg==15){
-        if(siglen!=64||pklen!=32)return 0;
-        return verify_ed25519(sig,rrsig_rdata,hdr_len,pubkey);}
-    return -1;}
+    if(alg==13&&(siglen!=64||pklen!=64))return 0;
+    if(alg==15&&(siglen!=64||pklen!=32))return 0;
+    /* Build the canonical form of every RR in the set. */
+    canon_rr_t *rrs=calloc((size_t)rr_count,sizeof(canon_rr_t));
+    if(!rrs)return 0;
+    int ok=0;
+    for(int i=0;i<rr_count;i++){
+        char oname[256];
+        int a=name_from_wire(pkt,plen,rr_offs[i],oname,sizeof(oname));
+        if(a<0||a+10>plen)goto out;
+        uint16_t rtype=get16(pkt,a);
+        uint16_t rclass=get16(pkt,a+2);
+        uint16_t rdlen=get16(pkt,a+8);
+        if(rtype!=covered)goto out;
+        if(a+10+(int)rdlen>plen)goto out;
+        /* Wildcard expansion (RFC 4035 §5.3.2): if the owner has more labels
+         * than the RRSIG labels field, the signed name was the wildcard —
+         * reconstruct "*." + the rightmost <labels> labels. */
+        const char *owner=oname;
+        char wname[260];
+        int olabels=name_label_count(oname);
+        if(olabels<sig_labels)goto out;
+        if(olabels>sig_labels){
+            const char *p=oname;
+            for(int skip=olabels-(int)sig_labels;skip>0;skip--){
+                p=strchr(p,'.');
+                if(!p)goto out;
+                p++;
+            }
+            snprintf(wname,sizeof(wname),"*.%s",p);
+            owner=wname;
+        }
+        /* owner | type | class | original TTL | rdlength | canonical rdata */
+        int pos=name_to_wire(owner,rrs[i].buf,CANON_RR_MAX);
+        if(pos<0||pos+10>CANON_RR_MAX)goto out;
+        put16(rrs[i].buf,pos,rtype);
+        put16(rrs[i].buf,pos+2,rclass);
+        put32(rrs[i].buf,pos+4,orig_ttl);
+        int clen=canon_rdata(pkt,plen,a+10,rdlen,rtype,
+                             rrs[i].buf+pos+10,CANON_RR_MAX-pos-10);
+        if(clen<0)goto out;
+        put16(rrs[i].buf,pos+8,(uint16_t)clen);
+        rrs[i].len=pos+10+clen;
+    }
+    /* Sort into canonical order (insertion sort; the set is small). */
+    for(int i=1;i<rr_count;i++){
+        canon_rr_t tmp=rrs[i];
+        int j=i-1;
+        while(j>=0&&canon_rr_cmp(&rrs[j],&tmp)>0){
+            rrs[j+1]=rrs[j];
+            j--;
+        }
+        rrs[j+1]=tmp;
+    }
+    /* Assemble RRSIG header || canonical RRset and verify. */
+    {
+        size_t need=(size_t)hdr_len;
+        for(int i=0;i<rr_count;i++)need+=(size_t)rrs[i].len;
+        uint8_t *data=malloc(need);
+        if(!data)goto out;
+        memcpy(data,rrsig_rdata,(size_t)hdr_len);
+        size_t off=(size_t)hdr_len;
+        for(int i=0;i<rr_count;i++){
+            memcpy(data+off,rrs[i].buf,(size_t)rrs[i].len);
+            off+=(size_t)rrs[i].len;
+        }
+        if(alg==13)ok=verify_ecdsa_p256(sig,data,(int)need,pubkey);
+        else       ok=verify_ed25519(sig,data,(int)need,pubkey);
+        free(data);
+    }
+out:
+    free(rrs);
+    return ok;}
 
 /*
  * dnssec_validate_response — validate RRSIG records in a DNS response.
@@ -685,9 +803,15 @@ static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen,
     const dns_hdr_t *h=(const dns_hdr_t*)resp;
     int ancount=ntohs(h->ancount);
     if(ancount==0)return DNSSEC_INSECURE;
-    /* Find RRSIG and DNSKEY records in answer section */
+    /* Scan the answer section: record every RR's offset/owner/type, and grab
+     * the RRSIG + DNSKEY rdata. */
     uint8_t rrsig_rd[512]; int rrsig_rdlen=0;
+    char    rrsig_owner[256]={0};
     uint8_t dnskey_rd[128]; int dnskey_rdlen=0;
+    int  an_offs[DNSSEC_MAX_RRS];
+    char an_names[DNSSEC_MAX_RRS][256];
+    uint16_t an_types[DNSSEC_MAX_RRS];
+    int an_n=0;
     int off=12;
     /* Skip question */
     for(int i=0;i<ntohs(h->qdcount)&&off<rlen;i++){
@@ -697,12 +821,28 @@ static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen,
         char rname[256]; int a=name_from_wire(resp,rlen,off,rname,sizeof(rname));
         if(a<0||a+10>rlen)break;
         uint16_t rtype=get16(resp,a); uint16_t rdlen=get16(resp,a+8);
-        if(rtype==46/*RRSIG*/&&rdlen>0&&rdlen<=(int)sizeof(rrsig_rd)){
-            memcpy(rrsig_rd,resp+a+10,rdlen); rrsig_rdlen=(int)rdlen;}
-        if(rtype==48/*DNSKEY*/&&rdlen>0&&rdlen<=(int)sizeof(dnskey_rd)){
+        if(a+10+(int)rdlen>rlen)break;
+        if(rtype==DNS_TYPE_RRSIG&&rrsig_rdlen==0&&rdlen>0&&rdlen<=(int)sizeof(rrsig_rd)){
+            memcpy(rrsig_rd,resp+a+10,rdlen); rrsig_rdlen=(int)rdlen;
+            safe_strcpy(rrsig_owner,rname,sizeof(rrsig_owner));}
+        if(rtype==DNS_TYPE_DNSKEY&&rdlen>0&&rdlen<=(int)sizeof(dnskey_rd)){
             memcpy(dnskey_rd,resp+a+10,rdlen); dnskey_rdlen=(int)rdlen;}
+        if(an_n<DNSSEC_MAX_RRS){
+            an_offs[an_n]=off;
+            an_types[an_n]=rtype;
+            safe_strcpy(an_names[an_n],rname,sizeof(an_names[an_n]));
+            an_names[an_n][sizeof(an_names[an_n])-1]=0;
+            an_n++;}
         off=a+10+(int)rdlen;}
     if(rrsig_rdlen==0)return DNSSEC_INSECURE; /* no signature — zone not signed */
+    if(rrsig_rdlen<18)return DNSSEC_BOGUS;
+    /* Select the RRset the RRSIG covers: same owner name + the covered type. */
+    uint16_t covered=get16(rrsig_rd,0);
+    int rr_offs[DNSSEC_MAX_RRS]; int rr_n=0;
+    for(int i=0;i<an_n;i++){
+        if(an_types[i]==covered&&strcmp(an_names[i],rrsig_owner)==0)
+            rr_offs[rr_n++]=an_offs[i];}
+    if(rr_n==0)return DNSSEC_BOGUS; /* signature over nothing present — fail closed */
     /* If no DNSKEY in response, fetch it */
     if(dnskey_rdlen==0){
         uint8_t dkresp[DNS_BUF*2]; long rtt=0;
@@ -724,11 +864,11 @@ static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen,
     /* Check trust anchor */
     if(!dnskey_is_trusted(dnskey_rd,dnskey_rdlen)){
         /* Key not trusted — still validate signature, mark as insecure */
-        int r=dnssec_verify_rrset(resp,rlen,rrsig_rd,rrsig_rdlen,dnskey_rd,dnskey_rdlen);
+        int r=dnssec_verify_rrset(resp,rlen,rr_offs,rr_n,rrsig_rd,rrsig_rdlen,dnskey_rd,dnskey_rdlen);
         if(r==0)return DNSSEC_BOGUS;
         return DNSSEC_INSECURE;}
     /* Key trusted — validate signature */
-    int r=dnssec_verify_rrset(resp,rlen,rrsig_rd,rrsig_rdlen,dnskey_rd,dnskey_rdlen);
+    int r=dnssec_verify_rrset(resp,rlen,rr_offs,rr_n,rrsig_rd,rrsig_rdlen,dnskey_rd,dnskey_rdlen);
     if(r==1)return DNSSEC_SECURE;
     if(r==0)return DNSSEC_BOGUS;
     return DNSSEC_INSECURE; /* unsupported alg */}
@@ -828,15 +968,15 @@ static int tsig_sign_query(uint8_t *buf, int off, int blen, uint16_t orig_id){
     /* TSIG variables */
     uint8_t vars[512];int vp=0;
     /* key name in wire format */
-    {char tmp[256];strncpy(tmp,g_cfg.tsig_key_name,255);char *lbl=strtok(tmp,".");
-     while(lbl){int ll=(int)strlen(lbl);vars[vp++]=(uint8_t)ll;memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok(NULL,".");}vars[vp++]=0;}
+    {char *sp2=NULL;char tmp[256];safe_strcpy(tmp,g_cfg.tsig_key_name,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp2);
+     while(lbl){int ll=(int)strlen(lbl);vars[vp++]=(uint8_t)ll;memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok_r(NULL,".",&sp2);}vars[vp++]=0;}
     vars[vp++]=0;vars[vp++]=255;/* class ANY */
     vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;/* ttl=0 */
     const char *alg_wire="\x0bhmac-sha256\x00";memcpy(vars+vp,alg_wire,13);vp+=13;
     vars[vp++]=0;vars[vp++]=0;/* time high */
     vars[vp++]=(uint8_t)((now>>24)&0xFF);vars[vp++]=(uint8_t)((now>>16)&0xFF);
     vars[vp++]=(uint8_t)((now>>8)&0xFF);vars[vp++]=(uint8_t)(now&0xFF);
-    vars[vp++]=0;vars[vp++]=5;/* fudge=300 */
+    vars[vp++]=TSIG_FUDGE>>8;vars[vp++]=TSIG_FUDGE&0xFF;
     vars[vp++]=0;vars[vp++]=0;/* error=0 */
     vars[vp++]=0;vars[vp++]=0;/* other len=0 */
     /* HMAC-SHA256 */
@@ -851,8 +991,8 @@ static int tsig_sign_query(uint8_t *buf, int off, int blen, uint16_t orig_id){
     EVP_MAC_CTX_free(mctx);EVP_MAC_free(evp_mac);
     if(off+200>blen)return off;
     /* key name */
-    {char tmp[256];strncpy(tmp,g_cfg.tsig_key_name,255);char *lbl=strtok(tmp,".");
-     while(lbl){int ll=(int)strlen(lbl);buf[off++]=(uint8_t)ll;memcpy(buf+off,lbl,ll);off+=ll;lbl=strtok(NULL,".");}buf[off++]=0;}
+    {char *sp3=NULL;char tmp[256];safe_strcpy(tmp,g_cfg.tsig_key_name,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp3);
+     while(lbl){int ll=(int)strlen(lbl);buf[off++]=(uint8_t)ll;memcpy(buf+off,lbl,ll);off+=ll;lbl=strtok_r(NULL,".",&sp3);}buf[off++]=0;}
     buf[off++]=0;buf[off++]=250;/* TSIG */
     buf[off++]=0;buf[off++]=255;/* class ANY */
     buf[off++]=0;buf[off++]=0;buf[off++]=0;buf[off++]=0;/* ttl=0 */
@@ -862,7 +1002,7 @@ static int tsig_sign_query(uint8_t *buf, int off, int blen, uint16_t orig_id){
     rd[rp++]=0;rd[rp++]=0;/* time high */
     rd[rp++]=(uint8_t)((now>>24)&0xFF);rd[rp++]=(uint8_t)((now>>16)&0xFF);
     rd[rp++]=(uint8_t)((now>>8)&0xFF);rd[rp++]=(uint8_t)(now&0xFF);
-    rd[rp++]=0;rd[rp++]=5;/* fudge */
+    rd[rp++]=TSIG_FUDGE>>8;rd[rp++]=TSIG_FUDGE&0xFF;
     rd[rp++]=0;rd[rp++]=(uint8_t)mlen;
     memcpy(rd+rp,mac,mlen);rp+=mlen;
     rd[rp++]=orig_id>>8;rd[rp++]=orig_id&0xFF;
@@ -1100,7 +1240,7 @@ static int route_find(const char *qname){
 static int route_add(const char *suffix,
                      const char *host, int port, upstream_proto_t proto){
     /* Normalise suffix: strip leading/trailing dots except standalone "." */
-    char sfx[256]; strncpy(sfx,suffix,255); sfx[255]=0;
+    char sfx[256]; safe_strcpy(sfx,suffix,sizeof(sfx));
     strlower(sfx);
     int slen=(int)strlen(sfx);
     while(slen>1&&sfx[slen-1]=='.'){sfx[--slen]=0;}
@@ -1114,7 +1254,7 @@ static int route_add(const char *suffix,
     if(uidx<0){
         if(g_cfg.upstream_count>=MAX_UPSTREAMS) return -1;
         uidx=g_cfg.upstream_count;
-        strncpy(g_cfg.upstream_host[uidx],host,255);
+        safe_strcpy(g_cfg.upstream_host[uidx],host,sizeof(g_cfg.upstream_host[uidx]));
         g_cfg.upstream_port[uidx]=port;
         g_cfg.upstream_proto[uidx]=proto;
         g_cfg.upstream_count++;}
@@ -1127,7 +1267,7 @@ static int route_add(const char *suffix,
     if(ridx<0){
         if(g_route_count>=MAX_ROUTES){pthread_mutex_unlock(&g_route_mutex);return -1;}
         ridx=g_route_count++;}
-    strncpy(g_routes[ridx].suffix,sfx,255);
+    safe_strcpy(g_routes[ridx].suffix,sfx,sizeof(g_routes[ridx].suffix));
     g_routes[ridx].upstream_idx=uidx;
     pthread_mutex_unlock(&g_route_mutex);
     return uidx;}
@@ -1138,7 +1278,7 @@ static int route_add(const char *suffix,
  * Returns 1 on success.
  */
 static int parse_server_arg(const char *arg){
-    char buf[512]; strncpy(buf,arg,511); buf[511]=0;
+    char buf[512]; safe_strcpy(buf,arg,sizeof(buf));
     char *suffix=buf, *hostpart=NULL;
 
     if(buf[0]=='/'){
@@ -1160,7 +1300,7 @@ static int parse_server_arg(const char *arg){
     if(col){
         int hlen=(int)(col-hostpart);
         if(hlen>255)hlen=255;
-        strncpy(host,hostpart,hlen); host[hlen]=0;
+        memcpy(host,hostpart,hlen); host[hlen]=0; /* exact-length prefix copy */
         char *col2=strchr(col+1,':');
         if(col2){
             port=atoi(col+1);
@@ -1171,7 +1311,7 @@ static int parse_server_arg(const char *arg){
             port=atoi(col+1);
         }
     } else {
-        strncpy(host,hostpart,255);
+        safe_strcpy(host,hostpart,sizeof(host));
     }
     if(!host[0]) return 0;
     return route_add(suffix,host,port,proto)>=0 ? 1 : 0;}
@@ -1185,10 +1325,10 @@ static int upstream_query_one(const char *qname, uint16_t qtype,
     /* Temporarily point g_cfg to this upstream for build_query/tcp_query */
     /* (they read g_cfg.upstream_host/port/proto) */
     char saved_host[256]; int saved_port; upstream_proto_t saved_proto;
-    strncpy(saved_host,g_cfg.upstream_host[0],255);
+    safe_strcpy(saved_host,g_cfg.upstream_host[0],sizeof(saved_host));
     saved_port=g_cfg.upstream_port[0];
     saved_proto=g_cfg.proto;
-    strncpy(g_cfg.upstream_host[0],g_cfg.upstream_host[upstream_idx],255);
+    safe_strcpy(g_cfg.upstream_host[0],g_cfg.upstream_host[upstream_idx],sizeof(g_cfg.upstream_host[0]));
     g_cfg.upstream_port[0]=g_cfg.upstream_port[upstream_idx];
     g_cfg.proto=g_cfg.upstream_proto[upstream_idx];
     int qlen=build_query(query,sizeof(query),qname,qtype,id,1);
@@ -1230,7 +1370,7 @@ static int upstream_query_one(const char *qname, uint16_t qtype,
     }
     clock_gettime(CLOCK_MONOTONIC,&t1);
     /* Restore */
-    strncpy(g_cfg.upstream_host[0],saved_host,255);
+    safe_strcpy(g_cfg.upstream_host[0],saved_host,sizeof(g_cfg.upstream_host[0]));
     g_cfg.upstream_port[0]=saved_port;
     g_cfg.proto=saved_proto;
     long rtt=(long)((t1.tv_sec-t0.tv_sec)*1000000L+(t1.tv_nsec-t0.tv_nsec)/1000L);
@@ -1532,20 +1672,20 @@ static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype){
     char buf[RESP_BUF];if(!vk_get(vk_key,buf,sizeof(buf)))return NULL;
     cache_entry_t *e=calloc(1,sizeof(cache_entry_t));
     if(!e)return NULL;
-    strncpy(e->qname,qname,255);e->qtype=qtype;
+    safe_strcpy(e->qname,qname,sizeof(e->qname));e->qtype=qtype;
     /* Parse header: nrr|rcode|negative|neg_ttl|inserted_at| */
-    char *tok=strtok(buf,"|");if(!tok){free(e);return NULL;}e->nrr=atoi(tok);
-    tok=strtok(NULL,"|");if(tok)e->rcode=(uint8_t)atoi(tok);
-    tok=strtok(NULL,"|");if(tok)e->negative=atoi(tok);
-    tok=strtok(NULL,"|");if(tok)e->neg_ttl=(uint32_t)atoi(tok);
-    tok=strtok(NULL,"|");if(tok)e->inserted_at=(time_t)atol(tok);
+    char *sp4=NULL;char *tok=strtok_r(buf,"|",&sp4);if(!tok){free(e);return NULL;}e->nrr=atoi(tok);
+    tok=strtok_r(NULL,"|",&sp4);if(tok)e->rcode=(uint8_t)atoi(tok);
+    tok=strtok_r(NULL,"|",&sp4);if(tok)e->negative=atoi(tok);
+    tok=strtok_r(NULL,"|",&sp4);if(tok)e->neg_ttl=(uint32_t)atoi(tok);
+    tok=strtok_r(NULL,"|",&sp4);if(tok)e->inserted_at=(time_t)atol(tok);
     /* Rebuild TTL against current time */
     if(entry_remaining_ttl(e)==0){free(e);return NULL;}
     if(e->nrr>0){
         e->rrs=calloc(e->nrr,sizeof(cache_rr_t));
         if(!e->rrs){free(e);return NULL;}
         for(int i=0;i<e->nrr;i++){
-            tok=strtok(NULL,"|");if(!tok)break;
+            tok=strtok_r(NULL,"|",&sp4);if(!tok)break;
             /* format: type:ttl_orig:rdlen:hex */
             unsigned tp=0,ttlo=0,rdl=0;char hexdata[2048]="";
             sscanf(tok,"%u:%u:%u:%2047s",&tp,&ttlo,&rdl,hexdata);
@@ -1570,7 +1710,7 @@ static cache_entry_t *parse_response_to_entry(const uint8_t *resp, int rlen,
     int nscount=ntohs(h->nscount);
     cache_entry_t *e=calloc(1,sizeof(cache_entry_t));
     if(!e)return NULL;
-    strncpy(e->qname,qname,255);e->qtype=qtype;
+    safe_strcpy(e->qname,qname,sizeof(e->qname));e->qtype=qtype;
     e->rcode=rcode;e->inserted_at=time(NULL);
     /* Skip question section */
     int off=12;
@@ -1644,7 +1784,7 @@ static void *prefetch_worker(void *arg){
 
 static void prefetch_async(const char *qname, uint16_t qtype){
     prefetch_job_t *j=malloc(sizeof(prefetch_job_t));if(!j)return;
-    strncpy(j->qname,qname,255);j->qtype=qtype;
+    safe_strcpy(j->qname,qname,sizeof(j->qname));j->qtype=qtype;
     pthread_t tid;pthread_attr_t attr;pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
     pthread_create(&tid,&attr,prefetch_worker,j);pthread_attr_destroy(&attr);}
@@ -1668,7 +1808,7 @@ typedef struct {
 static int dns_resolve(const char *qname_in, uint16_t qtype,
                         resolve_result_t *result){
     memset(result,0,sizeof(*result));
-    char qname[256];strncpy(qname,qname_in,255);strlower(qname);
+    char qname[256];safe_strcpy(qname,qname_in,sizeof(qname));strlower(qname);
     pthread_mutex_lock(&g_stat_mutex);g_stat_queries++;pthread_mutex_unlock(&g_stat_mutex);
 
     /* -1. mDNS for .local names (RFC 6762) — try multicast before unicast */
@@ -1697,7 +1837,7 @@ static int dns_resolve(const char *qname_in, uint16_t qtype,
                     uint32_t ttl=get32(mresp,a+4); uint16_t rdl=get16(mresp,a+8);
                     if(rcl==DNS_CLASS_IN&&rt!=DNS_TYPE_OPT){
                         result->answer_types[ridx2]=rt;result->answer_ttls[ridx2]=ttl;
-                        strncpy(result->answer_names[ridx2],rn,255);
+                        safe_strcpy(result->answer_names[ridx2],rn,sizeof(result->answer_names[ridx2]));
                         rdata_to_str(mresp,mrlen,a+10,rdl,rt,result->answers[ridx2],512);ridx2++;}
                     mo=a+10+(int)rdl;}
                 result->ancount=ridx2;
@@ -1752,7 +1892,7 @@ static int dns_resolve(const char *qname_in, uint16_t qtype,
                 memcpy(fake,ce->rrs[i].rdata,ce->rrs[i].rdlen<(int)sizeof(fake)?ce->rrs[i].rdlen:(int)sizeof(fake));
             rdata_to_str(fake,ce->rrs[i].rdlen,0,ce->rrs[i].rdlen,ce->rrs[i].type,
                          result->answers[i],sizeof(result->answers[i]));
-            strncpy(result->answer_names[i],qname,255);}
+            safe_strcpy(result->answer_names[i],qname,sizeof(result->answer_names[i]));}
         cache_entry_copy_free(ce);return 0;}
 
     /* 3. Miss — query upstream */
@@ -1786,14 +1926,14 @@ static int dns_resolve(const char *qname_in, uint16_t qtype,
         uint32_t ttl=get32(resp,a+4);uint16_t rdlen=get16(resp,a+8);
         if(rclass==DNS_CLASS_IN&&rtype!=DNS_TYPE_OPT){
             result->answer_types[ridx]=rtype;result->answer_ttls[ridx]=ttl;
-            strncpy(result->answer_names[ridx],rname,255);
+            safe_strcpy(result->answer_names[ridx],rname,sizeof(result->answer_names[ridx]));
             rdata_to_str(resp,rlen,a+10,rdlen,rtype,result->answers[ridx],512);ridx++;}
         off=a+10+(int)rdlen;}
     result->ancount=ridx;
     /* CNAME chain following */
     if(ridx>0&&result->answer_types[0]==DNS_TYPE_CNAME&&qtype!=DNS_TYPE_CNAME&&qtype!=DNS_TYPE_ANY){
         /* Follow CNAME target */
-        char cname_target[256];strncpy(cname_target,result->answers[0],255);
+        char cname_target[256];safe_strcpy(cname_target,result->answers[0],sizeof(cname_target));
         for(int hop=0;hop<MAX_CNAME_HOPS&&cname_target[0];hop++){
             resolve_result_t sub;memset(&sub,0,sizeof(sub));
             if(dns_resolve(cname_target,qtype,&sub)<0)break;
@@ -1801,12 +1941,12 @@ static int dns_resolve(const char *qname_in, uint16_t qtype,
             for(int j=0;j<sub.ancount&&ridx<32;j++){
                 result->answer_types[ridx]=sub.answer_types[j];
                 result->answer_ttls[ridx]=sub.answer_ttls[j];
-                strncpy(result->answer_names[ridx],sub.answer_names[j],255);
-                strncpy(result->answers[ridx],sub.answers[j],511);ridx++;}
+                safe_strcpy(result->answer_names[ridx],sub.answer_names[j],sizeof(result->answer_names[ridx]));
+                safe_strcpy(result->answers[ridx],sub.answers[j],sizeof(result->answers[ridx]));ridx++;}
             result->ancount=ridx;
             /* If the sub-result has a CNAME, keep chasing */
             if(sub.ancount>0&&sub.answer_types[0]==DNS_TYPE_CNAME)
-                strncpy(cname_target,sub.answers[0],255);
+                safe_strcpy(cname_target,sub.answers[0],sizeof(cname_target));
             else break;}}
     return 0;}
 
@@ -2056,32 +2196,32 @@ static const char *getenv_or(const char *key, const char *def){
     const char *v=getenv(key);return v&&v[0]?v:def;}
 
 static void config_load_env(void){
-    strncpy(g_cfg.upstream_host[0],getenv_or("UPSTREAM_HOST","127.0.0.1"),255);
+    safe_strcpy(g_cfg.upstream_host[0],getenv_or("UPSTREAM_HOST","127.0.0.1"),sizeof(g_cfg.upstream_host[0]));
     g_cfg.upstream_port[0]=atoi(getenv_or("UPSTREAM_PORT","5353"));
     g_cfg.upstream_proto[0]=PROTO_UDP; /* overridden below by UPSTREAM_PROTO */
     g_cfg.upstream_count=1;
     /* Parse UPSTREAM_FALLBACKS: comma-separated host:port[:proto] */
     const char *fallbacks=getenv_or("UPSTREAM_FALLBACKS","");
     if(fallbacks[0]){
-        char fb[512]; strncpy(fb,fallbacks,511);
-        char *tok=strtok(fb,",");
+        char fb[512]; safe_strcpy(fb,fallbacks,sizeof(fb));
+        char *sp5=NULL;char *tok=strtok_r(fb,",",&sp5);
         while(tok&&g_cfg.upstream_count<MAX_UPSTREAMS){
             int idx=g_cfg.upstream_count;
             /* format: host:port[:udp|tcp|dot] */
             char h[256]="";int p=5353;char pr[8]="udp";
             char *col=strchr(tok,':');
-            if(col){*col=0;strncpy(h,tok,255);char *col2=strchr(col+1,':');
-                if(col2){*col2=0;p=atoi(col+1);strncpy(pr,col2+1,7);}
+            if(col){*col=0;safe_strcpy(h,tok,sizeof(h));char *col2=strchr(col+1,':');
+                if(col2){*col2=0;p=atoi(col+1);safe_strcpy(pr,col2+1,sizeof(pr));}
                 else p=atoi(col+1);}
-            else strncpy(h,tok,255);
-            strncpy(g_cfg.upstream_host[idx],h,255);
+            else safe_strcpy(h,tok,sizeof(h));
+            safe_strcpy(g_cfg.upstream_host[idx],h,sizeof(g_cfg.upstream_host[idx]));
             g_cfg.upstream_port[idx]=p;
             if(!strcasecmp(pr,"dot"))      g_cfg.upstream_proto[idx]=PROTO_DOT;
             else if(!strcasecmp(pr,"tcp")) g_cfg.upstream_proto[idx]=PROTO_TCP;
             else if(!strcasecmp(pr,"doh")) g_cfg.upstream_proto[idx]=PROTO_DOH;
             else                           g_cfg.upstream_proto[idx]=PROTO_UDP;
             g_cfg.upstream_count++;
-            tok=strtok(NULL,",");
+            tok=strtok_r(NULL,",",&sp5);
         }
     }
     g_cfg.listen_port=atoi(getenv_or("LISTEN_PORT","5354"));
@@ -2090,51 +2230,52 @@ static void config_load_env(void){
     else if(!strcasecmp(proto,"tcp")){g_cfg.proto=PROTO_TCP;  g_cfg.upstream_proto[0]=PROTO_TCP;}
     else if(!strcasecmp(proto,"doh")){g_cfg.proto=PROTO_DOH;  g_cfg.upstream_proto[0]=PROTO_DOH;}
     else                             {g_cfg.proto=PROTO_UDP;  g_cfg.upstream_proto[0]=PROTO_UDP;}
-    strncpy(g_cfg.tsig_key_name,getenv_or("TSIG_KEY_NAME",""),255);
+    safe_strcpy(g_cfg.tsig_key_name,getenv_or("TSIG_KEY_NAME",""),sizeof(g_cfg.tsig_key_name));
     const char *tsig_b64=getenv_or("TSIG_SECRET_B64","");
     if(tsig_b64[0])
         g_cfg.tsig_secret_len=b64std_dec(tsig_b64,g_cfg.tsig_secret,sizeof(g_cfg.tsig_secret));
     const char *ckhex=getenv_or("COOKIE_SECRET","");
     if(ckhex[0])hex_dec(ckhex,g_cfg.cookie_secret,16);
     else RAND_bytes(g_cfg.cookie_secret,16);
-    strncpy(g_cfg.valkey_host,getenv_or("VALKEY_HOST","127.0.0.1"),255);
+    safe_strcpy(g_cfg.valkey_host,getenv_or("VALKEY_HOST","127.0.0.1"),sizeof(g_cfg.valkey_host));
     g_cfg.valkey_port=atoi(getenv_or("VALKEY_PORT","6379"));
-    strncpy(g_cfg.valkey_pass,getenv_or("VALKEY_PASS",""),255);
+    safe_strcpy(g_cfg.valkey_pass,getenv_or("VALKEY_PASS",""),sizeof(g_cfg.valkey_pass));
     g_cfg.cache_size=atoi(getenv_or("CACHE_SIZE","8192"));
     g_cfg.cache_ttl_max=(uint32_t)atoi(getenv_or("CACHE_TTL_MAX","3600"));
     g_cfg.cache_neg_ttl=(uint32_t)atoi(getenv_or("CACHE_NEG_TTL","300"));
-    strncpy(g_cfg.dot_ca_pem,getenv_or("DOT_CA_PEM",""),MAX_PEM_PATH-1);
+    safe_strcpy(g_cfg.dot_ca_pem,getenv_or("DOT_CA_PEM",""),sizeof(g_cfg.dot_ca_pem));
     g_cfg.cache_neg_ttl_min=(uint32_t)atoi(getenv_or("CACHE_NEG_TTL_MIN","1"));
-    strncpy(g_cfg.doh_path,getenv_or("DOH_PATH","/dns-query"),255);
+    safe_strcpy(g_cfg.doh_path,getenv_or("DOH_PATH","/dns-query"),sizeof(g_cfg.doh_path));
     g_cfg.doh_port=atoi(getenv_or("DOH_PORT","443"));
     g_cfg.listen_tcp=atoi(getenv_or("LISTEN_TCP","1"));
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count=0;
     const char *sdomains=getenv_or("SEARCH_DOMAINS","");
     if(sdomains[0]){
-        char sd_buf[1024];strncpy(sd_buf,sdomains,1023);
-        char *stok=strtok(sd_buf,",");
+        char sd_buf[1024];safe_strcpy(sd_buf,sdomains,sizeof(sd_buf));
+        char *sp6=NULL;char *stok=strtok_r(sd_buf,",",&sp6);
         while(stok&&g_cfg.search_domain_count<MAX_SEARCH_DOMAINS){
-            strncpy(g_cfg.search_domains[g_cfg.search_domain_count++],stok,255);
-            stok=strtok(NULL,",");
+            safe_strcpy(g_cfg.search_domains[g_cfg.search_domain_count],stok,sizeof(g_cfg.search_domains[g_cfg.search_domain_count]));
+            g_cfg.search_domain_count++;
+            stok=strtok_r(NULL,",",&sp6);
         }
     }
     /* Per-domain routing: DOMAIN_ROUTES=suffix=host:port[:proto],... */
     const char *dr_env=getenv_or("DOMAIN_ROUTES","");
     if(dr_env[0]){
-        char dr_buf[2048]; strncpy(dr_buf,dr_env,2047);
-        char *dr_tok=strtok(dr_buf,",");
+        char dr_buf[2048]; safe_strcpy(dr_buf,dr_env,sizeof(dr_buf));
+        char *sp7=NULL;char *dr_tok=strtok_r(dr_buf,",",&sp7);
         while(dr_tok){
             parse_server_arg(dr_tok);
-            dr_tok=strtok(NULL,",");
+            dr_tok=strtok_r(NULL,",",&sp7);
         }
     }
     /* DNSSEC trust anchors: DNSSEC_TRUST_ANCHORS=hex1,hex2,... */
     const char *ta_env=getenv_or("DNSSEC_TRUST_ANCHORS","");
     if(ta_env[0]){
-        char ta_buf[2048];strncpy(ta_buf,ta_env,2047);
-        char *ta_tok=strtok(ta_buf,",");
-        while(ta_tok){dnssec_add_trust_anchor(ta_tok);ta_tok=strtok(NULL,",");}
+        char ta_buf[2048];safe_strcpy(ta_buf,ta_env,sizeof(ta_buf));
+        char *sp8=NULL;char *ta_tok=strtok_r(ta_buf,",",&sp8);
+        while(ta_tok){dnssec_add_trust_anchor(ta_tok);ta_tok=strtok_r(NULL,",",&sp8);}
     }
     /* Load persisted routes from Valkey: domain_route:<suffix> → host:port:proto */
     /* (called after vk is connected — deferred to first use in dns_resolve) */
@@ -2303,6 +2444,7 @@ static void usage(const char *prog){
            "  UPSTREAM_HOST=10.0.0.1 TSIG_SECRET_B64=abc== %s --stats\n",
            prog,prog,prog,prog,prog,prog,prog,prog,prog,prog);}
 
+#ifndef UNIT_TEST
 int main(int argc,char **argv){
     SSL_library_init();OpenSSL_add_all_algorithms();SSL_load_error_strings();
     signal(SIGPIPE,SIG_IGN);srand(time(NULL));
@@ -2317,12 +2459,12 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--stats")){mode_stats=1;}
         else if(!strcmp(argv[i],"--dump")) {mode_dump=1;}
         else if(!strcmp(argv[i],"--flush")){mode_flush=1;
-            if(i+1<argc&&argv[i+1][0]!='-'){strncpy(flush_name,argv[++i],255);
-                if(i+1<argc&&argv[i+1][0]!='-')strncpy(flush_type_s,argv[++i],31);}}
+            if(i+1<argc&&argv[i+1][0]!='-'){safe_strcpy(flush_name,argv[++i],sizeof(flush_name));
+                if(i+1<argc&&argv[i+1][0]!='-')safe_strcpy(flush_type_s,argv[++i],sizeof(flush_type_s));}}
         else if(!strcmp(argv[i],"--upstream")&&i+1<argc){
             char *col=strchr(argv[i+1],':');
-            if(col){*col=0;strncpy(g_cfg.upstream_host[0],argv[i+1],255);g_cfg.upstream_port[0]=atoi(col+1);*col=':';}
-            else strncpy(g_cfg.upstream_host[0],argv[++i],255);i++;}
+            if(col){*col=0;safe_strcpy(g_cfg.upstream_host[0],argv[i+1],sizeof(g_cfg.upstream_host[0]));g_cfg.upstream_port[0]=atoi(col+1);*col=':';}
+            else safe_strcpy(g_cfg.upstream_host[0],argv[++i],sizeof(g_cfg.upstream_host[0]));i++;}
         else if(!strcmp(argv[i],"--proto")&&i+1<argc){i++;
             if(!strcasecmp(argv[i],"dot"))      g_cfg.proto=PROTO_DOT;
             else if(!strcasecmp(argv[i],"tcp")) g_cfg.proto=PROTO_TCP;
@@ -2331,38 +2473,39 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--listen")&&i+1<argc){g_cfg.listen_port=atoi(argv[++i]);}
         else if(!strcmp(argv[i],"--tsig-key")&&i+1<argc){i++;
             char *col=strchr(argv[i],':');
-            if(col){*col=0;strncpy(g_cfg.tsig_key_name,argv[i],255);
+            if(col){*col=0;safe_strcpy(g_cfg.tsig_key_name,argv[i],sizeof(g_cfg.tsig_key_name));
                 g_cfg.tsig_secret_len=b64std_dec(col+1,g_cfg.tsig_secret,sizeof(g_cfg.tsig_secret));*col=':';}
-            else strncpy(g_cfg.tsig_key_name,argv[i],255);}
+            else safe_strcpy(g_cfg.tsig_key_name,argv[i],sizeof(g_cfg.tsig_key_name));}
         else if(!strcmp(argv[i],"--cookie-secret")&&i+1<argc)
             hex_dec(argv[++i],g_cfg.cookie_secret,16);
         else if(!strcmp(argv[i],"--valkey")&&i+1<argc){i++;
             char *col=strchr(argv[i],':');
-            if(col){*col=0;strncpy(g_cfg.valkey_host,argv[i],255);g_cfg.valkey_port=atoi(col+1);}
-            else strncpy(g_cfg.valkey_host,argv[i],255);}
+            if(col){*col=0;safe_strcpy(g_cfg.valkey_host,argv[i],sizeof(g_cfg.valkey_host));g_cfg.valkey_port=atoi(col+1);}
+            else safe_strcpy(g_cfg.valkey_host,argv[i],sizeof(g_cfg.valkey_host));}
         else if(!strcmp(argv[i],"--no-valkey")){g_cfg.valkey_enabled=0;}
         else if(!strcmp(argv[i],"--cache-size")&&i+1<argc){g_cfg.cache_size=atoi(argv[++i]);}
         else if(!strcmp(argv[i],"--fallback")&&i+1<argc){i++;
             if(g_cfg.upstream_count<MAX_UPSTREAMS){
                 int idx=g_cfg.upstream_count;
                 char *col=strchr(argv[i],':');
-                if(col){*col=0;strncpy(g_cfg.upstream_host[idx],argv[i],255);
+                if(col){*col=0;safe_strcpy(g_cfg.upstream_host[idx],argv[i],sizeof(g_cfg.upstream_host[idx]));
                     char *col2=strchr(col+1,':');
                     if(col2){*col2=0;g_cfg.upstream_port[idx]=atoi(col+1);
                         if(!strcasecmp(col2+1,"dot"))g_cfg.upstream_proto[idx]=PROTO_DOT;
                         else if(!strcasecmp(col2+1,"tcp"))g_cfg.upstream_proto[idx]=PROTO_TCP;
                         else g_cfg.upstream_proto[idx]=PROTO_UDP;
                     }else{g_cfg.upstream_port[idx]=atoi(col+1);g_cfg.upstream_proto[idx]=PROTO_UDP;}
-                }else strncpy(g_cfg.upstream_host[idx],argv[i],255);
+                }else safe_strcpy(g_cfg.upstream_host[idx],argv[i],sizeof(g_cfg.upstream_host[idx]));
                 g_cfg.upstream_count++;}}
         else if(!strcmp(argv[i],"--search")&&i+1<argc){
-            if(g_cfg.search_domain_count<MAX_SEARCH_DOMAINS)
-                strncpy(g_cfg.search_domains[g_cfg.search_domain_count++],argv[++i],255);
+            if(g_cfg.search_domain_count<MAX_SEARCH_DOMAINS){
+                safe_strcpy(g_cfg.search_domains[g_cfg.search_domain_count],argv[++i],sizeof(g_cfg.search_domains[g_cfg.search_domain_count]));
+                g_cfg.search_domain_count++;}
             else i++;}
         else if(!strcmp(argv[i],"--trust-anchor")&&i+1<argc){
             dnssec_add_trust_anchor(argv[++i]);}
         else if(!strcmp(argv[i],"--doh-path")&&i+1<argc)
-            strncpy(g_cfg.doh_path,argv[++i],255);
+            safe_strcpy(g_cfg.doh_path,argv[++i],sizeof(g_cfg.doh_path));
         else if(!strcmp(argv[i],"--doh-port")&&i+1<argc)
             g_cfg.doh_port=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-tcp-proxy"))
@@ -2378,8 +2521,8 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--no-dnssec")){/* future flag */}
         else if(!strcmp(argv[i],"--no-mdns")){/* future flag */}
         else if(!strcmp(argv[i],"--conf")&&i+1<argc){config_load_file(argv[++i]);}
-        else if(argv[i][0]!='-'&&!query_name[0]){strncpy(query_name,argv[i],255);}
-        else if(argv[i][0]!='-'&&!query_type_s[0]){strncpy(query_type_s,argv[i],31);}
+        else if(argv[i][0]!='-'&&!query_name[0]){safe_strcpy(query_name,argv[i],sizeof(query_name));}
+        else if(argv[i][0]!='-'&&!query_type_s[0]){safe_strcpy(query_type_s,argv[i],sizeof(query_type_s));}
     }
     cache_init();
     if(g_cfg.proto==PROTO_DOT||g_cfg.proto==PROTO_DOH)dot_init();
@@ -2407,3 +2550,4 @@ int main(int argc,char **argv){
         proxy_run(NULL);}
     if(g_dot_ctx)SSL_CTX_free(g_dot_ctx);
     return 0;}
+#endif /* UNIT_TEST */

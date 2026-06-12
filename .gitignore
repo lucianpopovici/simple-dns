@@ -13,3 +13,11 @@ tmp/
 
 .env
 *.pyc
+
+specs
+last-claude
+
+# Built test / fuzz binaries
+tests/test_dnssec_verify
+tests/test_name_from_wire
+fuzz/fuzz_name_from_wire

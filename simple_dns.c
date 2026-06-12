@@ -94,6 +94,7 @@
 #include <openssl/rand.h>
 #include <openssl/bn.h>
 #include <openssl/bio.h>
+#include "dns_wire.h"
 
 /* ==========================================================================
  * Compile-time defaults
@@ -117,6 +118,10 @@
 #define EDNS_MAX_UDP        1232     /* current BCP 2020 recommendation */
 #define MAX_AXFR_THREADS    8
 #define TSIG_ALG_HMAC_SHA256 "hmac-sha256."
+/* TSIG time window in seconds (RFC 8945 §5.2.3 recommends 300). Emitted as
+ * two big-endian bytes in BOTH the digest input and the TSIG RDATA — keep
+ * every emit site on this constant so the two cannot drift apart. */
+#define TSIG_FUDGE 300
 #define DNS_COOKIE_CLIENT_LEN 8
 #define DNS_COOKIE_SERVER_LEN 8
 
@@ -687,62 +692,16 @@ static const int static_zone_sz=(int)(sizeof(static_zone)/sizeof(static_zone[0])
 /* ==========================================================================
  * Utility helpers
  * ======================================================================= */
-static void strlower(char *s){for(;*s;s++)if(*s>='A'&&*s<='Z')*s+=32;}
+/* Case-insensitive name equality. The 256-byte scratch buffers only bound
+ * the comparison; DNS names are capped at 255 octets (RFC 1035 §2.3.4), so
+ * truncation of legitimate input cannot occur here. */
 static int  streq_ci(const char *a,const char *b){
-    char la[256],lb[256];strncpy(la,a,255);la[255]=0;strlower(la);
-    strncpy(lb,b,255);lb[255]=0;strlower(lb);return strcmp(la,lb)==0;}
+    char la[256],lb[256];safe_strcpy(la,a,sizeof(la));strlower(la);
+    safe_strcpy(lb,b,sizeof(lb));strlower(lb);return strcmp(la,lb)==0;}
 static const char *cfgenv(const char *k,const char *def){
     const char *v=getenv(k);return v?v:def;}
 
 /* hex encode/decode */
-static void hex_enc(const uint8_t *in,int n,char *out){
-    static const char H[]="0123456789abcdef";
-    for(int i=0;i<n;i++){out[2*i]=H[in[i]>>4];out[2*i+1]=H[in[i]&0xF];}
-    out[2*n]=0;}
-static int hex_dec(const char *in,uint8_t *out,int maxlen){
-    int n=0;
-    while(in[0]&&in[1]&&n<maxlen){
-        char h[3]={in[0],in[1],0};out[n++]=(uint8_t)strtol(h,NULL,16);in+=2;}
-    return n;}
-
-/* base64 standard (for TSIG) */
-static const char B64S[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static int b64std_dec(const char *in,uint8_t *out,int olen){
-    int inlen=(int)strlen(in),o=0;
-    static const int8_t rev[256]={
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,-1, 0, 1, 2, 3, 4, 5, 6,
-         7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
-        49,50,51,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1};
-    for(int i=0;i+3<inlen&&o+2<olen;i+=4){
-        int8_t a=rev[(uint8_t)in[i]],b=rev[(uint8_t)in[i+1]],
-               c=rev[(uint8_t)in[i+2]],d=rev[(uint8_t)in[i+3]];
-        if(a<0||b<0)break;
-        out[o++]=(uint8_t)((a<<2)|(b>>4));
-        if(c>=0&&o<olen)out[o++]=(uint8_t)((b<<4)|(c>>2));
-        if(d>=0&&o<olen)out[o++]=(uint8_t)((c<<6)|d);}
-    return o;}
-
-/* base64url (for ACME/DNSSEC) */
-static const char B64U[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-static int b64url_enc(const uint8_t *in,int ilen,char *out,int olen){
-    int i=0,o=0;
-    for(;i+2<ilen&&o+3<olen;i+=3){
-        out[o++]=B64U[in[i]>>2];out[o++]=B64U[((in[i]&3)<<4)|(in[i+1]>>4)];
-        out[o++]=B64U[((in[i+1]&0xF)<<2)|(in[i+2]>>6)];out[o++]=B64U[in[i+2]&0x3F];}
-    if(i<ilen&&o+1<olen){out[o++]=B64U[in[i]>>2];
-        if(i+1<ilen&&o+1<olen){out[o++]=B64U[((in[i]&3)<<4)|(in[i+1]>>4)];
-            if(o<olen)out[o++]=B64U[(in[i+1]&0xF)<<2];}
-        else if(o<olen)out[o++]=B64U[(in[i]&3)<<4];}
-    if(o<olen)out[o]=0;return o;}
-
 static void sha256(const uint8_t *in,int n,uint8_t out[32]){
     EVP_MD_CTX *ctx=EVP_MD_CTX_new();unsigned int dl=32;
     EVP_DigestInit_ex(ctx,EVP_sha256(),NULL);EVP_DigestUpdate(ctx,in,n);
@@ -838,8 +797,8 @@ static int resp_parse(resp_conn_t *c,resp_reply_t *r){
     char line[512];if(resp_readline(c,line,sizeof(line))<0)return -1;
     memset(r,0,sizeof(*r));
     switch(line[0]){
-    case '+':r->type=0;strncpy(r->str,line+1,sizeof(r->str)-1);return 0;
-    case '-':r->type=1;strncpy(r->str,line+1,sizeof(r->str)-1);return 0;
+    case '+':r->type=0;safe_strcpy(r->str,line+1,sizeof(r->str));return 0;
+    case '-':r->type=1;safe_strcpy(r->str,line+1,sizeof(r->str));return 0;
     case ':':r->type=3;r->integer=atol(line+1);return 0;
     case '$':{int bl=atoi(line+1);if(bl<0){r->type=4;return 0;}r->type=2;
         /* clamp bl so we never write past r->str */
@@ -899,7 +858,7 @@ static int vk_get(const char *key,char *out,int olen){
     if(valkey_ensure(&vk)<0){pthread_mutex_unlock(&g_vk_mutex);return 0;}
     resp_reply_t r;if(resp_cmd(&vk,&r,2,"GET",key)<0){vk.fd=-1;pthread_mutex_unlock(&g_vk_mutex);return 0;}
     pthread_mutex_unlock(&g_vk_mutex);
-    if(r.type!=2)return 0;strncpy(out,r.str,olen-1);out[olen-1]=0;return 1;}
+    if(r.type!=2)return 0;safe_strcpy(out,r.str,olen);return 1;}
 static int vk_del(const char *key){
     pthread_mutex_lock(&g_vk_mutex);
     if(valkey_ensure(&vk)<0){pthread_mutex_unlock(&g_vk_mutex);return 0;}
@@ -921,18 +880,18 @@ static long vk_incr(const char *key){
  * Boot file
  * ======================================================================= */
 static void boot_load(void){
-    strncpy(g_valkey_host,cfgenv("DNS_VALKEY_HOST","127.0.0.1"),sizeof(g_valkey_host)-1);
+    safe_strcpy(g_valkey_host,cfgenv("DNS_VALKEY_HOST","127.0.0.1"),sizeof(g_valkey_host));
     g_valkey_port=atoi(cfgenv("DNS_VALKEY_PORT","6379"));
-    strncpy(g_valkey_pass,cfgenv("DNS_VALKEY_PASSWORD",""),sizeof(g_valkey_pass)-1);
+    safe_strcpy(g_valkey_pass,cfgenv("DNS_VALKEY_PASSWORD",""),sizeof(g_valkey_pass));
     g_config_port=atoi(cfgenv("CONFIG_PORT","8080"));
     FILE *f=fopen(BOOT_FILE,"r");if(!f)return;
     char line[512];
     while(fgets(line,sizeof(line),f)){
         line[strcspn(line,"\r\n")]=0;char *eq=strchr(line,'=');if(!eq)continue;*eq=0;
         char *k=line,*v=eq+1;
-        if(!strcmp(k,"VALKEY_HOST"))strncpy(g_valkey_host,v,sizeof(g_valkey_host)-1);
+        if(!strcmp(k,"VALKEY_HOST"))safe_strcpy(g_valkey_host,v,sizeof(g_valkey_host));
         else if(!strcmp(k,"VALKEY_PORT"))g_valkey_port=atoi(v);
-        else if(!strcmp(k,"VALKEY_PASSWORD"))strncpy(g_valkey_pass,v,sizeof(g_valkey_pass)-1);}
+        else if(!strcmp(k,"VALKEY_PASSWORD"))safe_strcpy(g_valkey_pass,v,sizeof(g_valkey_pass));}
     fclose(f);}
 static void boot_save(void){
     FILE *f=fopen(BOOT_FILE,"w");if(!f){perror("boot_save");return;}
@@ -1005,12 +964,12 @@ static void config_portal(void){
             form_field(body,"host",host,sizeof(host));
             form_field(body,"port",portstr,sizeof(portstr));
             form_field(body,"pass",pass,sizeof(pass));
-            if(!host[0])strncpy(host,"127.0.0.1",sizeof(host)-1);
+            if(!host[0])safe_strcpy(host,"127.0.0.1",sizeof(host));
             int port=portstr[0]?atoi(portstr):6379;
             resp_conn_t test;memset(&test,0,sizeof(test));test.fd=-1;
             if(valkey_connect_to(&test,host,port,pass)==0){
-                strncpy(g_valkey_host,host,sizeof(g_valkey_host)-1);
-                g_valkey_port=port;strncpy(g_valkey_pass,pass,sizeof(g_valkey_pass)-1);
+                safe_strcpy(g_valkey_host,host,sizeof(g_valkey_host));
+                g_valkey_port=port;safe_strcpy(g_valkey_pass,pass,sizeof(g_valkey_pass));
                 close(test.fd);boot_save();
                 char page[512];int pl=snprintf(page,sizeof(page),
                     "<html><body style=\"font-family:sans-serif;margin:60px auto;max-width:520px\">"
@@ -1032,7 +991,7 @@ static void config_portal(void){
  * ======================================================================= */
 static void config_load_from_valkey(void){
     char val[MAX_PEM];
-    #define G(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])strncpy(d,val,sizeof(d)-1);}while(0)
+    #define G(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])safe_strcpy(d,val,sizeof(d));}while(0)
     #define GI(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=atoi(val);}while(0)
     #define GU(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=(uint32_t)atol(val);}while(0)
     G("ddns_secret",g_ddns_secret);G("acme_domain",g_acme_domain);
@@ -1056,7 +1015,7 @@ static void config_load_from_valkey(void){
     else RAND_bytes(g_cookie_secret,16);
     /* NSEC3 params */
     if(vk_get("config:nsec3_iters",val,sizeof(val))&&val[0])g_nsec3_iters=atoi(val);
-    if(vk_get("config:nsec3_salt",val,sizeof(val))&&val[0])strncpy(g_nsec3_salt,val,sizeof(g_nsec3_salt)-1);
+    if(vk_get("config:nsec3_salt",val,sizeof(val))&&val[0])safe_strcpy(g_nsec3_salt,val,sizeof(g_nsec3_salt));
     /* If NSID empty, use hostname */
     if(!g_nsid[0])gethostname(g_nsid,sizeof(g_nsid)-1);
     /* PEM blobs */
@@ -1072,10 +1031,10 @@ static void config_load_from_valkey(void){
     if(vk_get("config:syslog_level",val,sizeof(val))&&val[0])
         g_syslog_level = syslog_level_from_str(val);
     if(vk_get("config:syslog_ident",val,sizeof(val))&&val[0])
-        strncpy(g_syslog_ident,val,sizeof(g_syslog_ident)-1);
+        safe_strcpy(g_syslog_ident,val,sizeof(g_syslog_ident));
     /* Remote syslog config */
     if(vk_get("config:syslog_remote_host",val,sizeof(val))&&val[0])
-        strncpy(g_rsyslog_host,val,sizeof(g_rsyslog_host)-1);
+        safe_strcpy(g_rsyslog_host,val,sizeof(g_rsyslog_host));
     if(vk_get("config:syslog_remote_port",val,sizeof(val))&&val[0])
         g_rsyslog_port = atoi(val);
     else if(g_rsyslog_host[0] && g_rsyslog_port==0)
@@ -1107,8 +1066,8 @@ static void config_set(const char *key,const char *val){
     if(!strcmp(key,"syslog_enabled")){g_syslog_enabled=atoi(val);syslog_init();}
     else if(!strcmp(key,"syslog_facility")){g_syslog_facility=syslog_facility_from_str(val);syslog_init();}
     else if(!strcmp(key,"syslog_level")){g_syslog_level=syslog_level_from_str(val);syslog_init();}
-    else if(!strcmp(key,"syslog_ident")){strncpy(g_syslog_ident,val,sizeof(g_syslog_ident)-1);syslog_init();}
-    else if(!strcmp(key,"syslog_remote_host")){strncpy(g_rsyslog_host,val,sizeof(g_rsyslog_host)-1);syslog_init();}
+    else if(!strcmp(key,"syslog_ident")){safe_strcpy(g_syslog_ident,val,sizeof(g_syslog_ident));syslog_init();}
+    else if(!strcmp(key,"syslog_remote_host")){safe_strcpy(g_rsyslog_host,val,sizeof(g_rsyslog_host));syslog_init();}
     else if(!strcmp(key,"syslog_remote_port")){g_rsyslog_port=atoi(val);syslog_init();}
     else if(!strcmp(key,"syslog_remote_proto")){
         if(!strcasecmp(val,"tcp"))      g_rsyslog_proto=RSYSLOG_TCP;
@@ -1213,15 +1172,15 @@ static int make_rrsig(const char *owner,uint16_t rrtype,uint32_t ttl,
     hdr[hp++]=t_inc>>24;hdr[hp++]=(t_inc>>16)&0xFF;hdr[hp++]=(t_inc>>8)&0xFF;hdr[hp++]=t_inc&0xFF;
     hdr[hp++]=tag>>8;hdr[hp++]=tag&0xFF;
     /* Signer name wire */
-    char sn[256];strncpy(sn,owner,255);strlower(sn);
-    {char tmp[256];strncpy(tmp,sn,255);char *lbl=strtok(tmp,".");
+    char sn[256];safe_strcpy(sn,owner,sizeof(sn));strlower(sn);
+    {char *sp1=NULL;char tmp[256];safe_strcpy(tmp,sn,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp1);
      while(lbl){int ll=(int)strlen(lbl);hdr[hp++]=(uint8_t)ll;
-         memcpy(hdr+hp,lbl,ll);hp+=ll;lbl=strtok(NULL,".");}hdr[hp++]=0;}
+         memcpy(hdr+hp,lbl,ll);hp+=ll;lbl=strtok_r(NULL,".",&sp1);}hdr[hp++]=0;}
     /* Canonical RR */
     uint8_t own_w[256];int ow=0;
-    {char tmp[256];strncpy(tmp,sn,255);char *lbl=strtok(tmp,".");
+    {char *sp2=NULL;char tmp[256];safe_strcpy(tmp,sn,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp2);
      while(lbl){int ll=(int)strlen(lbl);own_w[ow++]=(uint8_t)ll;
-         memcpy(own_w+ow,lbl,ll);ow+=ll;lbl=strtok(NULL,".");}own_w[ow++]=0;}
+         memcpy(own_w+ow,lbl,ll);ow+=ll;lbl=strtok_r(NULL,".",&sp2);}own_w[ow++]=0;}
     uint8_t rr[2048];int rp=0;
     memcpy(rr,own_w,ow);rp+=ow;rr[rp++]=rrtype>>8;rr[rp++]=rrtype&0xFF;
     rr[rp++]=0;rr[rp++]=DNS_CLASS_IN;
@@ -1286,29 +1245,18 @@ static void dnssec_init(void){
  * ======================================================================= */
 
 /* RFC 5155 Sec 5: base32hex encoding */
-static const char B32H[]="0123456789ABCDEFGHIJKLMNOPQRSTUV";
-static int base32hex_enc(const uint8_t *in,int ilen,char *out,int olen){
-    int i=0,o=0;
-    while(i<ilen&&o+7<olen){
-        uint64_t v=0;int take=ilen-i<5?ilen-i:5;
-        for(int j=0;j<take;j++)v|=(uint64_t)in[i+j]<<(32-j*8);
-        int bits=take*8;
-        for(int j=0;j<8&&bits>0;j++){out[o++]=B32H[(v>>(35-j*5))&0x1F];bits-=5;}
-        i+=take;}
-    out[o]=0;return o;}
-
 /* Compute NSEC3 owner name for a given qname */
 static void nsec3_hash_name(const char *name,const uint8_t *salt,int saltlen,
                              int iters,char *out_b32hex,int out_len){
     /* Wire-encode the name (lowercase); RFC 1035 max wire length = 255 bytes */
-    char lname[256];strncpy(lname,name,255);strlower(lname);
+    char lname[256];safe_strcpy(lname,name,sizeof(lname));strlower(lname);
     uint8_t wire[257];int wlen=0;   /* 257 = 255 payload + 1 root + guard */
-    char tmp[256];strncpy(tmp,lname,255);
-    char *lbl=strtok(tmp,".");
+    char tmp[256];safe_strcpy(tmp,lname,sizeof(tmp));
+    char *sp3=NULL;char *lbl=strtok_r(tmp,".",&sp3);
     while(lbl){int ll=(int)strlen(lbl);
         if(ll>63||wlen+ll+1>255)break;   /* enforce label and total limits */
         wire[wlen++]=(uint8_t)ll;
-        memcpy(wire+wlen,lbl,ll);wlen+=ll;lbl=strtok(NULL,".");}
+        memcpy(wire+wlen,lbl,ll);wlen+=ll;lbl=strtok_r(NULL,".",&sp3);}
     if(wlen<256)wire[wlen++]=0;   /* root label */
     /* Iterative SHA-1: H(x) = SHA-1(x || salt), repeated iters+1 times */
     uint8_t h[20];
@@ -1330,11 +1278,11 @@ static int nsec3_rdata(const char *name, uint16_t covered_type,
     uint8_t nexthash[20];
     /* Next hash = hash of the zone apex (simplified — in production use sorted order) */
     uint8_t zone_wire[257];int zw=0;
-    {char ztmp[256];strncpy(ztmp,g_zone_name,255);char *zl=strtok(ztmp,".");
+    {char *sp4=NULL;char ztmp[256];safe_strcpy(ztmp,g_zone_name,sizeof(ztmp));char *zl=strtok_r(ztmp,".",&sp4);
      while(zl){int ll=(int)strlen(zl);
          if(ll>63||zw+ll+1>255)break;
          zone_wire[zw++]=(uint8_t)ll;
-         memcpy(zone_wire+zw,zl,ll);zw+=ll;zl=strtok(NULL,".");}
+         memcpy(zone_wire+zw,zl,ll);zw+=ll;zl=strtok_r(NULL,".",&sp4);}
      if(zw<256)zone_wire[zw++]=0;}
     {uint8_t ib[256+64];int ib_len=zw;memcpy(ib,zone_wire,zw);
      if(saltlen){memcpy(ib+zw,salt,saltlen);ib_len+=saltlen;}
@@ -1445,9 +1393,9 @@ static int tsig_verify(const uint8_t *pkt,int plen){
     /* TSIG variables */
     uint8_t vars[512];int vp=0;
     /* key name wire */
-    {char tmp2[256];strncpy(tmp2,t.key_name,255);char *lbl=strtok(tmp2,".");
+    {char *sp5=NULL;char tmp2[256];safe_strcpy(tmp2,t.key_name,sizeof(tmp2));char *lbl=strtok_r(tmp2,".",&sp5);
      while(lbl){int ll=(int)strlen(lbl);vars[vp++]=(uint8_t)ll;
-         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok(NULL,".");}vars[vp++]=0;}
+         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok_r(NULL,".",&sp5);}vars[vp++]=0;}
     /* class=ANY, ttl=0 */
     vars[vp++]=0;vars[vp++]=255;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;
     /* alg name: hmac-sha256. */
@@ -1481,16 +1429,16 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     time_t now=time(NULL);
     uint8_t vars[512];int vp=0;
     /* key name wire */
-    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *lbl=strtok(tmp,".");
+    {char *sp6=NULL;char tmp[256];safe_strcpy(tmp,g_tsig_key_name,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp6);
      while(lbl){int ll=(int)strlen(lbl);vars[vp++]=(uint8_t)ll;
-         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok(NULL,".");}vars[vp++]=0;}
+         memcpy(vars+vp,lbl,ll);vp+=ll;lbl=strtok_r(NULL,".",&sp6);}vars[vp++]=0;}
     vars[vp++]=0;vars[vp++]=255;/* class ANY */
     vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;vars[vp++]=0;/* ttl=0 */
     const char *alg_wire="\x0bhmac-sha256\x00";memcpy(vars+vp,alg_wire,13);vp+=13;
     vars[vp++]=0;vars[vp++]=0;/* time high */
     vars[vp++]=(uint8_t)((now>>24)&0xFF);vars[vp++]=(uint8_t)((now>>16)&0xFF);
     vars[vp++]=(uint8_t)((now>>8)&0xFF);vars[vp++]=(uint8_t)(now&0xFF);
-    vars[vp++]=0;vars[vp++]=5;/* fudge=300 */
+    vars[vp++]=TSIG_FUDGE>>8;vars[vp++]=TSIG_FUDGE&0xFF;
     vars[vp++]=error>>8;vars[vp++]=error&0xFF;
     vars[vp++]=0;vars[vp++]=0;
     unsigned int mlen=32;uint8_t mac[32];
@@ -1506,9 +1454,9 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     /* Encode TSIG RR */
     if(off+200>blen)return off;
     /* key name */
-    {char tmp[256];strncpy(tmp,g_tsig_key_name,255);char *lbl=strtok(tmp,".");
+    {char *sp7=NULL;char tmp[256];safe_strcpy(tmp,g_tsig_key_name,sizeof(tmp));char *lbl=strtok_r(tmp,".",&sp7);
      while(lbl){int ll=(int)strlen(lbl);buf[off++]=(uint8_t)ll;
-         memcpy(buf+off,lbl,ll);off+=ll;lbl=strtok(NULL,".");}buf[off++]=0;}
+         memcpy(buf+off,lbl,ll);off+=ll;lbl=strtok_r(NULL,".",&sp7);}buf[off++]=0;}
     buf[off++]=0;buf[off++]=250;/* type TSIG=250 */
     buf[off++]=0;buf[off++]=255;/* class ANY */
     buf[off++]=0;buf[off++]=0;buf[off++]=0;buf[off++]=0;/* ttl=0 */
@@ -1518,7 +1466,7 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
     rdata[rp++]=0;rdata[rp++]=0;/* time high */
     rdata[rp++]=(uint8_t)((now>>24)&0xFF);rdata[rp++]=(uint8_t)((now>>16)&0xFF);
     rdata[rp++]=(uint8_t)((now>>8)&0xFF);rdata[rp++]=(uint8_t)(now&0xFF);
-    rdata[rp++]=0;rdata[rp++]=5;/* fudge */
+    rdata[rp++]=TSIG_FUDGE>>8;rdata[rp++]=TSIG_FUDGE&0xFF;
     rdata[rp++]=0;rdata[rp++]=(uint8_t)mlen;
     memcpy(rdata+rp,mac,mlen);rp+=mlen;
     rdata[rp++]=orig_id>>8;rdata[rp++]=orig_id&0xFF;
@@ -1534,35 +1482,6 @@ static int tsig_append(uint8_t *buf,int off,int blen,uint16_t orig_id,uint16_t e
 /* ==========================================================================
  * DNS wire helpers
  * ======================================================================= */
-static int name_to_wire(const char *name,uint8_t *buf,int blen){
-    int pos=0;char tmp[256];strncpy(tmp,name,255);tmp[255]=0;
-    char *lbl=strtok(tmp,".");
-    while(lbl){int ll=(int)strlen(lbl);if(pos+ll+1>=blen)return -1;
-        buf[pos++]=(uint8_t)ll;memcpy(buf+pos,lbl,ll);pos+=ll;lbl=strtok(NULL,".");}
-    if(pos>=blen)return -1;buf[pos++]=0;return pos;}
-static int name_from_wire(const uint8_t *pkt,int plen,int off,char *out,int olen){
-    int pos=off,opos=0,jumped=0,jret=-1,steps=0;
-    while(steps++<128){if(pos>=plen)return -1;uint8_t c=pkt[pos];
-        if((c&0xC0)==0xC0){if(pos+1>=plen)return -1;
-            int ptr=((c&0x3F)<<8)|pkt[pos+1];if(!jumped){jret=pos+2;jumped=1;}pos=ptr;continue;}
-        if(c==0){pos++;break;}int ll=c;pos++;
-        if(pos+ll>plen||opos+ll+1>=olen)return -1;
-        if(opos)out[opos++]='.';memcpy(out+opos,pkt+pos,ll);opos+=ll;pos+=ll;}
-    out[opos]=0;strlower(out);return jumped?jret:pos;}
-static void put16(uint8_t *b,int o,uint16_t v){b[o]=v>>8;b[o+1]=v&0xFF;}
-static void put32(uint8_t *b,int o,uint32_t v){
-    b[o]=v>>24;b[o+1]=(v>>16)&0xFF;b[o+2]=(v>>8)&0xFF;b[o+3]=v&0xFF;}
-static uint16_t get16(const uint8_t *b,int o){return((uint16_t)b[o]<<8)|b[o+1];}
-static uint32_t get32(const uint8_t *b,int o){
-    return((uint32_t)b[o]<<24)|((uint32_t)b[o+1]<<16)|((uint32_t)b[o+2]<<8)|b[o+3];}
-static int append_rr(uint8_t *buf,int off,int blen,const char *name,
-                     uint16_t type,uint16_t cls,uint32_t ttl,
-                     const uint8_t *rdata,uint16_t rdlen){
-    int n=name_to_wire(name,buf+off,blen-off);
-    if(n<0||off+n+10+(int)rdlen>blen)return -1;
-    off+=n;put16(buf,off,type);off+=2;put16(buf,off,cls);off+=2;
-    put32(buf,off,ttl);off+=4;put16(buf,off,rdlen);off+=2;
-    if(rdlen)memcpy(buf+off,rdata,rdlen);return off+rdlen;}
 
 static const char *type2str(uint16_t t){
     switch(t){case DNS_TYPE_A:return"A";case DNS_TYPE_NS:return"NS";
@@ -1735,18 +1654,18 @@ static int cookie_verify(const edns_info_t *ei, const struct in_addr *cip){
 static int emit_rr(uint8_t *resp,int off,int resp_len,
                    const char *name,uint16_t type,uint32_t ttl,
                    const uint8_t *rdata,uint16_t rdlen,int dnssec_ok,int *answers){
-    int noff=append_rr(resp,off,resp_len,name,type,DNS_CLASS_IN,ttl,rdata,rdlen);
+    int noff=append_rr_plain(resp,off,resp_len,name,type,DNS_CLASS_IN,ttl,rdata,rdlen);
     if(noff<0)return off;(*answers)++;off=noff;
     if(!dnssec_ok||!g_zsk)return off;
     /* Add RRSIG for ECDSA P-256 (Alg 13) */
     {pthread_mutex_lock(&g_zsk_mutex);EVP_PKEY *zsk=g_zsk;uint16_t tag=g_zsk_tag;pthread_mutex_unlock(&g_zsk_mutex);
      if(zsk){uint8_t sig[512];int sl=make_rrsig(name,type,ttl,rdata,rdlen,zsk,DNS_ALG_ECDSAP256SHA256,tag,sig);
-         if(sl>0){int so=append_rr(resp,off,resp_len,name,DNS_TYPE_RRSIG,DNS_CLASS_IN,ttl,sig,(uint16_t)sl);
+         if(sl>0){int so=append_rr_plain(resp,off,resp_len,name,DNS_TYPE_RRSIG,DNS_CLASS_IN,ttl,sig,(uint16_t)sl);
              if(so>0){off=so;(*answers)++;}}}}
     /* Add RRSIG for Ed25519 (Alg 15) */
     {pthread_mutex_lock(&g_zsk_mutex);EVP_PKEY *zsk=g_zsk_ed;uint16_t tag=g_zsk_ed_tag;pthread_mutex_unlock(&g_zsk_mutex);
      if(zsk){uint8_t sig[512];int sl=make_rrsig(name,type,ttl,rdata,rdlen,zsk,DNS_ALG_ED25519,tag,sig);
-         if(sl>0){int so=append_rr(resp,off,resp_len,name,DNS_TYPE_RRSIG,DNS_CLASS_IN,ttl,sig,(uint16_t)sl);
+         if(sl>0){int so=append_rr_plain(resp,off,resp_len,name,DNS_TYPE_RRSIG,DNS_CLASS_IN,ttl,sig,(uint16_t)sl);
              if(so>0){off=so;(*answers)++;}}}}
     return off;}
 
@@ -1829,10 +1748,10 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         if(vk_get(k,val,sizeof(val))){found=1;
             uint32_t ttl=DEFAULT_TTL;char *pipe=strchr(val,'|');
             if(pipe){ttl=(uint32_t)atoi(val);pipe++;}else pipe=val;
-            char *ip=strtok(pipe,"|");while(ip){struct in_addr a4;if(inet_pton(AF_INET,ip,&a4)==1){
+            char *sp9=NULL;char *ip=strtok_r(pipe,"|",&sp9);while(ip){struct in_addr a4;if(inet_pton(AF_INET,ip,&a4)==1){
                 uint8_t rd[4];memcpy(rd,&a4,4);
                 off=emit_rr(resp,off,resp_len,qname,DNS_TYPE_A,ttl,rd,4,dnssec_ok,&answers);}
-                ip=strtok(NULL,"|");}}}
+                ip=strtok_r(NULL,"|",&sp9);}}}
     /* Dynamic AAAA */
     if(qtype==DNS_TYPE_AAAA||qtype==DNS_TYPE_ANY){
         char val[256],k[512];
@@ -1844,10 +1763,10 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         if(vk_get(k,val,sizeof(val))){found=1;
             uint32_t ttl=DEFAULT_TTL;char *pipe=strchr(val,'|');
             if(pipe){ttl=(uint32_t)atoi(val);pipe++;}else pipe=val;
-            char *ip=strtok(pipe,"|");while(ip){struct in6_addr a6;if(inet_pton(AF_INET6,ip,&a6)==1){
+            char *sp10=NULL;char *ip=strtok_r(pipe,"|",&sp10);while(ip){struct in6_addr a6;if(inet_pton(AF_INET6,ip,&a6)==1){
                 uint8_t rd[16];memcpy(rd,&a6,16);
                 off=emit_rr(resp,off,resp_len,qname,DNS_TYPE_AAAA,ttl,rd,16,dnssec_ok,&answers);}
-                ip=strtok(NULL,"|");}}}
+                ip=strtok_r(NULL,"|",&sp10);}}}
     /* Provisioned record types from Valkey */
     {uint16_t pts[]={DNS_TYPE_CNAME,DNS_TYPE_MX,DNS_TYPE_TXT,DNS_TYPE_NS,
                      DNS_TYPE_SRV,DNS_TYPE_CAA,DNS_TYPE_SSHFP,DNS_TYPE_TLSA,
@@ -1871,36 +1790,36 @@ static int build_query_resp(const uint8_t *query,int qlen,uint8_t *resp,int resp
         case DNS_TYPE_SRV:{/* ttl|prio|weight|port|target */
             uint16_t prio=0,weight=0,port=0;char target[256]="";
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok){prio=(uint16_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok){weight=(uint16_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok){port=(uint16_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok)strncpy(target,tok,255);
+            char *sp11=NULL;char *tok=strtok_r(p2,"|",&sp11);if(tok){prio=(uint16_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp11);if(tok){weight=(uint16_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp11);if(tok){port=(uint16_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp11);if(tok)safe_strcpy(target,tok,sizeof(target));
             rd[0]=prio>>8;rd[1]=prio&0xFF;rd[2]=weight>>8;rd[3]=weight&0xFF;
             rd[4]=port>>8;rd[5]=port&0xFF;
             int n=name_to_wire(target,rd+6,sizeof(rd)-6);if(n<0)continue;rdlen=(uint16_t)(6+n);break;}
         case DNS_TYPE_CAA:{/* ttl|flags|tag|value */
             uint8_t flags=0;char tag[64]="",caaval[256]="";
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok){flags=(uint8_t)atoi(tok);}
-            tok=strtok(NULL,"|");if(tok)strncpy(tag,tok,63);
-            tok=strtok(NULL,"|");if(tok)strncpy(caaval,tok,255);
+            char *sp12=NULL;char *tok=strtok_r(p2,"|",&sp12);if(tok){flags=(uint8_t)atoi(tok);}
+            tok=strtok_r(NULL,"|",&sp12);if(tok)safe_strcpy(tag,tok,sizeof(tag));
+            tok=strtok_r(NULL,"|",&sp12);if(tok)safe_strcpy(caaval,tok,sizeof(caaval));
             rd[0]=flags;rd[1]=(uint8_t)strlen(tag);memcpy(rd+2,tag,strlen(tag));
             int tl=(int)strlen(tag);memcpy(rd+2+tl,caaval,strlen(caaval));
             rdlen=(uint16_t)(2+tl+(int)strlen(caaval));break;}
         case DNS_TYPE_SSHFP:{/* ttl|alg|fptype|fingerprint_hex */
             uint8_t alg=0,fptype=0;uint8_t fp[64];int fplen=0;
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok)alg=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)fptype=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)fplen=hex_dec(tok,fp,sizeof(fp));
+            char *sp13=NULL;char *tok=strtok_r(p2,"|",&sp13);if(tok)alg=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp13);if(tok)fptype=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp13);if(tok)fplen=hex_dec(tok,fp,sizeof(fp));
             rd[0]=alg;rd[1]=fptype;memcpy(rd+2,fp,fplen);rdlen=(uint16_t)(2+fplen);break;}
         case DNS_TYPE_TLSA:{/* ttl|usage|selector|mtype|data_hex */
             uint8_t usage=0,sel=0,mtype=0;uint8_t data[512];int dlen=0;
             char *p2=pipe;
-            char *tok=strtok(p2,"|");if(tok)usage=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)sel=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)mtype=(uint8_t)atoi(tok);
-            tok=strtok(NULL,"|");if(tok)dlen=hex_dec(tok,data,sizeof(data));
+            char *sp14=NULL;char *tok=strtok_r(p2,"|",&sp14);if(tok)usage=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp14);if(tok)sel=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp14);if(tok)mtype=(uint8_t)atoi(tok);
+            tok=strtok_r(NULL,"|",&sp14);if(tok)dlen=hex_dec(tok,data,sizeof(data));
             rd[0]=usage;rd[1]=sel;rd[2]=mtype;memcpy(rd+3,data,dlen);rdlen=(uint16_t)(3+dlen);break;}
         case DNS_TYPE_LOC:{/* stored as raw hex of wire rdata */
             int lo=hex_dec(pipe,rd,sizeof(rd));rdlen=(uint16_t)lo;break;}
@@ -1926,7 +1845,7 @@ finish_answer:
     if(any_minimal&&answers>0){
         /* Add HINFO record as hint per RFC 8482 */
         const uint8_t hinfo_rd[]={3,'R','F','C',1,'1'};
-        append_rr(resp,off,resp_len,qname,13/*HINFO*/,DNS_CLASS_IN,3600,hinfo_rd,sizeof(hinfo_rd));
+        append_rr_plain(resp,off,resp_len,qname,13/*HINFO*/,DNS_CLASS_IN,3600,hinfo_rd,sizeof(hinfo_rd));
         /* We don't count this in answers to avoid recursion */}
     /* EDNS OPT in response */
     off=edns_append_opt(resp,off,resp_len,is_tcp,dnssec_ok,0,&ei,ede_code,ede_text);
@@ -1977,8 +1896,8 @@ formerr:rh->flags=htons(DNS_QR|DNS_OPCODE_UPDATE|DNS_RCODE_FORMERR);return 12;}
 typedef struct{int fd;SSL *ssl;struct sockaddr_in addr;}axfr_conn_t;
 
 static int axfr_ip_allowed(const struct in_addr *cip){
-    char allow[1024];strncpy(allow,g_axfr_allow,sizeof(allow)-1);
-    char *tok=strtok(allow,",");
+    char allow[1024];safe_strcpy(allow,g_axfr_allow,sizeof(allow));
+    char *sp15=NULL;char *tok=strtok_r(allow,",",&sp15);
     while(tok){while(*tok==' ')tok++;
         /* Simple exact match or /8-/32 CIDR */
         char *slash=strchr(tok,'/');
@@ -1990,7 +1909,7 @@ static int axfr_ip_allowed(const struct in_addr *cip){
             if(bits==32)mask=0xFFFFFFFFu;
             if((cip->s_addr&mask)==(net.s_addr&mask))return 1;
         }else{struct in_addr a;if(inet_pton(AF_INET,tok,&a)==1&&a.s_addr==cip->s_addr)return 1;}
-        tok=strtok(NULL,",");}
+        tok=strtok_r(NULL,",",&sp15);}
     return 0;}
 
 /* Send one DNS message over TCP (2-byte length prefix) */
@@ -2022,7 +1941,7 @@ static void *axfr_thread(void *arg){
     if(n>0){off+=n;put16(buf,off,252);off+=2;put16(buf,off,DNS_CLASS_IN);off+=2;}
     rh->qdcount=htons(1);
     uint8_t soa_rd[512];int soa_len=build_soa_rdata(soa_rd,sizeof(soa_rd));
-    if(soa_len>0)off=append_rr(buf,off,sizeof(buf),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+    if(soa_len>0)off=append_rr_plain(buf,off,sizeof(buf),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
     tcp_send_msg(c.fd,c.ssl,buf,off);
 
     /* Send all static zone records */
@@ -2041,7 +1960,7 @@ static void *axfr_thread(void *arg){
         default:continue;}
         uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
         mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
-        int mo=12;mo=append_rr(mb,mo,sizeof(mb),r->name,r->type,DNS_CLASS_IN,r->ttl,rd,rdlen);
+        int mo=12;mo=append_rr_plain(mb,mo,sizeof(mb),r->name,r->type,DNS_CLASS_IN,r->ttl,rd,rdlen);
         tcp_send_msg(c.fd,c.ssl,mb,mo);}
 
     /* Send DNSKEY records */
@@ -2049,18 +1968,18 @@ static void *axfr_thread(void *arg){
      if(g_zsk&&dnskey_rdata_ecdsa(g_zsk,dkrd,sizeof(dkrd))>0){
          uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
          mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
-         int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,68);
+         int mo=12;mo=append_rr_plain(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,68);
          tcp_send_msg(c.fd,c.ssl,mb,mo);}
      if(g_zsk_ed&&dnskey_rdata_ed25519(g_zsk_ed,dkrd,sizeof(dkrd))>0){
          uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
          mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
-         int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,36);
+         int mo=12;mo=append_rr_plain(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_DNSKEY,DNS_CLASS_IN,3600,dkrd,36);
          tcp_send_msg(c.fd,c.ssl,mb,mo);}}
 
     /* Closing SOA */
     {uint8_t mb[BUF_SIZE];memset(mb,0,12);dns_hdr_t *mh=(dns_hdr_t*)mb;
      mh->flags=htons(DNS_QR|DNS_AA);mh->ancount=htons(1);
-     int mo=12;mo=append_rr(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
+     int mo=12;mo=append_rr_plain(mb,mo,sizeof(mb),g_zone_name,DNS_TYPE_SOA,DNS_CLASS_IN,g_soa_minimum,soa_rd,(uint16_t)soa_len);
      tcp_send_msg(c.fd,c.ssl,mb,mo);}
     dns_log(LOG_NOTICE,"[AXFR] Complete to %s\n",cip);
 done:
@@ -2072,15 +1991,15 @@ done:
  * ======================================================================= */
 static void notify_send(void){
     if(!g_notify_targets[0])return;
-    char targets[1024];strncpy(targets,g_notify_targets,sizeof(targets)-1);
-    char *tok=strtok(targets,",");
+    char targets[1024];safe_strcpy(targets,g_notify_targets,sizeof(targets));
+    char *sp16=NULL;char *tok=strtok_r(targets,",",&sp16);
     while(tok){while(*tok==' ')tok++;
         char host[256]="";int port=53;
         char *col=strchr(tok,':');
-        if(col){*col=0;port=atoi(col+1);}strncpy(host,tok,255);
-        int fd=socket(AF_INET,SOCK_DGRAM,0);if(fd<0){tok=strtok(NULL,",");continue;}
+        if(col){*col=0;port=atoi(col+1);}safe_strcpy(host,tok,sizeof(host));
+        int fd=socket(AF_INET,SOCK_DGRAM,0);if(fd<0){tok=strtok_r(NULL,",",&sp16);continue;}
         struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(port)};
-        if(inet_pton(AF_INET,host,&sa.sin_addr)!=1){close(fd);tok=strtok(NULL,",");continue;}
+        if(inet_pton(AF_INET,host,&sa.sin_addr)!=1){close(fd);tok=strtok_r(NULL,",",&sp16);continue;}
         uint8_t pkt[64]={0};dns_hdr_t *h=(dns_hdr_t*)pkt;
         h->id=htons((uint16_t)rand());
         h->flags=htons(DNS_QR&0?0:0|DNS_OPCODE_NOTIFY|DNS_AA);
@@ -2089,7 +2008,7 @@ static void notify_send(void){
         if(n>0){off+=n;put16(pkt,off,DNS_TYPE_SOA);off+=2;put16(pkt,off,DNS_CLASS_IN);off+=2;}
         sendto(fd,pkt,off,0,(struct sockaddr*)&sa,sizeof(sa));
         dns_log(LOG_NOTICE,"[NOTIFY] Sent to %s:%d\n",host,port);close(fd);
-        tok=strtok(NULL,",");}}
+        tok=strtok_r(NULL,",",&sp16);}}
 
 /* ==========================================================================
  * DNS packet dispatch (shared by UDP / DoT / DoH)
@@ -2187,7 +2106,7 @@ static void parse_url(const char *url,char *host,int *port,char *path,int plen){
     *port=443;strcpy(path,"/");const char *p=url;
     if(strncmp(p,"https://",8)==0)p+=8;else if(strncmp(p,"http://",7)==0){p+=7;*port=80;}
     const char *sl=strchr(p,'/');int hl=sl?(int)(sl-p):(int)strlen(p);
-    memcpy(host,p,hl);host[hl]=0;if(sl)strncpy(path,sl,plen-1);
+    memcpy(host,p,hl);host[hl]=0;if(sl)safe_strcpy(path,sl,plen);
     char *col=strchr(host,':');if(col){*port=atoi(col+1);*col=0;}}
 static void acme_jwk(EVP_PKEY *k,char *out,int olen){
     uint8_t xy[64];if(!ec_pub_xy(k,xy)){snprintf(out,olen,"{}");return;}
@@ -2292,7 +2211,7 @@ static int acme_issue(void){
     {char *p=az_body;while((p=strstr(p,"\"dns-01\""))!=NULL){
         char *obj=p-300;if(obj<az_body)obj=az_body;
         char tok2[256]={0},uv[512]={0};json_str(obj,"token",tok2,sizeof(tok2));json_str(obj,"url",uv,sizeof(uv));
-        if(tok2[0]&&uv[0]){strncpy(ch_tok,tok2,255);strncpy(ch_url,uv,511);}p+=8;break;}}
+        if(tok2[0]&&uv[0]){safe_strcpy(ch_tok,tok2,sizeof(ch_tok));safe_strcpy(ch_url,uv,sizeof(ch_url));}p+=8;break;}}
     free(az_body);if(!ch_tok[0]){dns_log(LOG_ERR,"[ACME] No dns-01 challenge\n");return -1;}
     char thumb[256];acme_thumbprint(g_acme_key,thumb,sizeof(thumb));
     char kauth[512];snprintf(kauth,sizeof(kauth),"%s.%s",ch_tok,thumb);
@@ -2330,7 +2249,7 @@ static int acme_issue(void){
     char *kpp;long kpl=BIO_get_mem_data(kb,&kpp);char key_pem[MAX_PEM];
     int kn=(int)(kpl<MAX_PEM-1?kpl:MAX_PEM-1);memcpy(key_pem,kpp,kn);key_pem[kn]=0;BIO_free(kb);EVP_PKEY_free(dkey);
     vk_set("config:tls_cert_pem",cert_pem,0);vk_set("config:tls_key_pem",key_pem,0);
-    strncpy(g_tls_cert_pem,cert_pem,sizeof(g_tls_cert_pem)-1);strncpy(g_tls_key_pem,key_pem,sizeof(g_tls_key_pem)-1);
+    safe_strcpy(g_tls_cert_pem,cert_pem,sizeof(g_tls_cert_pem));safe_strcpy(g_tls_key_pem,key_pem,sizeof(g_tls_key_pem));
     free(cert_pem);dns_log(LOG_NOTICE,"[ACME] Certificate stored in Valkey\n");
     /* Auto-publish TLSA record for the cert */
     if(g_acme_domain[0]){
@@ -2471,11 +2390,11 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
         qs_get(bdy,"key",cfgkey,sizeof(cfgkey));qs_get(bdy,"value",cfgval,sizeof(cfgval));
         if(!cfgkey[0]){api_send(fd,ssl,400,"missing key\n");return;}
         config_set(cfgkey,cfgval);
-        if(!strcmp(cfgkey,"ddns_secret"))strncpy(g_ddns_secret,cfgval,sizeof(g_ddns_secret)-1);
-        else if(!strcmp(cfgkey,"acme_domain"))strncpy(g_acme_domain,cfgval,sizeof(g_acme_domain)-1);
-        else if(!strcmp(cfgkey,"tls_cert_pem")){strncpy(g_tls_cert_pem,cfgval,sizeof(g_tls_cert_pem)-1);tls_reload();}
-        else if(!strcmp(cfgkey,"tls_key_pem")){strncpy(g_tls_key_pem,cfgval,sizeof(g_tls_key_pem)-1);tls_reload();}
-        else if(!strcmp(cfgkey,"mtls_ca_pem")){strncpy(g_mtls_ca_pem,cfgval,sizeof(g_mtls_ca_pem)-1);tls_reload();}
+        if(!strcmp(cfgkey,"ddns_secret"))safe_strcpy(g_ddns_secret,cfgval,sizeof(g_ddns_secret));
+        else if(!strcmp(cfgkey,"acme_domain"))safe_strcpy(g_acme_domain,cfgval,sizeof(g_acme_domain));
+        else if(!strcmp(cfgkey,"tls_cert_pem")){safe_strcpy(g_tls_cert_pem,cfgval,sizeof(g_tls_cert_pem));tls_reload();}
+        else if(!strcmp(cfgkey,"tls_key_pem")){safe_strcpy(g_tls_key_pem,cfgval,sizeof(g_tls_key_pem));tls_reload();}
+        else if(!strcmp(cfgkey,"mtls_ca_pem")){safe_strcpy(g_mtls_ca_pem,cfgval,sizeof(g_mtls_ca_pem));tls_reload();}
         char rb[128];snprintf(rb,sizeof(rb),"ok: config:%s updated\n",cfgkey);api_send(fd,ssl,200,rb);return;}
     if(is_mgmt&&!strcmp(path,"/acme/issue")){
         dns_log(LOG_NOTICE,"[ACME] Manual issue via API\n");int r=acme_issue();
