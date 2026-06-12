@@ -168,6 +168,20 @@ certd_debug: certd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
 	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+
+# =============================================================================
+# mdnsd — mDNS / DNS-SD responder (link-local; migration Step 3)
+# =============================================================================
+mdnsd: mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [PROD]  $@"
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	strip --strip-unneeded $@
+
+mdnsd_debug: mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [DEBUG] $@"
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
@@ -317,7 +331,8 @@ check: $(BIN_DEBUG)
 # =============================================================================
 clean:
 	@echo "  CLEAN"
-	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug $(SIG_GPG) $(SIG_OSSL) \
+	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug mdnsd mdnsd_debug \
+	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_name_from_wire \
 	      fuzz/fuzz_name_from_wire
 	@echo "  done"
@@ -333,6 +348,8 @@ help:
 	@echo "  make debug        Debug build: ASan/UBSan, full symbols, not stripped"
 	@echo "  make certd        certd sidecar (ACME/EST), hardened production build"
 	@echo "  make certd_debug  certd sidecar, ASan/UBSan debug build"
+	@echo "  make mdnsd        mDNS/DNS-SD responder, hardened production build"
+	@echo "  make mdnsd_debug  mDNS responder, ASan/UBSan debug build"
 	@echo "  make sign         (Re-)sign the existing production binary with GPG"
 	@echo "  make sign-openssl Sign with OpenSSL Ed25519 key (keys/codesign.key.pem)"
 	@echo "  make verify       Verify GPG and/or OpenSSL signatures"

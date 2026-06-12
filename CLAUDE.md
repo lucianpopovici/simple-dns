@@ -79,8 +79,9 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | Path | What it is |
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
-| `dns_server.c` | The authoritative server (~4600 lines, shrinking). ACME/EST extracted in Step 2; mDNS/HTTP still to go — see architecture below. |
+| `dns_server.c` | The authoritative server (~4000 lines, shrinking). ACME/EST extracted in Step 2, mDNS in Step 3; the HTTP surface still to go — see architecture below. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
+| `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |
 | `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC **validation**. Becomes `resolverd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
@@ -210,12 +211,16 @@ filter to worker threads. No outbound network except to Valkey.
 
 ### `mdnsd` — mDNS / DNS-SD responder (link-local, low trust)
 
-Separate process. Joins IPv4/IPv6 multicast groups, answers `.local` queries
-and `_services._dns-sd._udp.local` browse requests.
+**Done (migration Step 3):** `mdnsd.c`. Separate process. Joins IPv4/IPv6
+multicast groups, answers `.local` queries and `_services._dns-sd._udp.local`
+browse requests.
 
-Reads from Valkey: `mdns:*`, `config:mdns_*`.
-Never touches the authoritative zone or DNSSEC keys. Runs only on interfaces it
-is explicitly configured for — not implicitly "all interfaces."
+Reads from Valkey: `mdns:*`, `config:mdns_*`, and `zone:*` **read-only**
+(shared records are served over both unicast DNS and mDNS — the pre-split
+behavior). Never writes anything; never touches DNSSEC keys. Runs only on
+interfaces it is explicitly configured for (`config:mdns_interfaces`:
+comma-separated names, or `"all"` as an explicit opt-in) — never implicitly
+all interfaces; it refuses to start unconfigured.
 
 ### `certd` — certificate manager sidecar (network-facing, low trust)
 
@@ -284,7 +289,7 @@ Each namespace has exactly one writer category. Define and enforce this.
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
 | `config:*` | dashboard | dnsd, mdnsd, resolverd, certd | Runtime configuration |
-| `zone:*` | dashboard, certd (challenge TXT only), dnsd (TLSA on cert change) | dnsd | Authoritative records |
+| `zone:*` | dashboard, certd (challenge TXT only), dnsd (TLSA on cert change) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
 | `ddns:*` | dnsd (UPDATE) | dnsd | Dynamic records |
 | `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |
 | `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |

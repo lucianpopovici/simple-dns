@@ -126,24 +126,48 @@ Acceptance
 
 ---
 
-## Step 3 — Split out `mdnsd`  `[ ]`
+## Step 3 — Split out `mdnsd`  `[x]`
 
 Goal: the link-local responder is no longer in the authoritative daemon.
 
 Tasks
-- [ ] New binary `mdnsd`: multicast join (v4/v6), `.local` answers,
+- [x] New binary `mdnsd`: multicast join (v4/v6), `.local` answers,
       `_services._dns-sd._udp.local` browse, reading `mdns:*` + `config:mdns_*`
-- [ ] Restrict to explicitly configured interfaces (no implicit all-interfaces
-      join)
-- [ ] Remove `mdns_*` and multicast socket setup from `dns_server.c`
-- [ ] `mdnsd` links `libdnswire`
-- [ ] `Makefile`: add `mdnsd` target
+      (`mdnsd.c`; also reads `zone:*` read-only — preserves the pre-split
+      "shared records served over both unicast and mDNS" behavior)
+- [x] Restrict to explicitly configured interfaces (no implicit all-interfaces
+      join): `config:mdns_interfaces` = comma-separated names, or "all" to
+      opt in explicitly; unset → mdnsd refuses to start with a clear message
+- [x] Remove `mdns_*` and multicast socket setup from `dns_server.c`
+      (~550 lines; dns_server.c 4595 → 3983). `/mdns/*` mgmt endpoints return
+      410 — record provisioning goes via the dashboard (mdns:* owner), which
+      also removes a namespace-ownership violation (dnsd wrote mdns:*)
+- [x] `mdnsd` links `libdnswire`
+- [x] `Makefile`: `mdnsd` (hardened prod) + `mdnsd_debug` targets
+
+Two pre-existing responder bugs fixed in the move (both verified against the
+old code; query responses were NEVER well-formed before):
+1. `mdns_build_response` reused one offset to parse query questions and write
+   answers, leaving uninitialized garbage between the header and the first
+   answer. Now: pass 1 parses questions, pass 2 appends answers; legacy
+   unicast echoes the question section verbatim (RFC 6762 §6.7).
+2. Legacy unicast answers carried the cache-flush bit (class 0x8001 — parsers
+   reject it) and full TTLs. Now: plain IN class and TTL capped at 10s per
+   RFC 6762 §6.7. (Announcements keep cache-flush — correct for multicast.)
 
 Acceptance
-- [ ] `grep -n 'mdns_\|MDNS_\|IP_ADD_MEMBERSHIP' dns_server.c` returns nothing
-- [ ] `dnsd` joins no multicast groups (verify with `ip maddr` / `netstat -g`)
-- [ ] mDNS discovery still resolves a `.local` service via `mdnsd`
-- [ ] Global exit gate passes
+- [x] `grep -n 'mdns_\|MDNS_\|IP_ADD_MEMBERSHIP' dns_server.c` returns nothing
+- [x] `dnsd` joins no multicast groups (ip maddr membership count for
+      224.0.0.251 identical with dnsd stopped/running; the 3 standing
+      memberships belong to avahi)
+- [x] mDNS discovery still resolves a `.local` service via `mdnsd`
+      (mdns:A answered with correct rdata/class/TTL; `_services._dns-sd._udp
+      .local` browse returns the provisioned service type; 60-query hammer
+      under ASan clean. Note: dig sends ANY over TCP by default — use +notcp;
+      mdnsd is UDP-only by design)
+- [x] Global exit gate passes (all four binaries build clean — dns_server.c
+      warnings 38 → 34, removed code carried them; make check answers;
+      check-dnssec 12/12; check-wire 11/11; no bare strtok)
 
 ---
 

@@ -168,21 +168,6 @@
 #define DNS_TYPE_ANY     255
 #define DNS_TTL_MAX      2147483647u  /* RFC 2181 §8 — 2^31-1 */
 
-/* mDNS (RFC 6762) constants */
-#define MDNS_PORT         5353
-#define MDNS_MCAST4       "224.0.0.251"
-#define MDNS_MCAST6       "ff02::fb"
-#define MDNS_TTL_HOST     120        /* recommended for host records (RFC 6762 §11.3) */
-#define MDNS_TTL_SERVICE  4500       /* recommended for service records */
-#define MDNS_TTL_OTHER    4500       /* other records */
-#define MDNS_PROBE_WAIT   250000     /* 250 ms in µs between probes */
-#define MDNS_PROBE_COUNT  3          /* RFC 6762 §8.1 */
-#define MDNS_QU_BIT       0x8000     /* QU (unicast-response) bit in QTYPE */
-#define MDNS_CACHE_FLUSH  0x8000     /* Cache-flush bit in RRCLASS */
-#define MDNS_MAX_MSG      8192       /* max mDNS message size */
-
-/* DNS-SD (RFC 6763) constants */
-#define DNSSD_SERVICES    "_services._dns-sd._udp.local"
 
 
 #define DNS_CLASS_IN     1
@@ -252,8 +237,6 @@ static uint16_t  g_ksk_ed_tag = 0;
 /* Forward declarations for helpers used before their definitions */
 static void ixfr_journal_append(uint32_t,uint32_t,char,const char*,const char*);
 static void notify_send(void);
-static void mdns_announce(void);
-static int  mdns_build_response(const uint8_t*,int,uint8_t*,int,int);
 /* Wire + Valkey helpers used by early code (multi-zone, NSEC) */
 static int  vk_set(const char*,const char*,uint32_t);
 static int  vk_get(const char*,char*,int);
@@ -403,11 +386,6 @@ static void qlog_open(void){
     pthread_mutex_unlock(&g_qlog_mutex);}
 
 /* mDNS state */
-static int     g_mdns_enabled   = 0;       /* 0 = off, 1 = on */
-static char    g_mdns_hostname[256] = "";   /* e.g. myserver.local */
-static int     g_mdns4_sock     = -1;
-static int     g_mdns6_sock     = -1;
-static pthread_mutex_t g_mdns_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static char   g_tls_cert_pem[MAX_PEM] = "";
 static char   g_tls_key_pem[MAX_PEM]  = "";
@@ -1275,18 +1253,6 @@ static void config_load_from_valkey(void){
     #define GI(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=atoi(val);}while(0)
     #define GU(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=(uint32_t)atol(val);}while(0)
     G("ddns_secret",g_ddns_secret);
-    /* mDNS */
-    if(vk_get("config:mdns_enabled",val,sizeof(val))&&val[0])
-        g_mdns_enabled=atoi(val);
-    if(vk_get("config:mdns_hostname",val,sizeof(val))&&val[0])
-        safe_strcpy(g_mdns_hostname,val,sizeof(g_mdns_hostname));
-    /* Default mdns_hostname to <zone_name without trailing dot> if not set */
-    if(!g_mdns_hostname[0]&&g_zone_name[0]){
-        snprintf(g_mdns_hostname,sizeof(g_mdns_hostname),"%s",g_zone_name);
-        /* ensure .local suffix for mDNS */
-        if(!strstr(g_mdns_hostname,".local"))
-            strncat(g_mdns_hostname,".local",sizeof(g_mdns_hostname)-strlen(g_mdns_hostname)-1);
-    }
     GI("dns_port",g_dns_port);GI("dot_port",g_dot_port);
     GI("http_port",g_http_port);GI("https_port",g_https_port);
     G("soa_mname",g_soa_mname);G("soa_rname",g_soa_rname);
@@ -3464,506 +3430,6 @@ dot_done:
     if(ssl){SSL_shutdown(ssl);SSL_free(ssl);}close(c.fd);return NULL;}
 
 
-/* ==========================================================================
- * mDNS — RFC 6762 Multicast DNS + RFC 6763 DNS-SD (Service Discovery)
- *
- * Architecture:
- *   - Two raw UDP sockets (IPv4 + IPv6) joined to the mDNS multicast groups
- *   - Receive thread: reads multicast queries from all interfaces
- *   - Response: answers with matching records from Valkey (mdns:* and zone:*)
- *   - DNS-SD browsing: synthesises _services._dns-sd._udp.local responses
- *   - Probing: RFC 6762 §8 — sends 3 probe queries before announcing
- *   - Announcements: RFC 6762 §8.3 — sends gratuitous mDNS responses on start
- *
- * Valkey key schemas:
- *   mdns:<TYPE>:<name>         mDNS-only records (not served by unicast DNS)
- *   zone:<TYPE>:<name>         shared records (served by both unicast and mDNS)
- *
- * Record format follows the same convention as zone:* keys.
- *
- * DNS-SD service records (RFC 6763):
- *   mdns:PTR:_http._tcp.local  → 120|myservice._http._tcp.local
- *   mdns:SRV:myservice._http._tcp.local → 120|0|0|80|myserver.local
- *   mdns:TXT:myservice._http._tcp.local → 120|path=/api
- *
- * config:mdns_enabled   "1" to enable (default: 0)
- * config:mdns_hostname  Authoritative .local hostname
- *                       (default: <zone_name>.local)
- * ======================================================================= */
-
-/* ── Wire-format helpers specific to mDNS ─────────────────────────────── */
-
-/* Append a name in DNS wire format to buf[off].  Returns new offset, -1 on overflow. */
-static int mdns_put_name(uint8_t *buf, int off, int blen, const char *name){
-    char tmp[256]; safe_strcpy(tmp,name,sizeof(tmp));
-    /* strip trailing dot */
-    int tl=(int)strlen(tmp);
-    if(tl>0&&tmp[tl-1]=='.') tmp[--tl]=0;
-    char *sp24=NULL;char *lbl=strtok_r(tmp,".",&sp24);
-    while(lbl){
-        int ll=(int)strlen(lbl);
-        if(off+ll+1>=blen) return -1;
-        buf[off++]=(uint8_t)ll;
-        memcpy(buf+off,lbl,ll); off+=ll;
-        lbl=strtok_r(NULL,".",&sp24);
-    }
-    if(off>=blen) return -1;
-    buf[off++]=0;
-    return off;
-}
-
-/* Append a complete RR (no compression).  Returns new offset, -1 on overflow. */
-static int mdns_put_rr(uint8_t *buf, int off, int blen,
-                       const char *name, uint16_t rtype,
-                       uint16_t rclass_flags, /* MDNS_CACHE_FLUSH|DNS_CLASS_IN */
-                       uint32_t ttl,
-                       const uint8_t *rdata, uint16_t rdlen){
-    off=mdns_put_name(buf,off,blen,name);
-    if(off<0||off+10+(int)rdlen>blen) return -1;
-    buf[off++]=rtype>>8;  buf[off++]=rtype&0xFF;
-    buf[off++]=rclass_flags>>8; buf[off++]=rclass_flags&0xFF;
-    buf[off++]=ttl>>24; buf[off++]=(ttl>>16)&0xFF;
-    buf[off++]=(ttl>>8)&0xFF; buf[off++]=ttl&0xFF;
-    buf[off++]=rdlen>>8; buf[off++]=rdlen&0xFF;
-    if(rdlen) memcpy(buf+off,rdata,rdlen);
-    return off+(int)rdlen;
-}
-
-/* Send a raw mDNS message to the multicast group on both IPv4 and IPv6 */
-static void mdns_send(const uint8_t *msg, int len){
-    if(g_mdns4_sock>=0){
-        struct sockaddr_in dst4={0};
-        dst4.sin_family=AF_INET;
-        dst4.sin_port=htons(MDNS_PORT);
-        inet_pton(AF_INET,MDNS_MCAST4,&dst4.sin_addr);
-        sendto(g_mdns4_sock,msg,len,0,(struct sockaddr*)&dst4,sizeof(dst4));
-    }
-    if(g_mdns6_sock>=0){
-        struct sockaddr_in6 dst6={0};
-        dst6.sin6_family=AF_INET6;
-        dst6.sin6_port=htons(MDNS_PORT);
-        inet_pton(AF_INET6,MDNS_MCAST6,&dst6.sin6_addr);
-        sendto(g_mdns6_sock,msg,len,0,(struct sockaddr*)&dst6,sizeof(dst6));
-    }
-}
-
-/* ── DNS-SD service enumeration ─────────────────────────────────────────── */
-
-/*
- * mdns_append_sd_browse — append PTR records for _services._dns-sd._udp.local.
- * Scans Valkey for mdns:PTR:_*._*._*.local keys and returns the unique
- * service types as PTR records.
- */
-static int mdns_append_sd_browse(uint8_t *buf, int off, int blen, int *ancount){
-    pthread_mutex_lock(&g_vk_mutex);
-    if(valkey_ensure(&vk)<0){pthread_mutex_unlock(&g_vk_mutex);return off;}
-    resp_reply_t r;
-    resp_cmd(&vk,&r,2,"KEYS","mdns:PTR:_*");
-    if(r.type==5){
-        for(int i=0;i<r.count;i++){
-            resp_reply_t kr; resp_parse(&vk,&kr);
-            if(kr.type!=2)continue;
-            /* key = "mdns:PTR:<service-instance-or-type>" */
-            const char *svcname=kr.str+9; /* skip "mdns:PTR:" */
-            /* only include pure service type PTRs like "_http._tcp.local" */
-            if(svcname[0]!='_')continue;
-            /* rdata = service type name in wire format */
-            uint8_t rd[256]; int roff=0;
-            roff=name_to_wire(svcname,rd,sizeof(rd));
-            if(roff<0)continue;
-            off=mdns_put_rr(buf,off,blen,DNSSD_SERVICES,
-                            DNS_TYPE_PTR,DNS_CLASS_IN,MDNS_TTL_SERVICE,
-                            rd,(uint16_t)roff);
-            if(off<0){off=0;break;}
-            (*ancount)++;
-        }
-    }
-    pthread_mutex_unlock(&g_vk_mutex);
-    return off;
-}
-
-/* ── Core query answerer ─────────────────────────────────────────────────── */
-
-/*
- * mdns_lookup_records — find records for qname/qtype in both
- * mdns:TYPE:name and zone:TYPE:name Valkey keys.
- * Appends matching RRs to buf and increments *ancount.
- * Returns new offset, or original off on failure.
- */
-static int mdns_lookup_records(uint8_t *buf, int off, int blen,
-                               const char *qname, uint16_t qtype,
-                               int *ancount){
-    uint16_t types_to_check[16]; int ntypes=0;
-    if(qtype==DNS_TYPE_ANY){
-        uint16_t all[]={DNS_TYPE_A,DNS_TYPE_AAAA,DNS_TYPE_PTR,DNS_TYPE_SRV,
-                        DNS_TYPE_TXT,DNS_TYPE_CNAME,0};
-        for(int i=0;all[i];i++) types_to_check[ntypes++]=all[i];
-    } else {
-        types_to_check[ntypes++]=qtype;
-    }
-    for(int ti=0;ti<ntypes;ti++){
-        uint16_t qt=types_to_check[ti];
-        const char *tname=type2str(qt);
-        /* Try mdns:TYPE:name first, then zone:TYPE:name */
-        const char *prefixes[2]={"mdns:","zone:"};
-        for(int pi=0;pi<2;pi++){
-            char vkey[600];
-            snprintf(vkey,sizeof(vkey),"%s%s:%s",prefixes[pi],tname,qname);
-            char val[512];
-            if(!vk_get(vkey,val,sizeof(val)))continue;
-            /* Parse ttl|value */
-            uint32_t ttl=MDNS_TTL_OTHER;
-            char *pipe=strchr(val,'|');
-            char *vptr=val;
-            if(pipe){ttl=(uint32_t)atoi(val);vptr=pipe+1;}
-            uint8_t rd[512]; uint16_t rdlen=0;
-            switch(qt){
-            case DNS_TYPE_A:{
-                struct in_addr a4;
-                char *sp25=NULL;char *ip=strtok_r(vptr,"|",&sp25);
-                while(ip){
-                    if(inet_pton(AF_INET,ip,&a4)==1){
-                        memcpy(rd,&a4,4); rdlen=4;
-                        uint16_t cls=DNS_CLASS_IN|MDNS_CACHE_FLUSH;
-                        off=mdns_put_rr(buf,off,blen,qname,DNS_TYPE_A,cls,ttl,rd,rdlen);
-                        if(off<0)goto done;
-                        (*ancount)++;
-                    }
-                    ip=strtok_r(NULL,"|",&sp25);}
-                rdlen=0; /* already appended per-IP */
-                break;}
-            case DNS_TYPE_AAAA:{
-                struct in6_addr a6;
-                char *sp26=NULL;char *ip=strtok_r(vptr,"|",&sp26);
-                while(ip){
-                    if(inet_pton(AF_INET6,ip,&a6)==1){
-                        memcpy(rd,&a6,16); rdlen=16;
-                        uint16_t cls=DNS_CLASS_IN|MDNS_CACHE_FLUSH;
-                        off=mdns_put_rr(buf,off,blen,qname,DNS_TYPE_AAAA,cls,ttl,rd,rdlen);
-                        if(off<0)goto done;
-                        (*ancount)++;
-                    }
-                    ip=strtok_r(NULL,"|",&sp26);}
-                rdlen=0;
-                break;}
-            case DNS_TYPE_PTR:{
-                /* PTR: rdata = target name in wire format */
-                int n=name_to_wire(vptr,rd,sizeof(rd));
-                if(n<0)continue; rdlen=(uint16_t)n;
-                break;}
-            case DNS_TYPE_SRV:{
-                /* ttl|priority|weight|port|target */
-                uint16_t prio=0,weight=0,port=0; char target[256]="";
-                char *sp27=NULL;char *tok=strtok_r(vptr,"|",&sp27); if(tok)prio=(uint16_t)atoi(tok);
-                tok=strtok_r(NULL,"|",&sp27); if(tok)weight=(uint16_t)atoi(tok);
-                tok=strtok_r(NULL,"|",&sp27); if(tok)port=(uint16_t)atoi(tok);
-                tok=strtok_r(NULL,"|",&sp27); if(tok)safe_strcpy(target,tok,sizeof(target));
-                rd[0]=prio>>8; rd[1]=prio&0xFF;
-                rd[2]=weight>>8; rd[3]=weight&0xFF;
-                rd[4]=port>>8; rd[5]=port&0xFF;
-                int n=name_to_wire(target,rd+6,sizeof(rd)-6);
-                if(n<0)continue; rdlen=(uint16_t)(6+n);
-                break;}
-            case DNS_TYPE_TXT:{
-                int tl=txt_encode(vptr,rd,(int)sizeof(rd));
-                if(tl<0)continue;rdlen=(uint16_t)tl;
-                break;}
-            case DNS_TYPE_CNAME:{
-                int n=name_to_wire(vptr,rd,sizeof(rd));
-                if(n<0)continue; rdlen=(uint16_t)n;
-                break;}
-            default: continue;}
-            if(rdlen>0){
-                uint16_t cls=DNS_CLASS_IN|MDNS_CACHE_FLUSH;
-                off=mdns_put_rr(buf,off,blen,qname,qt,cls,ttl,rd,rdlen);
-                if(off<0)goto done;
-                (*ancount)++;
-            }
-        }
-    }
-done:
-    if(off<0){dns_log(LOG_DEBUG,"[mDNS] Response truncated for %s\n",qname);off=0;}
-    return off;
-}
-
-/*
- * mdns_build_response — build a mDNS response packet for an incoming query.
- * Only answers questions about .local names we are authoritative for.
- * Returns response length (0 = no answer, nothing to send).
- */
-static int mdns_build_response(const uint8_t *query, int qlen,
-                                uint8_t *resp, int resp_len,
-                                int is_legacy_unicast){
-    if(qlen<12) return 0;
-    const dns_hdr_t *qh=(const dns_hdr_t*)query;
-    /* Ignore non-query or responses */
-    if(ntohs(qh->flags)&DNS_QR) return 0;
-    int qdcount=ntohs(qh->qdcount);
-    if(qdcount==0||qdcount>10) return 0;
-
-    memset(resp,0,12);
-    dns_hdr_t *rh=(dns_hdr_t*)resp;
-    /* RFC 6762 §18: QR=1, AA=1, opcode=0 */
-    rh->flags=htons(DNS_QR|DNS_AA);
-    rh->id=is_legacy_unicast?qh->id:0; /* mDNS responses have id=0 */
-
-    int off=12; int ancount=0;
-
-    for(int qi=0;qi<qdcount;qi++){
-        char qname[256]={0};
-        int after=name_from_wire(query,qlen,off,qname,sizeof(qname));
-        if(after<0||after+3>=qlen) break;
-        uint16_t qtype=get16(query,after);
-        uint16_t qclass=get16(query,after+2)&0x7FFF; /* mask QU bit */
-        off=after+4;
-
-        /* Only answer IN class queries */
-        if(qclass!=DNS_CLASS_IN&&qclass!=DNS_CLASS_ANY) continue;
-        /* Only answer .local questions */
-        int nl=(int)strlen(qname);
-        int is_local=(nl>=6&&strcasecmp(qname+nl-6,".local")==0)
-                     ||(nl==5&&strcasecmp(qname,"local")==0);
-        if(!is_local) continue;
-
-        /* Special: _services._dns-sd._udp.local (RFC 6763 §9) */
-        if(strcasecmp(qname,DNSSD_SERVICES)==0){
-            off=mdns_append_sd_browse(resp,off,resp_len,&ancount);
-            if(off<=0){off=12;ancount=0;}
-            continue;
-        }
-
-        /* Regular record lookup */
-        int new_off=mdns_lookup_records(resp,off,resp_len,qname,qtype,&ancount);
-        if(new_off>0) off=new_off;
-    }
-
-    if(ancount==0) return 0;
-    rh->ancount=htons((uint16_t)ancount);
-    return off;
-}
-
-/* ── Probe & Announce ───────────────────────────────────────────────────── */
-
-/*
- * mdns_probe — RFC 6762 §8.1
- * Send 3 probe queries for our hostname before claiming it.
- * Each probe asks "does anyone else have records for g_mdns_hostname?"
- * We wait 250 ms between probes.
- */
-static void mdns_probe(void){
-    if(!g_mdns_hostname[0]) return;
-    dns_log(LOG_NOTICE,"[mDNS] Probing for %s\n",g_mdns_hostname);
-    for(int i=0;i<MDNS_PROBE_COUNT;i++){
-        uint8_t pkt[256]; int off=12;
-        memset(pkt,0,12);
-        dns_hdr_t *h=(dns_hdr_t*)pkt;
-        h->id=0; h->qdcount=htons(1);
-        /* question: <hostname> ANY IN */
-        off=mdns_put_name(pkt,off,sizeof(pkt),g_mdns_hostname);
-        if(off>0){
-            put16(pkt,off,DNS_TYPE_ANY);  off+=2;
-            put16(pkt,off,DNS_CLASS_IN);  off+=2;
-            mdns_send(pkt,off);
-        }
-        usleep(MDNS_PROBE_WAIT);
-    }
-    dns_log(LOG_NOTICE,"[mDNS] Probe complete — claiming %s\n",g_mdns_hostname);
-}
-
-/*
- * mdns_announce — RFC 6762 §8.3
- * Send unsolicited (gratuitous) mDNS responses for all our records.
- * Called after probing and whenever records change.
- */
-static void mdns_announce(void){
-    if(!g_mdns_enabled) return;
-    uint8_t pkt[MDNS_MAX_MSG]; int off=12; int ancount=0;
-    memset(pkt,0,12);
-    dns_hdr_t *h=(dns_hdr_t*)pkt;
-    h->id=0; h->flags=htons(DNS_QR|DNS_AA);
-
-    /* Announce all mdns:* and zone:* records */
-    const char *patterns[2]={"mdns:*","zone:A:*"};
-    for(int pi=0;pi<2;pi++){
-        pthread_mutex_lock(&g_vk_mutex);
-        if(valkey_ensure(&vk)<0){pthread_mutex_unlock(&g_vk_mutex);continue;}
-        resp_reply_t r;
-        resp_cmd(&vk,&r,2,"KEYS",patterns[pi]);
-        if(r.type==5){
-            for(int i=0;i<r.count;i++){
-                resp_reply_t kr; resp_parse(&vk,&kr);
-                if(kr.type!=2)continue;
-                /* parse key: prefix:TYPE:name */
-                char kbuf[512]; safe_strcpy(kbuf,kr.str,sizeof(kbuf));
-                char *p1=strchr(kbuf,':'); if(!p1)continue; *p1++=0;
-                char *p2=strchr(p1,':');   if(!p2)continue; *p2++=0;
-                char *tname=p1, *rname=p2;
-                uint16_t rt=str2type(tname); if(!rt)continue;
-                resp_reply_t vr; resp_cmd(&vk,&vr,2,"GET",kr.str);
-                if(vr.type!=2)continue;
-                char *vptr=vr.str;
-                uint32_t ttl=MDNS_TTL_OTHER;
-                char *pipe=strchr(vptr,'|');
-                if(pipe){ttl=(uint32_t)atoi(vptr);vptr=pipe+1;}
-                uint8_t rd[256]; uint16_t rdlen=0;
-                switch(rt){
-                case DNS_TYPE_A:{struct in_addr a4;if(inet_pton(AF_INET,vptr,&a4)==1){memcpy(rd,&a4,4);rdlen=4;}break;}
-                case DNS_TYPE_AAAA:{struct in6_addr a6;if(inet_pton(AF_INET6,vptr,&a6)==1){memcpy(rd,&a6,16);rdlen=16;}break;}
-                case DNS_TYPE_PTR:{int n=name_to_wire(vptr,rd,sizeof(rd));if(n>0)rdlen=(uint16_t)n;break;}
-                case DNS_TYPE_SRV:{uint16_t pr=0,wt=0,po=0;char tg[256]="";
-                    char *sp28=NULL;char *tok=strtok_r(vptr,"|",&sp28);if(tok)pr=(uint16_t)atoi(tok);
-                    tok=strtok_r(NULL,"|",&sp28);if(tok)wt=(uint16_t)atoi(tok);
-                    tok=strtok_r(NULL,"|",&sp28);if(tok)po=(uint16_t)atoi(tok);
-                    tok=strtok_r(NULL,"|",&sp28);if(tok)safe_strcpy(tg,tok,sizeof(tg));
-                    rd[0]=pr>>8;rd[1]=pr&0xFF;rd[2]=wt>>8;rd[3]=wt&0xFF;rd[4]=po>>8;rd[5]=po&0xFF;
-                    int n=name_to_wire(tg,rd+6,sizeof(rd)-6);if(n>0)rdlen=(uint16_t)(6+n);break;}
-                case DNS_TYPE_TXT:{int tl=txt_encode(vptr,rd,(int)sizeof(rd));if(tl<0)break;rdlen=(uint16_t)tl;break;}
-                default: break;}
-                if(rdlen){
-                    int no=mdns_put_rr(pkt,off,sizeof(pkt),rname,rt,
-                                       DNS_CLASS_IN|MDNS_CACHE_FLUSH,ttl,rd,rdlen);
-                    if(no>0){off=no;ancount++;}
-                }
-            }
-        }
-        pthread_mutex_unlock(&g_vk_mutex);
-    }
-    if(ancount>0){
-        h->ancount=htons((uint16_t)ancount);
-        mdns_send(pkt,off);
-        dns_log(LOG_NOTICE,"[mDNS] Announced %d records for %s\n",ancount,g_mdns_hostname);
-    }
-}
-
-/* ── Socket setup ───────────────────────────────────────────────────────── */
-
-/*
- * mdns_open_socket — create a UDP socket for mDNS on the given AF.
- * Joins the mDNS multicast group on all available interfaces.
- */
-static int mdns_open_socket(int af){
-    int fd=socket(af,SOCK_DGRAM,IPPROTO_UDP);
-    if(fd<0){dns_log(LOG_ERR,"[mDNS] socket(%d) failed: %s\n",af,strerror(errno));return -1;}
-    int opt=1;
-    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-#ifdef SO_REUSEPORT
-    setsockopt(fd,SOL_SOCKET,SO_REUSEPORT,&opt,sizeof(opt));
-#endif
-    if(af==AF_INET){
-        struct sockaddr_in sa={0};
-        sa.sin_family=AF_INET;
-        sa.sin_port=htons(MDNS_PORT);
-        sa.sin_addr.s_addr=INADDR_ANY;
-        if(bind(fd,(struct sockaddr*)&sa,sizeof(sa))<0){
-            dns_log(LOG_ERR,"[mDNS] bind IPv4 failed: %s\n",strerror(errno));
-            close(fd);return -1;}
-        /* Set multicast TTL=255 (RFC 6762 §11) */
-        uint8_t ttl=255; setsockopt(fd,IPPROTO_IP,IP_MULTICAST_TTL,&ttl,sizeof(ttl));
-        /* Loopback for local testing */
-        uint8_t loop=1; setsockopt(fd,IPPROTO_IP,IP_MULTICAST_LOOP,&loop,sizeof(loop));
-        /* Join multicast group on all interfaces */
-        struct ifaddrs *ifa=NULL; getifaddrs(&ifa);
-        for(struct ifaddrs *i=ifa;i;i=i->ifa_next){
-            if(!i->ifa_addr||i->ifa_addr->sa_family!=AF_INET) continue;
-            if(!(i->ifa_flags&IFF_MULTICAST)) continue;
-            struct ip_mreq mr={0};
-            inet_pton(AF_INET,MDNS_MCAST4,&mr.imr_multiaddr);
-            mr.imr_interface=((struct sockaddr_in*)i->ifa_addr)->sin_addr;
-            if(setsockopt(fd,IPPROTO_IP,IP_ADD_MEMBERSHIP,&mr,sizeof(mr))==0)
-                dns_log(LOG_NOTICE,"[mDNS] Joined %s on %s\n",MDNS_MCAST4,i->ifa_name);
-        }
-        if(ifa)freeifaddrs(ifa);
-    } else {
-        struct sockaddr_in6 sa6={0};
-        sa6.sin6_family=AF_INET6;
-        sa6.sin6_port=htons(MDNS_PORT);
-        if(bind(fd,(struct sockaddr*)&sa6,sizeof(sa6))<0){
-            dns_log(LOG_ERR,"[mDNS] bind IPv6 failed: %s\n",strerror(errno));
-            close(fd);return -1;}
-        int ttl=255; setsockopt(fd,IPPROTO_IPV6,IPV6_MULTICAST_HOPS,&ttl,sizeof(ttl));
-        int loop=1; setsockopt(fd,IPPROTO_IPV6,IPV6_MULTICAST_LOOP,&loop,sizeof(loop));
-        /* Join on all multicast-capable interfaces */
-        struct ifaddrs *ifa=NULL; getifaddrs(&ifa);
-        for(struct ifaddrs *i=ifa;i;i=i->ifa_next){
-            if(!i->ifa_addr||i->ifa_addr->sa_family!=AF_INET6) continue;
-            if(!(i->ifa_flags&IFF_MULTICAST)) continue;
-            struct ipv6_mreq mr6={0};
-            inet_pton(AF_INET6,MDNS_MCAST6,&mr6.ipv6mr_multiaddr);
-            mr6.ipv6mr_interface=if_nametoindex(i->ifa_name);
-            if(setsockopt(fd,IPPROTO_IPV6,IPV6_ADD_MEMBERSHIP,&mr6,sizeof(mr6))==0)
-                dns_log(LOG_NOTICE,"[mDNS] Joined %s on %s\n",MDNS_MCAST6,i->ifa_name);
-        }
-        if(ifa)freeifaddrs(ifa);
-    }
-    return fd;
-}
-
-/* ── Receive thread ─────────────────────────────────────────────────────── */
-
-typedef struct { int fd4; int fd6; } mdns_recv_args_t;
-
-static void *mdns_recv_thread(void *arg){
-    mdns_recv_args_t *a=(mdns_recv_args_t*)arg;
-    int fd4=a->fd4, fd6=a->fd6; free(a);
-
-    for(;;){
-        fd_set fds; FD_ZERO(&fds);
-        if(fd4>=0) FD_SET(fd4,&fds);
-        if(fd6>=0) FD_SET(fd6,&fds);
-        int maxfd=(fd4>fd6?fd4:fd6);
-        struct timeval tv={.tv_sec=5};
-        int r=select(maxfd+1,&fds,NULL,NULL,&tv);
-        if(r<=0) continue;
-
-        int socks[2]={fd4,fd6};
-        int afs[2]={AF_INET,AF_INET6};
-        for(int si=0;si<2;si++){
-            int fd=socks[si]; int af=afs[si];
-            if(fd<0||!FD_ISSET(fd,&fds)) continue;
-
-            uint8_t pkt[MDNS_MAX_MSG];
-            union {
-                struct sockaddr_in  v4;
-                struct sockaddr_in6 v6;
-            } src;
-            socklen_t srclen=sizeof(src);
-            ssize_t n=recvfrom(fd,pkt,sizeof(pkt),0,(struct sockaddr*)&src,&srclen);
-            if(n<12) continue;
-
-            /* Determine if this is a legacy unicast query (not from port 5353) */
-            int is_legacy=0;
-            if(af==AF_INET)
-                is_legacy=(ntohs(src.v4.sin_port)!=MDNS_PORT);
-            else
-                is_legacy=(ntohs(src.v6.sin6_port)!=MDNS_PORT);
-
-            uint8_t resp[MDNS_MAX_MSG];
-            int rlen=mdns_build_response(pkt,(int)n,resp,sizeof(resp),is_legacy);
-            if(rlen<=0) continue;
-
-            char src_str[64]="?";
-            if(af==AF_INET)
-                inet_ntop(AF_INET,&src.v4.sin_addr,src_str,sizeof(src_str));
-            else
-                inet_ntop(AF_INET6,&src.v6.sin6_addr,src_str,sizeof(src_str));
-            dns_log(LOG_DEBUG,"[mDNS] Query from %s → %d-byte response\n",src_str,rlen);
-
-            if(is_legacy){
-                /* Legacy unicast: respond directly to querier */
-                sendto(fd,resp,rlen,0,(struct sockaddr*)&src,srclen);
-            } else {
-                /* Standard mDNS: multicast the response (RFC 6762 §6) */
-                /* Small random delay 20-120ms to reduce collisions */
-                usleep(20000+(rand()%100000));
-                mdns_send(resp,rlen);
-            }
-        }
-    }
-    return NULL;
-}
-
-/* ── Management API: /mdns/announce and /mdns/records ───────────────────── */
-/*  Handled inside handle_api below */
 
 
 /* pki_spki_sha256 — SHA-256 of SubjectPublicKeyInfo (for TLSA 3 1 1) */
@@ -4204,41 +3670,10 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
      * the whole embedded API goes away in Step 4. */
     if(is_mgmt&&(!strcmp(path,"/acme/issue")||!strcmp(path,"/pki/est"))){
         api_send(fd,ssl,410,"moved to certd: run 'certd --once'\n");return;}
-    if(is_mgmt&&!strcmp(path,"/mdns/announce")){
-        mdns_announce();
-        api_send(fd,ssl,200,"mdns announced\n");return;}
-    if(is_mgmt&&!strcmp(path,"/mdns/records")&&!strcasecmp(method,"GET")){
-        /* List all mdns:* keys */
-        char body[HTTP_BUF];int bp=0;
-        bp+=snprintf(body+bp,sizeof(body)-bp,"mDNS records (mdns:* + zone:*):\n");
-        pthread_mutex_lock(&g_vk_mutex);
-        if(valkey_ensure(&vk)>=0){
-            resp_reply_t rr;resp_cmd(&vk,&rr,2,"KEYS","mdns:*");
-            if(rr.type==5){for(int i=0;i<rr.count&&bp<(int)sizeof(body)-256;i++){
-                resp_reply_t kr;resp_parse(&vk,&kr);if(kr.type!=2)continue;
-                resp_reply_t vr2;resp_cmd(&vk,&vr2,2,"GET",kr.str);
-                bp+=snprintf(body+bp,sizeof(body)-bp,"  %-50s = %s\n",kr.str,vr2.str);}}}
-        pthread_mutex_unlock(&g_vk_mutex);
-        api_send(fd,ssl,200,body);return;}
-    if(is_mgmt&&!strcmp(path,"/mdns/records")&&!strcasecmp(method,"POST")){
-        /* Provision an mDNS-only record: body: name=N&type=T&value=V[&ttl=N] */
-        char *bdy=strstr(buf,"\r\n\r\n");if(!bdy){api_send(fd,ssl,400,"no body\n");return;}bdy+=4;
-        char mname[256]={0},mtype[16]={0},mval[512]={0},mttls[16]={0};
-        qs_get(bdy,"name",mname,sizeof(mname));strlower(mname);
-        qs_get(bdy,"type",mtype,sizeof(mtype));
-        qs_get(bdy,"value",mval,sizeof(mval));
-        qs_get(bdy,"ttl",mttls,sizeof(mttls));
-        if(!mname[0]||!mtype[0]||!mval[0]){api_send(fd,ssl,400,"missing name/type/value\n");return;}
-        uint16_t mrt=str2type(mtype);
-        if(!mrt){api_send(fd,ssl,400,"unknown type\n");return;}
-        uint32_t mttl=mttls[0]?(uint32_t)atoi(mttls):MDNS_TTL_OTHER;
-        char mkey[512],mvval[1024];
-        snprintf(mkey,sizeof(mkey),"mdns:%s:%s",type2str(mrt),mname);
-        snprintf(mvval,sizeof(mvval),"%u|%s",mttl,mval);
-        vk_set(mkey,mvval,0);
-        mdns_announce();
-        char rb[256];snprintf(rb,sizeof(rb),"ok: %s\n",mkey);
-        api_send(fd,ssl,201,rb);return;}
+    /* mDNS moved to the mdnsd daemon (migration Step 3): mdns:* records are
+     * provisioned via the dashboard/Valkey (the namespace's writer). */
+    if(is_mgmt&&(!strcmp(path,"/mdns/announce")||!strcmp(path,"/mdns/records"))){
+        api_send(fd,ssl,410,"moved to mdnsd; provision mdns:* via dashboard\n");return;}
     if(is_mgmt&&!strcmp(path,"/pki/cacerts")){
         api_send(fd,ssl,410,"moved to certd\n");return;}
     if(is_mgmt&&!strcmp(path,"/zone/notify")){notify_send();api_send(fd,ssl,200,"notified\n");return;}
@@ -4315,28 +3750,9 @@ int main(int argc,char **argv){
      else
          dns_log(LOG_ERR,"[TLS] Failed to start cert:current watcher\n");}
 
-    /* Phase 6: Open mDNS sockets (before unicast sockets) */
-    if(g_mdns_enabled){
-        g_mdns4_sock=mdns_open_socket(AF_INET);
-        g_mdns6_sock=mdns_open_socket(AF_INET6);
-        if(g_mdns4_sock>=0||g_mdns6_sock>=0){
-            mdns_probe();
-            mdns_recv_args_t *ra=malloc(sizeof(mdns_recv_args_t));
-            if(ra){
-                ra->fd4=g_mdns4_sock; ra->fd6=g_mdns6_sock;
-                pthread_t mtid;
-                pthread_create(&mtid,NULL,mdns_recv_thread,ra);
-                pthread_detach(mtid);
-            }
-            mdns_announce();
-            dns_log(LOG_NOTICE,"[mDNS] Enabled: %s  IPv4=%s  IPv6=%s\n",
-                g_mdns_hostname,
-                g_mdns4_sock>=0?"up":"down",
-                g_mdns6_sock>=0?"up":"down");
-        }
-    }
+    /* (mDNS moved to the mdnsd daemon — migration Step 3.) */
 
-    /* Phase 6b: Open unicast DNS sockets — dual-stack IPv4 + IPv6 */
+    /* Phase 6: Open unicast DNS sockets — dual-stack IPv4 + IPv6 */
     int opt=1;
     /* IPv6 dual-stack */
     int dns6_sock=-1, dot6_sock=-1, tcp_dns_sock=-1;
@@ -4405,8 +3821,6 @@ int main(int argc,char **argv){
     dns_log(LOG_INFO,"║  HTTP DDNS + /list + /update               :%d                   ║\n",g_http_port);
     dns_log(LOG_INFO,"║  HTTPS mTLS management API                 :%d  %s           ║\n",g_https_port,g_mgmt_ctx?"mTLS":"----");
     dns_log(LOG_INFO,"║  Valkey                                     %s:%d          ║\n",g_valkey_host,g_valkey_port);
-    if(g_mdns_enabled)
-    dns_log(LOG_INFO,"║  mDNS  224.0.0.251+ff02::fb:5353   %-20s    ║\n",g_mdns_hostname);
     dns_log(LOG_INFO,"║  Zone                                       %-20s       ║\n",g_zone_name);
     dns_log(LOG_INFO,"║  DNSSEC ZSK P-256 tag                       %-6u                 ║\n",g_zsk_tag);
     dns_log(LOG_INFO,"║  DNSSEC ZSK P-256   tag                     %-6u (signs records)  ║\n",g_zsk_tag);
@@ -4431,10 +3845,6 @@ int main(int argc,char **argv){
     dns_log(LOG_INFO,"  POST /acme/issue  (mgmt) — ACME certificate\n");
     dns_log(LOG_INFO,"  POST /pki/est     (mgmt) — EST enrollment\n");
     dns_log(LOG_INFO,"  GET  /pki/cacerts (mgmt) — Fetch EST CA chain\n");
-    if(g_mdns_enabled){
-    dns_log(LOG_INFO,"  POST /mdns/announce   (mgmt) — Re-announce all mDNS records\n");
-    dns_log(LOG_INFO,"  GET  /mdns/records    (mgmt) — List mDNS records\n");
-    dns_log(LOG_INFO,"  POST /mdns/records    (mgmt) — Provision mDNS-only record\n");}
     dns_log(LOG_INFO,"\n");
 
     for(;;){
@@ -4562,8 +3972,6 @@ int main(int argc,char **argv){
     if(tcp_dns_sock>=0)close(tcp_dns_sock);
     if(dns6_sock>=0)close(dns6_sock);
     if(dot6_sock>=0)close(dot6_sock);
-    if(g_mdns4_sock>=0)close(g_mdns4_sock);
-    if(g_mdns6_sock>=0)close(g_mdns6_sock);
     if(vk.fd>=0)close(vk.fd);
     if(g_dot_ctx)SSL_CTX_free(g_dot_ctx);if(g_mgmt_ctx)SSL_CTX_free(g_mgmt_ctx);
     if(g_zsk)EVP_PKEY_free(g_zsk);if(g_zsk_ed)EVP_PKEY_free(g_zsk_ed);
