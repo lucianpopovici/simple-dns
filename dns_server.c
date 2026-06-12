@@ -120,9 +120,6 @@
 #define DEFAULT_TTL         60
 #define DEFAULT_NEG_TTL     300
 #define DNSSEC_SIG_VALIDITY (7*86400)
-#define ACME_CA_PROD        "https://acme-v02.api.letsencrypt.org/directory"
-#define ACME_CA_STAGING     "https://acme-staging-v02.api.letsencrypt.org/directory"
-#define ACME_RENEW_DAYS     30
 #define MAX_PEM             65536
 #define BUF_SIZE            4096     /* enlarged for EDNS/AXFR */
 #define HTTP_BUF            16384
@@ -254,8 +251,6 @@ static uint16_t  g_ksk_ed_tag = 0;
 
 /* Forward declarations for helpers used before their definitions */
 static void ixfr_journal_append(uint32_t,uint32_t,char,const char*,const char*);
-static int  acme_issue(void);
-static int  acme_needs_renewal(void);
 static void notify_send(void);
 static void mdns_announce(void);
 static int  mdns_build_response(const uint8_t*,int,uint8_t*,int,int);
@@ -368,25 +363,12 @@ static int    g_dot_port     = DOT_PORT_DEFAULT;
 static int    g_http_port    = HTTP_PORT_DEFAULT;
 static int    g_https_port   = HTTPS_PORT_DEFAULT;
 static char   g_ddns_secret[256]  = "changeme";
-static char   g_acme_domain[256]  = "";
-static char   g_acme_email[256]   = "";
-static char   g_acme_ca[512]      = ACME_CA_PROD;
 /* RRL configuration (rate limiting) */
 static int g_rrl_enabled = 0;
 static int g_rrl_rate    = 5;  /* max responses/window */
 static int g_rrl_window  = 1;  /* window in seconds */
 static int g_rrl_slip    = 2;  /* send TC every slip-th excess response */
 
-/* ACME mTLS client identity (for private CA ACME servers that require it) */
-static char   g_acme_client_cert_pem[MAX_PEM] = "";
-static char   g_acme_client_key_pem[MAX_PEM]  = "";
-static char   g_acme_ca_pem[MAX_PEM]          = "";
-/* EST (RFC 7030) configuration */
-static char   g_est_server[512]               = "";
-static char   g_est_domain[256]               = "";
-static char   g_est_client_cert_pem[MAX_PEM]  = "";
-static char   g_est_client_key_pem[MAX_PEM]   = "";
-static char   g_est_ca_pem[MAX_PEM]           = "";
 /* Structured query log */
 static char    g_query_log_path[512] = "";  /* "" = disabled */
 static FILE   *g_query_log_fp   = NULL;
@@ -858,12 +840,6 @@ static EVP_PKEY *g_zsk_ed = NULL;
 static uint16_t  g_zsk_ed_tag = 0;
 
 /* ACME state */
-static EVP_PKEY *g_acme_key = NULL;
-static char g_acme_account_url[512]  = "";
-static char g_acme_dir_newnonce[512] = "";
-static char g_acme_dir_newacct[512]  = "";
-static char g_acme_dir_neworder[512] = "";
-static char g_acme_nonce[256]        = "";
 
 /* Mutexes */
 static pthread_mutex_t g_vk_mutex   = PTHREAD_MUTEX_INITIALIZER;
@@ -950,13 +926,6 @@ static void sha1(const uint8_t *in,int n,uint8_t out[20]){
     EVP_DigestInit_ex(ctx,EVP_sha1(),NULL);EVP_DigestUpdate(ctx,in,n);
     EVP_DigestFinal_ex(ctx,out,&dl);EVP_MD_CTX_free(ctx);}
 
-static int json_str(const char *j,const char *key,char *out,int olen){
-    char nd[256];snprintf(nd,sizeof(nd),"\"%s\"",key);
-    const char *p=strstr(j,nd);if(!p)return 0;p+=strlen(nd);
-    while(*p==' '||*p==':'||*p=='\t'||*p=='\n')p++;
-    if(*p!='"')return 0;p++;int i=0;
-    while(*p&&*p!='"'&&i<olen-1){if(*p=='\\'&&p[1])p++;out[i++]=*p++;}
-    out[i]=0;return 1;}
 
 /* ==========================================================================
  * SipHash-2-4 for DNS Cookies (RFC 9018)
@@ -1305,15 +1274,7 @@ static void config_load_from_valkey(void){
     #define G(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])safe_strcpy(d,val,sizeof(d));}while(0)
     #define GI(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=atoi(val);}while(0)
     #define GU(k,d) do{if(vk_get("config:"k,val,sizeof(val))&&val[0])d=(uint32_t)atol(val);}while(0)
-    G("ddns_secret",g_ddns_secret);G("acme_domain",g_acme_domain);
-    G("acme_email",g_acme_email);G("acme_ca",g_acme_ca);
-    vk_get("config:acme_client_cert_pem",g_acme_client_cert_pem,sizeof(g_acme_client_cert_pem));
-    vk_get("config:acme_client_key_pem", g_acme_client_key_pem, sizeof(g_acme_client_key_pem));
-    vk_get("config:acme_ca_pem",         g_acme_ca_pem,         sizeof(g_acme_ca_pem));
-    G("est_server",g_est_server); G("est_domain",g_est_domain);
-    vk_get("config:est_client_cert_pem", g_est_client_cert_pem, sizeof(g_est_client_cert_pem));
-    vk_get("config:est_client_key_pem",  g_est_client_key_pem,  sizeof(g_est_client_key_pem));
-    vk_get("config:est_ca_pem",          g_est_ca_pem,          sizeof(g_est_ca_pem));
+    G("ddns_secret",g_ddns_secret);
     /* mDNS */
     if(vk_get("config:mdns_enabled",val,sizeof(val))&&val[0])
         g_mdns_enabled=atoi(val);
@@ -1366,7 +1327,6 @@ static void config_load_from_valkey(void){
     vk_get("config:tls_cert_pem",g_tls_cert_pem,sizeof(g_tls_cert_pem));
     vk_get("config:tls_key_pem",g_tls_key_pem,sizeof(g_tls_key_pem));
     vk_get("config:mtls_ca_pem",g_mtls_ca_pem,sizeof(g_mtls_ca_pem));
-    vk_get("acme:account_url",g_acme_account_url,sizeof(g_acme_account_url));
     /* Local syslog config */
     if(vk_get("config:syslog_enabled",val,sizeof(val))&&val[0])
         g_syslog_enabled = atoi(val);
@@ -1534,12 +1494,56 @@ static int cert_current_split(const char *blob,char *cert_out,size_t cert_sz,
     cert_out[pre+post]=0;
     if(!strstr(cert_out,"-----BEGIN CERTIFICATE-----"))return -1;
     return 0;}
+/* Publish TLSA 3 1 1 for _443._tcp.<name> and _853._tcp.<name>, bump the
+ * SOA serial and NOTIFY secondaries. This is dnsd's half of issuance: certd
+ * writes cert:current only; the zone is dnsd's to write (ownership table).
+ * The name comes from the certificate itself (first SAN dNSName, else CN),
+ * so dnsd needs no knowledge of the ACME/EST configuration. */
+static int pki_spki_sha256(X509 *cert, uint8_t out[32]);
+static uint32_t serial_bump(void);
+static void cert_publish_tlsa(const char *cert_pem){
+    BIO *b=BIO_new_mem_buf(cert_pem,-1);
+    X509 *cert=PEM_read_bio_X509(b,NULL,NULL,NULL);BIO_free(b);
+    if(!cert)return;
+    char domain[256]="";
+    GENERAL_NAMES *sans=X509_get_ext_d2i(cert,NID_subject_alt_name,NULL,NULL);
+    if(sans){
+        for(int i=0;i<sk_GENERAL_NAME_num(sans);i++){
+            GENERAL_NAME *gn=sk_GENERAL_NAME_value(sans,i);
+            if(gn->type==GEN_DNS){
+                const unsigned char *dn=ASN1_STRING_get0_data(gn->d.dNSName);
+                int dl=ASN1_STRING_length(gn->d.dNSName);
+                if(dl>0&&dl<(int)sizeof(domain)){memcpy(domain,dn,dl);domain[dl]=0;break;}}}
+        GENERAL_NAMES_free(sans);}
+    if(!domain[0])
+        X509_NAME_get_text_by_NID(X509_get_subject_name(cert),NID_commonName,
+                                  domain,sizeof(domain));
+    uint8_t h[32];
+    if(domain[0]&&pki_spki_sha256(cert,h)){
+        /* Lowercase only the owner name. The old cert_post_issue lowercased
+         * the whole key ("zone:tlsa:…"), which the lookup path — keyed
+         * "zone:TLSA:<qname>" via type2str — could never match. */
+        strlower(domain);
+        char hex[65];hex_enc(h,32,hex);
+        char tkey[600],tval[128];
+        snprintf(tval,sizeof(tval),"3600|3|1|1|%s",hex);
+        snprintf(tkey,sizeof(tkey),"zone:TLSA:_443._tcp.%s",domain);
+        vk_set(tkey,tval,0);
+        snprintf(tkey,sizeof(tkey),"zone:TLSA:_853._tcp.%s",domain);
+        vk_set(tkey,tval,0);
+        dns_log(LOG_NOTICE,"[PKI] TLSA 3 1 1 published for %s\n",domain);
+        serial_bump();notify_send();}
+    X509_free(cert);}
 static void *cert_watch_thread(void *arg){(void)arg;
     static char last[MAX_PEM];           /* static: keep worker stacks small */
     static char cur[MAX_PEM],cert[MAX_PEM],key[MAX_PEM];
     last[0]=0;
+    int first=1;
     for(;;){
-        sleep(CERT_WATCH_INTERVAL);
+        /* First pass runs immediately so a cert:current written while dnsd
+         * was down is picked up at boot, not one interval later. */
+        if(!first)sleep(CERT_WATCH_INTERVAL);
+        first=0;
         cur[0]=0;
         if(!vk_get("cert:current",cur,sizeof(cur)))continue;
         if(!cur[0]||strcmp(cur,last)==0)continue;
@@ -1552,7 +1556,8 @@ static void *cert_watch_thread(void *arg){(void)arg;
         safe_strcpy(g_tls_key_pem,key,sizeof(g_tls_key_pem));
         safe_strcpy(last,cur,sizeof(last));
         dns_log(LOG_NOTICE,"[TLS] cert:current changed — hot-reloading\n");
-        tls_reload();}
+        tls_reload();
+        cert_publish_tlsa(cert);}
     return NULL;}
 
 /* ==========================================================================
@@ -3960,174 +3965,6 @@ static void *mdns_recv_thread(void *arg){
 /* ── Management API: /mdns/announce and /mdns/records ───────────────────── */
 /*  Handled inside handle_api below */
 
-/* ==========================================================================
- * HTTPS client with optional mTLS client certificate support
- * ======================================================================= */
-static char *https_req_mtls(const char *host,int port,
-                            const char *method,const char *path,
-                            const char *body,
-                            const char *client_cert_pem,
-                            const char *client_key_pem,
-                            const char *server_ca_pem,
-                            const char *content_type,
-                            int *code,char *resp_hdrs,int hl){
-    char portstr[8];snprintf(portstr,sizeof(portstr),"%d",port);
-    struct addrinfo hints={0},*res;hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(host,portstr,&hints,&res)!=0)return NULL;
-    int fd=socket(res->ai_family,res->ai_socktype,0);
-    if(fd<0){freeaddrinfo(res);return NULL;}
-    struct timeval tv={.tv_sec=20};
-    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
-    if(connect(fd,res->ai_addr,res->ai_addrlen)!=0){close(fd);freeaddrinfo(res);return NULL;}
-    freeaddrinfo(res);
-    SSL_CTX *cctx=SSL_CTX_new(TLS_client_method());
-    if(!cctx){close(fd);return NULL;}
-    if(server_ca_pem&&server_ca_pem[0]){
-        X509_STORE *st=SSL_CTX_get_cert_store(cctx);
-        BIO *bca=BIO_new_mem_buf(server_ca_pem,-1);X509 *cx;
-        while((cx=PEM_read_bio_X509(bca,NULL,NULL,NULL))!=NULL){X509_STORE_add_cert(st,cx);X509_free(cx);}
-        BIO_free(bca);
-        SSL_CTX_set_verify(cctx,SSL_VERIFY_PEER,NULL);
-    } else { SSL_CTX_set_default_verify_paths(cctx); }
-    if(client_cert_pem&&client_cert_pem[0]&&client_key_pem&&client_key_pem[0]){
-        BIO *bc=BIO_new_mem_buf(client_cert_pem,-1);
-        X509 *cc=PEM_read_bio_X509_AUX(bc,NULL,NULL,NULL);
-        if(cc){SSL_CTX_use_certificate(cctx,cc);X509_free(cc);}
-        X509 *ci;while((ci=PEM_read_bio_X509(bc,NULL,NULL,NULL))!=NULL)
-            SSL_CTX_add_extra_chain_cert(cctx,ci);
-        BIO_free(bc);
-        BIO *bk=BIO_new_mem_buf(client_key_pem,-1);
-        EVP_PKEY *ck=PEM_read_bio_PrivateKey(bk,NULL,NULL,NULL);BIO_free(bk);
-        if(ck){SSL_CTX_use_PrivateKey(cctx,ck);EVP_PKEY_free(ck);}
-        if(!SSL_CTX_check_private_key(cctx)){
-            dns_log(LOG_ERR,"[PKI] mTLS cert/key mismatch\n");
-            SSL_CTX_free(cctx);close(fd);return NULL;}
-    }
-    SSL *ssl=SSL_new(cctx);SSL_set_fd(ssl,fd);
-    SSL_set_tlsext_host_name(ssl,host);
-    if(SSL_connect(ssl)<=0){
-        dns_log(LOG_ERR,"[PKI] TLS handshake to %s:%d failed\n",host,port);
-        SSL_free(ssl);SSL_CTX_free(cctx);close(fd);return NULL;}
-    char req[HTTP_BUF];int rp=0;
-    rp+=snprintf(req+rp,sizeof(req)-rp,
-        "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: dns-server/2.0\r\nAccept: */*\r\n",
-        method,path,host);
-    if(body){
-        const char *ct=content_type?content_type:"application/jose+json";
-        rp+=snprintf(req+rp,sizeof(req)-rp,
-            "Content-Type: %s\r\nContent-Length: %zu\r\n\r\n%s",ct,strlen(body),body);
-    } else { rp+=snprintf(req+rp,sizeof(req)-rp,"Connection: close\r\n\r\n"); }
-    SSL_write(ssl,req,rp);
-    char *rbuf=malloc(HTTP_BUF);if(!rbuf){SSL_shutdown(ssl);SSL_free(ssl);SSL_CTX_free(cctx);close(fd);return NULL;}
-    int rtotal=0,cap=HTTP_BUF;
-    for(;;){if(rtotal>=cap-1){char *nbuf=realloc(rbuf,cap*2);
-        if(!nbuf){break;}rbuf=nbuf;cap*=2;}
-        int n=SSL_read(ssl,rbuf+rtotal,cap-rtotal-1);if(n<=0)break;rtotal+=n;}
-    rbuf[rtotal]=0;SSL_shutdown(ssl);SSL_free(ssl);SSL_CTX_free(cctx);close(fd);
-    *code=0;sscanf(rbuf,"HTTP/1.%*c %d",code);
-    char *sep=strstr(rbuf,"\r\n\r\n");
-    if(!sep){free(rbuf);return NULL;}
-    if(resp_hdrs&&hl>0){int nn=(int)(sep-rbuf);if(nn>=hl)nn=hl-1;memcpy(resp_hdrs,rbuf,nn);resp_hdrs[nn]=0;}
-    char *ret=strdup(sep+4);free(rbuf);
-    if(!ret)return NULL;
-    return ret;}
-
-static char *https_req(const char *host,int port,const char *method,const char *path,
-                       const char *body,int *code,char *resp_hdrs,int hl){
-    return https_req_mtls(host,port,method,path,body,NULL,NULL,NULL,NULL,code,resp_hdrs,hl);}
-static int hdr_val(const char *h,const char *k,char *out,int olen){
-    char nd[256];snprintf(nd,sizeof(nd),"%s:",k);const char *p=strcasestr(h,nd);if(!p)return 0;
-    p+=strlen(nd);while(*p==' ')p++;int i=0;while(*p&&*p!='\r'&&*p!='\n'&&i<olen-1)out[i++]=*p++;out[i]=0;return 1;}
-static void parse_url(const char *url,char *host,int *port,char *path,int plen){
-    *port=443;strcpy(path,"/");const char *p=url;
-    if(strncmp(p,"https://",8)==0)p+=8;else if(strncmp(p,"http://",7)==0){p+=7;*port=80;}
-    const char *sl=strchr(p,'/');int hl=sl?(int)(sl-p):(int)strlen(p);
-    memcpy(host,p,hl);host[hl]=0;if(sl)safe_strcpy(path,sl,plen);
-    char *col=strchr(host,':');if(col){*port=atoi(col+1);*col=0;}}
-static void acme_jwk(EVP_PKEY *k,char *out,int olen){
-    uint8_t xy[64];if(!ec_pub_xy(k,xy)){snprintf(out,olen,"{}");return;}
-    char xb[64],yb[64];b64url_enc(xy,32,xb,sizeof(xb));b64url_enc(xy+32,32,yb,sizeof(yb));
-    snprintf(out,olen,"{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"%s\",\"y\":\"%s\"}",xb,yb);}
-static void acme_thumbprint(EVP_PKEY *k,char *out,int olen){
-    char jwk[512];acme_jwk(k,jwk,sizeof(jwk));
-    uint8_t h32[32];sha256((uint8_t*)jwk,strlen(jwk),h32);b64url_enc(h32,32,out,olen);}
-static char *acme_jws(EVP_PKEY *key,const char *url,const char *nonce,const char *payload){
-    char hj[1024];
-    if(g_acme_account_url[0])snprintf(hj,sizeof(hj),"{\"alg\":\"ES256\",\"nonce\":\"%s\",\"url\":\"%s\",\"kid\":\"%s\"}",nonce,url,g_acme_account_url);
-    else{char jwk[512];acme_jwk(key,jwk,sizeof(jwk));snprintf(hj,sizeof(hj),"{\"alg\":\"ES256\",\"nonce\":\"%s\",\"url\":\"%s\",\"jwk\":%s}",nonce,url,jwk);}
-    char hb[1024],pb[4096];b64url_enc((uint8_t*)hj,strlen(hj),hb,sizeof(hb));
-    if(payload)b64url_enc((uint8_t*)payload,strlen(payload),pb,sizeof(pb));else strcpy(pb,"");
-    char si[8192];snprintf(si,sizeof(si),"%s.%s",hb,pb);
-    EVP_MD_CTX *mc=EVP_MD_CTX_new();EVP_DigestSignInit(mc,NULL,EVP_sha256(),NULL,key);
-    EVP_DigestSignUpdate(mc,si,strlen(si));size_t sl=0;EVP_DigestSignFinal(mc,NULL,&sl);
-    if(sl==0){EVP_MD_CTX_free(mc);char *jws=malloc(16);if(jws)strcpy(jws,"{}");return jws;}
-    uint8_t *der=malloc(sl);
-    if(!der){EVP_MD_CTX_free(mc);return NULL;}
-    EVP_DigestSignFinal(mc,der,&sl);EVP_MD_CTX_free(mc);
-    uint8_t raw[64];ecdsa_der_to_raw(der,sl,raw);free(der);
-    char sb[256];b64url_enc(raw,64,sb,sizeof(sb));
-    char *jws=malloc(HTTP_BUF);if(!jws)return NULL;snprintf(jws,HTTP_BUF,"{\"protected\":\"%s\",\"payload\":\"%s\",\"signature\":\"%s\"}",hb,pb,sb);
-    return jws;}
-static int acme_nonce_fetch(const char *host,int port){
-    char hdrs[4096]={0};int code=0;char h2[256];int p2;char path[512];
-    parse_url(g_acme_dir_newnonce,h2,&p2,path,sizeof(path));
-    char *body=https_req(host,port,"HEAD",path,NULL,&code,hdrs,sizeof(hdrs));free(body);
-    hdr_val(hdrs,"Replay-Nonce",g_acme_nonce,sizeof(g_acme_nonce));return g_acme_nonce[0]?0:-1;}
-static char *acme_post(const char *url,const char *payload,const char *host,int port,
-                       int *code,char *rh,int hl){
-    acme_nonce_fetch(host,port);char *jws=acme_jws(g_acme_key,url,g_acme_nonce,payload);
-    char uh[256];int up;char upath[512];parse_url(url,uh,&up,upath,sizeof(upath));
-    char *body=https_req_mtls(uh,up,"POST",upath,jws,
-        g_acme_client_cert_pem[0]?g_acme_client_cert_pem:NULL,
-        g_acme_client_key_pem[0] ?g_acme_client_key_pem :NULL,
-        g_acme_ca_pem[0]         ?g_acme_ca_pem         :NULL,
-        NULL,code,rh,hl);
-    free(jws);
-    hdr_val(rh,"Replay-Nonce",g_acme_nonce,sizeof(g_acme_nonce));return body;}
-static int acme_directory(const char *host,int port){
-    char path[512];int p2;char h2[256];parse_url(g_acme_ca,h2,&p2,path,sizeof(path));
-    char hdrs[4096]={0};int code=0;
-    char *body=https_req_mtls(h2,p2,"GET",path,NULL,
-        g_acme_client_cert_pem[0]?g_acme_client_cert_pem:NULL,
-        g_acme_client_key_pem[0] ?g_acme_client_key_pem :NULL,
-        g_acme_ca_pem[0]         ?g_acme_ca_pem         :NULL,
-        NULL,&code,hdrs,sizeof(hdrs));
-    if(!body||code!=200){free(body);return -1;}
-    json_str(body,"newNonce",g_acme_dir_newnonce,sizeof(g_acme_dir_newnonce));
-    json_str(body,"newAccount",g_acme_dir_newacct,sizeof(g_acme_dir_newacct));
-    json_str(body,"newOrder",g_acme_dir_neworder,sizeof(g_acme_dir_neworder));
-    free(body);dns_log(LOG_NOTICE,"[ACME] Directory OK\n");(void)host;(void)port;return 0;}
-
-/* ==========================================================================
- * Shared PKI helpers: CSR generation, SPKI hash, post-issuance actions
- * ======================================================================= */
-
-/* make_csr_der — PKCS#10 DER with CN=domain and DNS SAN.
- * Returns malloc'd DER bytes (*derlen bytes), sets *dkout to the new key.
- * Both outputs must be freed by caller. Returns NULL on error. */
-static uint8_t *make_csr_der(const char *domain, EVP_PKEY **dkout, int *derlen){
-    EVP_PKEY_CTX *kctx=EVP_PKEY_CTX_new_id(EVP_PKEY_EC,NULL);
-    EVP_PKEY_keygen_init(kctx);
-    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx,NID_X9_62_prime256v1);
-    EVP_PKEY *dk=NULL; EVP_PKEY_keygen(kctx,&dk); EVP_PKEY_CTX_free(kctx);
-    if(!dk){*dkout=NULL;return NULL;} *dkout=dk;
-    X509_REQ *req=X509_REQ_new(); X509_REQ_set_pubkey(req,dk);
-    X509_NAME *nm=X509_REQ_get_subject_name(req);
-    X509_NAME_add_entry_by_txt(nm,"CN",MBSTRING_ASC,(unsigned char*)domain,-1,-1,0);
-    STACK_OF(X509_EXTENSION)*exts=sk_X509_EXTENSION_new_null();
-    char san[512]; snprintf(san,sizeof(san),"DNS:%s",domain);
-    X509_EXTENSION *ext=X509V3_EXT_conf_nid(NULL,NULL,NID_subject_alt_name,san);
-    if(ext)sk_X509_EXTENSION_push(exts,ext);
-    X509_REQ_add_extensions(req,exts);
-    sk_X509_EXTENSION_pop_free(exts,X509_EXTENSION_free);
-    X509_REQ_sign(req,dk,EVP_sha256());
-    int n=i2d_X509_REQ(req,NULL);
-    if(n<=0){X509_REQ_free(req);EVP_PKEY_free(dk);*dkout=NULL;return NULL;}
-    uint8_t *der=malloc((size_t)n);
-    if(!der){X509_REQ_free(req);EVP_PKEY_free(dk);*dkout=NULL;return NULL;}
-    uint8_t *p=der; i2d_X509_REQ(req,(unsigned char**)&p); X509_REQ_free(req);
-    *derlen=n; return der;}
 
 /* pki_spki_sha256 — SHA-256 of SubjectPublicKeyInfo (for TLSA 3 1 1) */
 static int pki_spki_sha256(X509 *cert, uint8_t out[32]){
@@ -4136,313 +3973,6 @@ static int pki_spki_sha256(X509 *cert, uint8_t out[32]){
     if(n<=0)return 0;
     SHA256(spki,(size_t)n,out); OPENSSL_free(spki); return 1;}
 
-/* cert_post_issue — shared actions after any PKI method issues a certificate:
- *   1. Store PEM in Valkey (config:tls_cert_pem / config:tls_key_pem)
- *   2. Hot-reload TLS contexts (no restart required)
- *   3. Publish TLSA 3 1 1 for _443._tcp.<domain> and _853._tcp.<domain>
- *   4. Send NOTIFY to secondaries */
-static void cert_post_issue(const char *domain,
-                            const char *cert_pem,
-                            const char *key_pem){
-    vk_set("config:tls_cert_pem",cert_pem,0);
-    vk_set("config:tls_key_pem", key_pem, 0);
-    safe_strcpy(g_tls_cert_pem,cert_pem,sizeof(g_tls_cert_pem));
-    safe_strcpy(g_tls_key_pem,key_pem,sizeof(g_tls_key_pem));
-    dns_log(LOG_NOTICE,"[PKI] Certificate stored in Valkey for %s\n",domain);
-    tls_reload();
-    /* TLSA */
-    BIO *b=BIO_new_mem_buf(cert_pem,-1);
-    X509 *cert=PEM_read_bio_X509(b,NULL,NULL,NULL); BIO_free(b);
-    if(cert){
-        uint8_t h[32]; char hex[65];
-        if(pki_spki_sha256(cert,h)){
-            hex_enc(h,32,hex);
-            char tkey[600],tval[128];
-            snprintf(tval,sizeof(tval),"3600|3|1|1|%s",hex);
-            snprintf(tkey,sizeof(tkey),"zone:TLSA:_443._tcp.%s",domain); strlower(tkey);
-            vk_set(tkey,tval,0);
-            snprintf(tkey,sizeof(tkey),"zone:TLSA:_853._tcp.%s",domain); strlower(tkey);
-            vk_set(tkey,tval,0);
-            dns_log(LOG_NOTICE,"[PKI] TLSA 3 1 1 published for %s\n",domain);
-            serial_bump(); notify_send();
-        }
-        X509_free(cert);
-    }
-}
-
-/* ==========================================================================
- * EST client — RFC 7030 Enrollment over Secure Transport
- *
- * config:est_server           EST base URL (https://pki.example.com)
- * config:est_domain           CN/SAN for the certificate (defaults to acme_domain)
- * config:est_client_cert_pem  Client cert PEM for mTLS authentication
- * config:est_client_key_pem   Client key PEM
- * config:est_ca_pem           CA PEM to verify the EST server (empty = system store)
- *
- * Endpoints used:
- *   GET  /.well-known/est/cacerts        CA certificate chain (PKCS#7 certs-only)
- *   POST /.well-known/est/simpleenroll   Initial enrollment
- *   POST /.well-known/est/simplereenroll Renewal using existing cert as identity
- * ======================================================================= */
-
-/* est_pkcs7_to_pem — extract certificates from a PKCS#7 certs-only blob.
- * Input may be raw DER, base64-DER, or PEM-armoured PKCS#7.
- * Returns malloc'd PEM chain string, or NULL. */
-static char *est_pkcs7_to_pem(const char *body, int blen){
-    /* Try PEM first */
-    PKCS7 *p7=NULL;
-    if(blen>5 && body[0]=='-'){
-        BIO *bp=BIO_new_mem_buf(body,blen);
-        p7=PEM_read_bio_PKCS7(bp,NULL,NULL,NULL); BIO_free(bp);}
-    if(!p7){
-        /* Strip whitespace and base64-decode */
-        char *stripped=malloc(blen+1); if(!stripped)return NULL;
-        int si=0;
-        for(int i=0;i<blen;i++)
-            if(body[i]!='\n'&&body[i]!='\r'&&body[i]!=' ') stripped[si++]=body[i];
-        stripped[si]=0;
-        uint8_t *der=malloc(si+4); int derlen=0;
-        if(der){derlen=b64std_dec(stripped,(uint8_t*)der,si+4);}
-        free(stripped);
-        if(der&&derlen>0){
-            const unsigned char *pp=(const unsigned char*)der;
-            p7=d2i_PKCS7(NULL,&pp,(long)derlen);}
-        free(der);}
-    if(!p7){dns_log(LOG_ERR,"[EST] Failed to parse PKCS#7\n");return NULL;}
-    STACK_OF(X509)*certs=NULL;
-    if(PKCS7_type_is_signed(p7))         certs=p7->d.sign->cert;
-    else if(PKCS7_type_is_signedAndEnveloped(p7)) certs=p7->d.signed_and_enveloped->cert;
-    if(!certs||sk_X509_num(certs)==0){
-        PKCS7_free(p7);
-        dns_log(LOG_ERR,"[EST] No certificates in PKCS#7\n"); return NULL;}
-    BIO *pb=BIO_new(BIO_s_mem());
-    for(int i=0;i<sk_X509_num(certs);i++)
-        PEM_write_bio_X509(pb,sk_X509_value(certs,i));
-    PKCS7_free(p7);
-    char *ptr; long plen=BIO_get_mem_data(pb,&ptr);
-    char *result=NULL;
-    if(plen>0){result=malloc(plen+1);if(result){memcpy(result,ptr,plen);result[plen]=0;}}
-    BIO_free(pb); return result;}
-
-/* est_cacerts — GET /.well-known/est/cacerts, returns PEM chain or NULL */
-static char *est_cacerts(const char *host,int port,
-                         const char *cc,const char *ck,const char *ca){
-    int code=0;
-    char *body=https_req_mtls(host,port,"GET","/.well-known/est/cacerts",
-                              NULL,cc,ck,ca,NULL,&code,NULL,0);
-    if(!body||code!=200){
-        dns_log(LOG_ERR,"[EST] cacerts failed HTTP %d\n",code);
-        free(body); return NULL;}
-    char *pem=est_pkcs7_to_pem(body,(int)strlen(body)); free(body); return pem;}
-
-/* est_enroll — POST CSR to simpleenroll or simplereenroll.
- * Returns PEM cert chain and sets *key_pem_out (both caller-freed). */
-static char *est_enroll(const char *host,int port,const char *domain,
-                        const char *op,
-                        const char *cc,const char *ck,const char *ca,
-                        char **key_pem_out){
-    EVP_PKEY *dk=NULL; int derlen=0;
-    uint8_t *csr=make_csr_der(domain,&dk,&derlen);
-    if(!csr){dns_log(LOG_ERR,"[EST] CSR generation failed\n");return NULL;}
-    /* Standard base64 (RFC 7030 requires non-URL-safe base64) */
-    int b64sz=(derlen/3+1)*4+2;
-    char *b64=malloc(b64sz);
-    if(!b64){free(csr);EVP_PKEY_free(dk);return NULL;}
-    b64url_enc(csr,derlen,b64,b64sz); free(csr);
-    for(char *p=b64;*p;p++){if(*p=='-')*p='+'; else if(*p=='_')*p='/';}
-    char path[128]; snprintf(path,sizeof(path),"/.well-known/est/%s",op);
-    int code=0; char rhdrs[2048]={0};
-    dns_log(LOG_NOTICE,"[EST] Submitting CSR to %s:%d%s for %s\n",host,port,path,domain);
-    char *body=https_req_mtls(host,port,"POST",path,b64,cc,ck,ca,
-                              "application/pkcs10",&code,rhdrs,sizeof(rhdrs));
-    free(b64);
-    if(code==202){
-        char ra[16]={0}; hdr_val(rhdrs,"Retry-After",ra,sizeof(ra));
-        int delay=ra[0]?atoi(ra):30; if(delay>120)delay=120;
-        dns_log(LOG_NOTICE,"[EST] Deferred — retrying in %ds\n",delay);
-        free(body); sleep(delay);
-        int b64bsz=(derlen/3+1)*4+2;
-        char *b64b=malloc(b64bsz);
-        if(b64b){
-            uint8_t *csr2=make_csr_der(domain,&dk,&derlen);
-            if(csr2){
-                b64url_enc(csr2,derlen,b64b,b64bsz); free(csr2);
-                for(char *p=b64b;*p;p++){if(*p=='-')*p='+';else if(*p=='_')*p='/';}
-                body=https_req_mtls(host,port,"POST",path,b64b,cc,ck,ca,
-                                    "application/pkcs10",&code,NULL,0);
-            } free(b64b);}
-    }
-    if(!body||(code!=200&&code!=201)){
-        dns_log(LOG_ERR,"[EST] Enrollment failed HTTP %d\n",code);
-        free(body); EVP_PKEY_free(dk); return NULL;}
-    char *cert_pem=est_pkcs7_to_pem(body,(int)strlen(body)); free(body);
-    if(!cert_pem){EVP_PKEY_free(dk);return NULL;}
-    BIO *kb=BIO_new(BIO_s_mem());
-    PEM_write_bio_PrivateKey(kb,dk,NULL,NULL,0,NULL,NULL);
-    char *kptr; long klen=BIO_get_mem_data(kb,&kptr);
-    char *key_pem=NULL;
-    if(klen>0){key_pem=malloc(klen+1);if(key_pem){memcpy(key_pem,kptr,klen);key_pem[klen]=0;}}
-    BIO_free(kb); EVP_PKEY_free(dk);
-    if(!key_pem){free(cert_pem);return NULL;}
-    *key_pem_out=key_pem;
-    dns_log(LOG_NOTICE,"[EST] Certificate issued for %s\n",domain);
-    return cert_pem;}
-
-/* est_issue — top-level EST entry point */
-static int est_issue(void){
-    if(!g_est_server[0])return -1;
-    const char *domain=g_est_domain[0]?g_est_domain:g_acme_domain;
-    if(!domain[0]){dns_log(LOG_ERR,"[EST] No domain configured\n");return -1;}
-    char host[256]=""; int port=443; char path[512];
-    parse_url(g_est_server,host,&port,path,sizeof(path));
-    const char *cc=g_est_client_cert_pem[0]?g_est_client_cert_pem:NULL;
-    const char *ck=g_est_client_key_pem[0] ?g_est_client_key_pem :NULL;
-    const char *ca=g_est_ca_pem[0]         ?g_est_ca_pem         :NULL;
-    const char *op=g_tls_cert_pem[0]?"simplereenroll":"simpleenroll";
-    /* Re-enrollment: use existing server cert as mTLS identity if no EST client cert */
-    if(!cc&&g_tls_cert_pem[0]&&g_tls_key_pem[0]){
-        cc=g_tls_cert_pem; ck=g_tls_key_pem;
-        dns_log(LOG_NOTICE,"[EST] Using server cert as mTLS identity for re-enrollment\n");}
-    char *key_pem=NULL;
-    char *cert_pem=est_enroll(host,port,domain,op,cc,ck,ca,&key_pem);
-    if(!cert_pem)return -1;
-    cert_post_issue(domain,cert_pem,key_pem);
-    free(cert_pem); free(key_pem); return 0;}
-
-static int est_needs_renewal(void){
-    if(!g_est_server[0])return 0;
-    if(!g_tls_cert_pem[0])return 1;
-    BIO *b=BIO_new_mem_buf(g_tls_cert_pem,-1);
-    X509 *cert=PEM_read_bio_X509(b,NULL,NULL,NULL); BIO_free(b);
-    if(!cert)return 1;
-    int days=0,secs=0;
-    ASN1_TIME_diff(&days,&secs,NULL,X509_get0_notAfter(cert));
-    X509_free(cert); return days<ACME_RENEW_DAYS;}
-
-/* pki_renewal_thread — unified renewal: EST first, ACME fallback */
-static void *pki_renewal_thread(void *arg){
-    (void)arg; sleep(5); /* short delay so DNS sockets are open before first ACME attempt */
-    for(;;){
-        if(est_needs_renewal()||acme_needs_renewal()){
-            dns_log(LOG_WARNING,"[PKI] Certificate renewal needed\n");
-            int ok=-1;
-            if(g_est_server[0]){
-                dns_log(LOG_NOTICE,"[PKI] Trying EST renewal\n");
-                ok=est_issue();
-                if(ok<0)dns_log(LOG_WARNING,"[PKI] EST failed, trying ACME\n");}
-            if(ok<0&&g_acme_domain[0]){
-                dns_log(LOG_NOTICE,"[PKI] Trying ACME renewal\n");
-                ok=acme_issue();}
-            if(ok<0)dns_log(LOG_ERR,"[PKI] All renewal methods failed\n");}
-        sleep(86400);}
-    return NULL;}
-
-static char *acme_gen_csr(const char *domain,EVP_PKEY **dkout){
-    EVP_PKEY_CTX *kctx=EVP_PKEY_CTX_new_id(EVP_PKEY_EC,NULL);
-    EVP_PKEY_keygen_init(kctx);EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx,NID_X9_62_prime256v1);
-    EVP_PKEY *dk=NULL;EVP_PKEY_keygen(kctx,&dk);EVP_PKEY_CTX_free(kctx);*dkout=dk;
-    X509_REQ *req=X509_REQ_new();X509_REQ_set_pubkey(req,dk);
-    X509_NAME *nm=X509_REQ_get_subject_name(req);
-    X509_NAME_add_entry_by_txt(nm,"CN",MBSTRING_ASC,(unsigned char*)domain,-1,-1,0);
-    STACK_OF(X509_EXTENSION)*exts=sk_X509_EXTENSION_new_null();
-    char san[512];snprintf(san,sizeof(san),"DNS:%s",domain);
-    X509_EXTENSION *ext=X509V3_EXT_conf_nid(NULL,NULL,NID_subject_alt_name,san);
-    if(ext)sk_X509_EXTENSION_push(exts,ext);
-    X509_REQ_add_extensions(req,exts);sk_X509_EXTENSION_pop_free(exts,X509_EXTENSION_free);
-    X509_REQ_sign(req,dk,EVP_sha256());
-    int csrlen=i2d_X509_REQ(req,NULL);
-    if(csrlen<=0){X509_REQ_free(req);EVP_PKEY_free(dk);*dkout=NULL;return NULL;}
-    uint8_t *cder=malloc((size_t)csrlen);
-    if(!cder){X509_REQ_free(req);EVP_PKEY_free(dk);*dkout=NULL;return NULL;}
-    uint8_t *p=cder;
-    i2d_X509_REQ(req,(unsigned char**)&p);X509_REQ_free(req);
-    char *cb64=malloc((size_t)csrlen*2+4);
-    if(!cb64){free(cder);EVP_PKEY_free(dk);*dkout=NULL;return NULL;}
-    b64url_enc(cder,csrlen,cb64,(int)((size_t)csrlen*2+4));free(cder);return cb64;}
-static int acme_issue(void){
-    if(!g_acme_domain[0])return 0;
-    dns_log(LOG_NOTICE,"[ACME] Requesting cert for %s\n",g_acme_domain);
-    char achost[256];int acport=443;char acpath[512];parse_url(g_acme_ca,achost,&acport,acpath,sizeof(acpath));
-    if(!g_acme_key){
-        char pem[MAX_PEM]={0};
-        if(vk_get("acme:account_key",pem,sizeof(pem))&&strlen(pem)>10){
-            BIO *b=BIO_new_mem_buf(pem,-1);g_acme_key=PEM_read_bio_PrivateKey(b,NULL,NULL,NULL);BIO_free(b);}
-        if(!g_acme_key){
-            EVP_PKEY_CTX *kctx=EVP_PKEY_CTX_new_id(EVP_PKEY_EC,NULL);
-            EVP_PKEY_keygen_init(kctx);EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx,NID_X9_62_prime256v1);
-            EVP_PKEY_keygen(kctx,&g_acme_key);EVP_PKEY_CTX_free(kctx);
-            BIO *b=BIO_new(BIO_s_mem());PEM_write_bio_PrivateKey(b,g_acme_key,NULL,NULL,0,NULL,NULL);
-            char *pp;long pl=BIO_get_mem_data(b,&pp);char p2[MAX_PEM];int nn=(int)(pl<MAX_PEM-1?pl:MAX_PEM-1);
-            memcpy(p2,pp,nn);p2[nn]=0;vk_set("acme:account_key",p2,0);BIO_free(b);}}
-    if(acme_directory(achost,acport)<0){dns_log(LOG_ERR,"[ACME] Directory failed\n");return -1;}
-    if(!g_acme_account_url[0]){
-        char pay[512];snprintf(pay,sizeof(pay),"{\"termsOfServiceAgreed\":true,\"contact\":[\"mailto:%s\"]}",g_acme_email[0]?g_acme_email:"admin@example.com");
-        char hdrs[4096]={0};int code=0;char *body=acme_post(g_acme_dir_newacct,pay,achost,acport,&code,hdrs,sizeof(hdrs));
-        free(body);hdr_val(hdrs,"Location",g_acme_account_url,sizeof(g_acme_account_url));
-        if(g_acme_account_url[0]){vk_set("acme:account_url",g_acme_account_url,0);dns_log(LOG_NOTICE,"[ACME] Account: %s\n",g_acme_account_url);}}
-    char pay[512];snprintf(pay,sizeof(pay),"{\"identifiers\":[{\"type\":\"dns\",\"value\":\"%s\"}]}",g_acme_domain);
-    char ord_hdrs[4096]={0};int code=0;
-    char *ord_body=acme_post(g_acme_dir_neworder,pay,achost,acport,&code,ord_hdrs,sizeof(ord_hdrs));
-    if(!ord_body||code<200||code>=300){dns_log(LOG_ERR,"[ACME] newOrder failed %d\n",code);free(ord_body);return -1;}
-    char order_url[512]={0};hdr_val(ord_hdrs,"Location",order_url,sizeof(order_url));
-    char authz_url[512]={0};
-    {char *p=strstr(ord_body,"authorizations");if(p){p=strchr(p,'[');if(p){p=strchr(p,'"');
-        if(p){p++;int i=0;while(*p&&*p!='"'&&i<(int)sizeof(authz_url)-1)authz_url[i++]=*p++;authz_url[i]=0;}}}}
-    char finalize_url[512]={0};json_str(ord_body,"finalize",finalize_url,sizeof(finalize_url));free(ord_body);
-    char ah[256];int ap=443;char apath[512];parse_url(authz_url,ah,&ap,apath,sizeof(apath));
-    char azh[4096]={0};char *az_body=acme_post(authz_url,NULL,ah,ap,&code,azh,sizeof(azh));
-    if(!az_body){dns_log(LOG_ERR,"[ACME] authz failed\n");return -1;}
-    char ch_tok[256]={0},ch_url[512]={0};
-    {char *p=az_body;while((p=strstr(p,"\"dns-01\""))!=NULL){
-        char *obj=p-300;if(obj<az_body)obj=az_body;
-        char tok2[256]={0},uv[512]={0};json_str(obj,"token",tok2,sizeof(tok2));json_str(obj,"url",uv,sizeof(uv));
-        if(tok2[0]&&uv[0]){safe_strcpy(ch_tok,tok2,sizeof(ch_tok));safe_strcpy(ch_url,uv,sizeof(ch_url));}p+=8;break;}}
-    free(az_body);if(!ch_tok[0]){dns_log(LOG_ERR,"[ACME] No dns-01 challenge\n");return -1;}
-    char thumb[256];acme_thumbprint(g_acme_key,thumb,sizeof(thumb));
-    char kauth[512];snprintf(kauth,sizeof(kauth),"%s.%s",ch_tok,thumb);
-    uint8_t h32[32];sha256((uint8_t*)kauth,strlen(kauth),h32);
-    char dns01val[256];b64url_enc(h32,32,dns01val,sizeof(dns01val));
-    dns_log(LOG_NOTICE,"[ACME] DNS-01 TXT: %s\n",dns01val);
-    char acme_name[512];snprintf(acme_name,sizeof(acme_name),"_acme-challenge.%s",g_acme_domain);strlower(acme_name);
-    char acme_val[512];snprintf(acme_val,sizeof(acme_val),"120|%s",dns01val);
-    char acme_vk[512];snprintf(acme_vk,sizeof(acme_vk),"zone:TXT:%s",acme_name);
-    vk_set(acme_vk,acme_val,0);dns_log(LOG_NOTICE,"[ACME] TXT %s set — waiting 5s\n",acme_name);sleep(5);
-    char ch_hdrs[4096]={0};char *ch_body=acme_post(ch_url,"{}",achost,acport,&code,ch_hdrs,sizeof(ch_hdrs));
-    free(ch_body);if(code<200||code>=300){vk_del(acme_vk);return -1;}
-    dns_log(LOG_NOTICE,"[ACME] Polling authz (up to 3min)\n");int validated=0;
-    for(int i=0;i<30;i++){sleep(6);char ph[4096]={0};char *pb=acme_post(authz_url,NULL,ah,ap,&code,ph,sizeof(ph));
-        if(!pb){dns_log(LOG_DEBUG,"[ACME] Polling authz...\n");continue;}
-        char status[64]={0};json_str(pb,"status",status,sizeof(status));free(pb);
-        dns_log(LOG_INFO,"[ACME] authz status: %s\n",status);if(!strcmp(status,"valid")){validated=1;break;}
-        if(!strcmp(status,"invalid"))break;}
-    vk_del(acme_vk);dns_log(LOG_NOTICE,"[ACME] Polling done\n");if(!validated){return -1;}
-    EVP_PKEY *dkey=NULL;char *csr=acme_gen_csr(g_acme_domain,&dkey);
-    char fin_pay[4096];snprintf(fin_pay,sizeof(fin_pay),"{\"csr\":\"%s\"}",csr);free(csr);
-    char fh[256];int fp=443;char fpath[512];parse_url(finalize_url,fh,&fp,fpath,sizeof(fpath));
-    char fin_hdrs[4096]={0};char *fb=acme_post(finalize_url,fin_pay,fh,fp,&code,fin_hdrs,sizeof(fin_hdrs));free(fb);
-    char cert_url[512]={0};
-    dns_log(LOG_NOTICE,"[ACME] Polling order (up to 3min)\n");
-    for(int i=0;i<30;i++){sleep(6);char oh[4096]={0};char *ob=acme_post(order_url,NULL,achost,acport,&code,oh,sizeof(oh));
-        if(!ob){dns_log(LOG_DEBUG,"[ACME] Polling order...\n");continue;}
-        char status[64]={0};json_str(ob,"status",status,sizeof(status));json_str(ob,"certificate",cert_url,sizeof(cert_url));free(ob);
-        dns_log(LOG_INFO,"[ACME] order status: %s\n",status);if(!strcmp(status,"valid")&&cert_url[0])break;}
-    dns_log(LOG_NOTICE,"[ACME] Order poll done\n");if(!cert_url[0]){EVP_PKEY_free(dkey);return -1;}
-    char ch2[256];int cp=443;char cpath[512];parse_url(cert_url,ch2,&cp,cpath,sizeof(cpath));
-    char cdh[4096]={0};char *cert_pem=acme_post(cert_url,NULL,ch2,cp,&code,cdh,sizeof(cdh));
-    if(!cert_pem||code<200||code>=300){free(cert_pem);EVP_PKEY_free(dkey);return -1;}
-    BIO *kb=BIO_new(BIO_s_mem());PEM_write_bio_PrivateKey(kb,dkey,NULL,NULL,0,NULL,NULL);
-    char *kpp;long kpl=BIO_get_mem_data(kb,&kpp);char key_pem[MAX_PEM];
-    int kn=(int)(kpl<MAX_PEM-1?kpl:MAX_PEM-1);memcpy(key_pem,kpp,kn);key_pem[kn]=0;BIO_free(kb);EVP_PKEY_free(dkey);
-    cert_post_issue(g_acme_domain,cert_pem,key_pem);
-    free(cert_pem); return 0;}
-static int acme_needs_renewal(void){
-    if(!g_acme_domain[0])return 0;if(!g_tls_cert_pem[0])return 1;
-    BIO *b=BIO_new_mem_buf(g_tls_cert_pem,-1);X509 *cert=PEM_read_bio_X509(b,NULL,NULL,NULL);BIO_free(b);
-    if(!cert)return 1;int days=0,secs=0;
-    ASN1_TIME_diff(&days,&secs,NULL,X509_get0_notAfter(cert));X509_free(cert);
-    dns_log(LOG_NOTICE,"[ACME] Cert expires in %d days\n",days);return days<ACME_RENEW_DAYS;}
-static void *acme_renewal_thread(void *arg){(void)arg;sleep(30);
-    for(;;){if(acme_needs_renewal()){dns_log(LOG_WARNING,"[ACME] Renewal needed\n");acme_issue();}sleep(86400);}return NULL;}
 
 /* ==========================================================================
  * HTTP(S) API + DoH handler
@@ -4623,7 +4153,6 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
         if(!cfgkey[0]){api_send(fd,ssl,400,"missing key\n");return;}
         config_set(cfgkey,cfgval);
         if(!strcmp(cfgkey,"ddns_secret"))safe_strcpy(g_ddns_secret,cfgval,sizeof(g_ddns_secret));
-        else if(!strcmp(cfgkey,"acme_domain"))safe_strcpy(g_acme_domain,cfgval,sizeof(g_acme_domain));
         else if(!strcmp(cfgkey,"tls_cert_pem")){safe_strcpy(g_tls_cert_pem,cfgval,sizeof(g_tls_cert_pem));tls_reload();}
         else if(!strcmp(cfgkey,"tls_key_pem")){safe_strcpy(g_tls_key_pem,cfgval,sizeof(g_tls_key_pem));tls_reload();}
         else if(!strcmp(cfgkey,"mtls_ca_pem")){safe_strcpy(g_mtls_ca_pem,cfgval,sizeof(g_mtls_ca_pem));tls_reload();}
@@ -4670,12 +4199,11 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
         char zkey[300];snprintf(zkey,sizeof(zkey),"zone_table:%s",zn);vk_del(zkey);
         dns_log(LOG_NOTICE,"[Zone] Deleted %s\n",zn);
         api_send(fd,ssl,200,"ok\n");return;}
-    if(is_mgmt&&!strcmp(path,"/acme/issue")){
-        dns_log(LOG_NOTICE,"[ACME] Manual issue via API\n");int r=acme_issue();
-        api_send(fd,ssl,200,r==0?"acme ok\n":"acme failed\n");return;}
-    if(is_mgmt&&!strcmp(path,"/pki/est")){
-        dns_log(LOG_NOTICE,"[EST] Manual enrollment via API\n");int r=est_issue();
-        api_send(fd,ssl,200,r==0?"est ok\n":"est failed\n");return;}
+    /* ACME/EST moved to the certd sidecar (migration Step 2). These
+     * endpoints are kept only to tell old callers where the function went;
+     * the whole embedded API goes away in Step 4. */
+    if(is_mgmt&&(!strcmp(path,"/acme/issue")||!strcmp(path,"/pki/est"))){
+        api_send(fd,ssl,410,"moved to certd: run 'certd --once'\n");return;}
     if(is_mgmt&&!strcmp(path,"/mdns/announce")){
         mdns_announce();
         api_send(fd,ssl,200,"mdns announced\n");return;}
@@ -4712,16 +4240,7 @@ static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
         char rb[256];snprintf(rb,sizeof(rb),"ok: %s\n",mkey);
         api_send(fd,ssl,201,rb);return;}
     if(is_mgmt&&!strcmp(path,"/pki/cacerts")){
-        if(!g_est_server[0]){api_send(fd,ssl,400,"est_server not configured\n");return;}
-        char ehost[256]="";int eport=443;char epath[512];
-        parse_url(g_est_server,ehost,&eport,epath,sizeof(epath));
-        char *pem=est_cacerts(ehost,eport,
-            g_est_client_cert_pem[0]?g_est_client_cert_pem:NULL,
-            g_est_client_key_pem[0] ?g_est_client_key_pem :NULL,
-            g_est_ca_pem[0]         ?g_est_ca_pem         :NULL);
-        if(!pem){api_send(fd,ssl,500,"cacerts failed\n");return;}
-        vk_set("est:cacerts",pem,0);
-        api_send(fd,ssl,200,pem); free(pem); return;}
+        api_send(fd,ssl,410,"moved to certd\n");return;}
     if(is_mgmt&&!strcmp(path,"/zone/notify")){notify_send();api_send(fd,ssl,200,"notified\n");return;}
 
     api_send(fd,ssl,400,"unknown endpoint\n");}
@@ -4787,16 +4306,9 @@ int main(int argc,char **argv){
      * server to be listening before Let's Encrypt can validate the challenge). */
     tls_reload();
 
-    /* Phase 5a: EST initial enrollment if no cert yet */
-    if(g_est_server[0]&&!g_tls_cert_pem[0]){
-        dns_log(LOG_INFO,"[Boot] No cert — running EST enrollment\n");
-        est_issue();}
-    /* Phase 5b: Unified PKI renewal thread */
-    if(g_acme_domain[0]||g_est_server[0]){
-        pthread_t tid;pthread_create(&tid,NULL,pki_renewal_thread,NULL);
-        pthread_detach(tid);}
-    /* Phase 5c: cert:current watcher — hot-reload TLS when certd (or an
-     * operator) replaces the active certificate (migration Step 2). */
+    /* Phase 5: cert:current watcher — hot-reload TLS when certd (or an
+     * operator) replaces the active certificate (migration Step 2). All
+     * issuance/renewal (ACME + EST) lives in the certd sidecar now. */
     {pthread_t ctid;
      if(pthread_create(&ctid,NULL,cert_watch_thread,NULL)==0)
          pthread_detach(ctid);
@@ -5056,7 +4568,6 @@ int main(int argc,char **argv){
     if(g_dot_ctx)SSL_CTX_free(g_dot_ctx);if(g_mgmt_ctx)SSL_CTX_free(g_mgmt_ctx);
     if(g_zsk)EVP_PKEY_free(g_zsk);if(g_zsk_ed)EVP_PKEY_free(g_zsk_ed);
     if(g_ksk)EVP_PKEY_free(g_ksk);if(g_ksk_ed)EVP_PKEY_free(g_ksk_ed);
-    if(g_acme_key)EVP_PKEY_free(g_acme_key);
     if(g_syslog_enabled)closelog();
     pthread_mutex_lock(&g_log_mutex);
     rsyslog_disconnect();

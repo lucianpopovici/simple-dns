@@ -79,7 +79,8 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | Path | What it is |
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
-| `dns_server.c` | The monolith authoritative server (~5000 lines). Will be decomposed — see architecture below. |
+| `dns_server.c` | The authoritative server (~4600 lines, shrinking). ACME/EST extracted in Step 2; mDNS/HTTP still to go — see architecture below. |
+| `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC **validation**. Becomes `resolverd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
@@ -218,16 +219,21 @@ is explicitly configured for — not implicitly "all interfaces."
 
 ### `certd` — certificate manager sidecar (network-facing, low trust)
 
-Extracts all ACME and EST client code out of `dnsd`.
+**Done (migration Step 2):** `certd.c`. All ACME and EST client code is out of
+`dnsd`.
 
 Owns: ACME directory/JWS/order flow, DNS-01 challenge orchestration, EST
-mTLS enrollment, CSR generation, renewal scheduling.
+mTLS enrollment, CSR generation, renewal scheduling (daemon mode checks daily;
+`certd --once` for cron/manual runs).
 
 Integration is entirely through Valkey:
 - For ACME DNS-01: writes the challenge as a normal zone record
   (`zone:TXT:_acme-challenge.<domain>`), waits, then deletes it.
-- On success: writes the issued cert + key to `cert:current` (PEM).
+- On success: writes the issued cert chain + key to `cert:current` (one PEM
+  blob). That is its only output — no `config:*`, no TLSA.
 - `dnsd` watches `cert:current` and hot-reloads — it never speaks ACME/EST.
+  On change, `dnsd` also publishes TLSA 3 1 1 (owner from the cert's SAN/CN),
+  bumps the SOA serial and NOTIFYs — zone writes stay in the zone's owner.
 
 This is the change that removes the most attacker-adjacent parser code from the
 trusted core. `certd` is the only component (besides `resolverd`) that makes
@@ -278,7 +284,7 @@ Each namespace has exactly one writer category. Define and enforce this.
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
 | `config:*` | dashboard | dnsd, mdnsd, resolverd, certd | Runtime configuration |
-| `zone:*` | dashboard, certd (challenge TXT only) | dnsd | Authoritative records |
+| `zone:*` | dashboard, certd (challenge TXT only), dnsd (TLSA on cert change) | dnsd | Authoritative records |
 | `ddns:*` | dnsd (UPDATE) | dnsd | Dynamic records |
 | `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |
 | `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |

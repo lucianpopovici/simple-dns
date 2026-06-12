@@ -1,5 +1,7 @@
 dns_server
 dns_server_debug
+certd
+certd_debug
 
 # Secrets — never commit private keys / cert chains
 *.key

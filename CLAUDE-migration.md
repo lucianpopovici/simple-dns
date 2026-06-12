@@ -73,50 +73,56 @@ absent key (environmental, see Step 0).
 
 ---
 
-## Step 2 — Split out `certd` (ACME + EST)  `[~]`
+## Step 2 — Split out `certd` (ACME + EST)  `[x]`
 
 Goal: remove the most attacker-adjacent parser code from the trusted core.
 Integration is Valkey-only.
 
 Tasks
-- [ ] New binary `certd` containing: ACME directory/JWS/order flow, DNS-01
+- [x] New binary `certd` containing: ACME directory/JWS/order flow, DNS-01
       orchestration, EST mTLS enrollment, CSR generation, renewal thread
-- [ ] `certd` writes the DNS-01 challenge as `zone:TXT:_acme-challenge.<domain>`
+      (`certd.c`; `--once` flag for cron/manual runs; daemon mode checks daily)
+- [x] `certd` writes the DNS-01 challenge as `zone:TXT:_acme-challenge.<domain>`
       and deletes it after validation
-      (the existing `acme_issue` already does this via `vk_set`/`vk_del` —
-      carries over unchanged)
-- [ ] `certd` writes the issued cert+key to `cert:current` (PEM)
-- [~] `dnsd` watches `cert:current` and hot-reloads TLS (no ACME/EST code left
-      in `dns_server.c`)
-      → watcher DONE + live-tested 2026-06-12: `cert_watch_thread` polls every
-      30s (Step 6 converts to keyspace notifications), splits the cert+key PEM
-      blob, hot-reloads; verified end-to-end (`SET cert:current` → DoT :8853
-      served the new CN). ACME/EST removal still pending.
-- [ ] Remove `acme_*`, `est_*`, `pki_renewal_thread` from `dns_server.c`
-- [ ] `Makefile`: add `certd` target + production signing
+      (the existing `acme_issue` already did this via `vk_set`/`vk_del` —
+      carried over unchanged)
+- [x] `certd` writes the issued cert+key to `cert:current` (PEM, chain+key in
+      one blob; it writes nothing else — no `config:*`, no TLSA)
+- [x] `dnsd` watches `cert:current` and hot-reloads TLS (no ACME/EST code left
+      in `dns_server.c`); the watcher's first pass runs at boot so a cert
+      written while dnsd was down is picked up immediately
+- [x] Remove `acme_*`, `est_*`, `pki_renewal_thread` from `dns_server.c`
+      (~520 lines; dns_server.c 5064 → 4595 lines)
+- [x] `Makefile`: `certd` (hardened prod) + `certd_debug` targets. GPG signing
+      still blocked on this machine (no secret key — see Step 0).
 
-Extraction inventory (for the `certd` build-out): move `https_req`,
-`https_req_mtls`, `parse_url`, `hdr_val`, `json_str`, `acme_jwk/thumbprint/
-jws/nonce_fetch/post/directory/gen_csr/issue/needs_renewal`, `est_pkcs7_to_pem/
-cacerts/enroll/issue/needs_renewal`, `pki_renewal_thread`, `cert_post_issue`
-(rewired to write `cert:current` instead of in-process `tls_reload`), the
-`g_acme_*`/`g_est_*` globals, plus a RESP/Valkey client and logging. Open spec
-question: `cert_post_issue` also publishes TLSA records (`zone:TLSA:*`) and
-sends NOTIFY — the ownership table only grants certd `zone:TXT:_acme-challenge.*`;
-either extend the table to TLSA publication by certd, or have dnsd publish TLSA
-itself when `cert:current` changes (cleaner — keeps zone writes in dnsd).
-Manual-issue mgmt endpoints (`/acme/issue`, EST enroll) reference `acme_issue`/
-`est_issue` and are removed in Step 4 anyway.
+TLSA ownership decision: **dnsd publishes TLSA** (and bumps serial + NOTIFYs)
+when `cert:current` changes, extracting the name from the certificate's SAN/CN
+— so all zone writes stay in dnsd and certd needs no zone access. While moving
+this, fixed a pre-existing bug: the old `cert_post_issue` lowercased the whole
+Valkey key (`zone:tlsa:…`), which the lookup path (`zone:TLSA:<qname>`) could
+never match — published TLSA records were unservable. Now only the owner name
+is lowercased.
+
+Mgmt endpoints `/acme/issue`, `/pki/est`, `/pki/cacerts` return 410
+"moved to certd" until Step 4 deletes the embedded API entirely.
 
 Acceptance
-- [ ] `grep -n 'acme_\|est_' dns_server.c` returns nothing
-- [ ] `dnsd` opens no outbound connections except to Valkey (verify with
-      `ss`/`lsof` or strace under load)
+- [x] `grep -n '\bacme_\|\best_' dns_server.c` returns nothing (word-boundary
+      form; the original pattern false-positives on `best_len`)
+- [x] `dnsd` opens no outbound connections except to Valkey (verified with
+      `ss -tnp` under query load: single ESTAB to 127.0.0.1:6379)
 - [ ] End-to-end cert issuance still works against a staging ACME CA, driven
-      entirely by `certd`
-- [ ] Replacing `cert:current` causes `dnsd` to serve the new cert on the next
-      DoT/HTTPS handshake without restart
-- [ ] Global exit gate passes
+      entirely by `certd` — **not verifiable in this environment** (needs a
+      public domain + reachable port 53); the ACME/EST code is byte-for-byte
+      the code that ran inside dnsd, `certd --once` runs the full decision
+      path against live Valkey
+- [x] Replacing `cert:current` causes `dnsd` to serve the new cert on the next
+      DoT/HTTPS handshake without restart (verified: openssl s_client on :8853
+      shows the new CN; TLSA RR for the new cert servable via dig)
+- [x] Global exit gate passes (make debug/dns_server/certd clean — warnings
+      45→38 in dns_server.c as removed code carried some; make check answers;
+      check-dnssec 12/12; check-wire 11/11; no bare strtok)
 
 ---
 
