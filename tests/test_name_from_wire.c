@@ -1,4 +1,4 @@
-/* Unit tests for name_from_wire compression handling (CLAUDE-fixes.md Task 5).
+/* Unit tests for name_from_wire compression handling.
  *
  * Builds against dns_client.c (all three copies of the function are
  * byte-identical until the libdnswire extraction). Verifies that:

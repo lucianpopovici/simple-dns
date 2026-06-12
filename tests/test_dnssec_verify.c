@@ -1,7 +1,7 @@
 /* tests/test_dnssec_verify.c
  *
- * Known-answer + negative tests for dnssec_verify_rrset / dnssec_validate_response
- * (CLAUDE-fixes.md Task 1).
+ * Known-answer + negative tests for dnssec_verify_rrset /
+ * dnssec_validate_response.
  *
  * Strategy: build a synthetic DNS response containing an A RRset (two records,
  * deliberately emitted in non-canonical order, one owner name compressed),

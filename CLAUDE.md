@@ -11,9 +11,10 @@ Use this file to guide refactoring. Do not attempt the whole split in one pass �
 follow the migration order at the bottom. Each step must leave the system
 buildable and passing `make check`.
 
-> A companion file, `CLAUDE-fixes.md`, lists concrete defects to fix first
-> (DNSSEC validation, `strtok` thread-safety, etc.). Do those before or
-> alongside step 1 below. `CLAUDE-migration.md` is the step-by-step tracker.
+> `CLAUDE-migration.md` is the step-by-step tracker. The prerequisite defect
+> fixes (DNSSEC validation, `strtok` thread-safety, etc.) are **complete** —
+> their spec is archived untracked at `specs/CLAUDE-fixes.md`; the work itself
+> is documented in the migration tracker's Step 0 and the git history.
 
 > Feature work plans (independent of the process split, but coordinate with
 > it): `CLAUDE-hidden-master.md` (hidden-master / public-secondary deployment
@@ -98,7 +99,7 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
 - **Do not weaken or remove a bounds check** while refactoring. Preserve the
   `-1`-on-overflow convention in every wire helper and check it at call sites.
 - **Do not introduce `strtok`** (use `strtok_r`) or any bare fixed-buffer copy
-  (use `safe_strcpy` with a real `sizeof`). See `CLAUDE-fixes.md` Tasks 2 and 6.
+  (use `safe_strcpy` with a real `sizeof`).
 - **Do not continue on a parse/alloc/crypto failure.** Fail closed: drop the
   request or return SERVFAIL; never serve partially-parsed data.
 - **Do not write a Valkey namespace you do not own** (see the ownership table).
@@ -122,19 +123,19 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
    > The targets (created in migration Step 1): `make check-wire` (parser unit
    > tests), `make fuzz-wire` (60s libFuzzer smoke on `name_from_wire`; needs
    > clang), `make check-dnssec` (DNSSEC/TSIG known-answer + negative tests).
-3. Confirm the relevant **Acceptance** boxes in `CLAUDE-migration.md` (or
-   `CLAUDE-fixes.md`) are satisfied.
+3. Confirm the relevant **Acceptance** boxes in `CLAUDE-migration.md` are
+   satisfied.
 4. Update any spec that changed: RFC list, Valkey schema, ownership table.
 
 ## When working on… read first
 
 | Change type | Read |
 |---|---|
-| Wire parsing / record encoding | `libdnswire` (`dns_wire.*`), `CLAUDE-fixes.md` Tasks 1 & 5 |
-| TSIG / DNSSEC | the crypto sections of `dns_server.c` / `dns_client.c`, `CLAUDE-fixes.md` Task 1 |
+| Wire parsing / record encoding | `libdnswire` (`dns_wire.*`), `tests/test_name_from_wire.c`, `fuzz/` |
+| TSIG / DNSSEC | the crypto sections of `dns_server.c` / `dns_client.c`, `tests/test_dnssec_verify.c` |
 | Process split / new daemon | this file (architecture + Valkey boundary), `CLAUDE-migration.md` |
 | Config / control plane | Valkey ownership table, `dashboard/app.py`, README schema |
-| Build / CI | `Makefile`, `.github/workflows/ci.yml`, `CLAUDE-fixes.md` Task 4 |
+| Build / CI | `Makefile`, `.github/workflows/ci.yml` |
 
 ---
 
@@ -236,8 +237,8 @@ arbitrary outbound connections.
 
 This is `dns_client.c`. Keep it a distinct daemon — authoritative and recursive
 are different DNS roles and must not share a process. Owns upstream UDP/TCP/DoT/
-DoH, the cache, and DNSSEC **validation** (note: validation must cover the
-RRset, not just the RRSIG header — see `CLAUDE-fixes.md` Task 1).
+DoH, the cache, and DNSSEC **validation** (validation covers the full
+canonical RRset per RFC 4034 §3.1.8.1 — guarded by `make check-dnssec`).
 
 Reads/writes Valkey: its persisted cache namespace only. It does not read the
 authoritative zone.
@@ -329,9 +330,9 @@ Each step is independently shippable and must pass `make debug`, `make`, and
 `make check`.
 
 1. **Extract `libdnswire`.** Move the shared wire helpers into `dns_wire.{c,h}`;
-   point all three `.c` files at it. No behavior change. (Also lets the
-   `CLAUDE-fixes.md` items — `name_from_wire` hardening, `strtok_r` — be made
-   once instead of three times.)
+   point all three `.c` files at it. No behavior change. (Also lets parser
+   fixes — `name_from_wire` hardening, `strtok_r` — be made once instead of
+   three times.)
 2. **Split out `certd`.** Move ACME + EST + renewal thread into a new binary
    that talks only through Valkey (`zone:TXT:_acme-challenge.*` and
    `cert:current`). Make `dnsd` watch `cert:current` and hot-reload. Remove the
@@ -358,8 +359,9 @@ sandboxable daemon — the trusted core this architecture is designed to produce
 - `make check` should bring up Valkey, start `dnsd` (plus `certd`/`mdnsd` where
   relevant), and smoke-test each independently.
 - Keep the existing hardening flags (`-fstack-protector-strong`,
-  `_FORTIFY_SOURCE=2`, PIE, RELRO/now) for every binary, and fix the
-  `OSSL_INC` default noted in `CLAUDE-fixes.md`.
+  `_FORTIFY_SOURCE=2`, PIE, RELRO/now) for every binary. (The old
+  world-writable `OSSL_INC` default is fixed: paths derive via `pkg-config`
+  with an `ossl-sanity` fail-fast check.)
 
 ---
 
@@ -387,7 +389,7 @@ correctness under hostile input, not just working on a happy-path `dig`.
   fixed must add the triggering input to the corpus.
 - **Crypto correctness tests.** DNSSEC verify and TSIG must have known-answer
   tests *and* negative tests (one flipped byte → fail). A verifier that only
-  ever sees valid input is untested. (Ties to `CLAUDE-fixes.md` Task 1.)
+  ever sees valid input is untested. (`make check-dnssec` covers DNSSEC.)
 - **Differential testing.** Compare `dnsd` responses to a reference resolver
   (`dig`, or Knot/BIND) over a query matrix; diffs are either bugs or documented
   intentional deviations.
@@ -418,8 +420,8 @@ CI must run on every change and block merge on failure:
 
 ### Memory-safety & error-handling conventions
 
-- No bare fixed-buffer copies. Use the `safe_strcpy` helper
-  (`CLAUDE-fixes.md` Task 6); pass real `sizeof` sizes, never hardcoded lengths.
+- No bare fixed-buffer copies. Use the `safe_strcpy` helper (in `libdnswire`);
+  pass real `sizeof` sizes, never hardcoded lengths.
 - Wire helpers return `-1` on overflow/error and callers must check it before
   advancing offsets — preserve this convention everywhere.
 - **Fail closed.** On parse error, allocation failure, or crypto failure, drop

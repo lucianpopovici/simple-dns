@@ -12,7 +12,7 @@ Global exit gate for every step:
 - [ ] `make debug` builds with no new warnings
 - [ ] `make` (production) builds and signs
 - [ ] `make check` passes
-- [ ] No new `strtok(` introduced (`grep -rn '\bstrtok(' *.c` clean — see CLAUDE-fixes.md Task 2)
+- [ ] No new `strtok(` introduced (`grep -rn '\bstrtok(' *.c` clean — the strtok fixes are done)
 
 ---
 
@@ -22,12 +22,12 @@ Do the correctness/safety fixes before refactoring, so the extracted code is
 already sound.
 
 Tasks
-- [x] Complete `CLAUDE-fixes.md` Task 1 (DNSSEC RRset coverage)
-- [x] Complete `CLAUDE-fixes.md` Task 2 (`strtok` → `strtok_r`)
-- [x] Complete `CLAUDE-fixes.md` Tasks 3–6 (fudge, OSSL_INC, pointer hardening, safe_strcpy)
+- [x] Complete fixes Task 1 (DNSSEC RRset coverage)
+- [x] Complete fixes Task 2 (`strtok` → `strtok_r`)
+- [x] Complete fixes Tasks 3–6 (fudge, OSSL_INC, pointer hardening, safe_strcpy)
 
 Acceptance
-- [x] All boxes in `CLAUDE-fixes.md` "Final checklist" are checked
+- [x] All boxes in the fixes spec final checklist are checked (spec archived untracked at `specs/CLAUDE-fixes.md`)
 - [x] Tampered-rdata DNSSEC test returns `DNSSEC_BOGUS` (`make check-dnssec`)
 
 Gate evidence (2026-06-12): `make debug` warning-neutral vs baseline; `make
@@ -47,7 +47,7 @@ Tasks
       `name_to_wire_c`, `append_rr`, `get16/put16/get32/put32`, `txt_encode`,
       hex enc/dec, base64 enc/dec, `compress_ctx_t` + reset
 - [x] Create `dns_wire.c` with the single canonical implementation (use the
-      hardened `name_from_wire` from CLAUDE-fixes.md Task 5)
+      hardened `name_from_wire` from fixes Task 5)
 - [x] Remove the duplicated copies from `dns_server.c`, `dns_client.c`,
       `simple_dns.c`; include `dns_wire.h` instead
 - [x] Decide `simple_dns.c`'s fate: label as reference + exclude from prod

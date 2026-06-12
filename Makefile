@@ -256,7 +256,7 @@ uninstall:
 # =============================================================================
 # Unit tests
 # =============================================================================
-# DNSSEC known-answer + negative tests (CLAUDE-fixes.md Task 1).
+# DNSSEC known-answer + negative tests.
 # Includes dns_client.c with -DUNIT_TEST, so it inherits that file's (dense,
 # pre-clang-format) style — suppress the indentation warning for now.
 check-dnssec: tests/test_dnssec_verify.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
@@ -266,7 +266,7 @@ check-dnssec: tests/test_dnssec_verify.c dns_client.c $(WIRE_SRC) dns_wire.h | o
 	      tests/test_dnssec_verify.c $(WIRE_SRC) $(LIBS)
 	./tests/test_dnssec_verify
 
-# name_from_wire compression-handling tests (CLAUDE-fixes.md Task 5).
+# name_from_wire compression-handling tests.
 # -Wno-unused-function: -DUNIT_TEST compiles out dns_client.c's main(), which
 # is the only caller of some helpers.
 check-wire: tests/test_name_from_wire.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
