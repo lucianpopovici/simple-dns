@@ -1497,6 +1497,64 @@ static void tls_reload(void){
     pthread_mutex_unlock(&g_tls_mutex);
     dns_log(LOG_INFO,"[TLS] Contexts %s\n",g_dot_ctx?"loaded":"unavailable (no cert yet)");}
 
+/* cert:current watcher (migration Step 2, CLAUDE.md Valkey contract).
+ *
+ * `cert:current` is written by certd as one PEM blob: certificate chain plus
+ * private key, concatenated in either order. dnsd only reads it: on change it
+ * splits the blob, swaps the in-memory cert/key and hot-reloads the TLS
+ * contexts. dnsd never writes cert:* and will not speak ACME/EST once the
+ * extraction completes.
+ *
+ * Polling (30s) is the Step 2 stopgap; Step 6 replaces it with Valkey
+ * keyspace notifications. */
+#define CERT_WATCH_INTERVAL 30
+static int cert_current_split(const char *blob,char *cert_out,size_t cert_sz,
+                              char *key_out,size_t key_sz){
+    static const char *kbegin_pat[]={"-----BEGIN PRIVATE KEY-----",
+                                     "-----BEGIN EC PRIVATE KEY-----",
+                                     "-----BEGIN RSA PRIVATE KEY-----",NULL};
+    const char *kb=NULL;
+    for(int ki=0;kbegin_pat[ki];ki++){
+        kb=strstr(blob,kbegin_pat[ki]);
+        if(kb)break;}
+    if(!kb)return -1;
+    const char *ke=strstr(kb,"-----END ");
+    if(!ke)return -1;
+    ke=strchr(ke,'\n');
+    if(!ke)ke=kb+strlen(kb);else ke++;
+    size_t klen=(size_t)(ke-kb);
+    if(klen+1>key_sz)return -1;
+    memcpy(key_out,kb,klen);
+    key_out[klen]=0;
+    /* cert = blob minus the key block (chain may precede and/or follow it) */
+    size_t pre=(size_t)(kb-blob),post=strlen(ke);
+    if(pre+post+1>cert_sz)return -1;
+    memcpy(cert_out,blob,pre);
+    memcpy(cert_out+pre,ke,post);
+    cert_out[pre+post]=0;
+    if(!strstr(cert_out,"-----BEGIN CERTIFICATE-----"))return -1;
+    return 0;}
+static void *cert_watch_thread(void *arg){(void)arg;
+    static char last[MAX_PEM];           /* static: keep worker stacks small */
+    static char cur[MAX_PEM],cert[MAX_PEM],key[MAX_PEM];
+    last[0]=0;
+    for(;;){
+        sleep(CERT_WATCH_INTERVAL);
+        cur[0]=0;
+        if(!vk_get("cert:current",cur,sizeof(cur)))continue;
+        if(!cur[0]||strcmp(cur,last)==0)continue;
+        if(cert_current_split(cur,cert,sizeof(cert),key,sizeof(key))<0){
+            dns_log(LOG_ERR,"[TLS] cert:current malformed — ignoring\n");
+            /* remember it so a broken blob is not re-parsed every tick */
+            safe_strcpy(last,cur,sizeof(last));
+            continue;}
+        safe_strcpy(g_tls_cert_pem,cert,sizeof(g_tls_cert_pem));
+        safe_strcpy(g_tls_key_pem,key,sizeof(g_tls_key_pem));
+        safe_strcpy(last,cur,sizeof(last));
+        dns_log(LOG_NOTICE,"[TLS] cert:current changed — hot-reloading\n");
+        tls_reload();}
+    return NULL;}
+
 /* ==========================================================================
  * DNSSEC helpers
  * ======================================================================= */
@@ -4737,6 +4795,13 @@ int main(int argc,char **argv){
     if(g_acme_domain[0]||g_est_server[0]){
         pthread_t tid;pthread_create(&tid,NULL,pki_renewal_thread,NULL);
         pthread_detach(tid);}
+    /* Phase 5c: cert:current watcher — hot-reload TLS when certd (or an
+     * operator) replaces the active certificate (migration Step 2). */
+    {pthread_t ctid;
+     if(pthread_create(&ctid,NULL,cert_watch_thread,NULL)==0)
+         pthread_detach(ctid);
+     else
+         dns_log(LOG_ERR,"[TLS] Failed to start cert:current watcher\n");}
 
     /* Phase 6: Open mDNS sockets (before unicast sockets) */
     if(g_mdns_enabled){
