@@ -1337,7 +1337,7 @@ static int vk_get(const char *key, char *out, int olen) {
         pthread_mutex_lock(&g_vk_mutex);
         if (valkey_ensure(&vk) >= 0) {
             char ts[16];
-            snprintf(ts, sizeof(ts), "%u", 7 * 86400);
+            snprintf(ts, sizeof(ts), "%u", 7u * 86400);
             resp_reply_t sw;
             resp_cmd(&vk, &sw, 5, "SET", skey, out, "EX", ts);
         }
@@ -3944,7 +3944,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 }
                 case DNS_TYPE_SSHFP: { /* ttl|alg|fptype|fingerprint_hex */
                     uint8_t alg = 0, fptype = 0;
-                    uint8_t fp[64];
+                    uint8_t fp[64] = {0};
                     int fplen = 0;
                     char *p2 = pipe;
                     char *sp16 = NULL;
@@ -3965,7 +3965,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 }
                 case DNS_TYPE_TLSA: { /* ttl|usage|selector|mtype|data_hex */
                     uint8_t usage = 0, sel = 0, mtype = 0;
-                    uint8_t data[512];
+                    uint8_t data[512] = {0};
                     int dlen = 0;
                     char *p2 = pipe;
                     char *sp17 = NULL;
