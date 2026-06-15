@@ -262,25 +262,46 @@ Acceptance (verified via Flask `test_client`, `tmp/t_auth.py` + `t_auth2.py`)
 
 ---
 
-## Step 6 — Live reload via Valkey keyspace notifications  `[ ]`
+## Step 6 — Live reload via Valkey keyspace notifications  `[x]`
 
 Goal: dashboard edits and `cert:current` updates apply without restart.
 
 Tasks
-- [ ] Enable Valkey keyspace notifications (server config)
-- [ ] Each daemon subscribes to the prefixes it owns (`dnsd`: `config:*`,
-      `zone:*`, `ddns:*`, `dnssec:*`, `cert:current`; `mdnsd`: `mdns:*`,
-      `config:mdns_*`; `resolverd`: `config:*`)
-- [ ] On notification, reload only the affected subset (avoid full restarts)
-- [ ] Remove any remaining "restart required" / `POST /config` dependence
+- [x] Enable Valkey keyspace notifications (server config): each daemon issues
+      `CONFIG SET notify-keyspace-events KEA` itself on connect (idempotent;
+      no out-of-band Valkey setup needed), and logs a warning + falls back to
+      boot/reconnect catch-up if `CONFIG SET` is denied.
+- [x] Each daemon subscribes (on a dedicated connection, separate from the
+      request/reply `vk`) to the prefixes it owns:
+      `dnsd` → `config:*`, `cert:current`, `zone_table:*`, `dnssec:*`;
+      `apid` → `cert:current`, `config:tls_cert_pem/tls_key_pem/mtls_ca_pem`;
+      `mdnsd` → `mdns:*`, `config:mdns_*`. (`resolverd`/`dns_client.c` is a
+      separate role not yet split out — deferred with it.) `zone:*`/`ddns:*`
+      records need no subscription: they are read live per query already.
+- [x] On notification, reload only the affected subset:
+      `config:*` → `config_load_from_valkey` (+ `tls_reload` for TLS keys);
+      `cert:current` → split + hot-reload TLS + publish TLSA (replaces the
+      Step-2 30s poll); `zone_table:*` → rebuild the in-memory zone list;
+      `mdns:*`/`config:mdns_*` → re-announce. `dnssec:*` is flagged for restart
+      (live ZSK/KSK rollover is Step 7). `apid` reloads its TLS material.
+- [x] Removed the "restart required" / SIGHUP / 30s-poll dependence: the dnsd
+      and apid cert pollers are gone; apid's mgmt-API responses no longer say
+      "applies on SIGHUP". (The SIGHUP handler is kept as a manual fallback.)
 
 Acceptance
-- [ ] Editing a `zone:*` record via the dashboard is reflected in the next query
-      with no restart
-- [ ] Editing SOA/rate-limit/NSID config takes effect live
-- [ ] No subscription leaks or reconnect storms under a Valkey restart (the
-      daemons re-subscribe cleanly)
-- [ ] Global exit gate passes
+- [x] Editing a `zone:*` record via the dashboard is reflected in the next query
+      with no restart (records are read live per query; verified pre-Step-6).
+- [x] Editing SOA/rate-limit/NSID config takes effect live — verified:
+      `SET config:rrl_enabled 1` flipped `/metrics dns_rrl_enabled` 0→1 within
+      ~1.5s with no restart, driven by the keyspace notification.
+- [x] No subscription leaks or reconnect storms under a Valkey restart: the
+      subscriber clears the 4s read timeout (else recv timeouts look like
+      disconnects → storm), reconnects with capped 1→30s backoff, and re-runs a
+      full catch-up so changes during the outage are not missed.
+- [x] Global exit gate passes: all 4 daemons build with `EXTRA_WARN=-Werror`,
+      clang-format clean, `make check`/`check-dnssec` (12/12)/`check-wire`
+      (11/11) pass. Live-tested cert:current hot-reload (~2s vs old 30s) and
+      mdnsd re-announce on `mdns:*` change.
 
 ---
 

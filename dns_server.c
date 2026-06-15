@@ -1221,6 +1221,28 @@ static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
         return -1;
     return resp_parse(c, r);
 }
+/* Send a command but do NOT read a reply — for (P)SUBSCRIBE, whose multi-bulk
+ * replies and subsequent messages are consumed by the subscriber read loop
+ * (resp_cmd would read only the array header and desync the stream). */
+static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        const char *a = va_arg(ap, const char *);
+        int al = (int) strlen(a);
+        if (pos < 0 || pos >= (int) sizeof(buf)) {
+            va_end(ap);
+            return -1;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
+    }
+    va_end(ap);
+    if (pos < 0 || pos >= (int) sizeof(buf))
+        return -1;
+    return resp_send(c, buf, pos);
+}
 
 static int valkey_connect_to(resp_conn_t *c, const char *host, int port, const char *pass) {
     if (c->fd >= 0) {
@@ -1704,17 +1726,15 @@ static void tls_reload(void) {
     dns_log(LOG_INFO, "[TLS] Contexts %s\n", g_dot_ctx ? "loaded" : "unavailable (no cert yet)");
 }
 
-/* cert:current watcher (migration Step 2, CLAUDE.md Valkey contract).
+/* cert:current handling (migration Step 2, CLAUDE.md Valkey contract).
  *
  * `cert:current` is written by certd as one PEM blob: certificate chain plus
  * private key, concatenated in either order. dnsd only reads it: on change it
  * splits the blob, swaps the in-memory cert/key and hot-reloads the TLS
- * contexts. dnsd never writes cert:* and will not speak ACME/EST once the
- * extraction completes.
+ * contexts. dnsd never writes cert:* and does not speak ACME/EST.
  *
- * Polling (30s) is the Step 2 stopgap; Step 6 replaces it with Valkey
- * keyspace notifications. */
-#define CERT_WATCH_INTERVAL 30
+ * Step 6 drives this from Valkey keyspace notifications (see
+ * keyspace_watch_thread) instead of polling. */
 static int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
                               size_t key_sz) {
     static const char *kbegin_pat[] = {"-----BEGIN PRIVATE KEY-----",
@@ -1805,35 +1825,156 @@ static void cert_publish_tlsa(const char *cert_pem) {
     }
     X509_free(cert);
 }
-static void *cert_watch_thread(void *arg) {
-    (void) arg;
-    static char last[MAX_PEM]; /* static: keep worker stacks small */
+/* Apply cert:current if it has changed since the last apply. Used for the
+ * boot/reconnect catch-up and on a cert:current keyspace notification. */
+static char g_cert_last[MAX_PEM];
+static void cert_current_reload(void) {
     static char cur[MAX_PEM], cert[MAX_PEM], key[MAX_PEM];
-    last[0] = 0;
-    int first = 1;
+    cur[0] = 0;
+    if (!vk_get("cert:current", cur, sizeof(cur)) || !cur[0])
+        return;
+    if (strcmp(cur, g_cert_last) == 0)
+        return;
+    if (cert_current_split(cur, cert, sizeof(cert), key, sizeof(key)) < 0) {
+        dns_log(LOG_ERR, "[TLS] cert:current malformed — ignoring\n");
+        safe_strcpy(g_cert_last, cur, sizeof(g_cert_last)); /* don't re-parse */
+        return;
+    }
+    safe_strcpy(g_tls_cert_pem, cert, sizeof(g_tls_cert_pem));
+    safe_strcpy(g_tls_key_pem, key, sizeof(g_tls_key_pem));
+    safe_strcpy(g_cert_last, cur, sizeof(g_cert_last));
+    dns_log(LOG_NOTICE, "[TLS] cert:current changed — hot-reloading\n");
+    tls_reload();
+    cert_publish_tlsa(cert);
+}
+
+/* ── Live reload via Valkey keyspace notifications (migration Step 6) ───────
+ *
+ * A dedicated subscriber connection (separate from the request/reply `vk`,
+ * which a subscribed connection cannot share) enables keyspace events and
+ * PSUBSCRIBEs to the namespaces dnsd owns, so dashboard/certd edits take
+ * effect without a restart or SIGHUP. zone:* and ddns:* RECORDS are already
+ * read live per query, so only these need action on change:
+ *   config:*       reload runtime config (SOA, RRL, NSID, TSIG, TLS paths…)
+ *   cert:current   hot-reload TLS + publish TLSA (replaces the old 30s poll)
+ *   zone_table:*   rebuild the in-memory multi-zone list
+ *   dnssec:*       flagged only — live ZSK/KSK rollover is Step 7
+ *
+ * The thread re-runs a full catch-up after every (re)connect, so changes made
+ * while it was disconnected are not missed; reconnects use capped backoff so a
+ * Valkey restart cannot cause a reconnect storm. */
+#define KEYSPACE_DB 0
+static void keyspace_apply(const char *key) {
+    if (strncmp(key, "cert:current", 12) == 0) {
+        cert_current_reload();
+    } else if (strncmp(key, "config:", 7) == 0) {
+        config_load_from_valkey();
+        if (strstr(key, "tls_") || strstr(key, "mtls_"))
+            tls_reload();
+        dns_log(LOG_INFO, "[Reload] config applied after %s change\n", key);
+    } else if (strncmp(key, "zone_table:", 11) == 0) {
+        zones_load_from_valkey();
+        dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
+    } else if (strncmp(key, "dnssec:", 7) == 0) {
+        dns_log(LOG_WARNING,
+                "[Reload] %s changed — restart to load new DNSSEC keys "
+                "(live rollover lands in migration Step 7)\n",
+                key);
+    }
+}
+
+static void *keyspace_watch_thread(void *arg) {
+    (void) arg;
+    static resp_conn_t sub;
+    int backoff = 1;
     for (;;) {
-        /* First pass runs immediately so a cert:current written while dnsd
-         * was down is picked up at boot, not one interval later. */
-        if (!first)
-            sleep(CERT_WATCH_INTERVAL);
-        first = 0;
-        cur[0] = 0;
-        if (!vk_get("cert:current", cur, sizeof(cur)))
-            continue;
-        if (!cur[0] || strcmp(cur, last) == 0)
-            continue;
-        if (cert_current_split(cur, cert, sizeof(cert), key, sizeof(key)) < 0) {
-            dns_log(LOG_ERR, "[TLS] cert:current malformed — ignoring\n");
-            /* remember it so a broken blob is not re-parsed every tick */
-            safe_strcpy(last, cur, sizeof(last));
+        memset(&sub, 0, sizeof(sub));
+        sub.fd = -1;
+        if (valkey_connect_to(&sub, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+            sleep(backoff);
+            if (backoff < 30)
+                backoff *= 2;
             continue;
         }
-        safe_strcpy(g_tls_cert_pem, cert, sizeof(g_tls_cert_pem));
-        safe_strcpy(g_tls_key_pem, key, sizeof(g_tls_key_pem));
-        safe_strcpy(last, cur, sizeof(last));
-        dns_log(LOG_NOTICE, "[TLS] cert:current changed — hot-reloading\n");
-        tls_reload();
-        cert_publish_tlsa(cert);
+        /* A subscriber blocks waiting for events, so drop the 4s read timeout
+         * valkey_connect_to set (else recv would time out and look like a
+         * disconnect — a reconnect storm). */
+        struct timeval no_to = {0};
+        setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
+
+        /* Enable keyspace notifications (idempotent). KEA = keyspace + keyevent
+         * channels, all event classes — covers SET/DEL/EXPIRE on watched keys. */
+        resp_reply_t r;
+        if (resp_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
+            r.type == 1)
+            dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications "
+                                 "(CONFIG SET denied?) — boot/reconnect catch-up only\n");
+
+        /* Catch up on anything changed before (re)subscribing, then subscribe.
+         * Catch-up uses the shared `vk` connection, not `sub`. */
+        config_load_from_valkey();
+        zones_load_from_valkey();
+        cert_current_reload();
+
+        static const char *prefixes[] = {"config:*", "cert:current", "zone_table:*", "dnssec:*",
+                                         NULL};
+        int subok = 1;
+        for (int i = 0; prefixes[i]; i++) {
+            char pat[160];
+            snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", KEYSPACE_DB, prefixes[i]);
+            if (resp_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
+                subok = 0;
+                break;
+            }
+        }
+        if (!subok) {
+            close(sub.fd);
+            sub.fd = -1;
+            sleep(backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
+        }
+        backoff = 1; /* connected + subscribed cleanly */
+        dns_log(LOG_NOTICE, "[Reload] live reload active (keyspace notifications)\n");
+
+        /* Each notification is a multi-bulk: ["pmessage", pattern, channel,
+         * payload]; channel is "__keyspace@<db>__:<key>", payload the event.
+         * PSUBSCRIBE acks ("psubscribe", …) flow through here too and are
+         * skipped. */
+        for (;;) {
+            resp_reply_t hdr;
+            if (resp_parse(&sub, &hdr) < 0)
+                break; /* disconnect */
+            if (hdr.type != 5 || hdr.count < 1)
+                continue;
+            char kind[16] = "", channel[512] = "";
+            int rderr = 0;
+            for (int i = 0; i < hdr.count; i++) {
+                resp_reply_t el;
+                if (resp_parse(&sub, &el) < 0) {
+                    rderr = 1;
+                    break;
+                }
+                if (i == 0)
+                    safe_strcpy(kind, el.str, sizeof(kind));
+                else if (i == 2)
+                    safe_strcpy(channel, el.str, sizeof(channel));
+            }
+            if (rderr)
+                break;
+            if (strcmp(kind, "pmessage") != 0)
+                continue;
+            const char *sep = strstr(channel, "__:");
+            if (sep)
+                keyspace_apply(sep + 3);
+        }
+        dns_log(LOG_WARNING, "[Reload] keyspace connection lost — reconnecting\n");
+        close(sub.fd);
+        sub.fd = -1;
+        sleep(backoff);
+        if (backoff < 30)
+            backoff *= 2;
     }
     return NULL;
 }
@@ -5422,15 +5563,16 @@ int main(int argc, char **argv) {
      * server to be listening before Let's Encrypt can validate the challenge). */
     tls_reload();
 
-    /* Phase 5: cert:current watcher — hot-reload TLS when certd (or an
-     * operator) replaces the active certificate (migration Step 2). All
-     * issuance/renewal (ACME + EST) lives in the certd sidecar now. */
+    /* Phase 5: live-reload subscriber — applies config:*, cert:current,
+     * zone_table:* edits via Valkey keyspace notifications, no restart needed
+     * (migration Step 6). Also does the boot catch-up for cert:current, so it
+     * subsumes the old polling cert watcher. ACME/EST live in certd. */
     {
         pthread_t ctid;
-        if (pthread_create(&ctid, NULL, cert_watch_thread, NULL) == 0)
+        if (pthread_create(&ctid, NULL, keyspace_watch_thread, NULL) == 0)
             pthread_detach(ctid);
         else
-            dns_log(LOG_ERR, "[TLS] Failed to start cert:current watcher\n");
+            dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
     }
 
     /* (mDNS moved to the mdnsd daemon — migration Step 3.) */

@@ -270,8 +270,8 @@ authoritative zone.
     read-only `/list`, and DDNS `/update` gated by `config:ddns_secret`.
   - Because `apid` is the relocated embedded API, it inherits that API's Valkey
     writes (`config:*`, `zone:*` records, `ddns:*`) — see the ownership table.
-    Config/zone-table changes are applied by `dnsd` on SIGHUP until Step 6 adds
-    keyspace-notification live reload; zone records are read live per query.
+    `dnsd` applies `config:*`/`zone_table:*` changes live via Valkey keyspace
+    notifications (migration Step 6); zone records are read live per query.
 - `dashboard/app.py` (Flask) is the control-plane UI. **Done (migration
   Step 5):** it now authenticates — single admin account (werkzeug scrypt
   hash), signed-cookie sessions, a global `before_request` gate, `/login`+
@@ -319,10 +319,17 @@ HTTP front-ends. Define and enforce this.
 | `cache:*` | resolverd | resolverd | Persisted resolver cache |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
 
-**Live reload:** enable Valkey keyspace notifications and have each daemon
-subscribe to the prefixes it owns, so dashboard edits and `cert:current` updates
-take effect without a restart. This replaces the current "restart or
-`POST /config`" requirement.
+**Live reload (done — migration Step 6):** each daemon runs a subscriber on a
+dedicated Valkey connection, enables keyspace notifications
+(`notify-keyspace-events KEA`) and PSUBSCRIBEs to the prefixes it owns, so
+dashboard edits and `cert:current` updates take effect without a restart —
+no more SIGHUP / `POST /config`. `dnsd` watches `config:*`, `cert:current`,
+`zone_table:*` (and flags `dnssec:*` for the Step-7 rollover); `apid` watches
+`cert:current` + the TLS config keys; `mdnsd` watches `mdns:*` + `config:mdns_*`
+and re-announces. zone/ddns records are already read live per query.
+Subscribers re-run a full catch-up after every reconnect and use capped
+backoff, so a Valkey restart causes neither missed updates nor a reconnect
+storm.
 
 ---
 

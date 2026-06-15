@@ -254,6 +254,27 @@ static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
         return -1;
     return resp_parse(c, r);
 }
+/* Send a command without reading a reply — for (P)SUBSCRIBE, whose replies and
+ * subsequent messages are consumed by the subscriber read loop. */
+static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        const char *a = va_arg(ap, const char *);
+        int al = (int) strlen(a);
+        if (pos < 0 || pos >= (int) sizeof(buf)) {
+            va_end(ap);
+            return -1;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
+    }
+    va_end(ap);
+    if (pos < 0 || pos >= (int) sizeof(buf))
+        return -1;
+    return resp_send(c, buf, pos);
+}
 static int valkey_connect(resp_conn_t *c) {
     if (c->fd >= 0) {
         close(c->fd);
@@ -988,6 +1009,111 @@ static int mdns_open_socket(int af) {
     return fd;
 }
 
+/* ── Live reload via Valkey keyspace notifications (migration Step 6) ───────
+ *
+ * mdnsd serves mdns: and zone: records live per query already, so the value here
+ * is re-announcing (RFC 6762 §8.3 gratuitous responses) when a record changes
+ * so the link learns it without waiting for the next query. A dedicated
+ * subscriber connection watches mdns:* and config:mdns_*; record/hostname
+ * edits trigger a re-announce, while interface/enable changes need a restart
+ * (the multicast sockets are bound at startup). Reconnects use capped backoff. */
+#define KEYSPACE_DB 0
+static void mdns_keyspace_apply(const char *key) {
+    if (strncmp(key, "mdns:", 5) == 0) {
+        mdns_announce();
+    } else if (strcmp(key, "config:mdns_hostname") == 0) {
+        char v[256] = "";
+        if (vk_get("config:mdns_hostname", v, sizeof(v)) && v[0])
+            safe_strcpy(g_mdns_hostname, v, sizeof(g_mdns_hostname));
+        mdns_announce();
+    } else if (strcmp(key, "config:mdns_interfaces") == 0 ||
+               strcmp(key, "config:mdns_enabled") == 0) {
+        dns_log(LOG_WARNING,
+                "[Reload] %s changed — restart mdnsd to apply "
+                "(multicast sockets are bound at startup)\n",
+                key);
+    } else if (strncmp(key, "config:mdns_", 12) == 0) {
+        mdns_announce();
+    }
+}
+
+static void *keyspace_watch_thread(void *arg) {
+    (void) arg;
+    static resp_conn_t sub;
+    int backoff = 1;
+    for (;;) {
+        memset(&sub, 0, sizeof(sub));
+        sub.fd = -1;
+        if (valkey_connect(&sub) < 0) {
+            sleep(backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
+        }
+        struct timeval no_to = {0}; /* block for events; drop the 4s read timeout */
+        setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
+        resp_reply_t r;
+        if (resp_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
+            r.type == 1)
+            dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications — "
+                                 "announce-on-change disabled\n");
+        static const char *prefixes[] = {"mdns:*", "config:mdns_*", NULL};
+        int subok = 1;
+        for (int i = 0; prefixes[i]; i++) {
+            char pat[160];
+            snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", KEYSPACE_DB, prefixes[i]);
+            if (resp_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
+                subok = 0;
+                break;
+            }
+        }
+        if (!subok) {
+            close(sub.fd);
+            sub.fd = -1;
+            sleep(backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
+        }
+        backoff = 1;
+        dns_log(LOG_NOTICE, "[Reload] live reload active (keyspace notifications)\n");
+        for (;;) {
+            resp_reply_t hdr;
+            if (resp_parse(&sub, &hdr) < 0)
+                break;
+            if (hdr.type != 5 || hdr.count < 1)
+                continue;
+            char kind[16] = "", channel[512] = "";
+            int rderr = 0;
+            for (int i = 0; i < hdr.count; i++) {
+                resp_reply_t el;
+                if (resp_parse(&sub, &el) < 0) {
+                    rderr = 1;
+                    break;
+                }
+                if (i == 0)
+                    safe_strcpy(kind, el.str, sizeof(kind));
+                else if (i == 2)
+                    safe_strcpy(channel, el.str, sizeof(channel));
+            }
+            if (rderr)
+                break;
+            if (strcmp(kind, "pmessage") != 0)
+                continue;
+            const char *sep = strstr(channel, "__:");
+            if (sep)
+                mdns_keyspace_apply(sep + 3);
+        }
+        dns_log(LOG_WARNING, "[Reload] keyspace connection lost — reconnecting\n");
+        close(sub.fd);
+        sub.fd = -1;
+        sleep(backoff);
+        if (backoff < 30)
+            backoff *= 2;
+    }
+    return NULL;
+}
+
 /* ── Receive loop ───────────────────────────────────────────────────────── */
 
 static void mdns_recv_loop(int fd4, int fd6) {
@@ -1116,6 +1242,15 @@ int main(int argc, char **argv) {
             g_mdns4_sock >= 0 ? "up" : "down", g_mdns6_sock >= 0 ? "up" : "down");
     mdns_probe();
     mdns_announce();
+    /* Live reload: re-announce when mdns: or config:mdns_ records change
+     * (migration Step 6). */
+    {
+        pthread_t kt;
+        if (pthread_create(&kt, NULL, keyspace_watch_thread, NULL) == 0)
+            pthread_detach(kt);
+        else
+            dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
+    }
     mdns_recv_loop(g_mdns4_sock, g_mdns6_sock);
     return 0;
 }

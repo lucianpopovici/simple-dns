@@ -10,10 +10,10 @@
  *     never interprets DNS payloads.
  *   - Management API (same endpoints the monolith served): list, update,
  *     delete, zone, config, zone/list, zone/add, zone/del. Every write
- *     goes to Valkey only — apid calls nothing inside dnsd. In-memory state
- *     dnsd derives from those keys (SOA serial, zone table, TLS PEMs)
- *     refreshes on SIGHUP until migration Step 6 adds keyspace-notification
- *     live reload; zone records themselves are read live per query already.
+ *     goes to Valkey only — apid calls nothing inside dnsd. dnsd applies the
+ *     in-memory state it derives from those keys (SOA serial, zone table,
+ *     TLS PEMs) live via Valkey keyspace notifications (migration Step 6);
+ *     zone records themselves are read live per query already.
  *   - /health (apid itself) and /metrics (proxied from dnsd's localhost-only
  *     read-only endpoint).
  *
@@ -24,9 +24,9 @@
  *                      client against config:mtls_ca_pem (required for
  *                      config and zone-table management, exactly as before)
  *
- * TLS material: cert:current (written by certd; hot-reloaded by polling —
- * Step 6 switches to notifications), falling back to config:tls_cert_pem /
- * config:tls_key_pem. Env: DNS_VALKEY_HOST/PORT/PASSWORD.
+ * TLS material: cert:current (written by certd), falling back to
+ * config:tls_cert_pem / config:tls_key_pem; hot-reloaded live via Valkey
+ * keyspace notifications (migration Step 6). Env: DNS_VALKEY_HOST/PORT/PASSWORD.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +57,6 @@
 #define MAX_PEM 65536
 #define DNS_BUF 65535
 #define DEFAULT_TTL 60
-#define CERT_WATCH_INTERVAL 30
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 static void dns_log(int level, const char *fmt, ...) {
@@ -244,6 +243,27 @@ static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
         return -1;
     return resp_parse(c, r);
 }
+/* Send a command without reading a reply — for (P)SUBSCRIBE, whose replies and
+ * subsequent messages are consumed by the subscriber read loop. */
+static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        const char *a = va_arg(ap, const char *);
+        int al = (int) strlen(a);
+        if (pos < 0 || pos >= (int) sizeof(buf)) {
+            va_end(ap);
+            return -1;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
+    }
+    va_end(ap);
+    if (pos < 0 || pos >= (int) sizeof(buf))
+        return -1;
+    return resp_send(c, buf, pos);
+}
 static int valkey_connect(resp_conn_t *c) {
     if (c->fd >= 0) {
         close(c->fd);
@@ -367,7 +387,7 @@ static long vk_incr(const char *key) {
 }
 
 /* SOA serial bump — same Valkey key dnsd uses (it INCRs config:zone_serial);
- * dnsd's in-memory serial refreshes on SIGHUP until Step 6 live reload. */
+ * dnsd picks up the new serial live via keyspace notifications (Step 6). */
 static void serial_bump(void) {
     if (vk_incr("config:zone_serial") < 0)
         dns_log(LOG_WARNING, "[apid] serial bump failed (Valkey down?)\n");
@@ -567,21 +587,99 @@ static int tls_material_load(void) {
     return 0;
 }
 
-static void *cert_watch_thread(void *arg) {
+/* Reload the HTTPS cert/key (cert:current or config:tls_*) and the mTLS CA,
+ * rebuilding the TLS context if anything changed. Used for the boot/reconnect
+ * catch-up and on a keyspace notification. */
+static void tls_material_reload(void) {
+    char ca2[MAX_PEM] = "";
+    vk_get("config:mtls_ca_pem", ca2, sizeof(ca2));
+    int changed = tls_material_load();
+    if (strcmp(ca2, g_mtls_ca_pem)) {
+        safe_strcpy(g_mtls_ca_pem, ca2, sizeof(g_mtls_ca_pem));
+        changed = 1;
+    }
+    if (changed) {
+        dns_log(LOG_NOTICE, "[TLS] Certificate material changed — reloading\n");
+        tls_reload();
+    }
+}
+
+/* Live reload via Valkey keyspace notifications (migration Step 6). apid owns
+ * the HTTPS TLS material, so it watches cert:current plus the config tls_cert_pem,
+ * tls_key_pem and mtls_ca_pem keys and hot-reloads — replacing the old 30s poll.
+ * A dedicated subscriber connection (separate from the request/reply `vk`);
+ * reconnects use capped backoff and re-run the catch-up so nothing is missed. */
+#define KEYSPACE_DB 0
+static void *keyspace_watch_thread(void *arg) {
     (void) arg;
+    static resp_conn_t sub;
+    int backoff = 1;
     for (;;) {
-        sleep(CERT_WATCH_INTERVAL);
-        char ca2[MAX_PEM] = "";
-        vk_get("config:mtls_ca_pem", ca2, sizeof(ca2));
-        int changed = tls_material_load();
-        if (strcmp(ca2, g_mtls_ca_pem)) {
-            safe_strcpy(g_mtls_ca_pem, ca2, sizeof(g_mtls_ca_pem));
-            changed = 1;
+        memset(&sub, 0, sizeof(sub));
+        sub.fd = -1;
+        if (valkey_connect(&sub) < 0) {
+            sleep(backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
         }
-        if (changed) {
-            dns_log(LOG_NOTICE, "[TLS] Certificate material changed — reloading\n");
-            tls_reload();
+        struct timeval no_to = {0}; /* block for events; drop the 4s read timeout */
+        setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
+        resp_reply_t r;
+        if (resp_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
+            r.type == 1)
+            dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications — "
+                                 "boot/reconnect catch-up only\n");
+        tls_material_reload(); /* catch up via the shared vk connection */
+        static const char *prefixes[] = {"cert:current", "config:tls_cert_pem",
+                                         "config:tls_key_pem", "config:mtls_ca_pem", NULL};
+        int subok = 1;
+        for (int i = 0; prefixes[i]; i++) {
+            char pat[160];
+            snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", KEYSPACE_DB, prefixes[i]);
+            if (resp_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
+                subok = 0;
+                break;
+            }
         }
+        if (!subok) {
+            close(sub.fd);
+            sub.fd = -1;
+            sleep(backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
+        }
+        backoff = 1;
+        dns_log(LOG_NOTICE, "[Reload] live TLS reload active (keyspace notifications)\n");
+        for (;;) {
+            resp_reply_t hdr;
+            if (resp_parse(&sub, &hdr) < 0)
+                break;
+            if (hdr.type != 5 || hdr.count < 1)
+                continue;
+            char kind[16] = "";
+            int rderr = 0;
+            for (int i = 0; i < hdr.count; i++) {
+                resp_reply_t el;
+                if (resp_parse(&sub, &el) < 0) {
+                    rderr = 1;
+                    break;
+                }
+                if (i == 0)
+                    safe_strcpy(kind, el.str, sizeof(kind));
+            }
+            if (rderr)
+                break;
+            if (strcmp(kind, "pmessage") == 0)
+                tls_material_reload();
+        }
+        dns_log(LOG_WARNING, "[Reload] keyspace connection lost — reconnecting\n");
+        close(sub.fd);
+        sub.fd = -1;
+        sleep(backoff);
+        if (backoff < 30)
+            backoff *= 2;
     }
     return NULL;
 }
@@ -1061,8 +1159,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         snprintf(fullkey, sizeof(fullkey), "config:%s", cfgkey);
         vk_set(fullkey, cfgval, 0);
         char rb[320];
-        snprintf(rb, sizeof(rb), "ok: config:%s updated (dnsd applies on SIGHUP until Step 6)\n",
-                 cfgkey);
+        snprintf(rb, sizeof(rb), "ok: config:%s updated (dnsd applies it live)\n", cfgkey);
         api_send(fd, ssl, 200, rb);
         return;
     }
@@ -1122,7 +1219,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         /* mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify_targets */
         snprintf(zval, sizeof(zval), "%s|%s|1|3600|900|604800|300|127.0.0.1|", zmn, zrn);
         vk_set(zkey, zval, 0);
-        dns_log(LOG_NOTICE, "[Zone] Added %s (dnsd loads on SIGHUP until Step 6)\n", zn);
+        dns_log(LOG_NOTICE, "[Zone] Added %s (dnsd loads the zone table live)\n", zn);
         char rb[320];
         snprintf(rb, sizeof(rb), "ok: zone %s added\n", zn);
         api_send(fd, ssl, 201, rb);
@@ -1269,7 +1366,7 @@ int main(int argc, char **argv) {
     dns_log(LOG_NOTICE, "[apid] Starting: HTTP :%d, HTTPS :%d, dnsd at 127.0.0.1:%d\n", g_http_port,
             g_https_port, g_dns_port);
     pthread_t t1, t2, t3;
-    if (pthread_create(&t3, NULL, cert_watch_thread, NULL) == 0)
+    if (pthread_create(&t3, NULL, keyspace_watch_thread, NULL) == 0)
         pthread_detach(t3);
     if (pthread_create(&t2, NULL, https_thread, NULL) == 0)
         pthread_detach(t2);
