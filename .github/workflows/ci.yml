@@ -11,8 +11,8 @@
 # exist.
 #
 # OpenSSL paths: libssl-dev on Ubuntu puts headers in /usr/include and the
-# libraries in /usr/lib/x86_64-linux-gnu. These override the broken
-# OSSL_INC=/tmp/ossl-inc default (see CLAUDE-fixes.md Task 4).
+# libraries in /usr/lib/x86_64-linux-gnu. The Makefile derives these via
+# pkg-config now, but CI pins them explicitly since the runner image is fixed.
 
 name: CI
 
@@ -49,10 +49,20 @@ jobs:
       - name: Build debug (ASan + UBSan) — compile/link check
         run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
-      - name: Build production binary (unsigned)
-        # Build the binary target directly, not `prod`, to skip GPG signing
+      - name: Build production binaries (unsigned)
+        # Build the binary targets directly, not `prod`, to skip GPG signing
         # (no signing key in CI; signing belongs to the release pipeline).
-        run: make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+        # Every daemon split out by the migration is built here.
+        run: |
+          make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make certd      OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make mdnsd      OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make apid       OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Unit tests (DNSSEC known-answer/negative + name parser)
+        run: |
+          make check-dnssec OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make check-wire   OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Smoke test against Valkey
         env:
@@ -64,10 +74,6 @@ jobs:
           sleep 2
           dig @127.0.0.1 -p 5353 example.local A +time=2 +tries=1 +short || true
           kill "$SRV" 2>/dev/null || true
-
-      # Once unit tests exist (migration Step 1), add:
-      #   - name: Unit tests (under ASan/UBSan)
-      #     run: make test
 
   warnings:
     name: Warnings as errors (advisory)
@@ -111,8 +117,10 @@ jobs:
   fuzz-smoke:
     name: Fuzz smoke (name_from_wire)
     runs-on: ubuntu-latest
-    # Self-activates once libdnswire and the harness exist (migration Step 1).
-    if: ${{ hashFiles('dns_wire.c', 'fuzz/fuzz_name_from_wire.c') != '' }}
+    # libdnswire + the harness landed in migration Step 1, so this always runs.
+    # (A job-level `if:` may not call hashFiles() — that is only valid in step
+    # contexts — so the old self-activation guard made the whole workflow
+    # invalid; the files are committed now, so no guard is needed.)
     steps:
       - uses: actions/checkout@v4
       - name: Install clang
