@@ -69,10 +69,13 @@ endif
 OSSL_SIGN_KEY ?= keys/codesign.key.pem
 
 # ── Common compile flags ─────────────────────────────────────────────────────
+# EXTRA_WARN is appended last so CI can promote the curated set to errors with
+# `make ... EXTRA_WARN=-Werror` without dropping the intentional -Wno-* flags
+# (CLAUDE.md: "promote the current warning set", keep the legacy suppressions).
 WARN       := -Wall -Wextra -Wformat=2 -Wformat-overflow=2 \
               -Wnull-dereference -Wstack-protector \
               -Wno-unused-parameter -Wno-missing-field-initializers \
-              -Wno-implicit-fallthrough
+              -Wno-implicit-fallthrough $(EXTRA_WARN)
 
 INCLUDES   := -I$(OSSL_INC)
 LIBS       := -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)

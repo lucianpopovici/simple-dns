@@ -49,7 +49,9 @@
  *   ./dns_client --dump           # dump all cached records
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3210,8 +3212,9 @@ typedef struct {
 } tcp_client_arg_t;
 static void *tcp_client_thread(void *arg) {
     tcp_client_arg_t *a = (tcp_client_arg_t *) arg;
-    free(arg);
-    proxy_handle_tcp(a->cfd);
+    int cfd = a->cfd;
+    free(a);
+    proxy_handle_tcp(cfd);
     return NULL;
 }
 

@@ -72,7 +72,9 @@
  *       -L<openssl-lib> -lssl -lcrypto -lpthread -Wl,-rpath,<openssl-lib>
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -582,7 +584,7 @@ static int rsyslog_connect(void) {
 
     /* Resolve host */
     struct addrinfo hints = {0}, *res = NULL;
-    char portstr[8];
+    char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", g_rsyslog_port);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = (g_rsyslog_proto == RSYSLOG_UDP) ? SOCK_DGRAM : SOCK_STREAM;
@@ -2271,7 +2273,6 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
     int off = 12;
     int skip = ntohs(h->qdcount) + ntohs(h->ancount) + ntohs(h->nscount);
     for (int i = 0; i < skip; i++) {
-        char name[256];
         int a = /* name_from_wire inline: */ off;
         /* skip name */
         for (;;) {
@@ -2302,7 +2303,6 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
     }
     /* Scan additional RRs for TSIG */
     for (int i = 0; i < ar; i++) {
-        char name[256];
         int a = off;
         int orig_off = a;
         /* skip name */
@@ -4500,7 +4500,8 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s\n", un, ip6);
             } else if (ut == DNS_TYPE_TXT && rdlen >= 1) {
                 uint8_t sl = rd[0];
-                if (sl > rdlen - 1 || sl > 255)
+                /* sl is uint8_t (<= 255), so only the rdlen bound matters */
+                if (sl > rdlen - 1)
                     goto formerr;
                 char txt[256];
                 memcpy(txt, rd + 1, sl);

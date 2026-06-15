@@ -76,15 +76,32 @@ jobs:
           kill "$SRV" 2>/dev/null || true
 
   warnings:
-    name: Warnings as errors (advisory)
+    name: Warnings as errors
     runs-on: ubuntu-latest
-    continue-on-error: true   # flip to false once the tree is warning-clean
+    # Advisory for one cycle to confirm the Ubuntu gcc agrees with local Fedora
+    # gcc; flip to blocking (remove this line) once green in CI.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
-      - name: Build with -Werror
-        run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB WARN="-Wall -Wextra -Werror"
+      - name: Build with the curated warning set promoted to errors
+        # EXTRA_WARN=-Werror keeps the project's curated WARN flags (incl. the
+        # intentional -Wno-* for the legacy dense code) and turns them fatal —
+        # CLAUDE.md: "promote the current warning set", not bare -Wall -Wextra.
+        run: |
+          set -e
+          for t in dns_server certd mdnsd apid; do
+            make "$t" EXTRA_WARN=-Werror OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          done
+          make debug EXTRA_WARN=-Werror OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          # Standalone translation units have no daemon target; syntax-check
+          # them under the same flags at -O2 (surfaces format-truncation etc.).
+          W="-Wall -Wextra -Wformat=2 -Wformat-overflow=2 -Wnull-dereference \
+             -Wstack-protector -Wno-unused-parameter -Wno-missing-field-initializers \
+             -Wno-implicit-fallthrough -Werror"
+          gcc -std=c99 -D_GNU_SOURCE -O2 -D_FORTIFY_SOURCE=2 -fPIE $W \
+              -I"$OSSL_INC" -fsyntax-only dns_client.c simple_dns.c
 
   static-analysis:
     name: Static analysis (advisory)

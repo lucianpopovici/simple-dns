@@ -1001,7 +1001,7 @@ static int acme_issue(void) {
     strlower(acme_name);
     char acme_val[512];
     snprintf(acme_val, sizeof(acme_val), "120|%s", dns01val);
-    char acme_vk[512];
+    char acme_vk[560];
     snprintf(acme_vk, sizeof(acme_vk), "zone:TXT:%s", acme_name);
     vk_set(acme_vk, acme_val, 0);
     dns_log(LOG_NOTICE, "[ACME] TXT %s set — waiting 5s\n", acme_name);

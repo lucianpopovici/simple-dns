@@ -62,7 +62,9 @@
  *       -L<openssl-lib> -lssl -lcrypto -lpthread -Wl,-rpath,<openssl-lib>
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -438,7 +440,7 @@ static int rsyslog_connect(void) {
 
     /* Resolve host */
     struct addrinfo hints = {0}, *res = NULL;
-    char portstr[8];
+    char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", g_rsyslog_port);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = (g_rsyslog_proto == RSYSLOG_UDP) ? SOCK_DGRAM : SOCK_STREAM;
@@ -1993,7 +1995,6 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
     int off = 12;
     int skip = ntohs(h->qdcount) + ntohs(h->ancount) + ntohs(h->nscount);
     for (int i = 0; i < skip; i++) {
-        char name[256];
         int a = /* name_from_wire inline: */ off;
         /* skip name */
         for (;;) {
@@ -2024,7 +2025,6 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
     }
     /* Scan additional RRs for TSIG */
     for (int i = 0; i < ar; i++) {
-        char name[256];
         int a = off;
         int orig_off = a;
         /* skip name */
@@ -4033,7 +4033,7 @@ static int acme_issue(void) {
     strlower(acme_name);
     char acme_val[512];
     snprintf(acme_val, sizeof(acme_val), "120|%s", dns01val);
-    char acme_vk[512];
+    char acme_vk[560];
     snprintf(acme_vk, sizeof(acme_vk), "zone:TXT:%s", acme_name);
     vk_set(acme_vk, acme_val, 0);
     dns_log(LOG_NOTICE, "[ACME] TXT %s set — waiting 5s\n", acme_name);
@@ -4447,7 +4447,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt, const struct in_addr *cip)
         serial_bump();
         dns_log(LOG_NOTICE, "[ZONE] %s %s = %s\n", type2str(rt), name, vval);
         notify_send();
-        char rb[256];
+        char rb[600];
         snprintf(rb, sizeof(rb), "ok: %s\n", vkey);
         api_send(fd, ssl, 201, rb);
         return;
