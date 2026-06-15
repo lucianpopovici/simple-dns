@@ -32,6 +32,10 @@ AllowAllArgumentsOnNextLine: false
 # Includes: do NOT reorder — C system-header order can be load-bearing.
 SortIncludes: false
 
+# Do NOT split long string literals into adjacent pieces: it changes the token
+# stream (adds quotes), so the reformat would not be a pure whitespace change.
+BreakStringLiterals: false
+
 # Misc
 KeepEmptyLinesAtTheStartOfBlocks: false
 MaxEmptyLinesToKeep: 1

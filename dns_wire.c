@@ -39,8 +39,8 @@ void hex_enc(const uint8_t *in, int n, char *out) {
 int hex_dec(const char *in, uint8_t *out, int maxlen) {
     int n = 0;
     while (in[0] && in[1] && n < maxlen) {
-        char h[3] = { in[0], in[1], 0 };
-        out[n++] = (uint8_t)strtol(h, NULL, 16);
+        char h[3] = {in[0], in[1], 0};
+        out[n++] = (uint8_t) strtol(h, NULL, 16);
         in += 2;
     }
     return n;
@@ -49,29 +49,29 @@ int hex_dec(const char *in, uint8_t *out, int maxlen) {
 /* ── base64 / base64url ──────────────────────────────────────────────────── */
 
 int b64std_dec(const char *in, uint8_t *out, int olen) {
-    int inlen = (int)strlen(in), o = 0;
+    int inlen = (int) strlen(in), o = 0;
     static const int8_t rev[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,-1, 0, 1, 2, 3, 4, 5, 6,
-         7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
-        49,50,51,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1};
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1,
+        -1, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, 0,  -1, -1, -1, 0,  1,  2,  3,
+        4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1,
+        -1, -1, -1, -1, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+        44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     for (int i = 0; i + 3 < inlen && o + 2 < olen; i += 4) {
-        int8_t a = rev[(uint8_t)in[i]], b = rev[(uint8_t)in[i + 1]],
-               c = rev[(uint8_t)in[i + 2]], d = rev[(uint8_t)in[i + 3]];
+        int8_t a = rev[(uint8_t) in[i]], b = rev[(uint8_t) in[i + 1]], c = rev[(uint8_t) in[i + 2]],
+               d = rev[(uint8_t) in[i + 3]];
         if (a < 0 || b < 0)
             break;
-        out[o++] = (uint8_t)((a << 2) | (b >> 4));
+        out[o++] = (uint8_t) ((a << 2) | (b >> 4));
         if (c >= 0 && o < olen)
-            out[o++] = (uint8_t)((b << 4) | (c >> 2));
+            out[o++] = (uint8_t) ((b << 4) | (c >> 2));
         if (d >= 0 && o < olen)
-            out[o++] = (uint8_t)((c << 6) | d);
+            out[o++] = (uint8_t) ((c << 6) | d);
     }
     return o;
 }
@@ -80,8 +80,8 @@ int b64std_dec(const char *in, uint8_t *out, int olen) {
  * +/, no padding. Translate to standard base64 then call b64std_dec. */
 int b64url_dec(const char *in, uint8_t *out, int olen) {
     char tmp[4096];
-    int n = (int)strlen(in);
-    if (n >= (int)sizeof(tmp) - 4)
+    int n = (int) strlen(in);
+    if (n >= (int) sizeof(tmp) - 4)
         return -1;
     for (int i = 0; i < n; i++) {
         char c = in[i];
@@ -98,8 +98,7 @@ int b64url_dec(const char *in, uint8_t *out, int olen) {
     return b64std_dec(tmp, out, olen);
 }
 
-static const char B64U[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+static const char B64U[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 int b64url_enc(const uint8_t *in, int ilen, char *out, int olen) {
     int i = 0, o = 0;
@@ -134,7 +133,7 @@ int base32hex_enc(const uint8_t *in, int ilen, char *out, int olen) {
         uint64_t v = 0;
         int take = ilen - i < 5 ? ilen - i : 5;
         for (int j = 0; j < take; j++)
-            v |= (uint64_t)in[i + j] << (32 - j * 8);
+            v |= (uint64_t) in[i + j] << (32 - j * 8);
         int bits = take * 8;
         for (int j = 0; j < 8 && bits > 0; j++) {
             out[o++] = B32H[(v >> (35 - j * 5)) & 0x1F];
@@ -161,12 +160,12 @@ void put32(uint8_t *b, int o, uint32_t v) {
 }
 
 uint16_t get16(const uint8_t *b, int o) {
-    return ((uint16_t)b[o] << 8) | b[o + 1];
+    return ((uint16_t) b[o] << 8) | b[o + 1];
 }
 
 uint32_t get32(const uint8_t *b, int o) {
-    return ((uint32_t)b[o] << 24) | ((uint32_t)b[o + 1] << 16) |
-           ((uint32_t)b[o + 2] << 8) | b[o + 3];
+    return ((uint32_t) b[o] << 24) | ((uint32_t) b[o + 1] << 16) | ((uint32_t) b[o + 2] << 8) |
+           b[o + 3];
 }
 
 /* ── DNS names ───────────────────────────────────────────────────────────── */
@@ -180,10 +179,10 @@ int name_to_wire(const char *name, uint8_t *buf, int blen) {
     char *saveptr = NULL;
     char *lbl = strtok_r(tmp, ".", &saveptr);
     while (lbl) {
-        int ll = (int)strlen(lbl);
+        int ll = (int) strlen(lbl);
         if (pos + ll + 1 >= blen)
             return -1;
-        buf[pos++] = (uint8_t)ll;
+        buf[pos++] = (uint8_t) ll;
         memcpy(buf + pos, lbl, ll);
         pos += ll;
         lbl = strtok_r(NULL, ".", &saveptr);
@@ -240,12 +239,12 @@ int name_from_wire(const uint8_t *pkt, int plen, int off, char *out, int olen) {
  * each up to 255 bytes. Splits s across as many chunks as needed and writes
  * them back-to-back. Returns total rdata length, or -1 on overflow. */
 int txt_encode(const char *s, uint8_t *rd, int maxlen) {
-    int slen = (int)strlen(s), out = 0;
+    int slen = (int) strlen(s), out = 0;
     while (slen > 0) {
         int chunk = slen > 255 ? 255 : slen;
         if (out + 1 + chunk > maxlen)
             return -1;
-        rd[out++] = (uint8_t)chunk;
+        rd[out++] = (uint8_t) chunk;
         memcpy(rd + out, s, chunk);
         out += chunk;
         s += chunk;
@@ -283,8 +282,7 @@ void compress_reset(void) {
  * inside the final DNS message where buf+pos lands — required so registered
  * pointers can be looked up by subsequent names. For owner-name emission
  * into the response buffer, buf=resp, pos=off, abs_off=off (they coincide). */
-int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen,
-                   int abs_off) {
+int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen, int abs_off) {
     char work[256];
     safe_strcpy(work, name, sizeof(work));
     char *labels[64];
@@ -299,8 +297,8 @@ int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen,
         char suffix[256];
         int sp = 0;
         for (int j = i; j < nlabels; j++) {
-            int ll = (int)strlen(labels[j]);
-            if (sp + ll + 1 >= (int)sizeof(suffix))
+            int ll = (int) strlen(labels[j]);
+            if (sp + ll + 1 >= (int) sizeof(suffix))
                 break;
             if (j > i)
                 suffix[sp++] = '.';
@@ -321,16 +319,15 @@ int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen,
         /* Register this suffix at its absolute offset (14-bit max) */
         int suffix_abs = abs_off + (pos - start);
         if (g_cc.count < 128 && suffix_abs < 0x4000) {
-            g_cc.offsets[g_cc.count] = (uint16_t)suffix_abs;
-            safe_strcpy(g_cc.names[g_cc.count], suffix,
-                        sizeof(g_cc.names[g_cc.count]));
+            g_cc.offsets[g_cc.count] = (uint16_t) suffix_abs;
+            safe_strcpy(g_cc.names[g_cc.count], suffix, sizeof(g_cc.names[g_cc.count]));
             g_cc.count++;
         }
         /* Emit this label */
-        int ll = (int)strlen(labels[i]);
+        int ll = (int) strlen(labels[i]);
         if (pos + ll + 1 >= blen)
             return -1;
-        buf[pos++] = (uint8_t)ll;
+        buf[pos++] = (uint8_t) ll;
         memcpy(buf + pos, labels[i], ll);
         pos += ll;
     }
@@ -340,13 +337,12 @@ int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen,
     return pos - start;
 }
 
-int append_rr(uint8_t *buf, int off, int blen, const char *name,
-              uint16_t type, uint16_t cls, uint32_t ttl,
-              const uint8_t *rdata, uint16_t rdlen) {
+int append_rr(uint8_t *buf, int off, int blen, const char *name, uint16_t type, uint16_t cls,
+              uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
     /* Owner name uses compression (RFC 1035 §4.1.4); rdata is copied verbatim,
      * so any names inside rdata were already encoded by their builder. */
     int n = name_to_wire_c(name, buf, off, blen, off);
-    if (n < 0 || off + n + 10 + (int)rdlen > blen)
+    if (n < 0 || off + n + 10 + (int) rdlen > blen)
         return -1;
     off += n;
     put16(buf, off, type);
@@ -362,11 +358,10 @@ int append_rr(uint8_t *buf, int off, int blen, const char *name,
     return off + rdlen;
 }
 
-int append_rr_plain(uint8_t *buf, int off, int blen, const char *name,
-                    uint16_t type, uint16_t cls, uint32_t ttl,
-                    const uint8_t *rdata, uint16_t rdlen) {
+int append_rr_plain(uint8_t *buf, int off, int blen, const char *name, uint16_t type, uint16_t cls,
+                    uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
     int n = name_to_wire(name, buf + off, blen - off);
-    if (n < 0 || off + n + 10 + (int)rdlen > blen)
+    if (n < 0 || off + n + 10 + (int) rdlen > blen)
         return -1;
     off += n;
     put16(buf, off, type);

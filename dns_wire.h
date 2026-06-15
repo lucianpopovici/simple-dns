@@ -45,8 +45,8 @@ int base32hex_enc(const uint8_t *in, int ilen, char *out, int olen);
 
 /* ── Fixed-width big-endian accessors ────────────────────────────────────── */
 
-void     put16(uint8_t *b, int o, uint16_t v);
-void     put32(uint8_t *b, int o, uint32_t v);
+void put16(uint8_t *b, int o, uint16_t v);
+void put32(uint8_t *b, int o, uint32_t v);
 uint16_t get16(const uint8_t *b, int o);
 uint32_t get32(const uint8_t *b, int o);
 
@@ -71,9 +71,9 @@ int txt_encode(const char *s, uint8_t *rd, int maxlen);
  * absolute offsets. The implementation keeps one thread-local context;
  * call compress_reset() at every outgoing-message boundary. */
 typedef struct {
-    int      count;
+    int count;
     uint16_t offsets[128];
-    char     names[128][256];
+    char names[128][256];
 } compress_ctx_t;
 
 void compress_reset(void);
@@ -81,18 +81,15 @@ void compress_reset(void);
 /* Emit name to buf+pos with compression against the thread-local context.
  * abs_off is the absolute message offset where buf+pos lands. Returns bytes
  * written or -1. */
-int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen,
-                   int abs_off);
+int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen, int abs_off);
 
 /* Append one resource record. append_rr compresses the owner name against
  * the thread-local context (use in dnsd, where compress_reset() is called per
  * message). append_rr_plain emits the owner uncompressed (no context needed).
  * Both return the new offset or -1; rdata is copied verbatim. */
-int append_rr(uint8_t *buf, int off, int blen, const char *name,
-              uint16_t type, uint16_t cls, uint32_t ttl,
-              const uint8_t *rdata, uint16_t rdlen);
-int append_rr_plain(uint8_t *buf, int off, int blen, const char *name,
-                    uint16_t type, uint16_t cls, uint32_t ttl,
-                    const uint8_t *rdata, uint16_t rdlen);
+int append_rr(uint8_t *buf, int off, int blen, const char *name, uint16_t type, uint16_t cls,
+              uint32_t ttl, const uint8_t *rdata, uint16_t rdlen);
+int append_rr_plain(uint8_t *buf, int off, int blen, const char *name, uint16_t type, uint16_t cls,
+                    uint32_t ttl, const uint8_t *rdata, uint16_t rdlen);
 
 #endif /* DNS_WIRE_H */

@@ -41,25 +41,25 @@
 #include "dns_wire.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size == 0 || size > (size_t)INT_MAX) {
+    if (size == 0 || size > (size_t) INT_MAX) {
         return 0;
     }
 
     /* Treat the whole input as a DNS message. Output buffer is the maximum
      * legal name length (255) + NUL; name_from_wire must never write past it. */
     char out[256];
-    int  plen = (int)size;
+    int plen = (int) size;
 
     /* (1) Start offset derived from the input so the fuzzer explores names
      *     beginning anywhere — including mid-label and out-of-range offsets.
      *     name_from_wire guards pos >= plen, so any offset is safe to pass. */
-    int off = (int)(data[0] % size);
-    (void)name_from_wire(data, plen, off, out, (int)sizeof(out));
+    int off = (int) (data[0] % size);
+    (void) name_from_wire(data, plen, off, out, (int) sizeof(out));
 
     /* (2) Also exercise offset 12, the canonical position of the first name in
      *     a real query (immediately after the 12-byte header). */
     if (plen > 12) {
-        (void)name_from_wire(data, plen, 12, out, (int)sizeof(out));
+        (void) name_from_wire(data, plen, 12, out, (int) sizeof(out));
     }
 
     /* Return value is intentionally ignored: this harness hunts memory-safety
