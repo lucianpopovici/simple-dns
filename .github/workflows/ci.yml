@@ -1,14 +1,12 @@
 # .github/workflows/ci.yml
 #
-# Minimal CI scaffold for the dns_server project. Place at
-# .github/workflows/ci.yml in the repo.
+# CI for the dns_server project. Place at .github/workflows/ci.yml in the repo.
 #
-# Jobs that pass against the current tree are blocking. Jobs that require a
-# clean baseline (formatting, static analysis, -Werror) run as ADVISORY
-# (continue-on-error) so they surface problems without blocking merges until the
-# baseline is fixed — flip continue-on-error to false once each is clean. The
-# fuzz job self-activates once migration Step 1 (dns_wire.c) and the harness
-# exist.
+# All jobs are blocking: build + sanitizer + smoke test, warnings-as-errors
+# (curated set + -Werror), static analysis (scan-build + cppcheck), clang-format,
+# and a 60s name_from_wire fuzz smoke. The tree is clean against all of them;
+# keep it that way (format new code with clang-format, fix warnings, add
+# cppcheck inline-suppr only with justification).
 #
 # OpenSSL paths: libssl-dev on Ubuntu puts headers in /usr/include and the
 # libraries in /usr/lib/x86_64-linux-gnu. The Makefile derives these via
@@ -103,9 +101,10 @@ jobs:
               -I"$OSSL_INC" -fsyntax-only dns_client.c simple_dns.c
 
   static-analysis:
-    name: Static analysis (advisory)
+    name: Static analysis
     runs-on: ubuntu-latest
-    continue-on-error: true   # flip to false once baselines are clean
+    # Blocking: scan-build reports no bugs and cppcheck is clean
+    # (verified green in CI run 27553189061).
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
