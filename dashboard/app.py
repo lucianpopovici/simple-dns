@@ -18,25 +18,98 @@ Environment overrides:
 
 import os
 import re
+import time
 import json
 import socket
+import secrets
 import urllib.request
 import urllib.error
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, render_template_string, request, redirect,
                    url_for, flash, jsonify, session, abort)
+from werkzeug.security import generate_password_hash, check_password_hash
 from valkey_client import ValkeyClient, ValkeyError
 
 # ── App setup ─────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dns-dashboard-dev-key-change-in-prod")
+# Real secret key is set in configure_auth() before the app serves a request;
+# a known/default key means forgeable session cookies.
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "")
 
 # ── Globals (set by parse_args) ───────────────────────────────────────────
 vk: ValkeyClient = None
 DNS_HOST = "127.0.0.1"
 DNS_METRICS_PORT = 8053
+
+# ── Authentication (migration Step 5) ─────────────────────────────────────
+# Single admin account. The password hash is provisioned out-of-band; the app
+# refuses to start without one (no blank-auth default). See configure_auth().
+DASH_USER      = os.getenv("DASHBOARD_USER", "admin")
+DASH_PW_HASH   = None     # werkzeug hash, set in configure_auth()
+SESSION_HOURS  = int(os.getenv("DASHBOARD_SESSION_HOURS", "12"))
+# Raw Valkey Explorer writes are opt-in; even then, secret namespaces are never
+# writable/deletable through that path (use the dedicated config pages).
+EXPLORER_WRITE = os.getenv("DASHBOARD_ENABLE_EXPLORER_WRITE", "") in ("1", "true", "yes")
+# Secret-bearing keys: masked in the Explorer, never raw-writable there.
+SECRET_KEY_RE  = re.compile(r"(^dnssec:|secret|cookie_secret|_key$|key_pem|tsig)", re.I)
+# Endpoints reachable without a session.
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "healthz"}
+# Per-process brute-force throttle: client-ip -> (fail_count, not_before_epoch)
+_login_fails = {}
+
+
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else (request.remote_addr or "?"))
+
+
+def is_secret_key(key: str) -> bool:
+    return bool(SECRET_KEY_RE.search(key or ""))
+
+
+def configure_auth(secret_key: str):
+    """Set the session secret and load the admin password hash. Returns an
+    error string if no credential is configured (caller must refuse to run)."""
+    global DASH_PW_HASH
+    if secret_key and secret_key not in ("change-in-production",
+                                         "dns-dashboard-dev-key-change-in-prod"):
+        app.secret_key = secret_key
+    else:
+        app.secret_key = secrets.token_hex(32)
+        print("[dns-dashboard] WARNING: no strong FLASK_SECRET_KEY set — "
+              "generated an ephemeral one; sessions reset on restart.")
+    # Password hash priority: explicit hash > plaintext env (hashed) > Valkey.
+    h = os.getenv("DASHBOARD_PASSWORD_HASH")
+    if not h:
+        pw = os.getenv("DASHBOARD_PASSWORD")
+        if pw:
+            h = generate_password_hash(pw)
+    if not h and vk is not None:
+        try:
+            h = vk.get("config:dashboard_password_hash") or None
+        except Exception:
+            h = None
+    DASH_PW_HASH = h
+    if not DASH_PW_HASH:
+        return ("no dashboard password configured — set DASHBOARD_PASSWORD, "
+                "DASHBOARD_PASSWORD_HASH, or Valkey config:dashboard_password_hash")
+    return None
+
+
+@app.before_request
+def _require_auth():
+    """Gate every endpoint except the public ones behind a logged-in session."""
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return
+    if session.get("authed"):
+        return
+    # Unauthenticated: JSON for API/XHR callers, redirect for browsers.
+    if request.path.startswith("/api/") or \
+       request.accept_mimetypes.best == "application/json":
+        return jsonify(error="authentication required"), 401
+    return redirect(url_for("login", next=request.path))
 
 # ── Record types served by dns_server ────────────────────────────────────
 RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV",
@@ -769,6 +842,12 @@ BASE = r"""<!DOCTYPE html>
         <span style="color:var(--red)">Valkey ERR</span>
       {% endif %}
     </div>
+    {% if current_user %}
+    <div class="sidebar-status" style="justify-content:space-between">
+      <span style="color:var(--muted,#8a93a3);font-size:.8rem">&#128100; {{ current_user }}</span>
+      <a href="{{ url_for('logout') }}" style="color:var(--muted,#8a93a3);font-size:.8rem">Sign out</a>
+    </div>
+    {% endif %}
   </nav>
 
   <!-- ── Content ────────────────────────────────────────────────── -->
@@ -827,7 +906,93 @@ function refreshMetrics() {
 def render(template_str: str, **kwargs):
     vk_ok = vk.ping()
     page_title = kwargs.pop("page_title", "DNS Dashboard")
-    return render_template_string(BASE + template_str, vk_ok=vk_ok, page_title=page_title, **kwargs)
+    return render_template_string(BASE + template_str, vk_ok=vk_ok, page_title=page_title,
+                                  current_user=session.get("user"), **kwargs)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Authentication routes (migration Step 5) ──────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+LOGIN_TMPL = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Sign in — DNS Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;background:#11151c;color:#e6e6e6;
+   display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+ .card{background:#1b2230;padding:36px 40px;border-radius:10px;width:320px;
+   box-shadow:0 8px 30px rgba(0,0,0,.4)}
+ h1{font-size:1.15rem;margin:0 0 4px} p.sub{color:#8a93a3;font-size:.82rem;margin:0 0 22px}
+ label{display:block;font-size:.8rem;margin:14px 0 5px;color:#b9c0cc}
+ input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #333c4d;
+   border-radius:5px;background:#10141b;color:#e6e6e6;font-size:.95rem}
+ button{margin-top:22px;width:100%;padding:10px;border:0;border-radius:5px;
+   background:#2d6db5;color:#fff;font-size:.95rem;cursor:pointer}
+ button:hover{background:#3179c9}
+ .err{margin-top:16px;background:#3a1d1d;border:1px solid #8a3b3b;color:#f1b0b0;
+   padding:9px 11px;border-radius:5px;font-size:.85rem}
+</style></head><body>
+ <form class="card" method="POST" action="{{ url_for('login') }}">
+   <h1>&#128274; DNS Dashboard</h1>
+   <p class="sub">Sign in to manage the control plane.</p>
+   {% with messages = get_flashed_messages(with_categories=true) %}
+     {% for cat, msg in messages %}<div class="err">{{ msg }}</div>{% endfor %}
+   {% endwith %}
+   <input type="hidden" name="next" value="{{ next_url }}">
+   <label>Username</label>
+   <input name="username" autocomplete="username" autofocus>
+   <label>Password</label>
+   <input name="password" type="password" autocomplete="current-password">
+   <button type="submit">Sign in</button>
+ </form>
+</body></html>"""
+
+
+def _safe_next(target: str) -> str:
+    """Only allow same-site relative redirects (no //host, no scheme)."""
+    if target and target.startswith("/") and not target.startswith("//"):
+        return target
+    return url_for("dashboard")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("authed"):
+        return redirect(url_for("dashboard"))
+    next_url = _safe_next(request.values.get("next", ""))
+    if request.method == "POST":
+        ip = _client_ip()
+        fails, not_before = _login_fails.get(ip, (0, 0))
+        if time.time() < not_before:
+            flash("Too many attempts — wait a moment and try again.", "error")
+            return render_template_string(LOGIN_TMPL, next_url=next_url), 429
+        user = request.form.get("username", "")
+        pw   = request.form.get("password", "")
+        ok = (DASH_PW_HASH is not None
+              and secrets.compare_digest(user, DASH_USER)
+              and check_password_hash(DASH_PW_HASH, pw))
+        if ok:
+            _login_fails.pop(ip, None)
+            session.clear()
+            session["authed"] = True
+            session["user"] = user
+            session.permanent = True
+            app.permanent_session_lifetime = timedelta(hours=SESSION_HOURS)
+            return redirect(next_url)
+        # Failure: generic message + escalating backoff (constant-ish time).
+        fails += 1
+        delay = min(30, 2 ** min(fails, 5)) if fails > 2 else 0
+        _login_fails[ip] = (fails, time.time() + delay)
+        time.sleep(0.5)
+        flash("Invalid credentials.", "error")
+        return render_template_string(LOGIN_TMPL, next_url=next_url), 401
+    return render_template_string(LOGIN_TMPL, next_url=next_url)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    flash("Signed out.", "success")
+    return redirect(url_for("login"))
 
 
 def badge(rtype: str) -> str:
@@ -1872,7 +2037,13 @@ def valkey_explorer():
             keys = vk.scan_match(pattern)
             values = vk.mget(keys) if keys else []
             ttls   = [vk.ttl(k) for k in keys]
-            results = [{"key": k, "value": v or "", "ttl": t}
+            # Mask secret-bearing values so a read-only Explorer view never
+            # leaks the TSIG/cookie secret or DNSSEC private keys.
+            results = [{"key": k,
+                        "value": ("••• (hidden)" if is_secret_key(k)
+                                  else (v or "")),
+                        "ttl": t,
+                        "secret": is_secret_key(k)}
                        for k, v, t in zip(keys, values, ttls)]
             results.sort(key=lambda r: r["key"])
         except ValkeyError:
@@ -1899,7 +2070,7 @@ def valkey_explorer():
         total_keys = 0
 
     return render(EXPLORER_TMPL, active="explorer", page_title="Valkey Explorer",
-        pattern=pattern, results=results,
+        pattern=pattern, results=results, explorer_write=EXPLORER_WRITE,
         total_keys=total_keys, ns_summary=ns_summary)
 
 
@@ -1908,9 +2079,17 @@ def explorer_set():
     key = request.form.get("key", "")
     val = request.form.get("value", "")
     ttl = int(request.form.get("ttl", 0))
+    if not EXPLORER_WRITE:
+        flash("Raw Explorer writes are disabled. Use the dedicated config pages, "
+              "or set DASHBOARD_ENABLE_EXPLORER_WRITE=1.", "error")
+        return redirect(url_for("valkey_explorer", pattern=request.form.get("pattern", "")))
     if not key:
         flash("Key required.", "error")
         return redirect(url_for("valkey_explorer"))
+    if is_secret_key(key):
+        flash(f"Refusing raw write to secret-bearing key {key}. "
+              "Use the DNSSEC/PKI/config pages.", "error")
+        return redirect(url_for("valkey_explorer", pattern=key.rsplit(":", 1)[0] + ":*"))
     try:
         vk.set(key, val, ex=ttl)
         flash(f"Set {key}", "success")
@@ -1923,6 +2102,13 @@ def explorer_set():
 def explorer_delete():
     key     = request.form.get("key", "")
     pattern = request.form.get("pattern", "")
+    if not EXPLORER_WRITE:
+        flash("Raw Explorer deletes are disabled. Use the dedicated config pages, "
+              "or set DASHBOARD_ENABLE_EXPLORER_WRITE=1.", "error")
+        return redirect(url_for("valkey_explorer", pattern=pattern))
+    if key and is_secret_key(key):
+        flash(f"Refusing raw delete of secret-bearing key {key}.", "error")
+        return redirect(url_for("valkey_explorer", pattern=pattern))
     if key:
         try:
             vk.delete(key)
@@ -1958,14 +2144,34 @@ def main():
     parser.add_argument("--dns-host",         default=os.getenv("DNS_HOST","127.0.0.1"))
     parser.add_argument("--dns-metrics-port", type=int, default=int(os.getenv("DNS_METRICS_PORT","8053")))
     parser.add_argument("--secret-key",       default=os.getenv("FLASK_SECRET_KEY","change-in-production"))
+    parser.add_argument("--gen-password-hash", metavar="PASSWORD",
+                        help="print a password hash for DASHBOARD_PASSWORD_HASH / "
+                             "config:dashboard_password_hash and exit")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    app.secret_key = args.secret_key
+    # Provisioning helper: hash a password for out-of-band credential setup.
+    if args.gen_password_hash:
+        print(generate_password_hash(args.gen_password_hash))
+        return
+
     DNS_HOST          = args.dns_host
     DNS_METRICS_PORT  = args.dns_metrics_port
     vk = ValkeyClient(args.valkey_host, args.valkey_port, args.valkey_pass)
 
+    # Step 5: refuse to serve without authentication configured.
+    err = configure_auth(args.secret_key)
+    if err:
+        print(f"[dns-dashboard] FATAL: {err}")
+        print("[dns-dashboard] Provision one with:  "
+              "python3 app.py --gen-password-hash 'yourpass'")
+        raise SystemExit(1)
+
+    if args.debug:
+        print("[dns-dashboard] WARNING: --debug enables the Werkzeug debugger; "
+              "never use it on an exposed instance.")
+    print(f"[dns-dashboard] Auth    → user '{DASH_USER}'; "
+          f"Explorer writes {'ENABLED' if EXPLORER_WRITE else 'disabled'}")
     print(f"[dns-dashboard] Valkey  → {args.valkey_host}:{args.valkey_port}")
     print(f"[dns-dashboard] Metrics → http://{DNS_HOST}:{DNS_METRICS_PORT}/metrics")
     print(f"[dns-dashboard] Serving → http://{args.host}:{args.port}/")

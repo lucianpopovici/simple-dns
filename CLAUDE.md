@@ -272,10 +272,15 @@ authoritative zone.
     writes (`config:*`, `zone:*` records, `ddns:*`) — see the ownership table.
     Config/zone-table changes are applied by `dnsd` on SIGHUP until Step 6 adds
     keyspace-notification live reload; zone records are read live per query.
-- `dashboard/app.py` (Flask) remains the control-plane UI but **must gain
-  authentication** before exposure (Step 5). Today it has none, and its Valkey
-  Explorer can set/delete arbitrary keys — unauthenticated full compromise
-  (zone data, TSIG secret, cookie secret all live in Valkey).
+- `dashboard/app.py` (Flask) is the control-plane UI. **Done (migration
+  Step 5):** it now authenticates — single admin account (werkzeug scrypt
+  hash), signed-cookie sessions, a global `before_request` gate, `/login`+
+  `/logout`, per-IP login backoff; it refuses to start without a password
+  configured. The raw Valkey Explorer is read-only unless explicitly opted in
+  (`DASHBOARD_ENABLE_EXPLORER_WRITE=1`) and never reads/writes secret-bearing
+  keys (`dnssec:*`, `*secret*`, `cookie_secret`, `*_key`, `key_pem`, `tsig`) —
+  those are masked on display and managed only via the dedicated pages.
+  Credential provisioning/rotation: see `dashboard/README.md`.
 - `dnsd` exposes only a tiny read-only `/health` + `/metrics` (Prometheus)
   bound to **localhost** (`config:metrics_port`, default 8054), scraped by
   `apid`'s `/metrics` proxy. All write operations go through Valkey, not an

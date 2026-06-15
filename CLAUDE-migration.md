@@ -224,23 +224,41 @@ Acceptance
 
 ---
 
-## Step 5 — Control-plane authentication  `[ ]`
+## Step 5 — Control-plane authentication  `[x]`
 
 Goal: close the unauthenticated-Valkey-write hole.
 
 Tasks
-- [ ] Add authentication to `dashboard/app.py` (login + session, or front it
-      with authenticating proxy)
-- [ ] Restrict or remove the raw Valkey Explorer write/delete path
-- [ ] Ensure secret-bearing keys (`config:tsig_secret_b64`,
-      `config:cookie_secret`, `dnssec:*`) require an authenticated session to
-      read or write
+- [x] Add authentication to `dashboard/app.py` (login + signed-cookie session):
+      single admin account, `werkzeug.security` scrypt hash, a global
+      `before_request` gate, `/login` + `/logout`, per-IP failed-login backoff.
+      The app **refuses to start** without a password configured (no blank
+      default), and auto-generates a strong session key if `FLASK_SECRET_KEY`
+      is weak/unset (warns that sessions reset on restart).
+- [x] Restrict the raw Valkey Explorer write/delete path: read-only unless
+      `DASHBOARD_ENABLE_EXPLORER_WRITE=1`, and even then secret-bearing keys are
+      never writable/deletable there; their values are masked on display.
+- [x] Ensure secret-bearing keys (`config:tsig_secret_b64`,
+      `config:cookie_secret`, `dnssec:*`, `*_key`, `*key_pem*`, `*tsig*`) require
+      an authenticated session (the global gate covers every route) and are
+      never reachable through the raw explorer.
 
-Acceptance
-- [ ] Unauthenticated request to any dashboard write endpoint is rejected
-- [ ] Arbitrary `SET`/`DEL` on secret namespaces is not reachable without auth
-- [ ] Documented how credentials are provisioned/rotated
-- [ ] Global exit gate passes (dashboard tests)
+Credential provisioning/rotation: `DASHBOARD_PASSWORD` (hashed in memory) or a
+pre-hashed `DASHBOARD_PASSWORD_HASH` or Valkey `config:dashboard_password_hash`
+(lookup order: hash-env → plaintext-env → Valkey). `python3 app.py
+--gen-password-hash '<pw>'` prints a hash; rotate by replacing the value and
+restarting. Documented in `dashboard/README.md`.
+
+Acceptance (verified via Flask `test_client`, `tmp/t_auth.py` + `t_auth2.py`)
+- [x] Unauthenticated request to any dashboard write endpoint is rejected
+      (GET / and POST /records/upsert → 302 /login; /api/metrics → 401 JSON)
+- [x] Arbitrary `SET`/`DEL` on secret namespaces is not reachable without auth
+      (gated globally; and even authed+opt-in, explorer refuses `dnssec:*` /
+      `*secret*` / `*tsig*` / `*_key` / `key_pem` writes and deletes)
+- [x] Documented how credentials are provisioned/rotated (dashboard/README.md)
+- [x] Global exit gate passes — pure-Python change; C binaries unaffected,
+      `make check` / `check-dnssec` / `check-wire` still green; `app.py`
+      `py_compile` clean. (No GPG key on this box, so signed `make` still N/A.)
 
 ---
 

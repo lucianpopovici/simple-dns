@@ -16,13 +16,57 @@ Flask-based dashboard and configuration interface for **dns_server**'s Valkey ba
 | **PKI / TLS** | ACME + EST config, PEM upload for cert/key/CA, cert status |
 | **AXFR / NOTIFY** | AXFR allow-list and NOTIFY target editing, transfer stats |
 | **IXFR Journal** | Recent incremental transfer journal entries, journal clear |
-| **Valkey Explorer** | Raw key search (glob pattern), set/delete arbitrary keys, namespace summary |
+| **Valkey Explorer** | Raw key search (glob pattern); set/delete is **opt-in** and never touches secret keys (see Authentication) |
+
+## Authentication (required)
+
+The dashboard is the control plane: it can read and write every Valkey key
+(zone data, the TSIG secret, DNSSEC private keys). It therefore **refuses to
+start without an admin password configured** — there is no blank-auth default.
+
+Provision a credential (pick one):
+
+```bash
+# 1. Plaintext at startup (hashed in memory; fine for dev / systemd EnvironmentFile)
+DASHBOARD_PASSWORD='choose-a-strong-one' python3 app.py
+
+# 2. A pre-computed hash (keeps the plaintext out of the environment)
+python3 app.py --gen-password-hash 'choose-a-strong-one'   # prints a scrypt hash
+DASHBOARD_PASSWORD_HASH='scrypt:...' python3 app.py
+
+# 3. Store the hash in Valkey (survives restarts, set once)
+valkey-cli set config:dashboard_password_hash "$(python3 app.py --gen-password-hash 'pw')"
+```
+
+Lookup order: `DASHBOARD_PASSWORD_HASH` → `DASHBOARD_PASSWORD` → Valkey
+`config:dashboard_password_hash`. Username defaults to `admin`
+(`DASHBOARD_USER` to change).
+
+**Rotation:** regenerate a hash with `--gen-password-hash`, replace the
+configured value (env var or `config:dashboard_password_hash`), then restart.
+Set a persistent `FLASK_SECRET_KEY` (`openssl rand -hex 32`) so sessions
+survive restarts; otherwise an ephemeral key is generated per start and all
+sessions reset.
+
+Other controls:
+- Every route requires a logged-in session; unauthenticated browser requests
+  redirect to `/login`, API/XHR requests get `401`.
+- Failed logins are throttled per client IP with escalating backoff.
+- The **Valkey Explorer** is read-only unless `DASHBOARD_ENABLE_EXPLORER_WRITE=1`;
+  even then it refuses to set/delete secret-bearing keys
+  (`dnssec:*`, `*secret*`, `cookie_secret`, `*_key`, `*key_pem*`, `*tsig*`) and
+  masks their values on display. Manage those through the DNSSEC/PKI/Config
+  pages, never the raw explorer.
+- Bind to localhost (default) or front with a TLS-terminating proxy; never run
+  `--debug` on an exposed instance (it enables the Werkzeug debugger).
+- Session lifetime: `DASHBOARD_SESSION_HOURS` (default 12).
 
 ## Requirements
 
 - Python 3.10+
-- Flask (`pip install flask`)
-- No other dependencies — Valkey RESP client is built-in (stdlib `socket` only)
+- Flask + Werkzeug (`pip install -r requirements.txt`) — `werkzeug.security`
+  provides the password hashing; the Valkey RESP client is built-in (stdlib
+  `socket` only)
 
 ## Run
 
