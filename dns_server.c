@@ -80,7 +80,6 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <time.h>
-#include <ctype.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -112,7 +111,7 @@
  * Compile-time defaults
  * ======================================================================= */
 #define BOOT_FILE           "dns_server.boot"
-#define CONFIG_PORT_DEFAULT 8080
+#define METRICS_PORT_DEFAULT 8054   /* localhost /metrics+/health */
 #define DNS_PORT_DEFAULT    5353
 #define DOT_PORT_DEFAULT    8853
 #define HTTP_PORT_DEFAULT   8053
@@ -285,17 +284,6 @@ static zone_entry_t  g_zones[MAX_ZONES];
 static int           g_zone_count = 0;
 static pthread_mutex_t g_zones_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Longest-suffix match. Returns zone index or -1. */
-static int zone_find(const char *qname){
-    int best=-1;size_t best_len=0;
-    pthread_mutex_lock(&g_zones_mutex);
-    for(int i=0;i<g_zone_count;i++){
-        size_t zl=strlen(g_zones[i].name),ql=strlen(qname);
-        int match=(ql==zl&&strcasecmp(qname,g_zones[i].name)==0)||
-                  (ql>zl+1&&qname[ql-zl-1]=='.'&&strcasecmp(qname+ql-zl,g_zones[i].name)==0);
-        if(match&&zl>best_len){best=i;best_len=zl;}}
-    pthread_mutex_unlock(&g_zones_mutex);
-    return best;}
 
 /* Add or update a zone. Returns its index or -1 on error. */
 static int zone_upsert(const char *name,const char *mname,const char *rname,
@@ -318,17 +306,6 @@ static int zone_upsert(const char *name,const char *mname,const char *rname,
     pthread_mutex_unlock(&g_zones_mutex);
     return idx;}
 
-/* Save zone to Valkey */
-static void zone_save(int idx){
-    if(idx<0||idx>=g_zone_count)return;
-    zone_entry_t *z=&g_zones[idx];
-    char key[300],val[4096];
-    snprintf(key,sizeof(key),"zone_table:%s",z->name);
-    snprintf(val,sizeof(val),"%s|%s|%u|%u|%u|%u|%u|%s|%s",
-        z->soa_mname,z->soa_rname,z->soa_serial,
-        z->soa_refresh,z->soa_retry,z->soa_expire,z->soa_minimum,
-        z->axfr_allow,z->notify_targets);
-    vk_set(key,val,0);}
 
 /* Load all zone_table:* keys from Valkey into the zone table */
 /* zones_load_from_valkey — defined below after Valkey types */
@@ -340,7 +317,7 @@ static void zones_load_from_valkey(void);
 static char   g_valkey_host[256] = "127.0.0.1";
 static int    g_valkey_port      = 6379;
 static char   g_valkey_pass[256] = "";
-static int    g_config_port  = CONFIG_PORT_DEFAULT;
+static int    g_metrics_port = METRICS_PORT_DEFAULT;
 static int    g_dns_port     = DNS_PORT_DEFAULT;
 static int    g_dot_port     = DOT_PORT_DEFAULT;
 static int    g_http_port    = HTTP_PORT_DEFAULT;
@@ -807,7 +784,6 @@ static int    g_dnssec_use_nsec3 = 1; /* 1=NSEC3 (default), 0=NSEC (plain) */
 
 /* TLS contexts */
 static SSL_CTX *g_dot_ctx  = NULL;
-static SSL_CTX *g_mgmt_ctx = NULL;
 
 /* DNSSEC ZSK (Alg 13 ECDSAP256) */
 static EVP_PKEY *g_zsk    = NULL;
@@ -1141,7 +1117,7 @@ static void boot_load(void){
     safe_strcpy(g_valkey_host,cfgenv("DNS_VALKEY_HOST","127.0.0.1"),sizeof(g_valkey_host));
     g_valkey_port=atoi(cfgenv("DNS_VALKEY_PORT","6379"));
     safe_strcpy(g_valkey_pass,cfgenv("DNS_VALKEY_PASSWORD",""),sizeof(g_valkey_pass));
-    g_config_port=atoi(cfgenv("CONFIG_PORT","8080"));
+    g_metrics_port=atoi(cfgenv("METRICS_PORT","8054"));
     FILE *f=fopen(BOOT_FILE,"r");if(!f)return;
     char line[512];
     while(fgets(line,sizeof(line),f)){
@@ -1151,98 +1127,7 @@ static void boot_load(void){
         else if(!strcmp(k,"VALKEY_PORT"))g_valkey_port=atoi(v);
         else if(!strcmp(k,"VALKEY_PASSWORD"))safe_strcpy(g_valkey_pass,v,sizeof(g_valkey_pass));}
     fclose(f);}
-static void boot_save(void){
-    FILE *f=fopen(BOOT_FILE,"w");if(!f){perror("boot_save");return;}
-    fprintf(f,"VALKEY_HOST=%s\nVALKEY_PORT=%d\nVALKEY_PASSWORD=%s\n",
-            g_valkey_host,g_valkey_port,g_valkey_pass);fclose(f);
-    dns_log(LOG_INFO,"[Boot] Saved %s\n",BOOT_FILE);}
 
-/* ==========================================================================
- * Config portal (blocking HTML form when Valkey unreachable)
- * ======================================================================= */
-static const char PORTAL_HTML_FMT[] =
-    "<!DOCTYPE html><html><head><title>DNS Server Setup</title>"
-    "<style>body{font-family:sans-serif;max-width:520px;margin:60px auto;background:#f5f5f5}"
-    "h1{color:#333}label{display:block;margin:12px 0 4px;font-weight:bold}"
-    "input{width:100%%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px}"
-    "button{margin-top:20px;padding:10px 28px;background:#2d6db5;color:#fff;"
-    "border:none;border-radius:4px;font-size:1rem;cursor:pointer}"
-    ".msg{padding:10px;border-radius:4px;margin-top:14px}"
-    ".err{background:#fdd;border:1px solid #f88}.ok{background:#dfd;border:1px solid #8d8}"
-    "</style></head><body>"
-    "<h1>&#128274; DNS Server &mdash; Valkey Setup</h1>"
-    "<p>The server cannot reach its Valkey database. "
-    "Please provide the connection details below.</p>"
-    "%s"
-    "<form method=\"POST\" action=\"/connect\">"
-    "<label>Valkey Host</label>"
-    "<input name=\"host\" value=\"%s\" placeholder=\"127.0.0.1\" required>"
-    "<label>Valkey Port</label>"
-    "<input name=\"port\" value=\"%d\" placeholder=\"6379\" type=\"number\" required>"
-    "<label>Password (leave empty if none)</label>"
-    "<input name=\"pass\" type=\"password\" placeholder=\"(none)\">"
-    "<button type=\"submit\">Connect &amp; Continue</button>"
-    "</form></body></html>\n";
-
-static void portal_send(int fd,int code,const char *body,int blen){
-    char hdr[256];int hl=snprintf(hdr,sizeof(hdr),
-        "HTTP/1.0 %d %s\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n",
-        code,code==200?"OK":"Bad Request",blen);
-    if(hl>0&&hl<(int)sizeof(hdr)){send(fd,hdr,hl,0);}
-    if(blen>0)send(fd,body,blen,0);}
-static int form_field(const char *body,const char *key,char *out,int olen){
-    char needle[128];snprintf(needle,sizeof(needle),"%s=",key);
-    const char *p=strstr(body,needle);if(!p)return 0;p+=strlen(needle);int i=0;
-    while(*p&&*p!='&'&&i<olen-1){
-        if(*p=='%'&&isxdigit((unsigned char)p[1])&&isxdigit((unsigned char)p[2])){
-            char h[3]={p[1],p[2],0};out[i++]=(char)strtol(h,NULL,16);p+=3;}
-        else if(*p=='+'){out[i++]=' ';p++;}else{out[i++]=*p++;}}
-    out[i]=0;return 1;}
-static void config_portal(void){
-    dns_log(LOG_WARNING,"[Portal] Starting on port %d\n",g_config_port);
-    int srv=socket(AF_INET,SOCK_STREAM,0);
-    int opt=1;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-    struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(g_config_port),.sin_addr.s_addr=INADDR_ANY};
-    if(bind(srv,(struct sockaddr*)&sa,sizeof(sa))<0){perror("portal bind");close(srv);return;}
-    listen(srv,4);char last_error[256]="";
-    for(;;){
-        int cfd=accept(srv,NULL,NULL);if(cfd<0)continue;
-        struct timeval tv={.tv_sec=10};setsockopt(cfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-        char buf[4096];int n=(int)recv(cfd,buf,sizeof(buf)-1,0);
-        if(n<=0){close(cfd);continue;}buf[n]=0;
-        char method[8],path[256];sscanf(buf,"%7s %255s",method,path);
-        if(!strcmp(method,"GET")){
-            char msg[512]="";
-            if(last_error[0])snprintf(msg,sizeof(msg),"<div class=\"msg err\">&#10007; %s</div>",last_error);
-            char page[8192];int pl=snprintf(page,sizeof(page),PORTAL_HTML_FMT,msg,g_valkey_host,g_valkey_port);
-            portal_send(cfd,200,page,pl);close(cfd);continue;}
-        if(!strcmp(method,"POST")&&!strcmp(path,"/connect")){
-            char *body=strstr(buf,"\r\n\r\n");if(!body){close(cfd);continue;}body+=4;
-            char host[256]="",portstr[16]="",pass[256]="";
-            form_field(body,"host",host,sizeof(host));
-            form_field(body,"port",portstr,sizeof(portstr));
-            form_field(body,"pass",pass,sizeof(pass));
-            if(!host[0])safe_strcpy(host,"127.0.0.1",sizeof(host));
-            int port=portstr[0]?atoi(portstr):6379;
-            resp_conn_t test;memset(&test,0,sizeof(test));test.fd=-1;
-            if(valkey_connect_to(&test,host,port,pass)==0){
-                safe_strcpy(g_valkey_host,host,sizeof(g_valkey_host));
-                g_valkey_port=port;safe_strcpy(g_valkey_pass,pass,sizeof(g_valkey_pass));
-                close(test.fd);boot_save();
-                char page[512];int pl=snprintf(page,sizeof(page),
-                    "<html><body style=\"font-family:sans-serif;margin:60px auto;max-width:520px\">"
-                    "<div class=\"ok\" style=\"padding:20px;background:#dfd;border:1px solid #8d8;border-radius:4px\">"
-                    "<h2>&#10003; Connected to Valkey %s:%d</h2><p>Server starting up.</p>"
-                    "</div></body></html>",host,port);
-                portal_send(cfd,200,page,pl);close(cfd);break;
-            }else{
-                snprintf(last_error,sizeof(last_error),"Could not connect to %s:%d",host,port);
-                char msg[512];snprintf(msg,sizeof(msg),"<div class=\"msg err\">&#10007; %s</div>",last_error);
-                char page[8192];int pl=snprintf(page,sizeof(page),PORTAL_HTML_FMT,msg,host,port);
-                portal_send(cfd,200,page,pl);close(cfd);continue;}}
-        const char *redir="HTTP/1.0 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
-        send(cfd,redir,strlen(redir),0);close(cfd);}
-    close(srv);}
 
 /* ==========================================================================
  * Config: load all settings from Valkey
@@ -1255,6 +1140,7 @@ static void config_load_from_valkey(void){
     G("ddns_secret",g_ddns_secret);
     GI("dns_port",g_dns_port);GI("dot_port",g_dot_port);
     GI("http_port",g_http_port);GI("https_port",g_https_port);
+    GI("metrics_port",g_metrics_port);
     G("soa_mname",g_soa_mname);G("soa_rname",g_soa_rname);
     GU("soa_refresh",g_soa_refresh);GU("soa_retry",g_soa_retry);
     GU("soa_expire",g_soa_expire);GU("soa_minimum",g_soa_minimum);
@@ -1330,28 +1216,6 @@ static void config_load_from_valkey(void){
     #undef GU
     dns_log(LOG_INFO,"[Config] dns:%d dot:%d http:%d https:%d zone:%s serial:%u\n",
            g_dns_port,g_dot_port,g_http_port,g_https_port,g_zone_name,g_soa_serial);}
-static void config_set(const char *key,const char *val){
-    char fkey[256];snprintf(fkey,sizeof(fkey),"config:%s",key);vk_set(fkey,val,0);
-    /* Live-apply syslog config changes */
-    if(!strcmp(key,"syslog_enabled")){g_syslog_enabled=atoi(val);syslog_init();}
-    else if(!strcmp(key,"syslog_facility")){g_syslog_facility=syslog_facility_from_str(val);syslog_init();}
-    else if(!strcmp(key,"syslog_level")){g_syslog_level=syslog_level_from_str(val);syslog_init();}
-    else if(!strcmp(key,"syslog_ident")){safe_strcpy(g_syslog_ident,val,sizeof(g_syslog_ident));syslog_init();}
-    else if(!strcmp(key,"syslog_remote_host")){safe_strcpy(g_rsyslog_host,val,sizeof(g_rsyslog_host));syslog_init();}
-    else if(!strcmp(key,"syslog_remote_port")){g_rsyslog_port=atoi(val);syslog_init();}
-    else if(!strcmp(key,"syslog_remote_proto")){
-        if(!strcasecmp(val,"tcp"))      g_rsyslog_proto=RSYSLOG_TCP;
-        else if(!strcasecmp(val,"tls")) g_rsyslog_proto=RSYSLOG_TLS;
-        else                            g_rsyslog_proto=RSYSLOG_UDP;
-        /* Adjust default port when proto changes and port was left at default */
-        if(g_rsyslog_port==514||g_rsyslog_port==6514)
-            g_rsyslog_port=(g_rsyslog_proto==RSYSLOG_TLS)?6514:514;
-        syslog_init();}
-    else if(!strcmp(key,"syslog_remote_level")){g_rsyslog_level=syslog_level_from_str(val);syslog_init();}
-    else if(!strcmp(key,"syslog_remote_tls_verify")){g_rsyslog_tls_verify=atoi(val);syslog_init();}
-    else if(!strcmp(key,"syslog_remote_format")){
-        g_rsyslog_fmt=strcasecmp(val,"rfc3164")==0?RFMT_RFC3164:RFMT_RFC5424;syslog_init();}
-}
 /* Bump SOA serial (YYYYMMDDnn format if possible, else simple increment) */
 static uint32_t serial_bump(void){
     long ns=vk_incr("config:zone_serial");
@@ -1389,7 +1253,6 @@ static SSL_CTX *tls_ctx_from_pem(const char *cert_pem,const char *key_pem,
 static void tls_reload(void){
     pthread_mutex_lock(&g_tls_mutex);
     if(g_dot_ctx){SSL_CTX_free(g_dot_ctx);g_dot_ctx=NULL;}
-    if(g_mgmt_ctx){SSL_CTX_free(g_mgmt_ctx);g_mgmt_ctx=NULL;}
     g_dot_ctx =tls_ctx_from_pem(g_tls_cert_pem,g_tls_key_pem,NULL,0);
     /* RFC 7858 §3.2: advertise "dot" ALPN on the DoT listener */
     if(g_dot_ctx){
@@ -1413,12 +1276,6 @@ static void tls_reload(void){
         }
         SSL_CTX_set_tlsext_ticket_keys(g_dot_ctx,
             s_ticket_key, sizeof(s_ticket_key));
-    }
-    g_mgmt_ctx=tls_ctx_from_pem(g_tls_cert_pem,g_tls_key_pem,g_mtls_ca_pem,1);
-    /* RFC 7540: advertise "h2" + "http/1.1" ALPN on the mTLS/DoH listener */
-    if(g_mgmt_ctx){
-        static const uint8_t h2_alpn[] = {2,'h','2',8,'h','t','t','p','/','1','.','1'};
-        SSL_CTX_set_alpn_protos(g_mgmt_ctx, h2_alpn, sizeof(h2_alpn));
     }
     pthread_mutex_unlock(&g_tls_mutex);
     dns_log(LOG_INFO,"[TLS] Contexts %s\n",g_dot_ctx?"loaded":"unavailable (no cert yet)");}
@@ -2078,16 +1935,6 @@ static const char *type2str(uint16_t t){
     case DNS_TYPE_ANY:return"ANY";
     default:return"?";}
 }
-static uint16_t str2type(const char *s){
-    if(!strcasecmp(s,"A"))return DNS_TYPE_A;if(!strcasecmp(s,"AAAA"))return DNS_TYPE_AAAA;
-    if(!strcasecmp(s,"CNAME"))return DNS_TYPE_CNAME;if(!strcasecmp(s,"MX"))return DNS_TYPE_MX;
-    if(!strcasecmp(s,"TXT"))return DNS_TYPE_TXT;if(!strcasecmp(s,"NS"))return DNS_TYPE_NS;
-    if(!strcasecmp(s,"SRV"))return DNS_TYPE_SRV;if(!strcasecmp(s,"CAA"))return DNS_TYPE_CAA;
-    if(!strcasecmp(s,"SSHFP"))return DNS_TYPE_SSHFP;if(!strcasecmp(s,"TLSA"))return DNS_TYPE_TLSA;
-    if(!strcasecmp(s,"DNAME"))return DNS_TYPE_DNAME;if(!strcasecmp(s,"LOC"))return DNS_TYPE_LOC;
-    if(!strcasecmp(s,"DS"))return DNS_TYPE_DS;if(!strcasecmp(s,"CDS"))return DNS_TYPE_CDS;if(!strcasecmp(s,"CDNSKEY"))return DNS_TYPE_CDNSKEY;
-    if(!strcasecmp(s,"URI"))return DNS_TYPE_URI;
-    return 0;}
 
 
 /* ==========================================================================
@@ -3443,254 +3290,77 @@ static int pki_spki_sha256(X509 *cert, uint8_t out[32]){
 /* ==========================================================================
  * HTTP(S) API + DoH handler
  * ======================================================================= */
-static void url_decode(char *s){char *r=s,*w=s;
-    while(*r){if(*r=='%'&&isxdigit((unsigned char)r[1])&&isxdigit((unsigned char)r[2])){
-        char h[3]={r[1],r[2],0};*w++=(char)strtol(h,NULL,16);r+=3;}
-    else if(*r=='+'){*w++=' ';r++;}else{*w++=*r++;}}*w=0;}
-static int qs_get(const char *qs,const char *key,char *out,int olen){
-    char nd[128];snprintf(nd,sizeof(nd),"%s=",key);const char *p=strstr(qs,nd);if(!p)return 0;
-    p+=strlen(nd);int i=0;while(p[i]&&p[i]!='&'&&i<olen-1){out[i]=p[i];i++;}out[i]=0;url_decode(out);return 1;}
-static void api_send(int fd,SSL *ssl,int code,const char *body){
-    char resp[HTTP_BUF];
-    const char *st=code==200?"OK":code==201?"Created":code==400?"Bad Request":
-                   code==403?"Forbidden":code==204?"No Content":"Internal Server Error";
-    int n=snprintf(resp,sizeof(resp),
-        "HTTP/1.0 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
-        code,st,strlen(body),body);
-    if(n>0){if(ssl)SSL_write(ssl,resp,n);else{ssize_t w=write(fd,resp,n);(void)w;}}}
-/* DNS-over-HTTPS (RFC 8484): respond to POST /dns-query with application/dns-message */
-static void handle_doh(int fd,SSL *ssl,const uint8_t *pkt,int plen,const struct in_addr *cip){
-    uint8_t resp[BUF_SIZE];int rlen=dns_process(pkt,plen,resp,sizeof(resp),1,cip);
-    if(rlen<0){api_send(fd,ssl,400,"bad dns message\n");return;}
-    char hdr[256];int hl=snprintf(hdr,sizeof(hdr),
-        "HTTP/1.0 200 OK\r\nContent-Type: application/dns-message\r\n"
-        "Content-Length: %d\r\nConnection: close\r\n\r\n",rlen);
-    if(ssl){SSL_write(ssl,hdr,hl);SSL_write(ssl,resp,rlen);}
-    else{ssize_t w=write(fd,hdr,hl);w=write(fd,resp,rlen);(void)w;}}
+/* ==========================================================================
+ * Localhost-only observability endpoint (migration Step 4)
+ *
+ * dnsd's entire HTTP surface is now read-only /health + /metrics bound to
+ * 127.0.0.1. Management writes and DoH go through the apid front (which talks
+ * to Valkey and forwards DoH to dnsd's DNS port). dnsd no longer parses
+ * management HTTP, terminates web TLS, or serves a first-boot config portal.
+ * ======================================================================= */
+static void metrics_send(int fd,int code,const char *ctype,const char *body){
+    char hdr[256];
+    int hl=snprintf(hdr,sizeof(hdr),
+        "HTTP/1.0 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        code,code==200?"OK":code==404?"Not Found":"Bad Request",
+        ctype,strlen(body));
+    if(hl>0){ssize_t w=write(fd,hdr,hl);(void)w;}
+    if(body[0]){ssize_t w=write(fd,body,strlen(body));(void)w;}}
 
-static void handle_api(int fd,SSL *ssl,int is_mgmt,const struct in_addr *cip){
-    char buf[HTTP_BUF];int n;
-    if(ssl)n=SSL_read(ssl,buf,sizeof(buf)-1);else n=(int)recv(fd,buf,sizeof(buf)-1,0);
+static void handle_metrics(int fd){
+    char buf[2048];int n=(int)recv(fd,buf,sizeof(buf)-1,0);
     if(n<=0)return;buf[n]=0;
-    char method[8],path[512];
-    if(sscanf(buf,"%7s %511s",method,path)!=2){api_send(fd,ssl,400,"bad request\n");return;}
-    char *qs=strchr(path,'?');if(qs){*qs=0;qs++;}else qs="";
-
-    /* DoH endpoint (RFC 8484) */
-    if(!strcasecmp(path,"/dns-query")){
-        if(!strcasecmp(method,"POST")){
-            char *bdy=strstr(buf,"\r\n\r\n");if(!bdy){api_send(fd,ssl,400,"no body\n");return;}bdy+=4;
-            int blen=n-(int)(bdy-buf);
-            handle_doh(fd,ssl,(uint8_t*)bdy,blen,cip);}
-        else{/* GET with dns= parameter */
-            char dns_b64[4096]={0};qs_get(qs,"dns",dns_b64,sizeof(dns_b64));
-            uint8_t pkt[BUF_SIZE];int plen=b64url_dec(dns_b64,pkt,sizeof(pkt));
-            handle_doh(fd,ssl,pkt,plen,cip);}
-        return;}
-
-    if(!strcmp(path,"/health")){api_send(fd,ssl,200,"ok\n");return;}
-
-    if(!strcmp(path,"/metrics")){
-        /* Prometheus text format (RFC-like, de-facto standard) */
-        char body[HTTP_BUF];int bp=0;
-        pthread_mutex_lock(&g_stat_mutex);
-        uint64_t sq=g_stat_queries,sn=g_stat_noerror,snx=g_stat_nxdomain,
-                 sr=g_stat_refused,ss=g_stat_servfail,
-                 rd=g_stat_rrl_drop,rt=g_stat_rrl_tc,
-                 ax=g_stat_axfr,dd=g_stat_ddns,si=g_stat_signed;
-        pthread_mutex_unlock(&g_stat_mutex);
-        bp+=snprintf(body+bp,sizeof(body)-bp,
-            "# HELP dns_queries_total Total DNS queries received\n"
-            "# TYPE dns_queries_total counter\n"
-            "dns_queries_total %llu\n"
-            "# HELP dns_responses_total DNS responses by rcode\n"
-            "# TYPE dns_responses_total counter\n"
-            "dns_responses_total{rcode=\"NOERROR\"} %llu\n"
-            "dns_responses_total{rcode=\"NXDOMAIN\"} %llu\n"
-            "dns_responses_total{rcode=\"REFUSED\"} %llu\n"
-            "dns_responses_total{rcode=\"SERVFAIL\"} %llu\n"
-            "# HELP dns_rrl_total RRL actions\n"
-            "# TYPE dns_rrl_total counter\n"
-            "dns_rrl_total{action=\"drop\"} %llu\n"
-            "dns_rrl_total{action=\"tc\"}   %llu\n"
-            "# HELP dns_axfr_total AXFR transfers completed\n"
-            "# TYPE dns_axfr_total counter\n"
-            "dns_axfr_total %llu\n"
-            "# HELP dns_ddns_total DDNS updates accepted\n"
-            "# TYPE dns_ddns_total counter\n"
-            "dns_ddns_total %llu\n"
-            "# HELP dns_dnssec_signatures_total DNSSEC RRSIGs generated\n"
-            "# TYPE dns_dnssec_signatures_total counter\n"
-            "dns_dnssec_signatures_total %llu\n"
-            "# HELP dns_zone_serial Current SOA serial\n"
-            "# TYPE dns_zone_serial gauge\n"
-            "dns_zone_serial %u\n"
-            "# HELP dns_rrl_enabled Whether RRL is active\n"
-            "# TYPE dns_rrl_enabled gauge\n"
-            "dns_rrl_enabled %d\n",
-            (unsigned long long)sq,
-            (unsigned long long)sn,(unsigned long long)snx,
-            (unsigned long long)sr,(unsigned long long)ss,
-            (unsigned long long)rd,(unsigned long long)rt,
-            (unsigned long long)ax,(unsigned long long)dd,
-            (unsigned long long)si,
-            g_soa_serial,g_rrl_enabled);
-        /* Content-Type: text/plain for Prometheus */
-        char resp_hdr[512];
-        snprintf(resp_hdr,sizeof(resp_hdr),
-            "HTTP/1.0 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n"
-            "Content-Length: %d\r\nConnection: close\r\n\r\n%s",bp,body);
-        if(ssl) SSL_write(ssl,resp_hdr,strlen(resp_hdr));
-        else send(fd,resp_hdr,strlen(resp_hdr),0);
-        return;}
-
-    if(!strcmp(path,"/list")){
-        char body[HTTP_BUF];int bp=0;
-        bp+=snprintf(body+bp,sizeof(body)-bp,"Zone: %s  Serial: %u\n\n",g_zone_name,g_soa_serial);
-        pthread_mutex_lock(&g_vk_mutex);
-        if(valkey_ensure(&vk)>=0){const char *pfxs[]={"ddns:*","zone:*",NULL};
-            for(int pi=0;pfxs[pi];pi++){resp_reply_t r;resp_cmd(&vk,&r,2,"KEYS",pfxs[pi]);
-                if(r.type==5){for(int i=0;i<r.count&&bp<(int)sizeof(body)-256;i++){
-                    resp_reply_t kr;resp_parse(&vk,&kr);if(kr.type!=2)continue;
-                    resp_reply_t vr;resp_cmd(&vk,&vr,2,"GET",kr.str);
-                    resp_reply_t tr;resp_cmd(&vk,&tr,2,"TTL",kr.str);
-                    bp+=snprintf(body+bp,sizeof(body)-bp,"  %-50s = %s  TTL=%ld\n",
-                        kr.str,vr.str,tr.type==3?tr.integer:-1L);}}}}
-        pthread_mutex_unlock(&g_vk_mutex);api_send(fd,ssl,200,body);return;}
-
-    /* Auth */
-    char akey[128]={0};qs_get(qs,"key",akey,sizeof(akey));
-    if(!is_mgmt&&strcmp(akey,g_ddns_secret)!=0){api_send(fd,ssl,403,"forbidden\n");return;}
-    char hostname[256]={0};qs_get(qs,"hostname",hostname,sizeof(hostname));if(hostname[0])strlower(hostname);
-
-    /* DDNS update */
-    if(!strcmp(path,"/update")){
-        char ip[64]={0},ip6[64]={0},ttls[16]={0};
-        qs_get(qs,"ip",ip,sizeof(ip));qs_get(qs,"ip6",ip6,sizeof(ip6));qs_get(qs,"ttl",ttls,sizeof(ttls));
-        if(!hostname[0]){api_send(fd,ssl,400,"missing hostname\n");return;}
-        uint32_t ttl=ttls[0]?(uint32_t)atoi(ttls):DEFAULT_TTL;if(ttl<10)ttl=10;
-        char vkey[512],rbody[256];
-        if(ip[0]){struct in_addr a4;if(inet_pton(AF_INET,ip,&a4)!=1){api_send(fd,ssl,400,"bad ip\n");return;}
-            snprintf(vkey,sizeof(vkey),"ddns:A:%s",hostname);vk_set(vkey,ip,ttl);serial_bump();
-            snprintf(rbody,sizeof(rbody),"ok: %s A %s TTL=%u\n",hostname,ip,ttl);api_send(fd,ssl,200,rbody);}
-        else if(ip6[0]){struct in6_addr a6;if(inet_pton(AF_INET6,ip6,&a6)!=1){api_send(fd,ssl,400,"bad ip6\n");return;}
-            snprintf(vkey,sizeof(vkey),"ddns:AAAA:%s",hostname);vk_set(vkey,ip6,ttl);serial_bump();
-            snprintf(rbody,sizeof(rbody),"ok: %s AAAA %s TTL=%u\n",hostname,ip6,ttl);api_send(fd,ssl,200,rbody);}
-        else api_send(fd,ssl,400,"missing ip or ip6\n");
-        return;}
-    if(!strcmp(path,"/delete")){
-        if(!hostname[0]){api_send(fd,ssl,400,"missing hostname\n");return;}
-        char typestr[16]={0};qs_get(qs,"type",typestr,sizeof(typestr));
-        char vk2[512];int d=0;
-        if(!typestr[0]||!strcasecmp(typestr,"A")){snprintf(vk2,sizeof(vk2),"ddns:A:%s",hostname);d+=vk_del(vk2);}
-        if(!typestr[0]||!strcasecmp(typestr,"AAAA")){snprintf(vk2,sizeof(vk2),"ddns:AAAA:%s",hostname);d+=vk_del(vk2);}
-        serial_bump();char rbody[128];snprintf(rbody,sizeof(rbody),"ok: deleted %d key(s)\n",d);api_send(fd,ssl,200,rbody);return;}
-
-    /* Zone provisioning */
-    if(!strcmp(path,"/zone")&&(!strcasecmp(method,"POST")||!strcasecmp(method,"PUT"))){
-        char *bdy=strstr(buf,"\r\n\r\n");if(!bdy){api_send(fd,ssl,400,"no body\n");return;}bdy+=4;
-        char name[256]={0},type[16]={0},value[512]={0},ttls[16]={0},pref[16]={0};
-        qs_get(bdy,"name",name,sizeof(name));strlower(name);qs_get(bdy,"type",type,sizeof(type));
-        qs_get(bdy,"value",value,sizeof(value));qs_get(bdy,"ttl",ttls,sizeof(ttls));qs_get(bdy,"pref",pref,sizeof(pref));
-        if(!name[0])qs_get(qs,"name",name,sizeof(name));if(!type[0])qs_get(qs,"type",type,sizeof(type));
-        if(!value[0])qs_get(qs,"value",value,sizeof(value));
-        if(!name[0]||!type[0]||!value[0]){api_send(fd,ssl,400,"missing name/type/value\n");return;}
-        uint16_t rt=str2type(type);if(!rt){api_send(fd,ssl,400,"unknown type\n");return;}
-        uint32_t ttl=ttls[0]?(uint32_t)atoi(ttls):300;
-        char vkey[512],vval[1024];snprintf(vkey,sizeof(vkey),"zone:%s:%s",type2str(rt),name);
-        if(rt==DNS_TYPE_MX)snprintf(vval,sizeof(vval),"%u|%s|%s",ttl,pref[0]?pref:"10",value);
-        else snprintf(vval,sizeof(vval),"%u|%s",ttl,value);
-        vk_set(vkey,vval,0);serial_bump();dns_log(LOG_NOTICE,"[ZONE] %s %s = %s\n",type2str(rt),name,vval);
-        notify_send();char rb[256];snprintf(rb,sizeof(rb),"ok: %s\n",vkey);api_send(fd,ssl,201,rb);return;}
-    if(!strcmp(path,"/zone")&&!strcasecmp(method,"DELETE")){
-        char name[256]={0},type[16]={0};qs_get(qs,"name",name,sizeof(name));strlower(name);qs_get(qs,"type",type,sizeof(type));
-        if(!name[0]){api_send(fd,ssl,400,"missing name\n");return;}int d=0;
-        if(type[0]){uint16_t rt=str2type(type);if(!rt){api_send(fd,ssl,400,"unknown type\n");return;}
-            char vkey[512];snprintf(vkey,sizeof(vkey),"zone:%s:%s",type2str(rt),name);d=vk_del(vkey);}
-        else{const char *ts[]={"A","AAAA","CNAME","MX","TXT","NS","SRV","CAA","SSHFP","TLSA","DNAME","LOC",NULL};
-            for(int i=0;ts[i];i++){char vk2[512];snprintf(vk2,sizeof(vk2),"zone:%s:%s",ts[i],name);d+=vk_del(vk2);}}
-        serial_bump();notify_send();char rb[128];snprintf(rb,sizeof(rb),"ok: deleted %d record(s)\n",d);api_send(fd,ssl,200,rb);return;}
-
-    /* Config management (mgmt only) */
-    if(is_mgmt&&!strcmp(path,"/config")&&!strcasecmp(method,"POST")){
-        char *bdy=strstr(buf,"\r\n\r\n");if(!bdy){api_send(fd,ssl,400,"no body\n");return;}bdy+=4;
-        char cfgkey[128]={0},cfgval[4096]={0};
-        qs_get(bdy,"key",cfgkey,sizeof(cfgkey));qs_get(bdy,"value",cfgval,sizeof(cfgval));
-        if(!cfgkey[0]){api_send(fd,ssl,400,"missing key\n");return;}
-        config_set(cfgkey,cfgval);
-        if(!strcmp(cfgkey,"ddns_secret"))safe_strcpy(g_ddns_secret,cfgval,sizeof(g_ddns_secret));
-        else if(!strcmp(cfgkey,"tls_cert_pem")){safe_strcpy(g_tls_cert_pem,cfgval,sizeof(g_tls_cert_pem));tls_reload();}
-        else if(!strcmp(cfgkey,"tls_key_pem")){safe_strcpy(g_tls_key_pem,cfgval,sizeof(g_tls_key_pem));tls_reload();}
-        else if(!strcmp(cfgkey,"mtls_ca_pem")){safe_strcpy(g_mtls_ca_pem,cfgval,sizeof(g_mtls_ca_pem));tls_reload();}
-        else if(!strcmp(cfgkey,"query_log_path")){
-            safe_strcpy(g_query_log_path,cfgval,sizeof(g_query_log_path));
-            qlog_open();
-            dns_log(LOG_NOTICE,"[QLog] Log path updated: %s\n",g_query_log_path);}
-        char rb[128];snprintf(rb,sizeof(rb),"ok: config:%s updated\n",cfgkey);api_send(fd,ssl,200,rb);return;}
-    /* Multi-zone management */
-    if(is_mgmt&&!strcasecmp(method,"GET")&&!strcmp(path,"/zone/list")){
-        char body[4096];int bp=0;
-        pthread_mutex_lock(&g_zones_mutex);
-        bp+=snprintf(body+bp,sizeof(body)-bp,"zones: %d\n",g_zone_count);
-        for(int zi=0;zi<g_zone_count&&bp<(int)sizeof(body)-128;zi++)
-            bp+=snprintf(body+bp,sizeof(body)-bp,"  [%d] %s serial=%u mname=%s\n",
-                zi,g_zones[zi].name,g_zones[zi].soa_serial,g_zones[zi].soa_mname);
-        pthread_mutex_unlock(&g_zones_mutex);
-        api_send(fd,ssl,200,body);return;}
-    if(is_mgmt&&!strcasecmp(method,"POST")&&!strcmp(path,"/zone/add")){
-        char *bdy=strstr(buf,"\r\n\r\n");if(!bdy){api_send(fd,ssl,400,"no body\n");return;}bdy+=4;
-        char zn[256]={0},zmn[256]={0},zrn[256]={0};
-        qs_get(bdy,"name",zn,sizeof(zn));strlower(zn);
-        qs_get(bdy,"mname",zmn,sizeof(zmn));
-        qs_get(bdy,"rname",zrn,sizeof(zrn));
-        if(!zn[0]){api_send(fd,ssl,400,"name required\n");return;}
-        if(!zmn[0]){snprintf(zmn,sizeof(zmn),"ns1.%s",zn);}
-        if(!zrn[0]){snprintf(zrn,sizeof(zrn),"hostmaster.%s",zn);}
-        int zi=zone_upsert(zn,zmn,zrn,1,3600,900,604800,300,"127.0.0.1","");
-        if(zi<0){api_send(fd,ssl,507,"zone table full\n");return;}
-        zone_save(zi);
-        dns_log(LOG_NOTICE,"[Zone] Added %s\n",zn);
-        char rb[256];snprintf(rb,sizeof(rb),"ok: zone %s added [%d]\n",zn,zi);
-        api_send(fd,ssl,201,rb);return;}
-    if(is_mgmt&&!strcasecmp(method,"POST")&&!strcmp(path,"/zone/del")){
-        char *bdy=strstr(buf,"\r\n\r\n");if(!bdy){api_send(fd,ssl,400,"no body\n");return;}bdy+=4;
-        char zn[256]={0};qs_get(bdy,"name",zn,sizeof(zn));strlower(zn);
-        if(!zn[0]){api_send(fd,ssl,400,"name required\n");return;}
-        pthread_mutex_lock(&g_zones_mutex);
-        int found_zi=-1;
-        for(int zi=0;zi<g_zone_count;zi++)if(strcasecmp(g_zones[zi].name,zn)==0){found_zi=zi;break;}
-        if(found_zi>=0){for(int zi=found_zi;zi<g_zone_count-1;zi++)g_zones[zi]=g_zones[zi+1];g_zone_count--;}
-        pthread_mutex_unlock(&g_zones_mutex);
-        if(found_zi<0){api_send(fd,ssl,404,"zone not found\n");return;}
-        char zkey[300];snprintf(zkey,sizeof(zkey),"zone_table:%s",zn);vk_del(zkey);
-        dns_log(LOG_NOTICE,"[Zone] Deleted %s\n",zn);
-        api_send(fd,ssl,200,"ok\n");return;}
-    /* ACME/EST moved to the certd sidecar (migration Step 2). These
-     * endpoints are kept only to tell old callers where the function went;
-     * the whole embedded API goes away in Step 4. */
-    if(is_mgmt&&(!strcmp(path,"/acme/issue")||!strcmp(path,"/pki/est"))){
-        api_send(fd,ssl,410,"moved to certd: run 'certd --once'\n");return;}
-    /* mDNS moved to the mdnsd daemon (migration Step 3): mdns:* records are
-     * provisioned via the dashboard/Valkey (the namespace's writer). */
-    if(is_mgmt&&(!strcmp(path,"/mdns/announce")||!strcmp(path,"/mdns/records"))){
-        api_send(fd,ssl,410,"moved to mdnsd; provision mdns:* via dashboard\n");return;}
-    if(is_mgmt&&!strcmp(path,"/pki/cacerts")){
-        api_send(fd,ssl,410,"moved to certd\n");return;}
-    if(is_mgmt&&!strcmp(path,"/zone/notify")){notify_send();api_send(fd,ssl,200,"notified\n");return;}
-
-    api_send(fd,ssl,400,"unknown endpoint\n");}
-
-static void handle_http_plain(int fd,const struct in_addr *cip){handle_api(fd,NULL,0,cip);}
-static void handle_https_mgmt(int fd,const struct in_addr *cip){
-    pthread_mutex_lock(&g_tls_mutex);SSL_CTX *ctx=g_mgmt_ctx;
-    SSL *ssl=ctx?SSL_new(ctx):NULL;pthread_mutex_unlock(&g_tls_mutex);
-    if(!ssl){close(fd);return;}
-    SSL_set_fd(ssl,fd);if(SSL_accept(ssl)<=0){ERR_print_errors_fp(stderr);SSL_free(ssl);close(fd);return;}
-    X509 *peer=SSL_get_peer_certificate(ssl);
-    if(!peer){SSL_shutdown(ssl);SSL_free(ssl);close(fd);return;}
-    char cn[256]={0};X509_NAME_get_text_by_NID(X509_get_subject_name(peer),NID_commonName,cn,sizeof(cn));
-    dns_log(LOG_DEBUG,"[mTLS] CN: %s\n",cn);X509_free(peer);
-    handle_api(fd,ssl,1,cip);SSL_shutdown(ssl);SSL_free(ssl);}
+    char method[8],path[256];
+    if(sscanf(buf,"%7s %255s",method,path)!=2){metrics_send(fd,400,"text/plain","bad request\n");return;}
+    if(strcasecmp(method,"GET")!=0){metrics_send(fd,404,"text/plain","not found\n");return;}
+    if(!strcmp(path,"/health")){metrics_send(fd,200,"text/plain","ok\n");return;}
+    if(strcmp(path,"/metrics")!=0){metrics_send(fd,404,"text/plain","not found\n");return;}
+    /* Prometheus text format (RFC-like, de-facto standard) */
+    char body[HTTP_BUF];int bp=0;
+    pthread_mutex_lock(&g_stat_mutex);
+    uint64_t sq=g_stat_queries,sn=g_stat_noerror,snx=g_stat_nxdomain,
+             sr=g_stat_refused,ss=g_stat_servfail,
+             rd=g_stat_rrl_drop,rt=g_stat_rrl_tc,
+             ax=g_stat_axfr,dd=g_stat_ddns,si=g_stat_signed;
+    pthread_mutex_unlock(&g_stat_mutex);
+    bp+=snprintf(body+bp,sizeof(body)-bp,
+        "# HELP dns_queries_total Total DNS queries received\n"
+        "# TYPE dns_queries_total counter\n"
+        "dns_queries_total %llu\n"
+        "# HELP dns_responses_total DNS responses by rcode\n"
+        "# TYPE dns_responses_total counter\n"
+        "dns_responses_total{rcode=\"NOERROR\"} %llu\n"
+        "dns_responses_total{rcode=\"NXDOMAIN\"} %llu\n"
+        "dns_responses_total{rcode=\"REFUSED\"} %llu\n"
+        "dns_responses_total{rcode=\"SERVFAIL\"} %llu\n"
+        "# HELP dns_rrl_total RRL actions\n"
+        "# TYPE dns_rrl_total counter\n"
+        "dns_rrl_total{action=\"drop\"} %llu\n"
+        "dns_rrl_total{action=\"tc\"}   %llu\n"
+        "# HELP dns_axfr_total AXFR transfers completed\n"
+        "# TYPE dns_axfr_total counter\n"
+        "dns_axfr_total %llu\n"
+        "# HELP dns_ddns_total DDNS updates accepted\n"
+        "# TYPE dns_ddns_total counter\n"
+        "dns_ddns_total %llu\n"
+        "# HELP dns_dnssec_signatures_total DNSSEC RRSIGs generated\n"
+        "# TYPE dns_dnssec_signatures_total counter\n"
+        "dns_dnssec_signatures_total %llu\n"
+        "# HELP dns_zone_serial Current SOA serial\n"
+        "# TYPE dns_zone_serial gauge\n"
+        "dns_zone_serial %u\n"
+        "# HELP dns_rrl_enabled Whether RRL is active\n"
+        "# TYPE dns_rrl_enabled gauge\n"
+        "dns_rrl_enabled %d\n",
+        (unsigned long long)sq,
+        (unsigned long long)sn,(unsigned long long)snx,
+        (unsigned long long)sr,(unsigned long long)ss,
+        (unsigned long long)rd,(unsigned long long)rt,
+        (unsigned long long)ax,(unsigned long long)dd,
+        (unsigned long long)si,
+        g_soa_serial,g_rrl_enabled);
+    metrics_send(fd,200,"text/plain; version=0.0.4",body);}
 
 /* ==========================================================================
  * main
@@ -3709,10 +3379,10 @@ int main(int argc,char **argv){
     /* Phase 1: Bootstrap Valkey */
     memset(&vk,0,sizeof(vk));vk.fd=-1;boot_load();
     dns_log(LOG_INFO,"[Boot] Connecting to Valkey %s:%d...\n",g_valkey_host,g_valkey_port);
-    if(valkey_connect(&vk)!=0){
-        dns_log(LOG_WARNING,"[Boot] Valkey unreachable — starting config portal on port %d\n",g_config_port);
-        config_portal();
-        if(valkey_connect(&vk)!=0){dns_log(LOG_ERR,"[Boot] FATAL: Valkey still unreachable\n");return 1;}}
+    for(int btry=0;valkey_connect(&vk)!=0;btry++){
+        if(btry>=30){dns_log(LOG_ERR,"[Boot] FATAL: Valkey unreachable at %s:%d\n",g_valkey_host,g_valkey_port);return 1;}
+        dns_log(LOG_WARNING,"[Boot] Valkey unreachable — retrying in 2s (provision connection via env or %s)\n",BOOT_FILE);
+        sleep(2);}
     dns_log(LOG_INFO,"[Boot] Valkey connected.\n");
 
     /* Phase 2: Load config */
@@ -3802,24 +3472,21 @@ int main(int argc,char **argv){
     setsockopt(dot_sock,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
     {struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(g_dot_port),.sin_addr.s_addr=INADDR_ANY};
      if(bind(dot_sock,(struct sockaddr*)&sa,sizeof(sa))<0){perror("dot bind");return 1;}listen(dot_sock,32);}
-    int http_sock=socket(AF_INET,SOCK_STREAM,0);
-    if(http_sock<0){perror("http socket");return 1;}
-    setsockopt(http_sock,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-    {struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(g_http_port),.sin_addr.s_addr=INADDR_ANY};
-     if(bind(http_sock,(struct sockaddr*)&sa,sizeof(sa))<0){perror("http bind");return 1;}listen(http_sock,32);}
-    int https_sock=socket(AF_INET,SOCK_STREAM,0);
-    if(https_sock<0){perror("https socket");return 1;}
-    setsockopt(https_sock,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-    {struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(g_https_port),.sin_addr.s_addr=INADDR_ANY};
-     if(bind(https_sock,(struct sockaddr*)&sa,sizeof(sa))<0){perror("https bind");return 1;}listen(https_sock,32);}
+    /* Localhost-only observability listener (migration Step 4). DoH and the
+     * management API are served by apid now, not dnsd. */
+    int metrics_sock=socket(AF_INET,SOCK_STREAM,0);
+    if(metrics_sock<0){perror("metrics socket");return 1;}
+    setsockopt(metrics_sock,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+    {struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(g_metrics_port)};
+     sa.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+     if(bind(metrics_sock,(struct sockaddr*)&sa,sizeof(sa))<0){perror("metrics bind");return 1;}listen(metrics_sock,8);}
     /* IPv6 sockets already created above */
 
     dns_log(LOG_INFO,"\n╔═══════════════════════════════════════════════════════════════════╗\n");
     dns_log(LOG_INFO,"║  DNS  UDP plain + RFC2136 UPDATE + NOTIFY  :%d                   ║\n",g_dns_port);
     dns_log(LOG_INFO,"║  DoT  TCP DNS-over-TLS + AXFR              :%d  %s           ║\n",g_dot_port,g_dot_ctx?"TLS ":"----");
-    dns_log(LOG_INFO,"║  DoH  DNS-over-HTTPS  /dns-query           :%d  %s           ║\n",g_https_port,g_mgmt_ctx?"TLS ":"----");
-    dns_log(LOG_INFO,"║  HTTP DDNS + /list + /update               :%d                   ║\n",g_http_port);
-    dns_log(LOG_INFO,"║  HTTPS mTLS management API                 :%d  %s           ║\n",g_https_port,g_mgmt_ctx?"mTLS":"----");
+    dns_log(LOG_INFO,"║  metrics/health (localhost, read-only)     :%d                   ║\n",g_metrics_port);
+    dns_log(LOG_INFO,"║  DoH + management API now served by apid                          ║\n");
     dns_log(LOG_INFO,"║  Valkey                                     %s:%d          ║\n",g_valkey_host,g_valkey_port);
     dns_log(LOG_INFO,"║  Zone                                       %-20s       ║\n",g_zone_name);
     dns_log(LOG_INFO,"║  DNSSEC ZSK P-256 tag                       %-6u                 ║\n",g_zsk_tag);
@@ -3835,26 +3502,20 @@ int main(int argc,char **argv){
     dns_log(LOG_INFO,"║  Authenticated denial                       %s                ║\n",
         g_dnssec_use_nsec3?"NSEC3":"NSEC (plain)");
     dns_log(LOG_INFO,"╚═══════════════════════════════════════════════════════════════════╝\n\n");
-    dns_log(LOG_INFO,"Key endpoints:\n");
-    dns_log(LOG_INFO,"  GET  /health  /list  /metrics\n");
-    dns_log(LOG_INFO,"  GET  /update?hostname=N&ip=IP&key=K[&ttl=60]\n");
-    dns_log(LOG_INFO,"  POST /dns-query  (DoH, application/dns-message)\n");
-    dns_log(LOG_INFO,"  POST /zone  body: name=N&type=T&value=V[&ttl=300&pref=10] (mgmt)\n");
-    dns_log(LOG_INFO,"  DELETE /zone?name=N&type=T (mgmt)\n");
-    dns_log(LOG_INFO,"  POST /config  body: key=K&value=V (mgmt)\n");
-    dns_log(LOG_INFO,"  POST /acme/issue  (mgmt) — ACME certificate\n");
-    dns_log(LOG_INFO,"  POST /pki/est     (mgmt) — EST enrollment\n");
-    dns_log(LOG_INFO,"  GET  /pki/cacerts (mgmt) — Fetch EST CA chain\n");
+    dns_log(LOG_INFO,"Local endpoints (127.0.0.1 only, read-only):\n");
+    dns_log(LOG_INFO,"  GET  /health   GET /metrics  (Prometheus)\n");
+    dns_log(LOG_INFO,"DoH and the management API are served by apid;\n");
+    dns_log(LOG_INFO,"ACME/EST by certd; mDNS by mdnsd.\n");
     dns_log(LOG_INFO,"\n");
 
     for(;;){
         fd_set fds;FD_ZERO(&fds);
-        FD_SET(dns_sock,&fds);FD_SET(dot_sock,&fds);FD_SET(http_sock,&fds);FD_SET(https_sock,&fds);
+        FD_SET(dns_sock,&fds);FD_SET(dot_sock,&fds);FD_SET(metrics_sock,&fds);
         if(tcp_dns_sock>=0)FD_SET(tcp_dns_sock,&fds);
         if(dns6_sock>=0)FD_SET(dns6_sock,&fds);
         if(dot6_sock>=0)FD_SET(dot6_sock,&fds);
         int maxfd=dns_sock;
-        if(dot_sock>maxfd)maxfd=dot_sock;if(http_sock>maxfd)maxfd=http_sock;if(https_sock>maxfd)maxfd=https_sock;
+        if(dot_sock>maxfd)maxfd=dot_sock;if(metrics_sock>maxfd)maxfd=metrics_sock;
         if(tcp_dns_sock>maxfd)maxfd=tcp_dns_sock;
         if(dns6_sock>maxfd)maxfd=dns6_sock;
         if(dot6_sock>maxfd)maxfd=dot6_sock;
@@ -3956,24 +3617,16 @@ int main(int argc,char **argv){
                 pthread_attr_setdetachstate(&attr6,PTHREAD_CREATE_DETACHED);
                 pthread_create(&tid6,&attr6,dot_thread,c6);pthread_attr_destroy(&attr6);}}}
 
-        if(FD_ISSET(http_sock,&fds)){
-            struct sockaddr_in cli;socklen_t clen=sizeof(cli);
-            int cfd=accept(http_sock,(struct sockaddr*)&cli,&clen);
-            if(cfd>=0){char cip2[INET_ADDRSTRLEN];inet_ntop(AF_INET,&cli.sin_addr,cip2,sizeof(cip2));
-                dns_log(LOG_DEBUG,"[HTTP] %s\n",cip2);handle_http_plain(cfd,&cli.sin_addr);close(cfd);}}
+        if(FD_ISSET(metrics_sock,&fds)){
+            int cfd=accept(metrics_sock,NULL,NULL);
+            if(cfd>=0){handle_metrics(cfd);close(cfd);}}}
 
-        if(FD_ISSET(https_sock,&fds)){
-            struct sockaddr_in cli;socklen_t clen=sizeof(cli);
-            int cfd=accept(https_sock,(struct sockaddr*)&cli,&clen);
-            if(cfd>=0){char cip2[INET_ADDRSTRLEN];inet_ntop(AF_INET,&cli.sin_addr,cip2,sizeof(cip2));
-                dns_log(LOG_DEBUG,"[mTLS/DoH] %s\n",cip2);handle_https_mgmt(cfd,&cli.sin_addr);close(cfd);}}}
-
-    close(dns_sock);close(dot_sock);close(http_sock);close(https_sock);
+    close(dns_sock);close(dot_sock);close(metrics_sock);
     if(tcp_dns_sock>=0)close(tcp_dns_sock);
     if(dns6_sock>=0)close(dns6_sock);
     if(dot6_sock>=0)close(dot6_sock);
     if(vk.fd>=0)close(vk.fd);
-    if(g_dot_ctx)SSL_CTX_free(g_dot_ctx);if(g_mgmt_ctx)SSL_CTX_free(g_mgmt_ctx);
+    if(g_dot_ctx)SSL_CTX_free(g_dot_ctx);
     if(g_zsk)EVP_PKEY_free(g_zsk);if(g_zsk_ed)EVP_PKEY_free(g_zsk_ed);
     if(g_ksk)EVP_PKEY_free(g_ksk);if(g_ksk_ed)EVP_PKEY_free(g_ksk_ed);
     if(g_syslog_enabled)closelog();

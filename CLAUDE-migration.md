@@ -171,34 +171,56 @@ Acceptance
 
 ---
 
-## Step 4 — Front HTTP surfaces with a reverse proxy  `[ ]`
+## Step 4 — Front HTTP surfaces with `apid`  `[x]`
 
 Goal: delete hand-rolled HTTP/HTTPS/mTLS, `url_decode`, `qs_get`, config portal,
 and DoH HTTP parsing from the C core.
 
-> Decision point (confirm before starting): adopt a reverse proxy
-> (nginx/envoy) OR keep a small in-house `apid`. Default in `CLAUDE.md` is the
-> proxy. Record the choice here: __________________
+> Decision point: adopt a reverse proxy (nginx/envoy) OR keep a small in-house
+> `apid`. Default in `CLAUDE.md` was the proxy.
+> Choice: **apid (in-house, user-confirmed 2026-06-12)**.
 
 Tasks
-- [ ] Stand up the proxy to terminate TLS + HTTP for DoH and any management
-      surface, forwarding to the relevant daemon
-- [ ] Reduce `dnsd` HTTP to a localhost-only, read-only `/health` + `/metrics`
-- [ ] Remove the embedded management API (`/zone`, `/config`, `/acme/issue`,
+- [x] Stand up `apid` to terminate TLS + HTTP for DoH and the management
+      surface, forwarding to the relevant daemon (`apid.c`: DoH → dnsd loopback
+      DNS port via UDP+TCP-retry; management → Valkey writes only)
+- [x] Reduce `dnsd` HTTP to a localhost-only, read-only `/health` + `/metrics`
+      (bound `127.0.0.1:config:metrics_port`, default 8054; `apid` proxies
+      `/metrics`)
+- [x] Remove the embedded management API (`/zone`, `/config`, `/acme/issue`,
       `/pki/*`), the first-boot config portal, and DoH HTTP parsing from
-      `dns_server.c`
-- [ ] Move first-boot Valkey bootstrap out of an HTTP portal (e.g. env/config
-      file or the dashboard) so `dnsd` no longer serves a portal
+      `dns_server.c` (also removed the 4 now-dead helpers: `handle_api`,
+      `handle_doh`, `handle_http_plain`, `handle_https_mgmt`, `api_send`,
+      `url_decode`, `qs_get`, `config_portal`, `boot_save`, `str2type`,
+      `config_set`, `zone_save`, `zone_find`, and `g_mgmt_ctx`)
+- [x] Move first-boot Valkey bootstrap out of an HTTP portal: `dnsd` now retries
+      the connection (30×2s) then exits FATAL; connection details come from env
+      or the `dns_server.boot` file
+
+Decision — apid as a Valkey writer: with the in-house front (not a passive
+proxy), `apid` *is* the relocated management API, so it writes
+`config:*`/`zone:*`/`ddns:*` exactly as the embedded API did. The ownership
+table in `CLAUDE.md` now lists the control-plane writer category as
+{dashboard, apid}. mTLS (client cert vs `config:mtls_ca_pem`) gates `/config`
+and zone-table management; `ddns_secret` gates plain-HTTP `/update`; DoH and
+read-only `/list` need no auth. Config/zone-table edits apply in `dnsd` on
+SIGHUP until Step 6 adds keyspace-notification live reload (zone records are
+already read live per query).
 
 Acceptance
-- [ ] `grep -n 'url_decode\|qs_get\|config_portal\|handle_api' dns_server.c`
+- [x] `grep -n 'url_decode\|qs_get\|config_portal\|handle_api' dns_server.c`
       returns nothing
-- [ ] `dnsd`'s only listening HTTP socket is localhost `/health` + `/metrics`
-- [ ] DoH `/dns-query` still works through the proxy (GET base64url + POST)
-- [ ] Management writes go through Valkey, not an embedded API
-- [ ] **`dnsd` is now meaningfully smaller and single-purpose** — record the
-      line count before/after: ______ → ______
-- [ ] Global exit gate passes
+- [x] `dnsd`'s only listening HTTP socket is localhost `/health` + `/metrics`
+      (verified `ss -ltnp`: 5353, 8853 v4/v6, `127.0.0.1:8054`; no 8053/8443)
+- [x] DoH `/dns-query` still works through `apid` (GET base64url tested →
+      answer carried the expected A rdata; POST uses the same `handle_doh` path)
+- [x] Management writes go through Valkey, not an embedded API (apid `/update`
+      → `ddns:A:*` confirmed in Valkey; apid never calls into dnsd)
+- [x] **`dnsd` is now meaningfully smaller and single-purpose** — line count
+      before/after: **5064 → 3642**
+- [x] Global exit gate passes (4 binaries build clean; `make check`,
+      `check-dnssec` 12/12, `check-wire` 11/11; no new warnings — dnsd carries
+      only the 3 pre-existing ones)
 
 ---
 

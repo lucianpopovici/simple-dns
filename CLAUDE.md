@@ -79,9 +79,10 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | Path | What it is |
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
-| `dns_server.c` | The authoritative server (~4000 lines, shrinking). ACME/EST extracted in Step 2, mDNS in Step 3; the HTTP surface still to go — see architecture below. |
+| `dns_server.c` | **`dnsd`** — the authoritative core (~3600 lines). ACME/EST extracted in Step 2, mDNS in Step 3, the HTTP/DoH/portal surface in Step 4. Now: DNS/DoT + localhost `/health`+`/metrics` only. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |
+| `apid.c` | **`apid`** — HTTP/HTTPS front for DoH + management (migration Step 4, done). Forwards DoH to `dnsd`; all writes go to Valkey. |
 | `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC **validation**. Becomes `resolverd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
@@ -172,10 +173,10 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
 │ (auth.)  │   │ (mDNS)   │   │ (PKI)   │  │   │  (Flask UI)  │   │ (recursive)  │
 └──────────┘   └──────────┘   └─────────┘  │   └──────────────┘   └──────────────┘
    ▲  ▲                                     │          ▲
-   │  │ DoH / mgmt (optional)               │          │ authenticated
-   │  └──────────── reverse proxy (nginx/envoy) ───────┘
-   │ DNS / DoT (53, 853)
- clients
+   │  │ DoH / mgmt                          │          │ authenticated
+   │  └──────────────────── apid ──────────────────────┘
+   │ DNS / DoT (53, 853)         (HTTP/HTTPS front; writes Valkey,
+ clients                          forwards DoH to dnsd's DNS port)
 ```
 
 Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) linked by `dnsd`,
@@ -254,19 +255,31 @@ canonical RRset per RFC 4034 §3.1.8.1 — guarded by `make check-dnssec`).
 Reads/writes Valkey: its persisted cache namespace only. It does not read the
 authoritative zone.
 
-### Control plane: reverse proxy + `dashboard`
+### Control plane: `apid` + `dashboard`
 
-- A real reverse proxy (nginx or envoy) terminates TLS and HTTP for the DoH
-  endpoint and for any management/metrics surface, forwarding cleanly to the
-  daemons. This removes the hand-rolled HTTP/HTTPS/mTLS server, `url_decode`,
-  and `qs_get` from the C code.
+- **Done (migration Step 4):** `apid.c`. Instead of nginx/envoy the project
+  uses a small in-house front (decision recorded in `CLAUDE-migration.md`).
+  `apid` terminates HTTP/HTTPS, serves DoH by forwarding the DNS message to
+  `dnsd`'s loopback DNS port (UDP, TCP retry on truncation — it never parses
+  DNS payloads), and serves the management API by writing **Valkey only**
+  (it calls nothing inside `dnsd`). This removed the hand-rolled
+  HTTP/HTTPS/mTLS server, `url_decode`, `qs_get`, `handle_api`, `handle_doh`
+  and the first-boot config portal from `dnsd`.
+  - Auth: the HTTPS listener treats a request as management only when a client
+    cert verifies against `config:mtls_ca_pem` (mTLS); plain HTTP allows DoH,
+    read-only `/list`, and DDNS `/update` gated by `config:ddns_secret`.
+  - Because `apid` is the relocated embedded API, it inherits that API's Valkey
+    writes (`config:*`, `zone:*` records, `ddns:*`) — see the ownership table.
+    Config/zone-table changes are applied by `dnsd` on SIGHUP until Step 6 adds
+    keyspace-notification live reload; zone records are read live per query.
 - `dashboard/app.py` (Flask) remains the control-plane UI but **must gain
-  authentication** before exposure. Today it has none, and its Valkey Explorer
-  can set/delete arbitrary keys — which means unauthenticated full compromise
+  authentication** before exposure (Step 5). Today it has none, and its Valkey
+  Explorer can set/delete arbitrary keys — unauthenticated full compromise
   (zone data, TSIG secret, cookie secret all live in Valkey).
-- `dnsd` exposes only a tiny read-only `/health` + `/metrics` (Prometheus),
-  ideally bound to localhost and scraped through the proxy. All write
-  operations go through Valkey, not an embedded API.
+- `dnsd` exposes only a tiny read-only `/health` + `/metrics` (Prometheus)
+  bound to **localhost** (`config:metrics_port`, default 8054), scraped by
+  `apid`'s `/metrics` proxy. All write operations go through Valkey, not an
+  embedded API.
 
 ### `libdnswire` — shared wire-format library
 
@@ -284,13 +297,16 @@ exclude it from the production build. If it is live, it must also use
 
 ## The Valkey boundary (integration contract)
 
-Each namespace has exactly one writer category. Define and enforce this.
+Each namespace has exactly one writer *category*. The control plane is that
+category for `config:*`/`zone:*`/`ddns:*`: it is the dashboard **and** `apid`
+(the relocated management API — Step 4), which are the two authenticated
+HTTP front-ends. Define and enforce this.
 
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
-| `config:*` | dashboard | dnsd, mdnsd, resolverd, certd | Runtime configuration |
-| `zone:*` | dashboard, certd (challenge TXT only), dnsd (TLSA on cert change) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
-| `ddns:*` | dnsd (UPDATE) | dnsd | Dynamic records |
+| `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid | Runtime configuration |
+| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
+| `ddns:*` | dnsd (RFC 2136 UPDATE), apid (HTTP `/update`, `ddns_secret`-gated) | dnsd | Dynamic records |
 | `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |
 | `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |
 | `cert:current` | certd | dnsd (hot-reload) | Active TLS cert + key |
@@ -350,9 +366,10 @@ Each step is independently shippable and must pass `make debug`, `make`, and
    ACME/EST code from `dns_server.c`.
 3. **Split out `mdnsd`.** Move the mDNS responder into its own binary reading
    `mdns:*`. Remove multicast handling from `dnsd`.
-4. **Front the HTTP surfaces with a reverse proxy** and reduce `dnsd` to a
-   localhost-only read-only `/health` + `/metrics`. Remove the embedded
-   management API, config portal, and DoH HTTP parsing from the C core.
+4. **Front the HTTP surfaces with `apid`** (in-house, chosen over nginx/envoy)
+   and reduce `dnsd` to a localhost-only read-only `/health` + `/metrics`.
+   Removed the embedded management API, config portal, and DoH HTTP parsing
+   from the C core.
 5. **Add control-plane authentication** to the dashboard; restrict or remove the
    raw Valkey Explorer write path.
 6. **Enable Valkey keyspace-notification live reload** across daemons.

@@ -4,6 +4,8 @@ certd
 certd_debug
 mdnsd
 mdnsd_debug
+apid
+apid_debug
 
 # Secrets — never commit private keys / cert chains
 *.key

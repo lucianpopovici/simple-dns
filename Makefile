@@ -108,7 +108,8 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity
+        check check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        certd certd_debug mdnsd mdnsd_debug apid apid_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
 # instead of a wall of confusing compiler/linker errors.
@@ -179,6 +180,22 @@ mdnsd: mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	strip --strip-unneeded $@
 
 mdnsd_debug: mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [DEBUG] $@"
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	@echo ""
+	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
+
+# =============================================================================
+# apid — HTTP/HTTPS front for DoH + management (migration Step 4)
+# =============================================================================
+apid: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [PROD]  $@"
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	strip --strip-unneeded $@
+
+apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
 	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
@@ -331,7 +348,7 @@ check: $(BIN_DEBUG)
 # =============================================================================
 clean:
 	@echo "  CLEAN"
-	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug mdnsd mdnsd_debug \
+	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug mdnsd mdnsd_debug apid apid_debug \
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_name_from_wire \
 	      fuzz/fuzz_name_from_wire
@@ -350,6 +367,8 @@ help:
 	@echo "  make certd_debug  certd sidecar, ASan/UBSan debug build"
 	@echo "  make mdnsd        mDNS/DNS-SD responder, hardened production build"
 	@echo "  make mdnsd_debug  mDNS responder, ASan/UBSan debug build"
+	@echo "  make apid         HTTP/HTTPS front (DoH + mgmt), hardened production build"
+	@echo "  make apid_debug   apid front, ASan/UBSan debug build"
 	@echo "  make sign         (Re-)sign the existing production binary with GPG"
 	@echo "  make sign-openssl Sign with OpenSSL Ed25519 key (keys/codesign.key.pem)"
 	@echo "  make verify       Verify GPG and/or OpenSSL signatures"
