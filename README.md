@@ -1,91 +1,126 @@
 # simple-dns
 
-A single-binary authoritative DNS server with a Valkey-backed control plane and
-a Flask dashboard for browsing/editing zone data. Designed to be small enough
-to read end-to-end (one C file, ~5000 lines) while covering the surface area
-of a production deployment: DNSSEC, dynamic updates, zone transfers,
-DNS-over-TLS, DNS-over-HTTPS, mDNS, and ACME/EST PKI bootstrap.
+A small authoritative DNS server with a Valkey-backed control plane and a Flask
+dashboard. It began as one ~5000-line `dns_server.c` and has been decomposed
+into a set of single-purpose daemons that share one wire-format library and
+integrate only through Valkey — so a bug in a low-trust path (mDNS, an HTTP
+parser, an ACME JSON response) can't be a bug in the privileged authoritative
+core. It still covers a production surface area: DNSSEC, dynamic updates, zone
+transfers, DNS-over-TLS, DNS-over-HTTPS, mDNS/DNS-SD, and ACME/EST PKI.
+
+The full target architecture and the migration that produced it are documented
+in `CLAUDE.md` and `CLAUDE-migration.md`.
+
+## Architecture
+
+Processes don't call each other — **Valkey is the integration bus**, and each
+namespace has exactly one writer category (see `CLAUDE.md` for the ownership
+table). Edits made through the control plane take effect live via Valkey
+keyspace notifications; no restarts.
+
+```
+                       ┌─────────────────────────────┐
+                       │           Valkey            │
+                       │   source of truth + bus     │
+                       └─────────────────────────────┘
+     ▲      ▲        ▲             ▲              ▲          ▲
+     │      │        │             │              │          │
+ ┌───┴──┐ ┌─┴────┐ ┌─┴────┐   ┌────┴─────┐   ┌────┴─────┐  (reads/writes)
+ │ dnsd │ │mdnsd │ │certd │   │   apid   │   │dashboard │
+ │auth. │ │ mDNS │ │ PKI  │   │HTTP/DoH/ │   │ Flask UI │
+ │      │ │      │ │      │   │   mgmt   │   │          │
+ └──┬───┘ └──────┘ └──────┘   └────┬─────┘   └──────────┘
+    │ DNS 53 / DoT 853                │ DoH + mgmt (8053/8443)
+  clients                          clients
+```
+
+| Daemon | Role | Listens on | Talks to |
+|---|---|---|---|
+| **`dnsd`** (`dns_server.c`) | Authoritative core: query resolution, DNSSEC signing, UPDATE/TSIG, AXFR/IXFR/NOTIFY, EDNS/cookies | `5353/udp+tcp` (DNS), `8853` (DoT), `127.0.0.1:8054` (read-only `/health`+`/metrics`) | Valkey only |
+| **`certd`** (`certd.c`) | ACME (RFC 8555, DNS-01) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA) | Valkey + CA |
+| **`mdnsd`** (`mdnsd.c`) | mDNS (RFC 6762) + DNS-SD (RFC 6763) responder, link-local | `5353` multicast on explicitly-configured interfaces | Valkey (read) |
+| **`apid`** (`apid.c`) | HTTP/HTTPS front: DoH + management API | `8053` (HTTP), `8443` (HTTPS/mTLS) | Valkey + dnsd (DoH forward) |
+| **`dashboard`** (`dashboard/app.py`) | Authenticated control-plane UI | `127.0.0.1:5000` (configurable) | Valkey |
+
+Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) — the single
+wire-format implementation (name parsing/encoding, RR append, base64/hex, …)
+linked by every binary.
 
 ## Components
 
 | Path | What it is |
 |---|---|
-| `dns_server.c` | The DNS server. Builds to a single binary. |
-| `Makefile` | Production + debug builds, GPG/OpenSSL code signing, install targets. |
-| `dashboard/` | Flask UI for the Valkey-backed control plane (see [Dashboard](#dashboard)). |
-| `simple_dns.c` / `dns_client.c` | Smaller reference DNS implementations. |
+| `dns_server.c` | `dnsd`, the authoritative core. |
+| `certd.c` | `certd`, the ACME/EST certificate sidecar. |
+| `mdnsd.c` | `mdnsd`, the mDNS/DNS-SD responder. |
+| `apid.c` | `apid`, the HTTP/HTTPS front for DoH + management. |
+| `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library. |
+| `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC validation (becomes `resolverd`). |
+| `simple_dns.c` | Smaller reference implementation; links `libdnswire`. |
+| `dashboard/` | Flask control-plane UI (see [Dashboard](#dashboard)). |
+| `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`) and a libFuzzer harness (`make fuzz-wire`). |
+| `Makefile` | Per-binary production + debug builds, GPG/OpenSSL signing, install. |
 
 ## Quick start
 
 ```bash
-# 1. Build (needs OpenSSL headers — set OSSL_INC if non-standard)
-make                       # production build, GPG-signed
-make debug                 # ASan/UBSan build, dns_server_debug
+# 1. Build. `make` builds + GPG-signs dnsd (needs a signing key); for local/CI
+#    use the unsigned per-binary targets:
+make dns_server certd mdnsd apid     # stripped, hardened production binaries (unsigned)
+make debug                           # dnsd ASan/UBSan build → dns_server_debug
 
-# 2. Start Valkey on 127.0.0.1:6379 (or set DNS_VALKEY_HOST / _PORT / _PASSWORD)
+# 2. Valkey on 127.0.0.1:6379 (or set DNS_VALKEY_HOST / _PORT / _PASSWORD)
 valkey-server &
 
-# 3. Run
-./dns_server               # binds 5353/udp + 8853/tcp + 8053/tcp + 8443/tcp
+# 3. Run the authoritative core (binds 5353 udp+tcp, 8853 DoT, 127.0.0.1:8054)
+./dns_server
+
+# 4. (optional) the sidecars — each only needs Valkey
+./apid                               # DoH + management on 8053/8443
+./certd --once                       # one ACME/EST renewal check (or run as a daemon)
+./mdnsd                              # needs config:mdns_enabled=1 + config:mdns_interfaces
 ```
 
-On first start, when Valkey is unreachable, the server opens a config portal
-on port 8080 (`CONFIG_PORT` env var) — fill in the Valkey connection details
-and it persists them to `dns_server.boot` and resumes.
+If Valkey is unreachable at startup, `dnsd` retries (≈1 min) and then exits with
+a clear error — provision the connection via the env vars or a `dns_server.boot`
+file (`VALKEY_HOST=…` lines). There is no first-boot HTTP portal.
 
-## What the DNS server does
+OpenSSL ≥ 3.0 is required. The `Makefile` derives `OSSL_INC`/`OSSL_LIB` via
+`pkg-config`; override them only for a non-standard install.
 
-### Protocols on the wire
+## Standards implemented
 
-| Port | Transport | Purpose |
-|---|---|---|
-| `5353/udp` | DNS-over-UDP | Standard queries, NOTIFY, UPDATE, mDNS |
-| `5353/tcp` | DNS-over-TCP | Truncation fallback, AXFR/IXFR |
-| `8853/tcp` | DNS-over-TLS (RFC 7858) | DoT including AXFR over TLS |
-| `8443/tcp` | DNS-over-HTTPS (RFC 8484) | DoH `/dns-query` (GET base64url + POST) |
-| `8053/tcp` | HTTP | `/health`, `/metrics`, `/list`, `/update` (DDNS) |
-| `8443/tcp` | HTTPS mTLS | Management API: `/zone`, `/config`, `/acme/issue`, `/pki/est`, `/pki/cacerts` |
-| `8080/tcp` | HTTP | First-boot config portal (only when Valkey unreachable) |
+`dnsd`'s header comment (`dns_server.c:1`) keeps the authoritative list. At a
+glance:
 
-### Standards implemented
-
-The server's header comment (`dns_server.c:1`) keeps the authoritative list.
-At a glance:
-
-- **Core / queries**: RFC 1034/1035, 2181, 2308, 4592 wildcards, 6303 locally-served zones, 8482 minimal-ANY, 9619 QDCOUNT enforcement.
-- **Record types**: A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV (2782), CAA (8659), SSHFP (4255), TLSA/DANE (6698/7671), LOC (1876), URI (7553), NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078).
-- **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256) and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155) authenticated denial.
-- **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, with real journal-based diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007).
-- **EDNS / transport**: 6891 OPT, 5001 NSID, 7828 TCP-keepalive, 7830/8467 padding, 8914 EDE, 9018 DNS Cookies.
-- **mDNS / DNS-SD**: 6762 + 6763, dual-stack IPv4 + IPv6.
-- **PKI bootstrap**: ACME (8555, DNS-01 challenge for cert auto-renewal) and EST (7030) over mTLS.
-
-### Recent fixes
-
-Several gaps in the originally claimed RFC coverage have been closed:
-
-| Commit | What changed |
-|---|---|
-| `Extend handle_update for TXT, CNAME, MX, SRV` | RFC 2136 UPDATE handler stops silently dropping non-A/AAAA records. ACME DNS-01 challenges over nsupdate now work end-to-end. |
-| `TXT rdata chunking per RFC 1035 §3.3.14` | TXT values longer than 255 bytes (DKIM keys, long SPF, verification tokens) are now split into multiple character strings instead of being truncated. |
-| `DNS name compression (RFC 1035 §4.1.4)` | Owner-name back-pointers in responses; ~30–50% size reduction on multi-RR responses. Fewer TC=1 fallbacks near the 512/1232-byte boundary. |
-| `DNS Cookie verification + BADCOOKIE (RFC 9018)` | The `cookie_verify` stub is replaced with a real RFC 9018 §4.2 implementation. Server cookies are now 16-byte SipHash-2-4 MACs bound to client IP and timestamp; clients that send a cookie complete a proper BADCOOKIE handshake. |
+- **Core / queries**: RFC 1034/1035, 2181, 2308, 4592 wildcards, 6303
+  locally-served zones, 8482 minimal-ANY, 9619 QDCOUNT enforcement.
+- **Record types**: A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV (2782),
+  CAA (8659), SSHFP (4255), TLSA/DANE (6698/7671), LOC (1876), URI (7553),
+  NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078).
+- **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
+  and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
+  authenticated denial. Validation (in `dns_client.c`) covers the full
+  canonical RRset per RFC 4034 §3.1.8.1.
+- **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, journal-based
+  diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007).
+- **EDNS / transport**: 6891 OPT, 5001 NSID, 7828 TCP-keepalive, 7830/8467
+  padding, 8914 EDE, 9018 DNS Cookies (real SipHash-2-4, BADCOOKIE handshake).
+- **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
+- **PKI bootstrap** (`certd`): ACME (8555, DNS-01) and EST (7030) over mTLS.
 
 ## Configuration
 
-All runtime configuration lives in Valkey under the `config:*` key prefix.
-The server reads them on startup, when `POST /config` lands, and on cert
-renewal. Connection details for Valkey itself come from three sources, in
-order of precedence:
+All runtime configuration lives in Valkey under `config:*`. Daemons subscribe to
+the keys they own and apply changes **live** via keyspace notifications — no
+SIGHUP, no `POST /config`, no restart (`dnsd` keeps a SIGHUP handler only as a
+manual fallback). Valkey connection details come from, in precedence order:
 
-1. Environment variables: `DNS_VALKEY_HOST`, `DNS_VALKEY_PORT`,
-   `DNS_VALKEY_PASSWORD`, `CONFIG_PORT`.
-2. `dns_server.boot` file in the working directory (auto-saved by the
-   first-boot config portal).
+1. Env: `DNS_VALKEY_HOST`, `DNS_VALKEY_PORT`, `DNS_VALKEY_PASSWORD`.
+2. A `dns_server.boot` file in the working directory.
 3. Defaults: `127.0.0.1:6379`, no password.
 
-The full Valkey schema is documented in the `dns_server.c` header comment;
-the most-edited keys are:
+The full schema is in the `dns_server.c` header comment; the most-edited keys:
 
 | Key | Purpose |
 |---|---|
@@ -93,16 +128,20 @@ the most-edited keys are:
 | `config:soa_*` | SOA `mname`, `rname`, `refresh`, `retry`, `expire`, `minimum`. |
 | `config:zone_serial` | SOA serial; auto-incremented on every change. |
 | `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. |
-| `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Generated randomly if absent. |
+| `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
 | `config:notify_targets` | Comma-separated `IP:port` recipients for NOTIFY on zone change. |
 | `config:nsid` | NSID string reported via EDNS option 3. |
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
 | `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
-| `config:acme_*`, `config:est_*` | ACME and EST endpoints / identity for cert auto-renewal. |
+| `config:metrics_port` | `dnsd` localhost metrics/health port (default 8054). |
+| `config:mdns_enabled` / `config:mdns_interfaces` | Enable `mdnsd` and its interface allowlist (`"all"` or a comma-separated list; it refuses to start unset). |
+| `config:acme_*`, `config:est_*` | ACME/EST endpoints + identity for `certd`. |
+| `config:dashboard_password_hash` | Dashboard admin password hash (see [Dashboard](#dashboard)). |
 
-Zone records use the `zone:<TYPE>:<fqdn>` namespace with pipe-delimited
-values; dynamic-update records use `ddns:<TYPE>:<fqdn>`. Examples:
+Zone records use `zone:<TYPE>:<fqdn>` with pipe-delimited values; dynamic-update
+records use `ddns:<TYPE>:<fqdn>`; mDNS-only records use `mdns:<TYPE>:<fqdn>`;
+the active TLS cert+key blob written by `certd` is `cert:current`. Examples:
 
 ```
 zone:TXT:_acme-challenge.host.example.local   →  60|abc...123
@@ -139,131 +178,112 @@ EOF
 dig @127.0.0.1 -p 5353 example.local AXFR -y "hmac-sha256:tsig-key:$KEY_B64"
 ```
 
-AXFR over DoT works on `:8853` if you prefer encrypted transfers.
+AXFR over DoT works on `:8853` for encrypted transfers.
 
-### Hot-reloading config
+### Certificates
 
-Most settings change live on the next query (zone records are read every
-request). Things that need a nudge:
+`certd` performs ACME DNS-01 (it writes the challenge to
+`zone:TXT:_acme-challenge.<domain>` and deletes it after validation) or EST
+enrollment, then writes the issued chain+key to `cert:current`. `dnsd` and
+`apid` watch `cert:current` and hot-reload TLS within seconds; `dnsd` also
+publishes the matching TLSA records. Run `certd` as a daemon (daily renewal
+check) or `certd --once` from cron.
 
-- TSIG / cookie secrets: send `SIGHUP` or `POST /config` to the server.
-- TLS cert/key: written via `/zone` upload or ACME — picked up automatically.
-- DNSSEC keys: stored in Valkey; re-read on `SIGHUP`.
+### Live reload
+
+Every setting applies live. Edit a `config:*`, `zone:*`, `ddns:*` or `mdns:*`
+key (via the dashboard, `apid`, or `valkey-cli`) and the owning daemon picks it
+up through a keyspace-notification subscriber: config changes re-load runtime
+state, `cert:current` hot-reloads TLS, `zone_table:*` rebuilds the zone list,
+`mdns:*` triggers a re-announce. Zone/DDNS records are also read live on every
+query. Subscribers re-subscribe with backoff across a Valkey restart.
 
 ### Logging
 
 Three sinks run in parallel: stdout/stderr with ISO-8601 timestamps, local
-syslog (configurable level via `config:syslog_*`), and optional remote syslog
-(`config:rsyslog_host` + `_port`). Query logs are written to the path in
-`config:query_log_path` when set.
+syslog (level via `config:syslog_*`), and optional remote syslog. Query logs go
+to `config:query_log_path` when set.
 
-## Build details
-
-The default `make` target produces a stripped, hardened binary with ASLR
-(`-fPIE -pie -Wl,-z,relro,-z,now`), stack-smashing protection, and
-`_FORTIFY_SOURCE=2`, then signs it with the first available GPG key. Useful
-flags:
+## Build & test
 
 ```bash
-make debug                 # ASan/UBSan, full symbols, dns_server_debug
-make GPG_KEY=ops@example.com   # pick the signing key explicitly
-make sign-openssl              # add a secondary OpenSSL Ed25519 signature
-make verify                    # verify GPG + OpenSSL signatures
-make install PREFIX=/usr/local # install binary + .asc signature
-make help                      # full target list
+make                 # production dnsd: optimised, stripped, hardened, GPG-signed
+make dns_server      # … unsigned (no GPG key needed; for local/CI)
+make certd mdnsd apid   # the sidecars (unsigned production builds)
+make debug           # dnsd under ASan/UBSan, full symbols
+make check           # smoke test (needs Valkey + dig)
+make check-dnssec    # DNSSEC known-answer + negative (flipped-byte) tests
+make check-wire      # name_from_wire compression/edge-case unit tests
+make fuzz-wire       # 60s libFuzzer smoke on the name parser (needs clang)
+make help            # full target list
 ```
 
-OpenSSL ≥ 3.0 is required. Override paths with `OSSL_INC=` / `OSSL_LIB=` if
-your distribution puts headers somewhere unusual.
+Production builds are hardened (`-fPIE -pie -Wl,-z,relro,-z,now`,
+`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`). CI (`.github/workflows/ci.yml`)
+builds every daemon, runs the unit tests and a fuzz smoke, and blocks on
+warnings-as-errors (curated set + `-Werror`), `clang-format`, and static
+analysis (scan-build + cppcheck). Format new/changed C with `clang-format -i`.
 
 # Dashboard
 
-A Flask-based dashboard and configuration interface for `dns_server`'s
-Valkey backend. Lives in `dashboard/`.
+A Flask control-plane UI for the Valkey backend, in `dashboard/`. It can read
+and write every key (zone data, the TSIG secret, DNSSEC private keys), so it
+**requires authentication and refuses to start without an admin password
+configured** — there is no blank-auth default.
 
 ## Features
 
 | Section | What it does |
 |---|---|
-| **Dashboard** | Live metrics (auto-polls `/metrics` every 15s), Valkey status, zone summary |
-| **Live Metrics** | Full Prometheus text output from dns_server |
-| **Zone Records** | Browse, add, delete `zone:*` records with type/name/value/TTL |
-| **DDNS Records** | Browse and manage `ddns:*` dynamic records |
-| **mDNS Records** | Browse and manage `mdns:*` multicast records |
-| **Server Config** | Tabbed editor for all `config:*` Valkey keys, grouped by function |
-| **DNSSEC** | Key inventory (ZSK/KSK), NSEC3 parameter editing, key deletion |
-| **PKI / TLS** | ACME + EST config, PEM upload for cert/key/CA, cert status |
-| **AXFR / NOTIFY** | AXFR allow-list and NOTIFY target editing, transfer stats |
-| **IXFR Journal** | Recent incremental transfer journal entries, journal clear |
-| **Valkey Explorer** | Raw key search (glob pattern), set/delete arbitrary keys, namespace summary |
+| **Dashboard** | Live metrics (auto-polls `/metrics`), Valkey status, zone summary |
+| **Live Metrics** | Full Prometheus text output from `dnsd` |
+| **Zone Records** | Browse, add, delete `zone:*` records |
+| **DDNS / mDNS Records** | Manage `ddns:*` and `mdns:*` records |
+| **Server Config** | Tabbed editor for `config:*` keys, grouped by function |
+| **DNSSEC** | Key inventory (ZSK/KSK), NSEC3 parameters, key deletion |
+| **PKI / TLS** | ACME + EST config, PEM upload, cert status |
+| **AXFR / NOTIFY**, **IXFR Journal** | Transfer allow-list/targets and journal view |
+| **Valkey Explorer** | Glob key search; writes are opt-in and never touch secret keys (masked on display) |
 
 ## Requirements
 
 - Python 3.10+
-- Flask (`pip install flask`)
-- No other dependencies — Valkey RESP client is built-in (stdlib `socket` only)
+- Flask + Werkzeug (`pip install -r dashboard/requirements.txt`)
+- No other dependencies — the Valkey RESP client is built-in (stdlib `socket`).
 
 ## Run
 
 ```bash
-# Minimal (connects to Valkey on localhost:6379, metrics on :8053)
-python3 dashboard/app.py
+# Provision an admin password (one of these), then run:
+DASHBOARD_PASSWORD='choose-a-strong-one' python3 dashboard/app.py
+
+# Pre-hash to keep the plaintext out of the environment:
+python3 dashboard/app.py --gen-password-hash 'pw'      # prints a scrypt hash
+DASHBOARD_PASSWORD_HASH='scrypt:...' python3 dashboard/app.py
 
 # Full options
 python3 dashboard/app.py \
-  --host 0.0.0.0 \
-  --port 5000 \
-  --valkey-host 127.0.0.1 \
-  --valkey-port 6379 \
-  --valkey-pass "" \
-  --dns-host 127.0.0.1 \
-  --dns-metrics-port 8053 \
+  --host 127.0.0.1 --port 5000 \
+  --valkey-host 127.0.0.1 --valkey-port 6379 --valkey-pass "" \
+  --dns-host 127.0.0.1 --dns-metrics-port 8054 \
   --secret-key "$(openssl rand -hex 32)"
-
-# Environment variables (all options available as env vars too)
-VALKEY_HOST=10.0.0.1 VALKEY_PASS=secret DNS_HOST=10.0.0.1 python3 dashboard/app.py
 ```
 
-## Configuration groups
+Credential lookup order: `DASHBOARD_PASSWORD_HASH` → `DASHBOARD_PASSWORD` →
+Valkey `config:dashboard_password_hash`. Set a persistent `FLASK_SECRET_KEY`
+(`openssl rand -hex 32`) so sessions survive restarts. See
+`dashboard/README.md` for credential rotation and the full auth model.
 
-The **Server Config** page is split into tabs:
+## Security notes
 
-| Tab | Keys |
-|---|---|
-| Zone & SOA | `zone_name`, `zone_serial`, `soa_mname/rname/refresh/retry/expire/minimum` |
-| Dynamic DNS | `ddns_secret` |
-| Zone Transfer | `axfr_allow`, `notify_targets` |
-| Security & Auth | `tsig_key_name`, `tsig_secret_b64`, `cookie_secret`, `nsid` |
-| Rate Limiting | `rrl_enabled`, `rrl_rate`, `rrl_window`, `rrl_slip` |
-| DNSSEC | `nsec3_iters`, `nsec3_salt` |
-| PKI / TLS / ACME | `acme_domain/email/ca`, `est_server/domain` |
-| Syslog | all `syslog_*` keys |
-| Query Logging | `query_log_path` |
-
-## Architecture
-
-```
-browser
-  ↕ HTTP
-dashboard/app.py (Flask)
-  ↕ RESP protocol (stdlib socket)
-Valkey  ←→  dns_server (C binary)
-              ↕
-       DNS / DoT / DoH / mDNS clients
-```
-
-The dashboard reads and writes Valkey keys directly. `dns_server` reads them
-on startup (`config_load_from_valkey`), on each `POST /config`, and during
-cert-renewal polling.
-
-Changes to most keys require either restarting `dns_server` or calling its
-`POST /config` API to hot-reload specific settings (TLS cert/key reload is
-instant; zone records are live-queried on every DNS request).
-
-## Security note
-
-The dashboard has no authentication by default. Deploy behind a reverse proxy
-(nginx, Caddy) with mTLS or basic auth if the port is exposed beyond
-localhost. Set `--secret-key` to a strong random value in production. The
-`dns_server`'s management HTTPS API on `:8443` is mTLS-only — clients must
-present a certificate signed by the configured CA.
+- The dashboard authenticates (login + signed-cookie session, per-IP login
+  backoff) and gates every route. The raw Valkey Explorer is read-only unless
+  `DASHBOARD_ENABLE_EXPLORER_WRITE=1`, and even then refuses to write/delete
+  secret-bearing keys. Still, bind it to localhost or front it with a
+  TLS-terminating proxy; never run it with `--debug` exposed.
+- `apid`'s management API (`/config`, `/zone*`) requires a client certificate
+  verified against `config:mtls_ca_pem` (mTLS); DDNS `/update` over plain HTTP
+  is gated by `config:ddns_secret`; DoH and read-only `/list` are open.
+- `dnsd`'s only HTTP surface is a read-only `/health`+`/metrics` bound to
+  localhost. Secrets (TSIG key, cookie secret, DNSSEC private keys) live in
+  Valkey and are read by `dnsd` only.
