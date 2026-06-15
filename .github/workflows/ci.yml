@@ -78,9 +78,8 @@ jobs:
   warnings:
     name: Warnings as errors
     runs-on: ubuntu-latest
-    # Advisory for one cycle to confirm the Ubuntu gcc agrees with local Fedora
-    # gcc; flip to blocking (remove this line) once green in CI.
-    continue-on-error: true
+    # Blocking: the tree is warning-clean under the curated set + -Werror
+    # (verified green in CI run 27550875223).
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -119,9 +118,10 @@ jobs:
         run: cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 *.c
 
   format:
-    name: clang-format (advisory)
+    name: clang-format
     runs-on: ubuntu-latest
-    continue-on-error: true   # flip to false after the one-time format commit
+    # Blocking: the tree was reflowed with .clang-format and verified clean in
+    # CI (run 27550875223). Keep new code formatted (`clang-format -i`).
     steps:
       - uses: actions/checkout@v4
       - name: Install clang-format

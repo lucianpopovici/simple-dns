@@ -1396,7 +1396,8 @@ static void zones_load_from_valkey(void) {
     int nk = 0;
     for (int i = 0; i < count; i++) {
         resp_reply_t kr;
-        resp_parse(&vk, &kr);
+        if (resp_parse(&vk, &kr) < 0)
+            break;
         if (kr.type == 2 && nk < MAX_ZONES) {
             safe_strcpy(zkeys[nk], kr.str, sizeof(zkeys[nk]));
             nk++;
@@ -2339,7 +2340,7 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
                         break;
                     }
                     if ((c2 & 0xC0) == 0xC0) {
-                        p2 += 2;
+                        /* compression pointer: the name ends here */
                         break;
                     }
                     /* bounds: dot + label (c2 bytes) must fit in 255 chars */
@@ -5319,45 +5320,44 @@ static void handle_metrics(int fd) {
     }
     /* Prometheus text format (RFC-like, de-facto standard) */
     char body[HTTP_BUF];
-    int bp = 0;
     pthread_mutex_lock(&g_stat_mutex);
     uint64_t sq = g_stat_queries, sn = g_stat_noerror, snx = g_stat_nxdomain, sr = g_stat_refused,
              ss = g_stat_servfail, rd = g_stat_rrl_drop, rt = g_stat_rrl_tc, ax = g_stat_axfr,
              dd = g_stat_ddns, si = g_stat_signed;
     pthread_mutex_unlock(&g_stat_mutex);
-    bp += snprintf(body + bp, sizeof(body) - bp,
-                   "# HELP dns_queries_total Total DNS queries received\n"
-                   "# TYPE dns_queries_total counter\n"
-                   "dns_queries_total %llu\n"
-                   "# HELP dns_responses_total DNS responses by rcode\n"
-                   "# TYPE dns_responses_total counter\n"
-                   "dns_responses_total{rcode=\"NOERROR\"} %llu\n"
-                   "dns_responses_total{rcode=\"NXDOMAIN\"} %llu\n"
-                   "dns_responses_total{rcode=\"REFUSED\"} %llu\n"
-                   "dns_responses_total{rcode=\"SERVFAIL\"} %llu\n"
-                   "# HELP dns_rrl_total RRL actions\n"
-                   "# TYPE dns_rrl_total counter\n"
-                   "dns_rrl_total{action=\"drop\"} %llu\n"
-                   "dns_rrl_total{action=\"tc\"}   %llu\n"
-                   "# HELP dns_axfr_total AXFR transfers completed\n"
-                   "# TYPE dns_axfr_total counter\n"
-                   "dns_axfr_total %llu\n"
-                   "# HELP dns_ddns_total DDNS updates accepted\n"
-                   "# TYPE dns_ddns_total counter\n"
-                   "dns_ddns_total %llu\n"
-                   "# HELP dns_dnssec_signatures_total DNSSEC RRSIGs generated\n"
-                   "# TYPE dns_dnssec_signatures_total counter\n"
-                   "dns_dnssec_signatures_total %llu\n"
-                   "# HELP dns_zone_serial Current SOA serial\n"
-                   "# TYPE dns_zone_serial gauge\n"
-                   "dns_zone_serial %u\n"
-                   "# HELP dns_rrl_enabled Whether RRL is active\n"
-                   "# TYPE dns_rrl_enabled gauge\n"
-                   "dns_rrl_enabled %d\n",
-                   (unsigned long long) sq, (unsigned long long) sn, (unsigned long long) snx,
-                   (unsigned long long) sr, (unsigned long long) ss, (unsigned long long) rd,
-                   (unsigned long long) rt, (unsigned long long) ax, (unsigned long long) dd,
-                   (unsigned long long) si, g_soa_serial, g_rrl_enabled);
+    snprintf(body, sizeof(body),
+             "# HELP dns_queries_total Total DNS queries received\n"
+             "# TYPE dns_queries_total counter\n"
+             "dns_queries_total %llu\n"
+             "# HELP dns_responses_total DNS responses by rcode\n"
+             "# TYPE dns_responses_total counter\n"
+             "dns_responses_total{rcode=\"NOERROR\"} %llu\n"
+             "dns_responses_total{rcode=\"NXDOMAIN\"} %llu\n"
+             "dns_responses_total{rcode=\"REFUSED\"} %llu\n"
+             "dns_responses_total{rcode=\"SERVFAIL\"} %llu\n"
+             "# HELP dns_rrl_total RRL actions\n"
+             "# TYPE dns_rrl_total counter\n"
+             "dns_rrl_total{action=\"drop\"} %llu\n"
+             "dns_rrl_total{action=\"tc\"}   %llu\n"
+             "# HELP dns_axfr_total AXFR transfers completed\n"
+             "# TYPE dns_axfr_total counter\n"
+             "dns_axfr_total %llu\n"
+             "# HELP dns_ddns_total DDNS updates accepted\n"
+             "# TYPE dns_ddns_total counter\n"
+             "dns_ddns_total %llu\n"
+             "# HELP dns_dnssec_signatures_total DNSSEC RRSIGs generated\n"
+             "# TYPE dns_dnssec_signatures_total counter\n"
+             "dns_dnssec_signatures_total %llu\n"
+             "# HELP dns_zone_serial Current SOA serial\n"
+             "# TYPE dns_zone_serial gauge\n"
+             "dns_zone_serial %u\n"
+             "# HELP dns_rrl_enabled Whether RRL is active\n"
+             "# TYPE dns_rrl_enabled gauge\n"
+             "dns_rrl_enabled %d\n",
+             (unsigned long long) sq, (unsigned long long) sn, (unsigned long long) snx,
+             (unsigned long long) sr, (unsigned long long) ss, (unsigned long long) rd,
+             (unsigned long long) rt, (unsigned long long) ax, (unsigned long long) dd,
+             (unsigned long long) si, g_soa_serial, g_rrl_enabled);
     metrics_send(fd, 200, "text/plain; version=0.0.4", body);
 }
 
