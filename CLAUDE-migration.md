@@ -333,8 +333,18 @@ Tasks
       RRset publishes current+next throughout; signer switches to next only in
       commit (`emit_rr` `use_next`). `dnssec:*` now reloads live
       (`zone_dnssec_reload`) — no longer restart-flagged.
-- [ ] **KSK** rollover with CDS/CDNSKEY parent signalling (RFC 7344/8078) —
-      remaining follow-up (ZSK roll above needs no DS coordination)
+- [x] **KSK** rollover with CDS/CDNSKEY parent signalling (RFC 6781 §4.1.2
+      Double-Signature + RFC 7344/8078). First fixed the broken CDS/CDNSKEY
+      (was DNSKEY-format rdata over the ZSK; now DS-format over the KSK via a
+      shared `ds_rdata_from_dnskey` that the DS answer also uses → CDS==DS by
+      construction, guarded by `make check-cds`). Engine (`ksk_rollover_*`,
+      `dnssec:<zone>:ksk_*`): double phase publishes old+new KSK and signs the
+      DNSKEY RRset with both, CDS/CDNSKEY advertises {old,new}; retire phase
+      advertises {new} only; then the old KSK is retired. Manual trigger
+      `config:zone:<z>:ksk_rollover_request`, auto via `ksk_validity`, holds
+      `ksk_{publish,commit}_hold`. Verified end-to-end (DNSKEY 1→2→2→1 KSK sets,
+      CDS==DS every phase, key rotated) + `tests/test_rollover.c` KSK no-gap
+      KAT/negative for alg 13+15.
 - [ ] (Optional) catalog zones (RFC 9432) for bulk provisioning — not done
 - [x] Migration script for existing single-zone data into the new key layout
       (`tools/migrate-multizone.sh`, dry-run by default, idempotent)

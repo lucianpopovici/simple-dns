@@ -374,9 +374,19 @@ storm.
   reloads live (no longer restart-flagged). Covered by `make check-dnssec`
   (`tests/test_rollover.c`: per-phase no-validation-gap KAT + negative).
 
-Still pending: **KSK rollover** with CDS/CDNSKEY parent signalling (the ZSK roll
-above needs no DS coordination). Catalog zones (RFC 9432) for bulk provisioning
-are optional and not yet done.
+- Automated per-zone DNSSEC **KSK rollover** (RFC 6781 §4.1.2 Double-Signature)
+  with CDS/CDNSKEY parent signalling (RFC 7344/8078): the DNSKEY RRset is signed
+  by both the old and new KSK throughout the roll while CDS/CDNSKEY advertises
+  the DS to publish — {old,new} in the `double` phase, {new} in `retire` — so the
+  parent's DS always matches a KSK that signed the published DNSKEY. State in
+  `dnssec:<zone>:ksk_{created,rollover,next,ed25519_next,rollover_seen}`; knobs in
+  `config:[zone:<zone>:]{ksk_validity,ksk_publish_hold,ksk_commit_hold,ksk_rollover_request}`.
+  CDS/CDNSKEY carry DS-format rdata over the KSK (identical to the DS answer by
+  construction), guarded by `make check-cds`; KSK no-gap KAT in
+  `tests/test_rollover.c`.
+
+Still pending: catalog zones (RFC 9432) for bulk provisioning are optional and
+not yet done.
 
 ---
 

@@ -368,9 +368,94 @@ static void run_alg(uint8_t alg) {
     EVP_PKEY_free(next);
 }
 
+/* KSK rollover (RFC 6781 §4.1.2 Double-Signature): the DNSKEY RRset is signed by
+ * BOTH the old and new KSK throughout the roll, while the parent's DS (advertised
+ * via CDS) swaps old -> {old,new} -> new. For whichever DS the parent currently
+ * serves, a KSK that signed the DNSKEY RRset must be present, or a validator
+ * chaining from that DS finds no usable key — a validation gap. dns_server.c
+ * phases: double = DS{old,new} / sign{old,new}; retire = DS{new} / sign{old,new};
+ * done = DS{new} / sign{new}. */
+static void run_ksk_alg(uint8_t alg) {
+    const int is_ed = (alg == 15);
+    printf("== KSK rollover, algorithm %u (%s) ==\n", alg, is_ed ? "Ed25519" : "ECDSA P-256");
+
+    EVP_PKEY *oldk = NULL, *newk = NULL;
+    pubkey_t ko, kn;
+    for (int tries = 0; tries < 16; tries++) {
+        if (oldk)
+            EVP_PKEY_free(oldk);
+        if (newk)
+            EVP_PKEY_free(newk);
+        oldk = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519")
+                     : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+        newk = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519")
+                     : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+        uint8_t po[80], pn[80];
+        int lo = oldk ? extract_pub(oldk, is_ed, po) : 0;
+        int ln = newk ? extract_pub(newk, is_ed, pn) : 0;
+        if (!lo || !ln) {
+            printf("  FAIL  KSK keygen/pubkey extraction\n");
+            g_failures++;
+            if (oldk)
+                EVP_PKEY_free(oldk);
+            if (newk)
+                EVP_PKEY_free(newk);
+            return;
+        }
+        make_dnskey(&ko, alg, po, lo);
+        make_dnskey(&kn, alg, pn, ln);
+        if (ko.tag != kn.tag)
+            break;
+    }
+    CHECK(ko.tag != kn.tag, "KSK: distinct key tags for old/new KSK");
+
+    /* RRSIGs over the DNSKEY RRset by each KSK (both sign during the roll). */
+    signed_pkt_t so, sn;
+    if (!build_signed(&so, alg, oldk, is_ed, ko.tag) ||
+        !build_signed(&sn, alg, newk, is_ed, kn.tag)) {
+        printf("  FAIL  KSK signing\n");
+        g_failures++;
+        EVP_PKEY_free(oldk);
+        EVP_PKEY_free(newk);
+        return;
+    }
+
+    /* DS sets the parent advertises per phase. */
+    pubkey_t ds_double[2] = {ko, kn};
+    pubkey_t ds_new[1] = {kn};
+
+    /* double: DS{old,new}, DNSKEY signed by both — every advertised DS resolves
+     * to a KSK that signed the RRset. */
+    CHECK(verify_with(&so, &ko) == 1 && verify_with(&sn, &kn) == 1,
+          "double: DNSKEY RRset is signed by both old and new KSK");
+    CHECK(select_key(ds_double, 2, ko.tag) != NULL && select_key(ds_double, 2, kn.tag) != NULL,
+          "double: parent DS {old,new} both resolve to a published KSK — no gap");
+
+    /* retire: DS{new}, still double-signed — the new DS resolves to the new KSK,
+     * which has signed the DNSKEY RRset. */
+    CHECK(select_key(ds_new, 1, kn.tag) != NULL && verify_with(&sn, &kn) == 1,
+          "retire: DS{new} resolves to the new KSK and verifies — no gap");
+    CHECK(select_key(ds_new, 1, ko.tag) == NULL,
+          "retire: the old KSK's DS is no longer advertised");
+
+    /* done: DS{new}, DNSKEY signed by the (promoted) new KSK. */
+    CHECK(verify_with(&sn, &kn) == 1, "done: new KSK signature verifies — no gap");
+
+    /* Negative — the gap double-signature prevents: swapping the parent DS to the
+     * new KSK before that key has signed the DNSKEY RRset. The new key cannot
+     * verify the old KSK's signature, so the chain from DS(new) breaks. */
+    CHECK(verify_with(&so, &kn) == 0,
+          "DS-swap-before-double: new KSK cannot verify the old KSK's RRSIG (gap caught)");
+
+    EVP_PKEY_free(oldk);
+    EVP_PKEY_free(newk);
+}
+
 int main(void) {
     run_alg(15); /* Ed25519 */
     run_alg(13); /* ECDSA P-256 */
+    run_ksk_alg(15);
+    run_ksk_alg(13);
     if (g_failures) {
         printf("\n%d FAILURE(S)\n", g_failures);
         return 1;

@@ -100,6 +100,18 @@
  *   config:zone:<zone>:zsk_rollover_request      Manual trigger (set a fresh value to roll now)
  *   config:rollover_tick_secs                    Rollover engine poll interval (s, default 30)
  *
+ * Per-zone KSK rollover schema (RFC 6781 §4.1.2 Double-Signature; written by dnsd):
+ *   dnssec:<zone>:ksk_created  Epoch the active KSK set was created
+ *   dnssec:<zone>:ksk_rollover "double|<epoch>" or "retire|<epoch>" (absent = idle)
+ *   dnssec:<zone>:ksk_next / :ksk_ed25519_next
+ *                              Incoming KSK set, present only during a rollover
+ *   dnssec:<zone>:ksk_rollover_seen              Last manual-trigger value acted on (edge-trigger)
+ *   config:[zone:<zone>:]ksk_validity            KSK lifetime (s); 0/unset = no auto-roll
+ *   config:[zone:<zone>:]ksk_publish_hold        Double-phase hold (s, default 3600; parent adds
+ * DS) config:[zone:<zone>:]ksk_commit_hold         Retire-phase hold (s, default 3600; old DS
+ * expires) config:zone:<zone>:ksk_rollover_request      Manual trigger (set a fresh value to roll
+ * now)
+ *
  * Build:
  *   gcc -O2 -Wall -I<openssl-inc> -o dns_server dns_server.c \
  *       -L<openssl-lib> -lssl -lcrypto -lpthread -Wl,-rpath,<openssl-lib>
@@ -337,12 +349,31 @@ typedef struct {
     int roll_phase;     /* ROLL_NONE / ROLL_PUBLISH / ROLL_COMMIT */
     time_t roll_since;  /* epoch the current phase was entered */
     time_t zsk_created; /* epoch the current ZSK set was created */
+    /* Per-zone KSK rollover (RFC 6781 §4.1.2 Double-Signature). The incoming KSK
+     * set is published alongside the current one and the DNSKEY RRset is signed
+     * by BOTH KSKs for the whole rollover; CDS/CDNSKEY advertises both DS so the
+     * parent can swap, then only the new one, before the old KSK is retired — so
+     * the parent's DS always matches a KSK that signs the published DNSKEY. */
+    EVP_PKEY *ksk_next; /* incoming KSK P-256 (rollover only) */
+    uint16_t ksk_next_tag;
+    EVP_PKEY *ksk_ed_next; /* incoming KSK Ed25519 (rollover only) */
+    uint16_t ksk_ed_next_tag;
+    int ksk_roll_phase;    /* KROLL_NONE / KROLL_DOUBLE / KROLL_RETIRE */
+    time_t ksk_roll_since; /* epoch the current KSK phase was entered */
+    time_t ksk_created;    /* epoch the current KSK set was created */
 } zone_entry_t;
 
 /* ZSK rollover phases (RFC 6781 §4.1.1.1 Pre-Publish). */
 #define ROLL_NONE 0
 #define ROLL_PUBLISH 1 /* publish current+next; keep signing with current */
 #define ROLL_COMMIT 2  /* publish current+next; sign with next */
+
+/* KSK rollover phases (RFC 6781 §4.1.2 Double-Signature). Both KSKs are in the
+ * DNSKEY RRset and both sign it throughout; only the advertised CDS/CDNSKEY (and
+ * thus the DS the parent should hold) changes between phases. */
+#define KROLL_NONE 0
+#define KROLL_DOUBLE 1 /* publish old+new KSK; CDS/CDNSKEY = {old, new} */
+#define KROLL_RETIRE 2 /* publish old+new KSK; CDS/CDNSKEY = {new} only */
 
 static zone_entry_t g_zones[MAX_ZONES];
 static int g_zone_count = 0;
@@ -2229,6 +2260,35 @@ static int ds_rdata_from_dnskey(const char *owner, const uint8_t *dkrd, int dkle
     sha256(hin, hp + dklen, ds_out + 4);
     return 4 + 32;
 }
+
+/* Emit a DS or CDS record (identical DS-format rdata) for one KSK. `rrtype` is
+ * DNS_TYPE_DS or DNS_TYPE_CDS. No-op (returns off unchanged) when ksk is NULL. */
+static int emit_ds_like(uint8_t *resp, int off, int resp_len, const char *qname, uint16_t rrtype,
+                        EVP_PKEY *ksk, int alg, uint16_t tag, int dnssec_ok, int *answers) {
+    if (!ksk)
+        return off;
+    uint8_t dkrd[68], dsrd[4 + 32];
+    int dklen = (alg == DNS_ALG_ED25519) ? dnskey_rdata_ksk_ed25519(ksk, dkrd, sizeof(dkrd))
+                                         : dnskey_rdata_ksk_ecdsa(ksk, dkrd, sizeof(dkrd));
+    if (dklen <= 0 || ds_rdata_from_dnskey(qname, dkrd, dklen, tag, alg, dsrd) <= 0)
+        return off;
+    return emit_rr(resp, off, resp_len, qname, rrtype, 3600, dsrd, 4 + 32, dnssec_ok, answers);
+}
+
+/* Emit a CDNSKEY record (KSK DNSKEY rdata) for one KSK. No-op when ksk is NULL. */
+static int emit_cdnskey(uint8_t *resp, int off, int resp_len, const char *qname, EVP_PKEY *ksk,
+                        int alg, int dnssec_ok, int *answers) {
+    if (!ksk)
+        return off;
+    uint8_t dkrd[68];
+    int dklen = (alg == DNS_ALG_ED25519) ? dnskey_rdata_ksk_ed25519(ksk, dkrd, sizeof(dkrd))
+                                         : dnskey_rdata_ksk_ecdsa(ksk, dkrd, sizeof(dkrd));
+    if (dklen <= 0)
+        return off;
+    return emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDNSKEY, 3600, dkrd, dklen, dnssec_ok,
+                   answers);
+}
+
 static int label_count(const char *n) {
     if (!n || !*n)
         return 0;
@@ -2461,7 +2521,8 @@ static void zone_dnssec_init(zone_entry_t *z) {
 /* Load an existing private key from Valkey without generating one.  Used for
  * the incoming ("next") ZSK set during a rollover, which is absent outside a
  * rollover.  Returns 1 on success. */
-static int dnssec_load_existing(const char *vk_key, EVP_PKEY **out, uint16_t *tag, int alg) {
+static int dnssec_load_existing(const char *vk_key, EVP_PKEY **out, uint16_t *tag, int alg,
+                                int is_ksk) {
     char pem[MAX_PEM] = {0};
     if (!(vk_get(vk_key, pem, sizeof(pem)) && strlen(pem) > 10))
         return 0;
@@ -2471,9 +2532,17 @@ static int dnssec_load_existing(const char *vk_key, EVP_PKEY **out, uint16_t *ta
     if (!k)
         return 0;
     *out = k;
+    /* Key tag must be computed over the rdata as published — KSK rdata carries
+     * the SEP flag (257), ZSK carries 256 — so pick the matching encoder. */
     uint8_t dkrd[68];
-    int dklen = (alg == DNS_ALG_ED25519) ? dnskey_rdata_ed25519(k, dkrd, sizeof(dkrd))
-                                         : dnskey_rdata_ecdsa(k, dkrd, sizeof(dkrd));
+    int ed = (alg == DNS_ALG_ED25519);
+    int dklen;
+    if (is_ksk)
+        dklen = ed ? dnskey_rdata_ksk_ed25519(k, dkrd, sizeof(dkrd))
+                   : dnskey_rdata_ksk_ecdsa(k, dkrd, sizeof(dkrd));
+    else
+        dklen = ed ? dnskey_rdata_ed25519(k, dkrd, sizeof(dkrd))
+                   : dnskey_rdata_ecdsa(k, dkrd, sizeof(dkrd));
     if (dklen > 0)
         *tag = keytag(dkrd, dklen);
     return 1;
@@ -2515,9 +2584,9 @@ static void zone_rollover_load(zone_entry_t *z) {
     if (phase != ROLL_NONE) {
         char nk[360];
         snprintf(nk, sizeof(nk), "dnssec:%.255s:zsk_next", z->name);
-        dnssec_load_existing(nk, &nk1, &t1, DNS_ALG_ECDSAP256SHA256);
+        dnssec_load_existing(nk, &nk1, &t1, DNS_ALG_ECDSAP256SHA256, 0);
         snprintf(nk, sizeof(nk), "dnssec:%.255s:zsk_ed25519_next", z->name);
-        dnssec_load_existing(nk, &nk2, &t2, DNS_ALG_ED25519);
+        dnssec_load_existing(nk, &nk2, &t2, DNS_ALG_ED25519, 0);
         if (!nk1 || !nk2) {
             dns_log(LOG_WARNING, "[Rollover] %s: incoming keys missing — aborting rollover\n",
                     z->name);
@@ -2542,6 +2611,65 @@ static void zone_rollover_load(zone_entry_t *z) {
         EVP_PKEY_free(old1);
     if (old2)
         EVP_PKEY_free(old2);
+
+    /* --- KSK rollover state (RFC 6781 §4.1.2 Double-Signature) ---
+     *   dnssec:<zone>:ksk_created   epoch the current KSK set was created
+     *   dnssec:<zone>:ksk_rollover  "double|<epoch>" or "retire|<epoch>" (absent = none)
+     *   dnssec:<zone>:ksk_next, :ksk_ed25519_next   incoming KSK set (rollover only) */
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_created", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0]) {
+        z->ksk_created = (time_t) atoll(v);
+    } else {
+        z->ksk_created = time(NULL);
+        char b[32];
+        snprintf(b, sizeof(b), "%lld", (long long) z->ksk_created);
+        vk_set(k, b, 0);
+    }
+    int kphase = KROLL_NONE;
+    time_t ksince = 0;
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0]) {
+        char ph[16] = "";
+        long long si = 0;
+        sscanf(v, "%15[^|]|%lld", ph, &si);
+        if (strcmp(ph, "double") == 0)
+            kphase = KROLL_DOUBLE;
+        else if (strcmp(ph, "retire") == 0)
+            kphase = KROLL_RETIRE;
+        ksince = (time_t) si;
+    }
+    EVP_PKEY *kk1 = NULL, *kk2 = NULL;
+    uint16_t kt1 = 0, kt2 = 0;
+    if (kphase != KROLL_NONE) {
+        char nk[360];
+        snprintf(nk, sizeof(nk), "dnssec:%.255s:ksk_next", z->name);
+        dnssec_load_existing(nk, &kk1, &kt1, DNS_ALG_ECDSAP256SHA256, 1);
+        snprintf(nk, sizeof(nk), "dnssec:%.255s:ksk_ed25519_next", z->name);
+        dnssec_load_existing(nk, &kk2, &kt2, DNS_ALG_ED25519, 1);
+        if (!kk1 || !kk2) {
+            dns_log(LOG_WARNING, "[Rollover] %s: incoming KSK missing — aborting KSK rollover\n",
+                    z->name);
+            if (kk1)
+                EVP_PKEY_free(kk1);
+            if (kk2)
+                EVP_PKEY_free(kk2);
+            kk1 = kk2 = NULL;
+            kphase = KROLL_NONE;
+        }
+    }
+    pthread_mutex_lock(&g_zsk_mutex);
+    EVP_PKEY *kold1 = z->ksk_next, *kold2 = z->ksk_ed_next;
+    z->ksk_next = kk1;
+    z->ksk_ed_next = kk2;
+    z->ksk_next_tag = kt1;
+    z->ksk_ed_next_tag = kt2;
+    z->ksk_roll_phase = kphase;
+    z->ksk_roll_since = ksince;
+    pthread_mutex_unlock(&g_zsk_mutex);
+    if (kold1)
+        EVP_PKEY_free(kold1);
+    if (kold2)
+        EVP_PKEY_free(kold2);
 }
 
 /* Reload a zone's full DNSSEC key state live (current set + rollover/next set),
@@ -2695,6 +2823,93 @@ static void rollover_finish(zone_entry_t *z) {
             z->zsk_ed_tag);
 }
 
+/* ==========================================================================
+ * KSK rollover engine (RFC 6781 §4.1.2 Double-Signature)
+ *
+ * double:  DNSKEY = {ZSK.., old KSK, new KSK}, the DNSKEY RRset signed by BOTH
+ *          KSKs; CDS/CDNSKEY advertises {old, new} so the parent publishes both
+ *          DS. Held (ksk_publish_hold) long enough for the parent to add DS(new)
+ *          and for it to propagate; an operator who has confirmed the parent has
+ *          DS(new) can advance immediately via the manual request.
+ * retire:  same double-signed DNSKEY, but CDS/CDNSKEY now advertises {new} only,
+ *          telling the parent to drop DS(old). Held (ksk_commit_hold) until
+ *          DS(old) has expired from caches.
+ * finish:  promote new KSK -> current, drop the old one; rollover over.
+ * Both KSKs sign the DNSKEY RRset throughout, so whichever DS the parent serves
+ * (old, new, or both) always points at a KSK that signed it — no validation gap.
+ * ======================================================================= */
+
+/* Begin a KSK rollover: generate + store the incoming KSK set, enter `double`. */
+static void ksk_rollover_start(zone_entry_t *z) {
+    char pem[MAX_PEM], k[360];
+    if (dnssec_generate_pem(DNS_ALG_ECDSAP256SHA256, pem, sizeof(pem)) != 0) {
+        dns_log(LOG_ERR, "[Rollover] %s: KSK P-256 keygen failed\n", z->name);
+        return;
+    }
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_next", z->name);
+    vk_set(k, pem, 0);
+    if (dnssec_generate_pem(DNS_ALG_ED25519, pem, sizeof(pem)) != 0) {
+        dns_log(LOG_ERR, "[Rollover] %s: KSK Ed25519 keygen failed\n", z->name);
+        return;
+    }
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_ed25519_next", z->name);
+    vk_set(k, pem, 0);
+    char st[64];
+    snprintf(st, sizeof(st), "double|%lld", (long long) time(NULL));
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
+    vk_set(k, st, 0);
+    zone_rollover_load(z); /* bring the next KSK set + phase into memory */
+    serial_bump(z);        /* DNSKEY + CDS/CDNSKEY RRsets changed */
+    notify_send();
+    dns_log(LOG_NOTICE,
+            "[Rollover] %s: KSK started — double (new KSK tags %u/%u); CDS/CDNSKEY = {old, new}\n",
+            z->name, z->ksk_next_tag, z->ksk_ed_next_tag);
+}
+
+/* double -> retire: keep both KSKs published and double-signing, but advertise
+ * only the new KSK in CDS/CDNSKEY so the parent drops DS(old). */
+static void ksk_rollover_to_retire(zone_entry_t *z) {
+    char k[360], st[64];
+    snprintf(st, sizeof(st), "retire|%lld", (long long) time(NULL));
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
+    vk_set(k, st, 0);
+    zone_rollover_load(z);
+    serial_bump(z);
+    notify_send();
+    dns_log(LOG_NOTICE, "[Rollover] %s: KSK retire — CDS/CDNSKEY = {new} only (parent drops old)\n",
+            z->name);
+}
+
+/* retire -> done: promote the new KSK to current, drop the old one. */
+static void ksk_rollover_finish(zone_entry_t *z) {
+    char k[360], pem[MAX_PEM];
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_next", z->name);
+    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
+        char ck[360];
+        snprintf(ck, sizeof(ck), "dnssec:%.255s:ksk", z->name);
+        vk_set(ck, pem, 0);
+    }
+    vk_del(k);
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_ed25519_next", z->name);
+    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
+        char ck[360];
+        snprintf(ck, sizeof(ck), "dnssec:%.255s:ksk_ed25519", z->name);
+        vk_set(ck, pem, 0);
+    }
+    vk_del(k);
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
+    vk_del(k);
+    char now_s[32];
+    snprintf(now_s, sizeof(now_s), "%lld", (long long) time(NULL));
+    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_created", z->name);
+    vk_set(k, now_s, 0);
+    zone_dnssec_reload(z); /* current = promoted KSK; next/phase cleared */
+    serial_bump(z);
+    notify_send();
+    dns_log(LOG_NOTICE, "[Rollover] %s: KSK complete — active KSK tags %u/%u\n", z->name,
+            z->ksk_tag, z->ksk_ed_tag);
+}
+
 /* Drive each zone's rollover state machine one step (time- and request-based). */
 static void rollover_tick(void) {
     time_t now = time(NULL);
@@ -2734,6 +2949,38 @@ static void rollover_tick(void) {
         } else if (phase == ROLL_COMMIT) {
             if ((now - since) >= roll_cfg(z->name, "rollover_commit_hold", 3600))
                 rollover_finish(z);
+        }
+
+        /* KSK rollover (RFC 6781 §4.1.2). Independent of the ZSK roll, but we do
+         * not *start* one while a ZSK roll is mid-flight, to limit DNSKEY churn. */
+        pthread_mutex_lock(&g_zsk_mutex);
+        int kphase = z->ksk_roll_phase;
+        time_t ksince = z->ksk_roll_since, kcreated = z->ksk_created;
+        int zsk_idle = (z->roll_phase == ROLL_NONE);
+        pthread_mutex_unlock(&g_zsk_mutex);
+        if (kphase == KROLL_NONE) {
+            long req = roll_cfg(z->name, "ksk_rollover_request", 0);
+            char sk[360], sv[64] = "";
+            snprintf(sk, sizeof(sk), "dnssec:%.255s:ksk_rollover_seen", z->name);
+            vk_get(sk, sv, sizeof(sv));
+            long seen = sv[0] ? atol(sv) : 0;
+            int manual = (req > 0 && req != seen);
+            long validity = roll_cfg(z->name, "ksk_validity", 0); /* 0 = no auto-roll */
+            int age_due = (validity > 0 && (now - kcreated) >= validity);
+            if ((manual || age_due) && zsk_idle) {
+                ksk_rollover_start(z);
+                if (manual) {
+                    char b[32];
+                    snprintf(b, sizeof(b), "%ld", req);
+                    vk_set(sk, b, 0);
+                }
+            }
+        } else if (kphase == KROLL_DOUBLE) {
+            if ((now - ksince) >= roll_cfg(z->name, "ksk_publish_hold", 3600))
+                ksk_rollover_to_retire(z);
+        } else if (kphase == KROLL_RETIRE) {
+            if ((now - ksince) >= roll_cfg(z->name, "ksk_commit_hold", 3600))
+                ksk_rollover_finish(z);
         }
     }
 }
@@ -4238,6 +4485,17 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     int roll_active = (t_zone && t_zone->roll_phase != ROLL_NONE);
     EVP_PKEY *g_zsk_next = roll_active ? t_zone->zsk_next : NULL;
     EVP_PKEY *g_zsk_ed_next = roll_active ? t_zone->zsk_ed_next : NULL;
+    /* Incoming KSK set during a KSK rollover (RFC 6781 §4.1.2 Double-Signature).
+     * Published + double-signs the DNSKEY RRset throughout the roll. CDS/CDNSKEY
+     * (and the apex DS answer) advertise the old KSK while phase != RETIRE and
+     * the new KSK while phase != NONE — so DOUBLE = {old,new}, RETIRE = {new}. */
+    int ksk_phase = t_zone ? t_zone->ksk_roll_phase : KROLL_NONE;
+    EVP_PKEY *g_ksk_next = (ksk_phase != KROLL_NONE) ? t_zone->ksk_next : NULL;
+    EVP_PKEY *g_ksk_ed_next = (ksk_phase != KROLL_NONE) ? t_zone->ksk_ed_next : NULL;
+    uint16_t g_ksk_next_tag = t_zone ? t_zone->ksk_next_tag : 0;
+    uint16_t g_ksk_ed_next_tag = t_zone ? t_zone->ksk_ed_next_tag : 0;
+    int cds_old = (ksk_phase != KROLL_RETIRE); /* advertise current KSK's DS */
+    int cds_new = (ksk_phase != KROLL_NONE);   /* advertise incoming KSK's DS */
     /* DNSKEY — serve ZSK (flag 256) + KSK (flag 257), KSK signs DNSKEY RRset */
     if ((qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
         uint8_t dkrd[68];
@@ -4328,68 +4586,113 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 }
             }
         }
+        /* KSK rollover (Double-Signature): publish the incoming KSK set and sign
+         * the DNSKEY RRset with it too, so the RRset validates against the DS of
+         * either KSK while the parent's DS is being swapped. */
+        if (g_ksk_next && dnskey_rdata_ksk_ecdsa(g_ksk_next, dkrd, sizeof(dkrd)) > 0) {
+            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
+                               dkrd, 68);
+            if (n2 > 0) {
+                off = n2;
+                answers++;
+            }
+            if (dnssec_ok) {
+                uint8_t sig[512];
+                int sl = make_rrsig(qname, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk_next,
+                                    DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, sig);
+                if (sl > 0) {
+                    int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
+                                       3600, sig, (uint16_t) sl);
+                    if (so > 0) {
+                        off = so;
+                        answers++;
+                    }
+                }
+            }
+        }
+        if (g_ksk_ed_next && dnskey_rdata_ksk_ed25519(g_ksk_ed_next, dkrd, sizeof(dkrd)) > 0) {
+            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
+                               dkrd, 36);
+            if (n2 > 0) {
+                off = n2;
+                answers++;
+            }
+            if (dnssec_ok) {
+                uint8_t sig[512];
+                int sl = make_rrsig(qname, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed_next,
+                                    DNS_ALG_ED25519, g_ksk_ed_next_tag, sig);
+                if (sl > 0) {
+                    int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
+                                       3600, sig, (uint16_t) sl);
+                    if (so > 0) {
+                        off = so;
+                        answers++;
+                    }
+                }
+            }
+        }
         if (any_minimal && answers > 0)
             goto finish_answer;
     }
     /* RFC 7344: CDS (child DS) — the DS the child wants the parent to publish.
-     * Same rdata format as DS, computed over the *KSK* (the SEP that signs the
-     * DNSKEY RRset), so it matches the DS answer below. (Not the ZSK, and not
-     * DNSKEY-format rdata.) */
+     * DS-format rdata over the *KSK* (the SEP that signs the DNSKEY RRset), so it
+     * matches the DS answer below. During a KSK rollover this advertises the old
+     * KSK (phase != RETIRE) and/or the new KSK (phase != NONE), driving the
+     * parent's DS swap (cds_old / cds_new computed above). */
     if (qtype == DNS_TYPE_CDS || qtype == DNS_TYPE_ANY) {
-        uint8_t dkrd[68], dsrd[4 + 32];
-        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0 &&
-            ds_rdata_from_dnskey(qname, dkrd, 68, g_ksk_tag, DNS_ALG_ECDSAP256SHA256, dsrd) > 0) {
-            found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDS, 3600, dsrd, 4 + 32, dnssec_ok,
-                          &answers);
+        int before = off;
+        if (cds_old) {
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_CDS, g_ksk,
+                               DNS_ALG_ECDSAP256SHA256, g_ksk_tag, dnssec_ok, &answers);
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_CDS, g_ksk_ed, DNS_ALG_ED25519,
+                               g_ksk_ed_tag, dnssec_ok, &answers);
         }
-        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0 &&
-            ds_rdata_from_dnskey(qname, dkrd, 36, g_ksk_ed_tag, DNS_ALG_ED25519, dsrd) > 0) {
-            found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDS, 3600, dsrd, 4 + 32, dnssec_ok,
-                          &answers);
+        if (cds_new) {
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_CDS, g_ksk_next,
+                               DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, dnssec_ok, &answers);
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_CDS, g_ksk_ed_next,
+                               DNS_ALG_ED25519, g_ksk_ed_next_tag, dnssec_ok, &answers);
         }
+        if (off > before)
+            found = 1;
     }
     /* RFC 7344: CDNSKEY — the DNSKEY the child wants the parent to publish a DS
-     * for: the KSK, in DNSKEY rdata format. */
+     * for: the KSK(s), in DNSKEY rdata format. Same old/new phase logic as CDS. */
     if (qtype == DNS_TYPE_CDNSKEY || qtype == DNS_TYPE_ANY) {
-        uint8_t dkrd[68];
-        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0) {
-            found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDNSKEY, 3600, dkrd, 68, dnssec_ok,
-                          &answers);
+        int before = off;
+        if (cds_old) {
+            off = emit_cdnskey(resp, off, resp_len, qname, g_ksk, DNS_ALG_ECDSAP256SHA256,
+                               dnssec_ok, &answers);
+            off = emit_cdnskey(resp, off, resp_len, qname, g_ksk_ed, DNS_ALG_ED25519, dnssec_ok,
+                               &answers);
         }
-        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0) {
-            found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDNSKEY, 3600, dkrd, 36, dnssec_ok,
-                          &answers);
+        if (cds_new) {
+            off = emit_cdnskey(resp, off, resp_len, qname, g_ksk_next, DNS_ALG_ECDSAP256SHA256,
+                               dnssec_ok, &answers);
+            off = emit_cdnskey(resp, off, resp_len, qname, g_ksk_ed_next, DNS_ALG_ED25519,
+                               dnssec_ok, &answers);
         }
+        if (off > before)
+            found = 1;
     }
-    /* RFC 4034 §5: DS — Delegation Signer over the zone's KSKs.
-     * DS rdata = keytag(2) | alg(1) | digest_type=2(SHA-256)(1) |
-     * sha256(owner_wire||dnskey_rdata)(32) Only emitted at the zone apex where our KSKs live. */
+    /* RFC 4034 §5: DS — Delegation Signer over the zone's KSK(s). Kept identical
+     * to CDS (same emit_ds_like + old/new phase logic) so CDS == DS always. */
     if (qtype == DNS_TYPE_DS || qtype == DNS_TYPE_ANY) {
-        uint8_t dkrd[68], dsrd[4 + 32];
-        /* P-256 KSK */
-        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0 &&
-            ds_rdata_from_dnskey(qname, dkrd, 68, g_ksk_tag, DNS_ALG_ECDSAP256SHA256, dsrd) > 0) {
-            int n2 = emit_rr(resp, off, resp_len, qname, DNS_TYPE_DS, 3600, dsrd, 4 + 32, dnssec_ok,
-                             &answers);
-            if (n2 > 0) {
-                off = n2;
-                found = 1;
-            }
+        int before = off;
+        if (cds_old) {
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_DS, g_ksk,
+                               DNS_ALG_ECDSAP256SHA256, g_ksk_tag, dnssec_ok, &answers);
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_DS, g_ksk_ed, DNS_ALG_ED25519,
+                               g_ksk_ed_tag, dnssec_ok, &answers);
         }
-        /* Ed25519 KSK */
-        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0 &&
-            ds_rdata_from_dnskey(qname, dkrd, 36, g_ksk_ed_tag, DNS_ALG_ED25519, dsrd) > 0) {
-            int n2 = emit_rr(resp, off, resp_len, qname, DNS_TYPE_DS, 3600, dsrd, 4 + 32, dnssec_ok,
-                             &answers);
-            if (n2 > 0) {
-                off = n2;
-                found = 1;
-            }
+        if (cds_new) {
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_DS, g_ksk_next,
+                               DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, dnssec_ok, &answers);
+            off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_DS, g_ksk_ed_next,
+                               DNS_ALG_ED25519, g_ksk_ed_next_tag, dnssec_ok, &answers);
         }
+        if (off > before)
+            found = 1;
     }
     /* SOA at the zone apex (RFC 1035) — answer authoritatively from the
      * selected zone's SOA parameters. */
@@ -6912,6 +7215,10 @@ int main(int argc, char **argv) {
             EVP_PKEY_free(z->zsk_next);
         if (z->zsk_ed_next)
             EVP_PKEY_free(z->zsk_ed_next);
+        if (z->ksk_next)
+            EVP_PKEY_free(z->ksk_next);
+        if (z->ksk_ed_next)
+            EVP_PKEY_free(z->ksk_ed_next);
     }
     if (g_syslog_enabled)
         closelog();
