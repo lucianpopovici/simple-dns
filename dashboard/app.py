@@ -234,8 +234,34 @@ def fetch_metrics() -> dict:
         return {"ok": False, "error": str(e), "raw": {}}
 
 
+def list_zones() -> list[str]:
+    """Configured authoritative zones (zone_table:<zone>), primary first."""
+    try:
+        zones = sorted(k.split(":", 1)[1] for k in vk.scan_match("zone_table:*"))
+    except ValkeyError:
+        zones = []
+    primary = vk_get("config:zone_name")
+    if primary and primary not in zones:
+        zones.insert(0, primary)
+    return zones
+
+
+def resolve_zone(name: str) -> str:
+    """Longest-suffix match of a record name against the configured zones,
+    mirroring dnsd/apid zone selection.  Falls back to config:zone_name."""
+    name = (name or "").lower()
+    best, best_len = "", -1
+    for z in list_zones():
+        zl = len(z)
+        if name == z or name.endswith("." + z):
+            if zl > best_len:
+                best, best_len = z, zl
+    return best or (vk_get("config:zone_name") or "")
+
+
 def get_zone_records() -> list[dict]:
-    """Return all zone:* and ddns:* records as a sorted list."""
+    """Return all zone:* and ddns:* records as a sorted list.
+    Keys are multi-zone: zone:<zone>:<TYPE>:<name> / ddns:<zone>:<TYPE>:<name>."""
     try:
         keys = vk.scan_match("zone:*") + vk.scan_match("ddns:*")
         if not keys:
@@ -244,19 +270,21 @@ def get_zone_records() -> list[dict]:
         ttls   = [vk.ttl(k) for k in keys]
         records = []
         for k, v, t in zip(keys, values, ttls):
-            parts = k.split(":", 2)
-            ns  = parts[0]                          # zone | ddns
-            rtype = parts[1] if len(parts) > 1 else "?"
-            name  = parts[2] if len(parts) > 2 else "?"
+            parts = k.split(":", 3)                 # ns:zone:TYPE:name
+            ns    = parts[0]                        # zone | ddns
+            zone  = parts[1] if len(parts) > 1 else "?"
+            rtype = parts[2] if len(parts) > 2 else "?"
+            name  = parts[3] if len(parts) > 3 else "?"
             records.append({
                 "key":   k,
                 "ns":    ns,
+                "zone":  zone,
                 "type":  rtype,
                 "name":  name,
                 "value": v or "",
                 "ttl":   t,
             })
-        return sorted(records, key=lambda r: (r["name"], r["type"]))
+        return sorted(records, key=lambda r: (r["zone"], r["name"], r["type"]))
     except ValkeyError:
         return []
 
@@ -286,13 +314,16 @@ def get_ixfr_journal(n: int = 20) -> list[str]:
 
 
 def get_dnssec_info() -> dict:
-    """Return DNSSEC key presence and Valkey keys."""
+    """Return DNSSEC key presence for the primary zone's per-zone keys
+    (dnssec:<zone>:*), falling back to the legacy un-prefixed keys."""
     info = {}
-    for key in ["dnssec:zsk", "dnssec:zsk_ed25519", "dnssec:ksk", "dnssec:ksk_ed25519"]:
-        val = vk_get(key)
+    zone = vk_get("config:zone_name") or "example.local"
+    for suffix in ["zsk", "zsk_ed25519", "ksk", "ksk_ed25519"]:
+        key = f"dnssec:{zone}:{suffix}"
+        val = vk_get(key) or vk_get(f"dnssec:{suffix}")
         info[key] = {
             "present": bool(val),
-            "preview": (val[:60] + "...") if len(val) > 60 else val,
+            "preview": (val[:60] + "...") if val and len(val) > 60 else (val or ""),
         }
     info["nsec3_iters"] = vk_get("config:nsec3_iters") or "1"
     info["nsec3_salt"]  = vk_get("config:nsec3_salt")  or "(none)"
@@ -1264,12 +1295,13 @@ RECORDS_TMPL = r"""
   <div class="panel-body" style="padding:0">
     <table class="data-table" id="rec-table">
       <thead><tr>
-        <th>NS</th><th>Type</th><th>Name</th><th>Value</th><th>TTL</th><th>Actions</th>
+        <th>NS</th><th>Zone</th><th>Type</th><th>Name</th><th>Value</th><th>TTL</th><th>Actions</th>
       </tr></thead>
       <tbody>
         {% for r in records %}
         <tr>
           <td><span class="badge badge-{{ r.ns }}">{{ r.ns }}</span></td>
+          <td class="dim">{{ r.zone }}</td>
           <td>{{ r.type|safe_badge }}</td>
           <td class="name">{{ r.name }}</td>
           <td class="val" title="{{ r.value }}">{{ r.value[:80] }}{% if r.value|length > 80 %}…{% endif %}</td>
@@ -1320,7 +1352,11 @@ def record_upsert():
     if not name or not value:
         flash("Name and value are required.", "error")
         return redirect(request.referrer or url_for("records"))
-    key = f"{ns}:{rtype}:{name}"
+    zone = resolve_zone(name)
+    if not zone:
+        flash(f"No authoritative zone configured for {name}.", "error")
+        return redirect(request.referrer or url_for("records"))
+    key = f"{ns}:{zone}:{rtype}:{name}"
     try:
         vk.set(key, value, ex=ttl)
         flash(f"Set {key} = {value[:60]}", "success")

@@ -345,6 +345,32 @@ static int vk_get(const char *key, char *out, int olen) {
     return 1;
 }
 
+/* Look up a shared authoritative record by name across all zones.
+ * Records are keyed zone:<zone>:<TYPE>:<name> (multi-zone, Step 7); mDNS shares
+ * the unicast zone's records, so we glob the zone segment.  qname is fully
+ * qualified, so at most one key matches. */
+static int zone_glob_get(const char *tname, const char *qname, char *out, int olen) {
+    char pat[600], key[600] = "";
+    snprintf(pat, sizeof(pat), "zone:*:%s:%s", tname, qname);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) >= 0) {
+        resp_reply_t r;
+        if (resp_cmd(&vk, &r, 2, "KEYS", pat) >= 0 && r.type == 5) {
+            for (int i = 0; i < r.count; i++) {
+                resp_reply_t kr;
+                if (resp_parse(&vk, &kr) < 0)
+                    break;
+                if (kr.type == 2 && !key[0])
+                    safe_strcpy(key, kr.str, sizeof(key));
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!key[0])
+        return 0;
+    return vk_get(key, out, olen);
+}
+
 /* ── Type name mapping (the record types mDNS serves) ────────────────────── */
 static const char *type2str(uint16_t t) {
     switch (t) {
@@ -518,14 +544,18 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen, const char *qnam
     for (int ti = 0; ti < ntypes; ti++) {
         uint16_t qt = types_to_check[ti];
         const char *tname = type2str(qt);
-        /* Try mdns:TYPE:name first, then zone:TYPE:name */
-        const char *prefixes[2] = {"mdns:", "zone:"};
+        /* Try mdns:TYPE:name first, then the shared zone:<zone>:TYPE:name */
         for (int pi = 0; pi < 2; pi++) {
-            char vkey[600];
-            snprintf(vkey, sizeof(vkey), "%s%s:%s", prefixes[pi], tname, qname);
             char val[512];
-            if (!vk_get(vkey, val, sizeof(val)))
-                continue;
+            if (pi == 0) {
+                char vkey[600];
+                snprintf(vkey, sizeof(vkey), "mdns:%s:%s", tname, qname);
+                if (!vk_get(vkey, val, sizeof(val)))
+                    continue;
+            } else {
+                if (!zone_glob_get(tname, qname, val, sizeof(val)))
+                    continue;
+            }
             /* Parse ttl|value */
             uint32_t ttl = MDNS_TTL_OTHER;
             char *pipe = strchr(val, '|');
@@ -780,8 +810,9 @@ static void mdns_announce(void) {
     h->id = 0;
     h->flags = htons(DNS_QR | DNS_AA);
 
-    /* Announce all mdns:* and zone:* records */
-    const char *patterns[2] = {"mdns:*", "zone:A:*"};
+    /* Announce all mdns:* and shared zone:*:A:* records.  Keys are
+     * mdns:<TYPE>:<name> (3 parts) and zone:<zone>:<TYPE>:<name> (4 parts). */
+    const char *patterns[2] = {"mdns:*", "zone:*:A:*"};
     for (int pi = 0; pi < 2; pi++) {
         pthread_mutex_lock(&g_vk_mutex);
         if (valkey_ensure(&vk) < 0) {
@@ -796,13 +827,21 @@ static void mdns_announce(void) {
                 resp_parse(&vk, &kr);
                 if (kr.type != 2)
                     continue;
-                /* parse key: prefix:TYPE:name */
+                /* parse key: mdns:TYPE:name OR zone:<zone>:TYPE:name */
                 char kbuf[512];
                 safe_strcpy(kbuf, kr.str, sizeof(kbuf));
                 char *p1 = strchr(kbuf, ':');
                 if (!p1)
                     continue;
                 *p1++ = 0;
+                int is_zone = (strcmp(kbuf, "zone") == 0);
+                if (is_zone) {
+                    /* skip the <zone> segment */
+                    char *zsep = strchr(p1, ':');
+                    if (!zsep)
+                        continue;
+                    p1 = zsep + 1;
+                }
                 char *p2 = strchr(p1, ':');
                 if (!p2)
                     continue;

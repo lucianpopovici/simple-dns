@@ -57,6 +57,7 @@
 #define MAX_PEM 65536
 #define DNS_BUF 65535
 #define DEFAULT_TTL 60
+#define MAX_ZONES_LIST 64 /* cap on zones scanned for longest-suffix resolution */
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 static void dns_log(int level, const char *fmt, ...) {
@@ -386,10 +387,61 @@ static long vk_incr(const char *key) {
     return r.type == 3 ? r.integer : -1;
 }
 
-/* SOA serial bump — same Valkey key dnsd uses (it INCRs config:zone_serial);
+/* Resolve the most-specific configured zone (zone_table:<z>) that `name`
+ * belongs to.  Falls back to config:zone_name.  This is how the management API
+ * decides which zone's namespace (zone:<z>:* / ddns:<z>:*) a record is written
+ * to, mirroring dnsd's longest-suffix zone selection. */
+static void resolve_zone(const char *name, char *out, int outsz) {
+    out[0] = 0;
+    size_t best = 0, nl = strlen(name);
+    char zns[MAX_ZONES_LIST][256];
+    int nz = 0;
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) >= 0) {
+        resp_reply_t r;
+        resp_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
+        if (r.type == 5) {
+            int cnt = r.count;
+            for (int i = 0; i < cnt; i++) {
+                resp_reply_t kr;
+                if (resp_parse(&vk, &kr) < 0)
+                    break;
+                if (kr.type == 2 && nz < MAX_ZONES_LIST) {
+                    safe_strcpy(zns[nz], kr.str + 11, sizeof(zns[nz])); /* skip "zone_table:" */
+                    nz++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    for (int i = 0; i < nz; i++) {
+        const char *z = zns[i];
+        size_t zl = strlen(z);
+        if (zl == 0 || zl > nl)
+            continue;
+        int m = (zl == nl && strcasecmp(name, z) == 0) ||
+                (nl > zl + 1 && name[nl - zl - 1] == '.' && strcasecmp(name + nl - zl, z) == 0);
+        if (m && zl > best) {
+            best = zl;
+            safe_strcpy(out, z, outsz);
+        }
+    }
+    if (!out[0])
+        vk_get("config:zone_name", out, outsz);
+}
+
+/* SOA serial bump for a zone.  The primary zone (config:zone_name) keeps the
+ * legacy config:zone_serial counter; other zones use config:zone:<z>:serial.
  * dnsd picks up the new serial live via keyspace notifications (Step 6). */
-static void serial_bump(void) {
-    if (vk_incr("config:zone_serial") < 0)
+static void serial_bump_zone(const char *zn) {
+    char primary[256] = "";
+    vk_get("config:zone_name", primary, sizeof(primary));
+    char ikey[320];
+    if (!zn || !zn[0] || strcasecmp(zn, primary) == 0)
+        safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
+    else
+        snprintf(ikey, sizeof(ikey), "config:zone:%s:serial", zn);
+    if (vk_incr(ikey) < 0)
         dns_log(LOG_WARNING, "[apid] serial bump failed (Valkey down?)\n");
 }
 
@@ -1009,16 +1061,22 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         uint32_t ttl = ttls[0] ? (uint32_t) atoi(ttls) : DEFAULT_TTL;
         if (ttl < 10)
             ttl = 10;
-        char vkey[512], rbody[640];
+        char zn[256];
+        resolve_zone(hostname, zn, sizeof(zn));
+        if (!zn[0]) {
+            api_send(fd, ssl, 400, "no authoritative zone for that hostname\n");
+            return;
+        }
+        char vkey[600], rbody[700];
         if (ip[0]) {
             struct in_addr a4;
             if (inet_pton(AF_INET, ip, &a4) != 1) {
                 api_send(fd, ssl, 400, "bad ip\n");
                 return;
             }
-            snprintf(vkey, sizeof(vkey), "ddns:A:%s", hostname);
+            snprintf(vkey, sizeof(vkey), "ddns:%s:A:%s", zn, hostname);
             vk_set(vkey, ip, ttl);
-            serial_bump();
+            serial_bump_zone(zn);
             snprintf(rbody, sizeof(rbody), "ok: %s A %s TTL=%u\n", hostname, ip, ttl);
             api_send(fd, ssl, 200, rbody);
         } else if (ip6[0]) {
@@ -1027,9 +1085,9 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
                 api_send(fd, ssl, 400, "bad ip6\n");
                 return;
             }
-            snprintf(vkey, sizeof(vkey), "ddns:AAAA:%s", hostname);
+            snprintf(vkey, sizeof(vkey), "ddns:%s:AAAA:%s", zn, hostname);
             vk_set(vkey, ip6, ttl);
-            serial_bump();
+            serial_bump_zone(zn);
             snprintf(rbody, sizeof(rbody), "ok: %s AAAA %s TTL=%u\n", hostname, ip6, ttl);
             api_send(fd, ssl, 200, rbody);
         } else
@@ -1041,19 +1099,25 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             api_send(fd, ssl, 400, "missing hostname\n");
             return;
         }
+        char zn[256];
+        resolve_zone(hostname, zn, sizeof(zn));
+        if (!zn[0]) {
+            api_send(fd, ssl, 400, "no authoritative zone for that hostname\n");
+            return;
+        }
         char typestr[16] = {0};
         qs_get(qs, "type", typestr, sizeof(typestr));
-        char vk2[512];
+        char vk2[600];
         int d = 0;
         if (!typestr[0] || !strcasecmp(typestr, "A")) {
-            snprintf(vk2, sizeof(vk2), "ddns:A:%s", hostname);
+            snprintf(vk2, sizeof(vk2), "ddns:%s:A:%s", zn, hostname);
             d += vk_del(vk2);
         }
         if (!typestr[0] || !strcasecmp(typestr, "AAAA")) {
-            snprintf(vk2, sizeof(vk2), "ddns:AAAA:%s", hostname);
+            snprintf(vk2, sizeof(vk2), "ddns:%s:AAAA:%s", zn, hostname);
             d += vk_del(vk2);
         }
-        serial_bump();
+        serial_bump_zone(zn);
         char rbody[128];
         snprintf(rbody, sizeof(rbody), "ok: deleted %d key(s)\n", d);
         api_send(fd, ssl, 200, rbody);
@@ -1091,16 +1155,22 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             return;
         }
         uint32_t ttl = ttls[0] ? (uint32_t) atoi(ttls) : 300;
-        char vkey[512], vval[1024];
-        snprintf(vkey, sizeof(vkey), "zone:%s:%s", type2str(rt), name);
+        char zn[256];
+        resolve_zone(name, zn, sizeof(zn));
+        if (!zn[0]) {
+            api_send(fd, ssl, 400, "no authoritative zone for that name\n");
+            return;
+        }
+        char vkey[600], vval[1024];
+        snprintf(vkey, sizeof(vkey), "zone:%s:%s:%s", zn, type2str(rt), name);
         if (rt == 15)
             snprintf(vval, sizeof(vval), "%u|%s|%s", ttl, pref[0] ? pref : "10", value);
         else
             snprintf(vval, sizeof(vval), "%u|%s", ttl, value);
         vk_set(vkey, vval, 0);
-        serial_bump();
-        dns_log(LOG_NOTICE, "[ZONE] %s %s = %s\n", type2str(rt), name, vval);
-        char rb[600];
+        serial_bump_zone(zn);
+        dns_log(LOG_NOTICE, "[ZONE] %s %s:%s = %s\n", type2str(rt), zn, name, vval);
+        char rb[640];
         snprintf(rb, sizeof(rb), "ok: %s\n", vkey);
         api_send(fd, ssl, 201, rb);
         return;
@@ -1114,6 +1184,12 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             api_send(fd, ssl, 400, "missing name\n");
             return;
         }
+        char zn[256];
+        resolve_zone(name, zn, sizeof(zn));
+        if (!zn[0]) {
+            api_send(fd, ssl, 400, "no authoritative zone for that name\n");
+            return;
+        }
         int d = 0;
         if (type[0]) {
             uint16_t rt = str2type(type);
@@ -1121,19 +1197,19 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
                 api_send(fd, ssl, 400, "unknown type\n");
                 return;
             }
-            char vkey[512];
-            snprintf(vkey, sizeof(vkey), "zone:%s:%s", type2str(rt), name);
+            char vkey[600];
+            snprintf(vkey, sizeof(vkey), "zone:%s:%s:%s", zn, type2str(rt), name);
             d = vk_del(vkey);
         } else {
             const char *ts[] = {"A",   "AAAA",  "CNAME", "MX",    "TXT", "NS", "SRV",
                                 "CAA", "SSHFP", "TLSA",  "DNAME", "LOC", NULL};
             for (int i = 0; ts[i]; i++) {
-                char vk2[512];
-                snprintf(vk2, sizeof(vk2), "zone:%s:%s", ts[i], name);
+                char vk2[600];
+                snprintf(vk2, sizeof(vk2), "zone:%s:%s:%s", zn, ts[i], name);
                 d += vk_del(vk2);
             }
         }
-        serial_bump();
+        serial_bump_zone(zn);
         char rb[128];
         snprintf(rb, sizeof(rb), "ok: deleted %d record(s)\n", d);
         api_send(fd, ssl, 200, rb);

@@ -305,27 +305,47 @@ Acceptance
 
 ---
 
-## Step 7 — Multi-zone support  `[ ]`
+## Step 7 — Multi-zone support  `[~]`
 
 Goal: serve multiple authoritative zones from the slimmed-down `dnsd`.
 
+> Scope decision (user-confirmed 2026-06-16): land **core multi-zone first**
+> (serving + per-zone SOA/keys/AXFR/UPDATE + migration + control plane); do
+> **automated per-zone DNSSEC key rollover** as a separate follow-up commit.
+
 Tasks
-- [ ] Re-key zone data as `zone:<zonename>:<type>:<name>` and config as
-      `config:zone:<zonename>:*`
-- [ ] `dnsd` selects the most-specific configured zone per query
-- [ ] Per-zone SOA, DNSSEC keys, AXFR/NOTIFY settings
+- [x] Re-key zone data as `zone:<zonename>:<type>:<name>` and config as
+      `config:zone:<zonename>:*` (records, ddns, per-zone serial/NSEC3 config).
+      `apid` and the dashboard resolve the owning zone (longest-suffix) before
+      writing; `mdnsd` globs `zone:*:<TYPE>:<name>` for shared records.
+- [x] `dnsd` selects the most-specific configured zone per query
+      (`zone_for_qname`, longest-suffix), threaded through SOA/NSEC/NSEC3/
+      signing via a thread-local current-zone pointer. Added an apex-SOA answer.
+- [x] Per-zone SOA, DNSSEC keys, AXFR/NOTIFY settings (per-zone ZSK/KSK loaded
+      from `dnssec:<zone>:*` with legacy adoption for the primary zone; AXFR/
+      IXFR/NOTIFY/UPDATE select the zone named by the request)
 - [ ] Per-zone automated DNSSEC key rollover (RFC 6781) with existing
-      CDS/CDNSKEY publication
-- [ ] (Optional) catalog zones (RFC 9432) for bulk provisioning
-- [ ] Migration script for existing single-zone data into the new key layout
-- [ ] Dashboard updated for zone selection/management
+      CDS/CDNSKEY publication — **deferred to a follow-up commit** (live
+      `dnssec:*` reload stays restart-flagged until then)
+- [ ] (Optional) catalog zones (RFC 9432) for bulk provisioning — not done
+- [x] Migration script for existing single-zone data into the new key layout
+      (`tools/migrate-multizone.sh`, dry-run by default, idempotent)
+- [x] Dashboard updated for zone selection/management (zone column + per-record
+      zone resolution; DNSSEC view reads per-zone keys)
 
 Acceptance
-- [ ] Two distinct zones resolve correctly from one `dnsd` instance
-- [ ] Each zone signs with its own keys; cross-zone queries are isolated
-- [ ] A scheduled ZSK rollover completes without a validation gap
-- [ ] Existing single-zone deployments migrate via the script with no data loss
-- [ ] Global exit gate passes
+- [x] Two distinct zones resolve correctly from one `dnsd` instance
+      (verified: `www.example.com`→10.20.30.40 and `host.example.local`→
+      192.168.5.5 from one instance; per-zone SOA `ns1.example.com serial 10`
+      vs `ns1.example.local serial 6`)
+- [x] Each zone signs with its own keys; cross-zone queries are isolated
+      (distinct DNSKEY RRsets per zone; SOA mname/serial isolated)
+- [ ] A scheduled ZSK rollover completes without a validation gap — **follow-up**
+- [x] Existing single-zone deployments migrate via the script with no data loss
+      (RENAME preserves TTLs; dnsd adopts legacy DNSSEC keys → DS unchanged)
+- [x] Global exit gate passes (all 4 daemons build with `EXTRA_WARN=-Werror`;
+      `make check` answers; `check-dnssec` + `check-wire` pass; ASan query sweep
+      clean)
 
 ---
 

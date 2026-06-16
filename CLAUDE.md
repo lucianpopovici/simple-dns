@@ -347,19 +347,25 @@ storm.
 
 ---
 
-## Multi-zone (functional gap to close)
+## Multi-zone (migration Step 7 — done; rollover pending)
 
-The current design is single-zone (`config:zone_name`). The target supports
-multiple authoritative zones:
-- Key zones as `zone:<zonename>:<type>:<name>` and config as
-  `config:zone:<zonename>:*`.
-- `dnsd` selects the most specific configured zone for each query.
-- Consider catalog zones (RFC 9432) for provisioning many zones from one
-  catalog. Add automated DNSSEC key rollover (RFC 6781) per zone, paired with
-  the existing CDS/CDNSKEY publication.
+`dnsd` serves multiple authoritative zones (it is no longer single-zone):
+- Records are keyed `zone:<zonename>:<type>:<name>` and per-zone config as
+  `config:zone:<zonename>:*` (NSEC3 params, denial mode, serial). Zone SOA +
+  transfer settings live in `zone_table:<zonename>`; DNSSEC keys in
+  `dnssec:<zonename>:*`.
+- `dnsd` selects the most specific configured zone per query (longest-suffix
+  match), and that zone drives SOA, NSEC/NSEC3 denial, and DNSSEC signing keys
+  for the whole response. The same selection scopes UPDATE writes and AXFR.
+- The primary zone (`config:zone_name`) seeds itself from the legacy global
+  `config:*`/`dnssec:*` keys, so a single-zone deployment keeps its existing
+  DS/keytags. Existing data is migrated with `tools/migrate-multizone.sh`.
+- `apid` and the dashboard resolve the owning zone by longest-suffix match
+  before writing `zone:<zone>:*` / `ddns:<zone>:*`.
 
-Do this after the process split — it is easier to add in the slimmed-down
-`dnsd` than in the monolith.
+Still pending (separate follow-up commit): automated per-zone DNSSEC key
+rollover (RFC 6781) — live `dnssec:*` reload remains restart-flagged until then.
+Catalog zones (RFC 9432) for bulk provisioning are optional and not yet done.
 
 ---
 
@@ -385,7 +391,10 @@ Each step is independently shippable and must pass `make debug`, `make`, and
 5. **Add control-plane authentication** to the dashboard; restrict or remove the
    raw Valkey Explorer write path.
 6. **Enable Valkey keyspace-notification live reload** across daemons.
-7. **Add multi-zone support** in the now-minimal `dnsd`.
+7. **Add multi-zone support** in the now-minimal `dnsd`. *(Done: re-keyed
+   `zone:<zone>:*` storage, longest-suffix zone selection, per-zone SOA / NSEC3
+   / DNSSEC keys / AXFR / NOTIFY / UPDATE, `tools/migrate-multizone.sh`, apid +
+   dashboard zone resolution. Automated DNSSEC rollover is a follow-up.)*
 
 After step 4, `dnsd` should be a substantially smaller, single-purpose,
 sandboxable daemon — the trusted core this architecture is designed to produce.

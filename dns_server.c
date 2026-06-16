@@ -59,13 +59,23 @@
  *   config:cookie_secret       16-byte hex cookie secret
  *   config:axfr_allow          Comma-separated IPs/CIDRs allowed to do AXFR
  *   config:notify_targets      Comma-separated IP:port targets for NOTIFY
- *   zone:NSEC3PARAM:<zone>     NSEC3 parameters        (iters|salt_hex)
- *   zone:SRV:<name>            SRV record              (ttl|prio|weight|port|target)
- *   zone:CAA:<name>            CAA record              (ttl|flags|tag|value)
- *   zone:SSHFP:<name>          SSHFP record            (ttl|alg|fptype|fingerprint_hex)
- *   zone:TLSA:<name>           TLSA record             (ttl|usage|selector|mtype|data_hex)
- *   zone:DNAME:<name>          DNAME record            (ttl|target)
- *   zone:LOC:<name>            LOC record              (ttl|loc_wire_hex)
+ *
+ * Multi-zone key schema (migration Step 7) — records carry the owning zone:
+ *   zone_table:<zone>          Zone SOA + transfer settings
+ *                              (mname|rname|serial|refresh|retry|expire|minimum
+ *                               |axfr_allow|notify_targets)
+ *   zone:<zone>:<TYPE>:<name>  Authoritative record, e.g. zone:example.com:A:www.example.com
+ *                              (SRV ttl|prio|weight|port|target; CAA ttl|flags|tag|value;
+ *                               SSHFP ttl|alg|fptype|fp_hex; TLSA ttl|usage|sel|mtype|hex;
+ *                               DNAME ttl|target; LOC ttl|loc_wire_hex; …)
+ *   ddns:<zone>:<TYPE>:<name>  Dynamic record (RFC 2136 / HTTP /update)
+ *   config:zone:<zone>:serial  Per-zone SOA serial counter (primary keeps config:zone_serial)
+ *   config:zone:<zone>:nsec3_iters / :nsec3_salt / :dnssec_nsec_mode
+ *                              Per-zone denial config (defaults from the global config:* values)
+ *   dnssec:<zone>:{zsk,zsk_ed25519,ksk,ksk_ed25519}
+ *                              Per-zone DNSSEC keys (primary adopts the legacy dnssec:* keys)
+ *   The legacy single-zone keys (zone:<TYPE>:<name>, dnssec:zsk, …) are migrated
+ *   with tools/migrate-multizone.sh.
  *
  * Build:
  *   gcc -O2 -Wall -I<openssl-inc> -o dns_server dns_server.c \
@@ -226,11 +236,8 @@
 #define DNS_DNSKEY_FLAG_ZSK 256
 #define DNS_DNSKEY_FLAG_KSK 257 /* Secure Entry Point — RFC 3757 */
 
-/* KSK globals (sign DNSKEY RRset only) */
-static EVP_PKEY *g_ksk = NULL; /* KSK P-256 */
-static uint16_t g_ksk_tag = 0;
-static EVP_PKEY *g_ksk_ed = NULL; /* KSK Ed25519 */
-static uint16_t g_ksk_ed_tag = 0;
+/* DNSSEC signing keys are now per-zone (see zone_entry_t): ZSK signs RRsets,
+ * KSK signs the DNSKEY RRset.  Loaded from dnssec:<zone>:* at startup. */
 
 /* Forward declarations for helpers used before their definitions */
 static void ixfr_journal_append(uint32_t, uint32_t, char, const char *, const char *);
@@ -276,11 +283,68 @@ typedef struct {
     uint32_t soa_refresh, soa_retry, soa_expire, soa_minimum;
     char axfr_allow[1024];
     char notify_targets[1024];
+    /* Per-zone DNSSEC denial parameters (config:zone:<name>:*) */
+    int nsec3_iters;
+    char nsec3_salt[64];
+    int dnssec_use_nsec3; /* 1 = NSEC3 (default), 0 = NSEC (plain) */
+    /* Per-zone DNSSEC signing keys (dnssec:<name>:*). Guarded by g_zsk_mutex. */
+    EVP_PKEY *zsk; /* ZSK P-256 */
+    uint16_t zsk_tag;
+    EVP_PKEY *zsk_ed; /* ZSK Ed25519 */
+    uint16_t zsk_ed_tag;
+    EVP_PKEY *ksk; /* KSK P-256 */
+    uint16_t ksk_tag;
+    EVP_PKEY *ksk_ed; /* KSK Ed25519 */
+    uint16_t ksk_ed_tag;
 } zone_entry_t;
 
 static zone_entry_t g_zones[MAX_ZONES];
 static int g_zone_count = 0;
 static pthread_mutex_t g_zones_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* The authoritative zone selected for the request currently being handled by
+ * this worker thread.  Set by the query / UPDATE / AXFR entry points before any
+ * record emission, and read by the SOA / NSEC / signing helpers so they operate
+ * on the matched zone's data and keys instead of a single global zone. */
+static __thread zone_entry_t *t_zone = NULL;
+
+/* Longest-suffix match of qname against the configured zones.
+ * Returns the most specific zone that is equal to, or a parent of, qname. */
+static zone_entry_t *zone_for_qname(const char *qname) {
+    zone_entry_t *best = NULL;
+    size_t best_len = 0;
+    size_t ql = strlen(qname);
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++) {
+        zone_entry_t *z = &g_zones[i];
+        size_t zl = strlen(z->name);
+        if (zl == 0 || zl > ql)
+            continue;
+        int match = 0;
+        if (zl == ql && strcasecmp(qname, z->name) == 0)
+            match = 1;
+        else if (ql > zl + 1 && qname[ql - zl - 1] == '.' &&
+                 strcasecmp(qname + ql - zl, z->name) == 0)
+            match = 1;
+        if (match && zl > best_len) {
+            best = z;
+            best_len = zl;
+        }
+    }
+    pthread_mutex_unlock(&g_zones_mutex);
+    return best;
+}
+
+/* Build "zone:<zone>:<type>:<name>" for the current request's zone. */
+static int zkey(char *buf, size_t sz, const char *type, const char *name) {
+    const char *zn = t_zone ? t_zone->name : "";
+    return snprintf(buf, sz, "zone:%s:%s:%s", zn, type, name);
+}
+/* Build "ddns:<zone>:<type>:<name>" for the current request's zone. */
+static int dkey(char *buf, size_t sz, const char *type, const char *name) {
+    const char *zn = t_zone ? t_zone->name : "";
+    return snprintf(buf, sz, "ddns:%s:%s:%s", zn, type, name);
+}
 
 /* Add or update a zone. Returns its index or -1 on error. */
 static int zone_upsert(const char *name, const char *mname, const char *rname, uint32_t serial,
@@ -318,6 +382,11 @@ static int zone_upsert(const char *name, const char *mname, const char *rname, u
 /* Load all zone_table:* keys from Valkey into the zone table */
 /* zones_load_from_valkey — defined below after Valkey types */
 static void zones_load_from_valkey(void);
+/* Apply per-zone config (config:zone:<z>:*) and load DNSSEC keys for every zone
+ * that does not yet have them.  Idempotent; safe to re-run on live reload. */
+static void zones_post_load(void);
+/* Seed/refresh the primary zone from the legacy global config:* values. */
+static void seed_primary_zone(void);
 
 /* ==========================================================================
  * Runtime configuration
@@ -849,13 +918,7 @@ static int g_dnssec_use_nsec3 = 1; /* 1=NSEC3 (default), 0=NSEC (plain) */
 /* TLS contexts */
 static SSL_CTX *g_dot_ctx = NULL;
 
-/* DNSSEC ZSK (Alg 13 ECDSAP256) */
-static EVP_PKEY *g_zsk = NULL;
-static uint16_t g_zsk_tag = 0;
-
-/* DNSSEC ZSK2 (Alg 15 Ed25519) */
-static EVP_PKEY *g_zsk_ed = NULL;
-static uint16_t g_zsk_ed_tag = 0;
+/* DNSSEC signing keys live per-zone in zone_entry_t (loaded from dnssec:<zone>:*). */
 
 /* ACME state */
 
@@ -1622,22 +1685,39 @@ static void config_load_from_valkey(void) {
     dns_log(LOG_INFO, "[Config] dns:%d dot:%d http:%d https:%d zone:%s serial:%u\n", g_dns_port,
             g_dot_port, g_http_port, g_https_port, g_zone_name, g_soa_serial);
 }
-/* Bump SOA serial (YYYYMMDDnn format if possible, else simple increment) */
-static uint32_t serial_bump(void) {
-    long ns = vk_incr("config:zone_serial");
+/* Bump a zone's SOA serial.  The persistent counter lives at
+ * config:zone:<zone>:serial; the primary zone keeps the legacy
+ * config:zone_serial key for backward compatibility. */
+static uint32_t serial_bump(zone_entry_t *z) {
+    char ikey[320];
+    int primary = (!z || strcasecmp(z->name, g_zone_name) == 0);
+    if (primary)
+        safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
+    else
+        snprintf(ikey, sizeof(ikey), "config:zone:%s:serial", z->name);
+    long ns = vk_incr(ikey);
     if (ns > 0) {
         pthread_mutex_lock(&g_soa_mutex);
-        g_soa_serial = (uint32_t) ns;
+        if (z)
+            z->soa_serial = (uint32_t) ns;
+        if (primary)
+            g_soa_serial = (uint32_t) ns;
         pthread_mutex_unlock(&g_soa_mutex);
-        return g_soa_serial;
+        return (uint32_t) ns;
     }
     pthread_mutex_lock(&g_soa_mutex);
-    g_soa_serial++;
+    uint32_t nv;
+    if (z)
+        nv = ++z->soa_serial;
+    else
+        nv = ++g_soa_serial;
+    if (primary)
+        g_soa_serial = nv;
     pthread_mutex_unlock(&g_soa_mutex);
     char buf[32];
-    snprintf(buf, sizeof(buf), "%u", g_soa_serial);
-    vk_set("config:zone_serial", buf, 0);
-    return g_soa_serial;
+    snprintf(buf, sizeof(buf), "%u", nv);
+    vk_set(ikey, buf, 0);
+    return nv;
 }
 
 /* ==========================================================================
@@ -1778,7 +1858,7 @@ static int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, 
  * The name comes from the certificate itself (first SAN dNSName, else CN),
  * so dnsd needs no knowledge of the ACME/EST configuration. */
 static int pki_spki_sha256(X509 *cert, uint8_t out[32]);
-static uint32_t serial_bump(void);
+static uint32_t serial_bump(zone_entry_t *z);
 static void cert_publish_tlsa(const char *cert_pem) {
     BIO *b = BIO_new_mem_buf(cert_pem, -1);
     X509 *cert = PEM_read_bio_X509(b, NULL, NULL, NULL);
@@ -1813,14 +1893,18 @@ static void cert_publish_tlsa(const char *cert_pem) {
         strlower(domain);
         char hex[65];
         hex_enc(h, 32, hex);
-        char tkey[600], tval[128];
+        char owner[300];
+        snprintf(owner, sizeof(owner), "_443._tcp.%s", domain);
+        zone_entry_t *z = zone_for_qname(owner);
+        const char *zn = z ? z->name : g_zone_name;
+        char tkey[700], tval[128];
         snprintf(tval, sizeof(tval), "3600|3|1|1|%s", hex);
-        snprintf(tkey, sizeof(tkey), "zone:TLSA:_443._tcp.%s", domain);
+        snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_443._tcp.%s", zn, domain);
         vk_set(tkey, tval, 0);
-        snprintf(tkey, sizeof(tkey), "zone:TLSA:_853._tcp.%s", domain);
+        snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_853._tcp.%s", zn, domain);
         vk_set(tkey, tval, 0);
-        dns_log(LOG_NOTICE, "[PKI] TLSA 3 1 1 published for %s\n", domain);
-        serial_bump();
+        dns_log(LOG_NOTICE, "[PKI] TLSA 3 1 1 published for %s (zone %s)\n", domain, zn);
+        serial_bump(z);
         notify_send();
     }
     X509_free(cert);
@@ -1869,11 +1953,14 @@ static void keyspace_apply(const char *key) {
         cert_current_reload();
     } else if (strncmp(key, "config:", 7) == 0) {
         config_load_from_valkey();
+        seed_primary_zone(); /* propagate SOA/zone config edits to the primary zone */
+        zones_post_load();   /* re-apply per-zone NSEC3 config; load keys for new zones */
         if (strstr(key, "tls_") || strstr(key, "mtls_"))
             tls_reload();
         dns_log(LOG_INFO, "[Reload] config applied after %s change\n", key);
     } else if (strncmp(key, "zone_table:", 11) == 0) {
         zones_load_from_valkey();
+        zones_post_load(); /* apply per-zone config + load keys for any new zone */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         dns_log(LOG_WARNING,
@@ -2201,11 +2288,19 @@ static int make_rrsig(const char *owner, uint16_t rrtype, uint32_t ttl, const ui
     return hp + 64;
 }
 
-/* Load or generate ZSK from Valkey */
-static void dnssec_init_key(const char *vk_key, EVP_PKEY **out, uint16_t *tag, int alg,
-                            const char *label) {
+/* Load or generate a DNSSEC key from Valkey.
+ * Reads vk_key first; if absent and legacy_key is given, adopts the legacy
+ * key under vk_key (eases migration of pre-multi-zone single-zone keys);
+ * only generates + stores a fresh key when neither exists. */
+static void dnssec_init_key(const char *vk_key, const char *legacy_key, EVP_PKEY **out,
+                            uint16_t *tag, int alg, const char *label) {
     char pem[MAX_PEM] = {0};
-    if (vk_get(vk_key, pem, sizeof(pem)) && strlen(pem) > 10) {
+    int have = (vk_get(vk_key, pem, sizeof(pem)) && strlen(pem) > 10);
+    if (!have && legacy_key && vk_get(legacy_key, pem, sizeof(pem)) && strlen(pem) > 10) {
+        have = 1;
+        vk_set(vk_key, pem, 0); /* adopt the legacy key under the per-zone path */
+    }
+    if (have) {
         BIO *b = BIO_new_mem_buf(pem, -1);
         pthread_mutex_lock(&g_zsk_mutex);
         *out = PEM_read_bio_PrivateKey(b, NULL, NULL, NULL);
@@ -2246,17 +2341,74 @@ static void dnssec_init_key(const char *vk_key, EVP_PKEY **out, uint16_t *tag, i
         *tag = keytag(dkrd, dklen);
     dns_log(LOG_INFO, "[DNSSEC] %s key tag: %u\n", label, *tag);
 }
+/* Load (or generate) the four DNSSEC keys for one zone.  The primary zone
+ * (== g_zone_name) falls back to the legacy un-prefixed dnssec:* keys so an
+ * existing single-zone deployment keeps its established DS/keytags. */
+static void zone_dnssec_init(zone_entry_t *z) {
+    int primary = (strcasecmp(z->name, g_zone_name) == 0);
+    char k[320];
+    char lbl[300];
+    snprintf(k, sizeof(k), "dnssec:%s:zsk", z->name);
+    snprintf(lbl, sizeof(lbl), "%s ZSK-P256", z->name);
+    dnssec_init_key(k, primary ? "dnssec:zsk" : NULL, &z->zsk, &z->zsk_tag, DNS_ALG_ECDSAP256SHA256,
+                    lbl);
+    snprintf(k, sizeof(k), "dnssec:%s:zsk_ed25519", z->name);
+    snprintf(lbl, sizeof(lbl), "%s ZSK-Ed25519", z->name);
+    dnssec_init_key(k, primary ? "dnssec:zsk_ed25519" : NULL, &z->zsk_ed, &z->zsk_ed_tag,
+                    DNS_ALG_ED25519, lbl);
+    snprintf(k, sizeof(k), "dnssec:%s:ksk", z->name);
+    snprintf(lbl, sizeof(lbl), "%s KSK-P256", z->name);
+    dnssec_init_key(k, primary ? "dnssec:ksk" : NULL, &z->ksk, &z->ksk_tag, DNS_ALG_ECDSAP256SHA256,
+                    lbl);
+    snprintf(k, sizeof(k), "dnssec:%s:ksk_ed25519", z->name);
+    snprintf(lbl, sizeof(lbl), "%s KSK-Ed25519", z->name);
+    dnssec_init_key(k, primary ? "dnssec:ksk_ed25519" : NULL, &z->ksk_ed, &z->ksk_ed_tag,
+                    DNS_ALG_ED25519, lbl);
+}
+/* Per-zone NSEC3 / denial config (config:zone:<z>:*), defaulting to the legacy
+ * global config:* values which seed the primary zone. */
+static void zone_apply_config(zone_entry_t *z) {
+    z->nsec3_iters = g_nsec3_iters;
+    safe_strcpy(z->nsec3_salt, g_nsec3_salt, sizeof(z->nsec3_salt));
+    z->dnssec_use_nsec3 = g_dnssec_use_nsec3;
+    if (strcasecmp(z->name, g_zone_name) == 0)
+        return; /* primary zone uses the global config as-is */
+    char k[320], v[128];
+    snprintf(k, sizeof(k), "config:zone:%s:nsec3_iters", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0])
+        z->nsec3_iters = atoi(v);
+    snprintf(k, sizeof(k), "config:zone:%s:nsec3_salt", z->name);
+    if (vk_get(k, v, sizeof(v)))
+        safe_strcpy(z->nsec3_salt, v, sizeof(z->nsec3_salt));
+    snprintf(k, sizeof(k), "config:zone:%s:dnssec_nsec_mode", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0])
+        z->dnssec_use_nsec3 = (strcasecmp(v, "nsec") == 0) ? 0 : 1;
+}
+/* Seed/refresh the primary zone (config:zone_name) from the legacy global
+ * config:* values, so a single-zone deployment with no zone_table:* entry still
+ * has one fully-populated zone, and live config:* edits propagate to it. */
+static void seed_primary_zone(void) {
+    if (!g_zone_name[0])
+        return;
+    char mname[300], rname[300];
+    snprintf(mname, sizeof(mname), "ns1.%s", g_zone_name);
+    snprintf(rname, sizeof(rname), "hostmaster.%s", g_zone_name);
+    zone_upsert(g_zone_name, g_soa_mname[0] ? g_soa_mname : mname,
+                g_soa_rname[0] ? g_soa_rname : rname, g_soa_serial, g_soa_refresh, g_soa_retry,
+                g_soa_expire, g_soa_minimum, g_axfr_allow, g_notify_targets);
+}
+static void zones_post_load(void) {
+    pthread_mutex_lock(&g_zones_mutex);
+    int n = g_zone_count;
+    pthread_mutex_unlock(&g_zones_mutex);
+    for (int i = 0; i < n; i++) {
+        zone_apply_config(&g_zones[i]);
+        if (!g_zones[i].zsk && !g_zones[i].zsk_ed && !g_zones[i].ksk && !g_zones[i].ksk_ed)
+            zone_dnssec_init(&g_zones[i]);
+    }
+}
 static void dnssec_init(void) {
-    pthread_mutex_lock(&g_zsk_mutex);
-    g_zsk = NULL;
-    g_zsk_ed = NULL;
-    g_ksk = NULL;
-    g_ksk_ed = NULL;
-    pthread_mutex_unlock(&g_zsk_mutex);
-    dnssec_init_key("dnssec:zsk", &g_zsk, &g_zsk_tag, DNS_ALG_ECDSAP256SHA256, "ZSK-P256");
-    dnssec_init_key("dnssec:zsk_ed25519", &g_zsk_ed, &g_zsk_ed_tag, DNS_ALG_ED25519, "ZSK-Ed25519");
-    dnssec_init_key("dnssec:ksk", &g_ksk, &g_ksk_tag, DNS_ALG_ECDSAP256SHA256, "KSK-P256");
-    dnssec_init_key("dnssec:ksk_ed25519", &g_ksk_ed, &g_ksk_ed_tag, DNS_ALG_ED25519, "KSK-Ed25519");
+    zones_post_load();
 }
 
 /* ==========================================================================
@@ -2307,13 +2459,16 @@ static void nsec3_hash_name(const char *name, const uint8_t *salt, int saltlen, 
 
 /* Build NSEC3 RDATA for a name, covering given type bitmap */
 static int nsec3_rdata(const char *name, uint16_t covered_type, uint8_t *out, int outlen) {
+    const char *zsalt = t_zone ? t_zone->nsec3_salt : g_nsec3_salt;
+    int ziters = t_zone ? t_zone->nsec3_iters : g_nsec3_iters;
+    const char *zname = t_zone ? t_zone->name : g_zone_name;
     uint8_t salt[16];
     int saltlen = 0;
-    if (g_nsec3_salt[0])
-        saltlen = hex_dec(g_nsec3_salt, salt, sizeof(salt));
+    if (zsalt[0])
+        saltlen = hex_dec(zsalt, salt, sizeof(salt));
     /* Compute next-closer hash (we use the same name hash as next for simplicity) */
     char hash[64];
-    nsec3_hash_name(name, salt, saltlen, g_nsec3_iters, hash, sizeof(hash));
+    nsec3_hash_name(name, salt, saltlen, ziters, hash, sizeof(hash));
     /* Build RDATA: alg(1)|flags(1)|iters(2)|saltlen(1)|salt|hashlen(1)|nexthash|bitmap */
     uint8_t nexthash[20];
     /* Next hash = hash of the zone apex (simplified — in production use sorted order) */
@@ -2322,7 +2477,7 @@ static int nsec3_rdata(const char *name, uint16_t covered_type, uint8_t *out, in
     {
         char *sp4 = NULL;
         char ztmp[256];
-        safe_strcpy(ztmp, g_zone_name, sizeof(ztmp));
+        safe_strcpy(ztmp, zname, sizeof(ztmp));
         char *zl = strtok_r(ztmp, ".", &sp4);
         while (zl) {
             int ll = (int) strlen(zl);
@@ -2345,7 +2500,7 @@ static int nsec3_rdata(const char *name, uint16_t covered_type, uint8_t *out, in
             ib_len += saltlen;
         }
         sha1(ib, ib_len, nexthash);
-        for (int i = 0; i < g_nsec3_iters; i++) {
+        for (int i = 0; i < ziters; i++) {
             uint8_t ib2[256 + 64];
             memcpy(ib2, nexthash, 20);
             if (saltlen) {
@@ -2359,8 +2514,8 @@ static int nsec3_rdata(const char *name, uint16_t covered_type, uint8_t *out, in
     int op = 0;
     out[op++] = NSEC3_ALG_SHA1;
     out[op++] = 0; /* flags: opt-out=0 */
-    out[op++] = (uint16_t) g_nsec3_iters >> 8;
-    out[op++] = (uint16_t) g_nsec3_iters & 0xFF;
+    out[op++] = (uint16_t) ziters >> 8;
+    out[op++] = (uint16_t) ziters & 0xFF;
     out[op++] = (uint8_t) saltlen;
     memcpy(out + op, salt, saltlen);
     op += saltlen;
@@ -3149,30 +3304,39 @@ static int rrl_check(const struct in_addr *cip, const char *qname) {
  * SOA record builder
  * ======================================================================= */
 static int build_soa_rdata(uint8_t *rd, int rdlen) {
+    /* Emit SOA for the current request's zone (t_zone), falling back to the
+     * legacy single-zone globals when no zone has been selected. */
+    const char *mname = (t_zone && t_zone->soa_mname[0]) ? t_zone->soa_mname : g_soa_mname;
+    const char *rname = (t_zone && t_zone->soa_rname[0]) ? t_zone->soa_rname : g_soa_rname;
     int pos = 0;
-    int n = name_to_wire(g_soa_mname, rd, rdlen);
+    int n = name_to_wire(mname, rd, rdlen);
     if (n < 0)
         return -1;
     pos += n;
-    n = name_to_wire(g_soa_rname, rd + pos, rdlen - pos);
+    n = name_to_wire(rname, rd + pos, rdlen - pos);
     if (n < 0)
         return -1;
     pos += n;
     if (pos + 20 > rdlen)
         return -1;
     pthread_mutex_lock(&g_soa_mutex);
-    put32(rd, pos, g_soa_serial);
+    put32(rd, pos, t_zone ? t_zone->soa_serial : g_soa_serial);
     pos += 4;
-    put32(rd, pos, g_soa_refresh);
+    put32(rd, pos, t_zone ? t_zone->soa_refresh : g_soa_refresh);
     pos += 4;
-    put32(rd, pos, g_soa_retry);
+    put32(rd, pos, t_zone ? t_zone->soa_retry : g_soa_retry);
     pos += 4;
-    put32(rd, pos, g_soa_expire);
+    put32(rd, pos, t_zone ? t_zone->soa_expire : g_soa_expire);
     pos += 4;
-    put32(rd, pos, g_soa_minimum);
+    put32(rd, pos, t_zone ? t_zone->soa_minimum : g_soa_minimum);
     pos += 4;
     pthread_mutex_unlock(&g_soa_mutex);
     return pos;
+}
+
+/* SOA minimum TTL for the current zone (used for negative-cache TTLs). */
+static uint32_t zone_soa_minimum(void) {
+    return t_zone ? t_zone->soa_minimum : g_soa_minimum;
 }
 
 /* ==========================================================================
@@ -3444,7 +3608,7 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
 static int nsec_rdata(const char *qname, uint8_t *rd, int rdlen) {
     (void) qname;
     /* Next owner name = zone apex */
-    int pos = name_to_wire(g_zone_name, rd, rdlen);
+    int pos = name_to_wire(t_zone ? t_zone->name : g_zone_name, rd, rdlen);
     if (pos < 0)
         return -1;
     /* Type bitmap window 0: build bitmap for common types */
@@ -3475,8 +3639,8 @@ static int add_nsec_denial(uint8_t *resp, int off, int resp_len, const char *qna
     int rdlen = nsec_rdata(qname, rd, sizeof(rd));
     if (rdlen < 0)
         return off;
-    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_NSEC, g_soa_minimum, rd, (uint16_t) rdlen,
-                  dnssec_ok, auth_count);
+    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_NSEC, zone_soa_minimum(), rd,
+                  (uint16_t) rdlen, dnssec_ok, auth_count);
     return off;
 }
 
@@ -3492,14 +3656,14 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
         return off;
     (*answers)++;
     off = noff;
-    if (!dnssec_ok || !g_zsk)
+    if (!dnssec_ok || !t_zone || !t_zone->zsk)
         return off;
     /* Add RRSIG for ECDSA P-256 (Alg 13) */
     STAT_INC(g_stat_signed);
     {
         pthread_mutex_lock(&g_zsk_mutex);
-        EVP_PKEY *zsk = g_zsk;
-        uint16_t tag = g_zsk_tag;
+        EVP_PKEY *zsk = t_zone->zsk;
+        uint16_t tag = t_zone->zsk_tag;
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
@@ -3518,8 +3682,8 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
     /* Add RRSIG for Ed25519 (Alg 15) */
     {
         pthread_mutex_lock(&g_zsk_mutex);
-        EVP_PKEY *zsk = g_zsk_ed;
-        uint16_t tag = g_zsk_ed_tag;
+        EVP_PKEY *zsk = t_zone->zsk_ed;
+        uint16_t tag = t_zone->zsk_ed_tag;
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
@@ -3543,8 +3707,8 @@ static int add_soa_authority(uint8_t *resp, int off, int resp_len, int dnssec_ok
     int soa_len = build_soa_rdata(soa_rd, sizeof(soa_rd));
     if (soa_len < 0)
         return off;
-    off = emit_rr(resp, off, resp_len, g_zone_name, DNS_TYPE_SOA, g_soa_minimum, soa_rd,
-                  (uint16_t) soa_len, dnssec_ok, auth_count);
+    off = emit_rr(resp, off, resp_len, t_zone ? t_zone->name : g_zone_name, DNS_TYPE_SOA,
+                  zone_soa_minimum(), soa_rd, (uint16_t) soa_len, dnssec_ok, auth_count);
     return off;
 }
 
@@ -3555,16 +3719,19 @@ static int add_nsec3_denial(uint8_t *resp, int off, int resp_len, const char *qn
     int n3len = nsec3_rdata(qname, qtype, n3rd, sizeof(n3rd));
     if (n3len > 0) {
         /* NSEC3 owner name = base32hex_hash.zone */
+        const char *zsalt = t_zone ? t_zone->nsec3_salt : g_nsec3_salt;
+        int ziters = t_zone ? t_zone->nsec3_iters : g_nsec3_iters;
         uint8_t salt[16];
         int saltlen = 0;
-        if (g_nsec3_salt[0])
-            saltlen = hex_dec(g_nsec3_salt, salt, sizeof(salt));
+        if (zsalt[0])
+            saltlen = hex_dec(zsalt, salt, sizeof(salt));
         char hash[64];
-        nsec3_hash_name(qname, salt, saltlen, g_nsec3_iters, hash, sizeof(hash));
+        nsec3_hash_name(qname, salt, saltlen, ziters, hash, sizeof(hash));
         char nsec3_owner[512];
-        snprintf(nsec3_owner, sizeof(nsec3_owner), "%s.%s", hash, g_zone_name);
+        snprintf(nsec3_owner, sizeof(nsec3_owner), "%s.%s", hash,
+                 t_zone ? t_zone->name : g_zone_name);
         strlower(nsec3_owner);
-        off = emit_rr(resp, off, resp_len, nsec3_owner, DNS_TYPE_NSEC3, g_soa_minimum, n3rd,
+        off = emit_rr(resp, off, resp_len, nsec3_owner, DNS_TYPE_NSEC3, zone_soa_minimum(), n3rd,
                       (uint16_t) n3len, dnssec_ok, auth_count);
     }
     return off;
@@ -3575,6 +3742,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     if (qlen < 12)
         return -1;
     compress_reset();
+    t_zone = NULL; /* selected after the qname is parsed (see below) */
     const dns_hdr_t *qh = (const dns_hdr_t *) query;
     dns_hdr_t *rh = (dns_hdr_t *) resp;
     /* RFC 9619 / 2181: QDCOUNT must be 1 for QUERY */
@@ -3628,16 +3796,11 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
      * caching false NXDOMAIN when they accidentally route public
      * names to us.  Locally-served zones (RFC 6303) are exempt. */
     {
-        int in_zone = 0;
-        /* Check: qname == g_zone_name or qname ends with .<g_zone_name> */
-        if (g_zone_name[0]) {
-            size_t zl = strlen(g_zone_name), ql = strlen(qname);
-            if (streq_ci(qname, g_zone_name))
-                in_zone = 1;
-            else if (ql > zl + 1 && qname[ql - zl - 1] == '.' &&
-                     streq_ci(qname + ql - zl, g_zone_name))
-                in_zone = 1;
-        }
+        /* Multi-zone: pick the most specific configured zone for this qname.
+         * t_zone drives SOA, NSEC/NSEC3 and DNSSEC signing for the whole
+         * response below. */
+        t_zone = zone_for_qname(qname);
+        int in_zone = (t_zone != NULL);
         if (!in_zone && !is_local_zone(qname)) {
             rh->flags = htons(DNS_QR | DNS_RCODE_REFUSED);
             rh->qdcount = htons(1);
@@ -3667,7 +3830,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         rh->nscount = htons((uint16_t) auth_count);
         if (dnssec_ok) {
             int ac2 = 0;
-            if (g_dnssec_use_nsec3)
+            if (t_zone ? t_zone->dnssec_use_nsec3 : g_dnssec_use_nsec3)
                 off = add_nsec3_denial(resp, off, resp_len, qname, qtype, dnssec_ok, &ac2);
             else
                 off = add_nsec_denial(resp, off, resp_len, qname, dnssec_ok, &ac2);
@@ -3677,6 +3840,13 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                               "Locally served zone");
         return off;
     }
+    /* DNSSEC signing keys for the matched zone (NULL for locally-served zones). */
+    EVP_PKEY *g_zsk = t_zone ? t_zone->zsk : NULL;
+    EVP_PKEY *g_zsk_ed = t_zone ? t_zone->zsk_ed : NULL;
+    EVP_PKEY *g_ksk = t_zone ? t_zone->ksk : NULL;
+    EVP_PKEY *g_ksk_ed = t_zone ? t_zone->ksk_ed : NULL;
+    uint16_t g_ksk_tag = t_zone ? t_zone->ksk_tag : 0;
+    uint16_t g_ksk_ed_tag = t_zone ? t_zone->ksk_ed_tag : 0;
     /* DNSKEY — serve ZSK (flag 256) + KSK (flag 257), KSK signs DNSKEY RRset */
     if ((qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
         uint8_t dkrd[68];
@@ -3824,6 +3994,20 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
         }
     }
+    /* SOA at the zone apex (RFC 1035) — answer authoritatively from the
+     * selected zone's SOA parameters. */
+    if ((qtype == DNS_TYPE_SOA || qtype == DNS_TYPE_ANY) && t_zone &&
+        streq_ci(qname, t_zone->name)) {
+        uint8_t soa_rd[512];
+        int soa_len = build_soa_rdata(soa_rd, sizeof(soa_rd));
+        if (soa_len > 0) {
+            found = 1;
+            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_SOA, zone_soa_minimum(), soa_rd,
+                          (uint16_t) soa_len, dnssec_ok, &answers);
+            if (any_minimal && answers > 0)
+                goto finish_answer;
+        }
+    }
     /* Static zone */
     for (int i = 0; i < static_zone_sz; i++) {
         dns_rec_t *r = &static_zone[i];
@@ -3882,8 +4066,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Dynamic A */
     if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
-        char val[128], k[512];
-        snprintf(k, sizeof(k), "ddns:A:%s", qname);
+        char val[128], k[768];
+        dkey(k, sizeof(k), "A", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
             struct in_addr a4;
@@ -3897,7 +4081,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                               dnssec_ok, &answers);
             }
         }
-        snprintf(k, sizeof(k), "zone:A:%s", qname);
+        zkey(k, sizeof(k), "A", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
             uint32_t ttl = DEFAULT_TTL;
@@ -3923,8 +4107,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Dynamic AAAA */
     if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
-        char val[256], k[512];
-        snprintf(k, sizeof(k), "ddns:AAAA:%s", qname);
+        char val[256], k[768];
+        dkey(k, sizeof(k), "AAAA", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
             struct in6_addr a6;
@@ -3938,7 +4122,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                               dnssec_ok, &answers);
             }
         }
-        snprintf(k, sizeof(k), "zone:AAAA:%s", qname);
+        zkey(k, sizeof(k), "AAAA", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
             uint32_t ttl = DEFAULT_TTL;
@@ -3981,8 +4165,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)
                 continue;
-            char k[512];
-            snprintf(k, sizeof(k), "zone:%s:%s", type2str(pt), qname);
+            char k[768];
+            zkey(k, sizeof(k), type2str(pt), qname);
             char val[512];
             if (!vk_get(k, val, sizeof(val)))
                 continue;
@@ -4217,8 +4401,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* RFC 1034 §3.6.2 — CNAME synthesis for non-CNAME queries */
     if (!found && answers == 0 && qtype != DNS_TYPE_CNAME && qtype != DNS_TYPE_ANY) {
-        char cname_key[512];
-        snprintf(cname_key, sizeof(cname_key), "zone:CNAME:%s", qname);
+        char cname_key[768];
+        zkey(cname_key, sizeof(cname_key), "CNAME", qname);
         char cname_val[512];
         if (vk_get(cname_key, cname_val, sizeof(cname_val))) {
             found = 1;
@@ -4236,16 +4420,17 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 char cur[256];
                 safe_strcpy(cur, cname_target, sizeof(cur));
                 for (int hop = 0; hop < 8 && cur[0]; hop++) {
-                    size_t zl = strlen(g_zone_name), nl = strlen(cur);
-                    int in_zone = (nl == zl && strcasecmp(cur, g_zone_name) == 0) ||
+                    const char *zn = t_zone ? t_zone->name : g_zone_name;
+                    size_t zl = strlen(zn), nl = strlen(cur);
+                    int in_zone = (nl == zl && strcasecmp(cur, zn) == 0) ||
                                   (nl > zl + 1 && cur[nl - zl - 1] == '.' &&
-                                   strcasecmp(cur + nl - zl, g_zone_name) == 0);
+                                   strcasecmp(cur + nl - zl, zn) == 0);
                     if (!in_zone)
                         break;
                     /* A records at this hop */
                     if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
-                        char ck[512];
-                        snprintf(ck, sizeof(ck), "zone:A:%s", cur);
+                        char ck[768];
+                        zkey(ck, sizeof(ck), "A", cur);
                         char cv[256];
                         if (vk_get(ck, cv, sizeof(cv))) {
                             uint32_t t2 = DEFAULT_TTL;
@@ -4271,8 +4456,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                     }
                     /* AAAA records */
                     if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
-                        char ck[512];
-                        snprintf(ck, sizeof(ck), "zone:AAAA:%s", cur);
+                        char ck[768];
+                        zkey(ck, sizeof(ck), "AAAA", cur);
                         char cv[256];
                         if (vk_get(ck, cv, sizeof(cv))) {
                             uint32_t t2 = DEFAULT_TTL;
@@ -4297,7 +4482,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                         }
                     }
                     /* Next CNAME hop? */
-                    snprintf(cname_key, sizeof(cname_key), "zone:CNAME:%s", cur);
+                    zkey(cname_key, sizeof(cname_key), "CNAME", cur);
                     if (answers == 0 && vk_get(cname_key, cname_val, sizeof(cname_val))) {
                         cpipe = strchr(cname_val, '|');
                         cname_target = cpipe ? cpipe + 1 : cname_val;
@@ -4378,9 +4563,9 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
             /* Also check Valkey wildcard */
             if (!found) {
-                char wk[512];
+                char wk[768];
                 if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
-                    snprintf(wk, sizeof(wk), "zone:A:%s", wname);
+                    zkey(wk, sizeof(wk), "A", wname);
                     char wv[128];
                     if (vk_get(wk, wv, sizeof(wv))) {
                         found = 1;
@@ -4401,7 +4586,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                     }
                 }
                 if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
-                    snprintf(wk, sizeof(wk), "zone:AAAA:%s", wname);
+                    zkey(wk, sizeof(wk), "AAAA", wname);
                     char wv[256];
                     if (vk_get(wk, wv, sizeof(wv))) {
                         found = 1;
@@ -4463,7 +4648,7 @@ finish_answer:
         }
         off = add_soa_authority(resp, off, resp_len, dnssec_ok, &auth_count);
         if (dnssec_ok) {
-            if (g_dnssec_use_nsec3)
+            if (t_zone ? t_zone->dnssec_use_nsec3 : g_dnssec_use_nsec3)
                 off = add_nsec3_denial(resp, off, resp_len, qname, qtype, dnssec_ok, &auth_count);
             else
                 off = add_nsec_denial(resp, off, resp_len, qname, dnssec_ok, &auth_count);
@@ -4500,15 +4685,15 @@ finish_answer:
  * ======================================================================= */
 /* Returns 1 if at least one RR exists for `name` (any type, any namespace). */
 static int prereq_name_exists(const char *name) {
-    char vk[512];
+    char vk[768];
     char tmp[8];
     const char *types[] = {"A",   "AAAA",  "CNAME", "MX",    "TXT", "NS", "SRV",
                            "CAA", "SSHFP", "TLSA",  "DNAME", "LOC", NULL};
     for (int ti = 0; types[ti]; ti++) {
-        snprintf(vk, sizeof(vk), "ddns:%s:%s", types[ti], name);
+        dkey(vk, sizeof(vk), types[ti], name);
         if (vk_get(vk, tmp, sizeof(tmp)))
             return 1;
-        snprintf(vk, sizeof(vk), "zone:%s:%s", types[ti], name);
+        zkey(vk, sizeof(vk), types[ti], name);
         if (vk_get(vk, tmp, sizeof(tmp)))
             return 1;
     }
@@ -4519,15 +4704,15 @@ static int prereq_name_exists(const char *name) {
 }
 /* Returns 1 if at least one RR of type `rtype` exists for `name`. */
 static int prereq_rrset_exists(const char *name, uint16_t rtype) {
-    char vk[512];
+    char vk[768];
     char tmp[8];
     const char *ts = type2str(rtype);
     if (!ts)
         return 0;
-    snprintf(vk, sizeof(vk), "ddns:%s:%s", ts, name);
+    dkey(vk, sizeof(vk), ts, name);
     if (vk_get(vk, tmp, sizeof(tmp)))
         return 1;
-    snprintf(vk, sizeof(vk), "zone:%s:%s", ts, name);
+    zkey(vk, sizeof(vk), ts, name);
     if (vk_get(vk, tmp, sizeof(tmp)))
         return 1;
     for (int i = 0; i < static_zone_sz; i++)
@@ -4553,16 +4738,22 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         return 12;
     }
     int off = 12;
+    t_zone = NULL;
     for (int i = 0; i < ntohs(h->qdcount); i++) {
         char zn[256];
         int za = name_from_wire(pkt, plen, off, zn, sizeof(zn));
         if (za < 0)
             goto formerr;
-        /* RFC 2136 §3.1: reject updates not for our zone */
-        if (i == 0 && !streq_ci(zn, g_zone_name)) {
-            dns_log(LOG_WARNING, "[UPDATE] Rejected: zone '%s' not authoritative here\n", zn);
-            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTZONE);
-            return 12;
+        /* RFC 2136 §3.1: the zone section names one authoritative zone; select
+         * it so all reads/writes below are scoped to it.  Reject if we are not
+         * authoritative for that zone. */
+        if (i == 0) {
+            t_zone = zone_for_qname(zn);
+            if (!t_zone || strcasecmp(t_zone->name, zn) != 0) {
+                dns_log(LOG_WARNING, "[UPDATE] Rejected: zone '%s' not authoritative here\n", zn);
+                rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTZONE);
+                return 12;
+            }
         }
         off = za + 4;
         if (off > plen)
@@ -4615,16 +4806,16 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
             goto formerr;
         const uint8_t *rd = pkt + off;
         off += rdlen;
-        char k[512];
+        char k[768];
         if (uc == DNS_CLASS_IN && rdlen > 0) {
             if (ut == DNS_TYPE_A && rdlen == 4) {
                 char ip[32];
                 snprintf(ip, sizeof(ip), "%d.%d.%d.%d", rd[0], rd[1], rd[2], rd[3]);
-                snprintf(k, sizeof(k), "ddns:A:%s", un);
+                dkey(k, sizeof(k), "A", un);
                 vk_set(k, ip, uttl ? uttl : DEFAULT_TTL);
                 {
-                    uint32_t prev = g_soa_serial;
-                    uint32_t next = serial_bump();
+                    uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
+                    uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(prev, next, 'A', un, ip);
                 }
                 dns_log(LOG_NOTICE, "[DDNS] A %s->%s\n", un, ip);
@@ -4632,11 +4823,11 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
             } else if (ut == DNS_TYPE_AAAA && rdlen == 16) {
                 char ip6[INET6_ADDRSTRLEN];
                 inet_ntop(AF_INET6, rd, ip6, sizeof(ip6));
-                snprintf(k, sizeof(k), "ddns:AAAA:%s", un);
+                dkey(k, sizeof(k), "AAAA", un);
                 vk_set(k, ip6, uttl ? uttl : DEFAULT_TTL);
                 {
-                    uint32_t prev = g_soa_serial;
-                    uint32_t next = serial_bump();
+                    uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
+                    uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(prev, next, 'A', un, ip6);
                 }
                 dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s\n", un, ip6);
@@ -4650,9 +4841,9 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 txt[sl] = 0;
                 char val[320];
                 snprintf(val, sizeof(val), "%u|%s", uttl ? uttl : DEFAULT_TTL, txt);
-                snprintf(k, sizeof(k), "zone:TXT:%s", un);
+                zkey(k, sizeof(k), "TXT", un);
                 vk_set(k, val, 0);
-                serial_bump();
+                serial_bump(t_zone);
                 dns_log(LOG_NOTICE, "[UPDATE] TXT %s = %.60s%s\n", un, txt, sl > 60 ? "..." : "");
             } else if (ut == DNS_TYPE_CNAME && rdlen >= 1) {
                 char target[256];
@@ -4661,9 +4852,9 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                     goto formerr;
                 char val[320];
                 snprintf(val, sizeof(val), "%u|%s", uttl ? uttl : DEFAULT_TTL, target);
-                snprintf(k, sizeof(k), "zone:CNAME:%s", un);
+                zkey(k, sizeof(k), "CNAME", un);
                 vk_set(k, val, 0);
-                serial_bump();
+                serial_bump(t_zone);
                 dns_log(LOG_NOTICE, "[UPDATE] CNAME %s -> %s\n", un, target);
             } else if (ut == DNS_TYPE_MX && rdlen >= 3) {
                 uint16_t pref = (rd[0] << 8) | rd[1];
@@ -4674,9 +4865,9 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                     goto formerr;
                 char val[384];
                 snprintf(val, sizeof(val), "%u|%u|%s", uttl ? uttl : DEFAULT_TTL, pref, target);
-                snprintf(k, sizeof(k), "zone:MX:%s", un);
+                zkey(k, sizeof(k), "MX", un);
                 vk_set(k, val, 0);
-                serial_bump();
+                serial_bump(t_zone);
                 dns_log(LOG_NOTICE, "[UPDATE] MX %s -> %u %s\n", un, pref, target);
             } else if (ut == DNS_TYPE_SRV && rdlen >= 7) {
                 uint16_t prio = (rd[0] << 8) | rd[1];
@@ -4690,38 +4881,38 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 char val[384];
                 snprintf(val, sizeof(val), "%u|%u|%u|%u|%s", uttl ? uttl : DEFAULT_TTL, prio,
                          weight, port, target);
-                snprintf(k, sizeof(k), "zone:SRV:%s", un);
+                zkey(k, sizeof(k), "SRV", un);
                 vk_set(k, val, 0);
-                serial_bump();
+                serial_bump(t_zone);
                 dns_log(LOG_NOTICE, "[UPDATE] SRV %s -> %u %u %u %s\n", un, prio, weight, port,
                         target);
             }
         } else if ((uc == DNS_CLASS_ANY || uc == DNS_CLASS_NONE) && rdlen == 0) {
             if (ut == DNS_TYPE_A || ut == DNS_TYPE_ANY) {
-                snprintf(k, sizeof(k), "ddns:A:%s", un);
+                dkey(k, sizeof(k), "A", un);
                 vk_del(k);
             }
             if (ut == DNS_TYPE_AAAA || ut == DNS_TYPE_ANY) {
-                snprintf(k, sizeof(k), "ddns:AAAA:%s", un);
+                dkey(k, sizeof(k), "AAAA", un);
                 vk_del(k);
             }
             if (ut == DNS_TYPE_TXT || ut == DNS_TYPE_ANY) {
-                snprintf(k, sizeof(k), "zone:TXT:%s", un);
+                zkey(k, sizeof(k), "TXT", un);
                 vk_del(k);
             }
             if (ut == DNS_TYPE_CNAME || ut == DNS_TYPE_ANY) {
-                snprintf(k, sizeof(k), "zone:CNAME:%s", un);
+                zkey(k, sizeof(k), "CNAME", un);
                 vk_del(k);
             }
             if (ut == DNS_TYPE_MX || ut == DNS_TYPE_ANY) {
-                snprintf(k, sizeof(k), "zone:MX:%s", un);
+                zkey(k, sizeof(k), "MX", un);
                 vk_del(k);
             }
             if (ut == DNS_TYPE_SRV || ut == DNS_TYPE_ANY) {
-                snprintf(k, sizeof(k), "zone:SRV:%s", un);
+                zkey(k, sizeof(k), "SRV", un);
                 vk_del(k);
             }
-            serial_bump();
+            serial_bump(t_zone);
         }
     }
     /* Append TSIG to response */
@@ -4825,11 +5016,12 @@ typedef struct {
     int ixfr;
     uint32_t ixfr_serial;
     uint16_t query_id;
+    char zone[256]; /* requested zone (AXFR/IXFR question name) */
 } axfr_conn_t;
 
-static int axfr_ip_allowed(const struct in_addr *cip) {
+static int axfr_ip_allowed(const struct in_addr *cip, const char *allow_list) {
     char allow[1024];
-    safe_strcpy(allow, g_axfr_allow, sizeof(allow));
+    safe_strcpy(allow, allow_list, sizeof(allow));
     char *sp22 = NULL;
     char *tok = strtok_r(allow, ",", &sp22);
     while (tok) {
@@ -4882,10 +5074,14 @@ static void *axfr_thread(void *arg) {
     free(arg);
     char cip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &c.addr.sin_addr, cip, sizeof(cip));
-    dns_log(LOG_NOTICE, "[%s] Transfer to %s\n", c.ixfr ? "IXFR" : "AXFR", cip);
+    dns_log(LOG_NOTICE, "[%s] Transfer of %s to %s\n", c.ixfr ? "IXFR" : "AXFR", c.zone, cip);
 
-    if (!axfr_ip_allowed(&c.addr.sin_addr)) {
-        dns_log(LOG_ERR, "[AXFR] REFUSED %s\n", cip);
+    /* Select the requested zone; all SOA/keys/static records below are scoped
+     * to t_zone.  Refuse if we are not authoritative for it. */
+    t_zone = zone_for_qname(c.zone);
+    const char *allow = (t_zone && t_zone->axfr_allow[0]) ? t_zone->axfr_allow : g_axfr_allow;
+    if (!t_zone || !axfr_ip_allowed(&c.addr.sin_addr, allow)) {
+        dns_log(LOG_ERR, "[AXFR] REFUSED %s for %s\n", cip, c.zone);
         /* Send REFUSED response */
         uint8_t ref[12] = {0};
         dns_hdr_t *rh = (dns_hdr_t *) ref;
@@ -4894,12 +5090,13 @@ static void *axfr_thread(void *arg) {
         tcp_send_msg(c.fd, c.ssl, ref, 12);
         goto done;
     }
+    const char *zname = t_zone->name;
 
     uint8_t soa_rd[512];
     int soa_len = build_soa_rdata(soa_rd, sizeof(soa_rd));
 
     /* ── IXFR path (RFC 1995) ── */
-    if (c.ixfr && c.ixfr_serial > 0 && c.ixfr_serial < g_soa_serial) {
+    if (c.ixfr && c.ixfr_serial > 0 && c.ixfr_serial < t_zone->soa_serial) {
         char *entries[IXFR_JOURNAL_MAX];
         int ne = 0;
         ne = ixfr_journal_fetch(c.ixfr_serial, entries, IXFR_JOURNAL_MAX);
@@ -4917,21 +5114,21 @@ static void *axfr_thread(void *arg) {
             mh->ancount = htons(1);
             mo = 12;
             if (soa_len > 0)
-                mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_SOA, DNS_CLASS_IN,
-                               g_soa_minimum, soa_rd, (uint16_t) soa_len);
+                mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
+                               t_zone->soa_minimum, soa_rd, (uint16_t) soa_len);
             mo = tsig_axfr_first(mb, mo, sizeof(mb), c.query_id, ixfr_mac, &ixfr_mac_len);
             tcp_send_msg(c.fd, c.ssl, mb, mo);
             /* Old SOA (the one being replaced) */
             uint8_t old_soa[512];
             int old_soa_len = 0;
             { /* build SOA with from_serial */
-                uint32_t saved = g_soa_serial;
                 pthread_mutex_lock(&g_soa_mutex);
-                g_soa_serial = c.ixfr_serial;
+                uint32_t saved = t_zone->soa_serial;
+                t_zone->soa_serial = c.ixfr_serial;
                 pthread_mutex_unlock(&g_soa_mutex);
                 old_soa_len = build_soa_rdata(old_soa, sizeof(old_soa));
                 pthread_mutex_lock(&g_soa_mutex);
-                g_soa_serial = saved;
+                t_zone->soa_serial = saved;
                 pthread_mutex_unlock(&g_soa_mutex);
             }
             compress_reset();
@@ -4941,8 +5138,8 @@ static void *axfr_thread(void *arg) {
             mh->ancount = htons(1);
             mo = 12;
             if (old_soa_len > 0)
-                mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_SOA, DNS_CLASS_IN,
-                               g_soa_minimum, old_soa, (uint16_t) old_soa_len);
+                mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
+                               t_zone->soa_minimum, old_soa, (uint16_t) old_soa_len);
             tsig_axfr_mid(mb, mo, ixfr_mac, &ixfr_mac_len);
             tcp_send_msg(c.fd, c.ssl, mb, mo);
             /* Changes */
@@ -4990,17 +5187,17 @@ static void *axfr_thread(void *arg) {
             mh->ancount = htons(1);
             mo = 12;
             if (soa_len > 0)
-                mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_SOA, DNS_CLASS_IN,
-                               g_soa_minimum, soa_rd, (uint16_t) soa_len);
+                mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
+                               t_zone->soa_minimum, soa_rd, (uint16_t) soa_len);
             mo = tsig_axfr_last(mb, mo, sizeof(mb), c.query_id, ixfr_mac, ixfr_mac_len);
             tcp_send_msg(c.fd, c.ssl, mb, mo);
             dns_log(LOG_NOTICE, "[IXFR] Sent %d changes serial %u->%u to %s\n", ne, c.ixfr_serial,
-                    g_soa_serial, cip);
+                    t_zone->soa_serial, cip);
             goto done;
         }
         dns_log(LOG_NOTICE, "[IXFR] Serial %u not in journal, falling back to AXFR\n",
                 c.ixfr_serial);
-    } else if (c.ixfr && c.ixfr_serial == g_soa_serial) {
+    } else if (c.ixfr && c.ixfr_serial == t_zone->soa_serial) {
         /* Already up to date — send just the current SOA */
         uint8_t mb[BUF_SIZE];
         compress_reset();
@@ -5010,11 +5207,11 @@ static void *axfr_thread(void *arg) {
         mh->ancount = htons(1);
         int mo = 12;
         if (soa_len > 0)
-            mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_SOA, DNS_CLASS_IN,
-                           g_soa_minimum, soa_rd, (uint16_t) soa_len);
+            mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
+                           t_zone->soa_minimum, soa_rd, (uint16_t) soa_len);
         mo = tsig_append(mb, mo, sizeof(mb), c.query_id, 0);
         tcp_send_msg(c.fd, c.ssl, mb, mo);
-        dns_log(LOG_NOTICE, "[IXFR] Already current serial %u for %s\n", g_soa_serial, cip);
+        dns_log(LOG_NOTICE, "[IXFR] Already current serial %u for %s\n", t_zone->soa_serial, cip);
         goto done;
     }
 
@@ -5030,7 +5227,7 @@ static void *axfr_thread(void *arg) {
     rh->ancount = htons(1);
     int off = 12;
     /* Question section: zone name, type AXFR */
-    int n = name_to_wire(g_zone_name, buf + off, sizeof(buf) - off);
+    int n = name_to_wire(zname, buf + off, sizeof(buf) - off);
     if (n > 0) {
         off += n;
         put16(buf, off, 252);
@@ -5040,14 +5237,21 @@ static void *axfr_thread(void *arg) {
     }
     rh->qdcount = htons(1);
     if (soa_len > 0)
-        off = append_rr(buf, off, sizeof(buf), g_zone_name, DNS_TYPE_SOA, DNS_CLASS_IN,
-                        g_soa_minimum, soa_rd, (uint16_t) soa_len);
+        off = append_rr(buf, off, sizeof(buf), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
+                        t_zone->soa_minimum, soa_rd, (uint16_t) soa_len);
     off = tsig_axfr_first(buf, off, sizeof(buf), c.query_id, axfr_mac, &axfr_mac_len);
     tcp_send_msg(c.fd, c.ssl, buf, off);
 
-    /* Send all static zone records */
+    /* Send all static zone records that belong to this zone */
+    size_t znl = strlen(zname);
     for (int i = 0; i < static_zone_sz; i++) {
         dns_rec_t *r = &static_zone[i];
+        size_t rnl = strlen(r->name);
+        int in_zone = (rnl == znl && strcasecmp(r->name, zname) == 0) ||
+                      (rnl > znl + 1 && r->name[rnl - znl - 1] == '.' &&
+                       strcasecmp(r->name + rnl - znl, zname) == 0);
+        if (!in_zone)
+            continue;
         uint8_t rd[256];
         uint16_t rdlen = 0;
         switch (r->type) {
@@ -5105,6 +5309,8 @@ static void *axfr_thread(void *arg) {
     /* Send DNSKEY records */
     {
         uint8_t dkrd[68];
+        EVP_PKEY *g_zsk = t_zone->zsk;
+        EVP_PKEY *g_zsk_ed = t_zone->zsk_ed;
         if (g_zsk && dnskey_rdata_ecdsa(g_zsk, dkrd, sizeof(dkrd)) > 0) {
             uint8_t mb[BUF_SIZE];
             compress_reset();
@@ -5113,8 +5319,8 @@ static void *axfr_thread(void *arg) {
             mh->flags = htons(DNS_QR | DNS_AA);
             mh->ancount = htons(1);
             int mo = 12;
-            mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                           dkrd, 68);
+            mo =
+                append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600, dkrd, 68);
             tsig_axfr_mid(mb, mo, axfr_mac, &axfr_mac_len);
             tcp_send_msg(c.fd, c.ssl, mb, mo);
         }
@@ -5126,8 +5332,8 @@ static void *axfr_thread(void *arg) {
             mh->flags = htons(DNS_QR | DNS_AA);
             mh->ancount = htons(1);
             int mo = 12;
-            mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                           dkrd, 36);
+            mo =
+                append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600, dkrd, 36);
             tsig_axfr_mid(mb, mo, axfr_mac, &axfr_mac_len);
             tcp_send_msg(c.fd, c.ssl, mb, mo);
         }
@@ -5142,7 +5348,7 @@ static void *axfr_thread(void *arg) {
         mh->flags = htons(DNS_QR | DNS_AA);
         mh->ancount = htons(1);
         int mo = 12;
-        mo = append_rr(mb, mo, sizeof(mb), g_zone_name, DNS_TYPE_SOA, DNS_CLASS_IN, g_soa_minimum,
+        mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN, t_zone->soa_minimum,
                        soa_rd, (uint16_t) soa_len);
         mo = tsig_axfr_last(mb, mo, sizeof(mb), c.query_id, axfr_mac, axfr_mac_len);
         tcp_send_msg(c.fd, c.ssl, mb, mo);
@@ -5161,11 +5367,12 @@ done:
 /* ==========================================================================
  * DNS NOTIFY sender (RFC 1996)
  * ======================================================================= */
-static void notify_send(void) {
-    if (!g_notify_targets[0])
+/* Send a NOTIFY for one zone to a comma-separated target list. */
+static void notify_zone(const char *zname, const char *targets_csv) {
+    if (!zname[0] || !targets_csv[0])
         return;
     char targets[1024];
-    safe_strcpy(targets, g_notify_targets, sizeof(targets));
+    safe_strcpy(targets, targets_csv, sizeof(targets));
     char *sp23 = NULL;
     char *tok = strtok_r(targets, ",", &sp23);
     while (tok) {
@@ -5196,7 +5403,7 @@ static void notify_send(void) {
         h->flags = htons(DNS_QR & 0 ? 0 : 0 | DNS_OPCODE_NOTIFY | DNS_AA);
         h->qdcount = htons(1);
         int off = 12;
-        int n = name_to_wire(g_zone_name, pkt + off, sizeof(pkt) - off);
+        int n = name_to_wire(zname, pkt + off, sizeof(pkt) - off);
         if (n > 0) {
             off += n;
             put16(pkt, off, DNS_TYPE_SOA);
@@ -5205,10 +5412,24 @@ static void notify_send(void) {
             off += 2;
         }
         sendto(fd, pkt, off, 0, (struct sockaddr *) &sa, sizeof(sa));
-        dns_log(LOG_NOTICE, "[NOTIFY] Sent to %s:%d\n", host, port);
+        dns_log(LOG_NOTICE, "[NOTIFY] %s sent to %s:%d\n", zname, host, port);
         close(fd);
         tok = strtok_r(NULL, ",", &sp23);
     }
+}
+
+/* NOTIFY every configured zone's secondaries (RFC 1996). */
+static void notify_send(void) {
+    pthread_mutex_lock(&g_zones_mutex);
+    int n = g_zone_count;
+    pthread_mutex_unlock(&g_zones_mutex);
+    for (int i = 0; i < n; i++) {
+        if (g_zones[i].notify_targets[0])
+            notify_zone(g_zones[i].name, g_zones[i].notify_targets);
+    }
+    /* Fallback: legacy single-zone notify config if no per-zone targets set. */
+    if (n == 0 && g_notify_targets[0])
+        notify_zone(g_zone_name, g_notify_targets);
 }
 
 /* ==========================================================================
@@ -5292,9 +5513,9 @@ static void *dot_thread(void *arg) {
         }
         /* Check for AXFR */
         uint16_t qtype = 0;
+        char axfr_qn[256] = "";
         {
-            char qn[256] = "";
-            int a = name_from_wire(pkt, ml, 12, qn, sizeof(qn));
+            int a = name_from_wire(pkt, ml, 12, axfr_qn, sizeof(axfr_qn));
             if (a >= 0 && a + 1 < ml)
                 qtype = get16(pkt, a);
         }
@@ -5311,6 +5532,7 @@ static void *dot_thread(void *arg) {
             ac->fd = c.fd;
             ac->ssl = ssl;
             ac->addr = c.addr;
+            safe_strcpy(ac->zone, axfr_qn, sizeof(ac->zone));
             ac->ixfr = (qtype == 251); /* flag for IXFR vs AXFR */
             /* parse requested SOA serial from authority section of IXFR request */
             ac->ixfr_serial = 0;
@@ -5543,15 +5765,8 @@ int main(int argc, char **argv) {
     /* Phase 2: Load config */
     config_load_from_valkey();
 
-    /* Phase 2b: Populate multi-zone table */
-    {
-        char mname[300], rname[300];
-        snprintf(mname, sizeof(mname), "ns1.%s", g_zone_name);
-        snprintf(rname, sizeof(rname), "hostmaster.%s", g_zone_name);
-        zone_upsert(g_zone_name, g_soa_mname[0] ? g_soa_mname : mname,
-                    g_soa_rname[0] ? g_soa_rname : rname, g_soa_serial, g_soa_refresh, g_soa_retry,
-                    g_soa_expire, g_soa_minimum, g_axfr_allow, g_notify_targets);
-    }
+    /* Phase 2b: Populate multi-zone table (primary seed + zone_table:*) */
+    seed_primary_zone();
     zones_load_from_valkey();
     dns_log(LOG_INFO, "[Zones] %d zone(s) loaded\n", g_zone_count);
 
@@ -5692,17 +5907,20 @@ int main(int argc, char **argv) {
     dns_log(LOG_INFO, "║  DoH + management API now served by apid                          ║\n");
     dns_log(LOG_INFO, "║  Valkey                                     %s:%d          ║\n",
             g_valkey_host, g_valkey_port);
-    dns_log(LOG_INFO, "║  Zone                                       %-20s       ║\n", g_zone_name);
-    dns_log(LOG_INFO, "║  DNSSEC ZSK P-256 tag                       %-6u                 ║\n",
-            g_zsk_tag);
+    zone_entry_t *pz = zone_for_qname(g_zone_name);
+    uint16_t b_zsk = pz ? pz->zsk_tag : 0, b_zsk_ed = pz ? pz->zsk_ed_tag : 0;
+    uint16_t b_ksk = pz ? pz->ksk_tag : 0, b_ksk_ed = pz ? pz->ksk_ed_tag : 0;
+    dns_log(LOG_INFO, "║  Zones configured                           %-6d                 ║\n",
+            g_zone_count);
+    dns_log(LOG_INFO, "║  Primary zone                               %-20s       ║\n", g_zone_name);
     dns_log(LOG_INFO, "║  DNSSEC ZSK P-256   tag                     %-6u (signs records)  ║\n",
-            g_zsk_tag);
+            b_zsk);
     dns_log(LOG_INFO, "║  DNSSEC ZSK Ed25519 tag                     %-6u (signs records)  ║\n",
-            g_zsk_ed_tag);
+            b_zsk_ed);
     dns_log(LOG_INFO, "║  DNSSEC KSK P-256   tag                     %-6u (signs DNSKEY)   ║\n",
-            g_ksk_tag);
+            b_ksk);
     dns_log(LOG_INFO, "║  DNSSEC KSK Ed25519 tag                     %-6u (signs DNSKEY)   ║\n",
-            g_ksk_ed_tag);
+            b_ksk_ed);
     dns_log(LOG_INFO, "║  TSIG                                       %s                ║\n",
             g_tsig_secret_len ? "enabled" : "disabled");
     dns_log(LOG_INFO, "║  RRL                                        %s (rate=%d/win=%ds)  ║\n",
@@ -5924,14 +6142,17 @@ int main(int argc, char **argv) {
         close(vk.fd);
     if (g_dot_ctx)
         SSL_CTX_free(g_dot_ctx);
-    if (g_zsk)
-        EVP_PKEY_free(g_zsk);
-    if (g_zsk_ed)
-        EVP_PKEY_free(g_zsk_ed);
-    if (g_ksk)
-        EVP_PKEY_free(g_ksk);
-    if (g_ksk_ed)
-        EVP_PKEY_free(g_ksk_ed);
+    for (int zi = 0; zi < g_zone_count; zi++) {
+        zone_entry_t *z = &g_zones[zi];
+        if (z->zsk)
+            EVP_PKEY_free(z->zsk);
+        if (z->zsk_ed)
+            EVP_PKEY_free(z->zsk_ed);
+        if (z->ksk)
+            EVP_PKEY_free(z->ksk);
+        if (z->ksk_ed)
+            EVP_PKEY_free(z->ksk_ed);
+    }
     if (g_syslog_enabled)
         closelog();
     pthread_mutex_lock(&g_log_mutex);

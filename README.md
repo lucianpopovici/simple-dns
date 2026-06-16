@@ -124,9 +124,9 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 
 | Key | Purpose |
 |---|---|
-| `config:zone_name` | Authoritative zone (default `example.local`). |
-| `config:soa_*` | SOA `mname`, `rname`, `refresh`, `retry`, `expire`, `minimum`. |
-| `config:zone_serial` | SOA serial; auto-incremented on every change. |
+| `config:zone_name` | Primary authoritative zone (default `example.local`). Additional zones are added via `zone_table:<zone>`. |
+| `config:soa_*` | Default SOA `mname`, `rname`, `refresh`, `retry`, `expire`, `minimum` for the primary zone. |
+| `config:zone_serial` | Primary zone SOA serial; other zones use `config:zone:<zone>:serial`. |
 | `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. |
 | `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
@@ -139,17 +139,37 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:acme_*`, `config:est_*` | ACME/EST endpoints + identity for `certd`. |
 | `config:dashboard_password_hash` | Dashboard admin password hash (see [Dashboard](#dashboard)). |
 
-Zone records use `zone:<TYPE>:<fqdn>` with pipe-delimited values; dynamic-update
-records use `ddns:<TYPE>:<fqdn>`; mDNS-only records use `mdns:<TYPE>:<fqdn>`;
-the active TLS cert+key blob written by `certd` is `cert:current`. Examples:
+### Multi-zone layout
+
+`dnsd` serves multiple authoritative zones. Each zone is registered with a
+`zone_table:<zone>` entry (SOA + transfer settings) and its records carry the
+owning zone in the key:
+
+* Records: `zone:<zone>:<TYPE>:<fqdn>` (pipe-delimited values)
+* Dynamic-update records: `ddns:<zone>:<TYPE>:<fqdn>`
+* Per-zone config: `config:zone:<zone>:serial`, `:nsec3_iters`, `:nsec3_salt`,
+  `:dnssec_nsec_mode` (each defaults to the global `config:*` value)
+* Per-zone DNSSEC keys: `dnssec:<zone>:{zsk,zsk_ed25519,ksk,ksk_ed25519}`
+
+`dnsd` picks the most specific zone for each query by longest-suffix match; that
+zone supplies the SOA, NSEC/NSEC3 denial, and signing keys. mDNS-only records
+still use `mdns:<TYPE>:<fqdn>`; the active TLS cert+key blob from `certd` is
+`cert:current`. Examples:
 
 ```
-zone:TXT:_acme-challenge.host.example.local   →  60|abc...123
-zone:MX:example.local                          →  300|10|mail.example.local
-zone:SRV:_xmpp._tcp.example.local              →  60|10|20|5222|xmpp.example.local
-zone:TLSA:_443._tcp.www.example.local          →  300|3|1|1|<sha256 hex>
-ddns:A:laptop.example.local                    →  192.0.2.42      (TTL stored as key TTL)
+zone_table:example.com                                 →  ns1.example.com|hostmaster.example.com|10|3600|900|604800|300|127.0.0.1|
+zone:example.local:TXT:_acme-challenge.host.example.local → 60|abc...123
+zone:example.local:MX:example.local                    →  300|10|mail.example.local
+zone:example.com:SRV:_xmpp._tcp.example.com            →  60|10|20|5222|xmpp.example.com
+zone:example.com:TLSA:_443._tcp.www.example.com        →  300|3|1|1|<sha256 hex>
+ddns:example.local:A:laptop.example.local              →  192.0.2.42   (TTL stored as key TTL)
 ```
+
+The primary zone (`config:zone_name`) seeds itself from the legacy global
+`config:*`/`dnssec:*` keys, so a single-zone deployment keeps its existing
+DS records and key tags. To convert an existing single-zone deployment to this
+layout, run `tools/migrate-multizone.sh` (dry-run by default; re-run with
+`--apply`).
 
 ## Operating notes
 
