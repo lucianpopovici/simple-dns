@@ -307,12 +307,18 @@ uninstall:
 # DNSSEC known-answer + negative tests.
 # Includes dns_client.c with -DUNIT_TEST, so it inherits that file's (dense,
 # pre-clang-format) style — suppress the indentation warning for now.
-check-dnssec: tests/test_dnssec_verify.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_dnssec_verify"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
 	      $(INCLUDES) -I. -o tests/test_dnssec_verify \
 	      tests/test_dnssec_verify.c $(WIRE_SRC) $(LIBS)
 	./tests/test_dnssec_verify
+	@echo "  CC [TEST]  tests/test_rollover"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
+	      $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_rollover \
+	      tests/test_rollover.c $(WIRE_SRC) $(LIBS)
+	./tests/test_rollover
 
 # name_from_wire compression-handling tests.
 # -Wno-unused-function: -DUNIT_TEST compiles out dns_client.c's main(), which
@@ -353,7 +359,7 @@ clean:
 	@echo "  CLEAN"
 	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug mdnsd mdnsd_debug apid apid_debug \
 	      $(SIG_GPG) $(SIG_OSSL) \
-	      tests/test_dnssec_verify tests/test_name_from_wire \
+	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
 	      fuzz/fuzz_name_from_wire
 	@echo "  done"
 

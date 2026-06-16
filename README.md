@@ -101,7 +101,11 @@ glance:
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
   and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
   authenticated denial. Validation (in `dns_client.c`) covers the full
-  canonical RRset per RFC 4034 §3.1.8.1.
+  canonical RRset per RFC 4034 §3.1.8.1. Automated per-zone ZSK rollover
+  follows RFC 6781 §4.1.1.1 (Pre-Publish): the incoming key is published
+  alongside the current one before the signer switches, and the old key is
+  retired only after old signatures expire from caches — so a validator always
+  holds the key its RRSIG points at.
 - **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, journal-based
   diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007).
 - **EDNS / transport**: 6891 OPT, 5001 NSID, 7828 TCP-keepalive, 7830/8467
@@ -134,6 +138,9 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:nsid` | NSID string reported via EDNS option 3. |
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
 | `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
+| `config:zsk_validity` (or `config:zone:<zone>:zsk_validity`) | ZSK lifetime in seconds; `dnsd` auto-starts a rollover when the active ZSK is older. `0`/unset = no automatic rollover. |
+| `config:zone:<zone>:zsk_rollover_request` | Manual trigger: set to a fresh value (e.g. an epoch) to start a ZSK rollover for that zone now. Edge-triggered. |
+| `config:rollover_publish_hold` / `config:rollover_commit_hold` | Hold times (seconds) for the publish and commit phases (defaults 3600 each; per-zone overridable via `config:zone:<zone>:*`). Size publish ≥ DNSKEY TTL and commit ≥ max record TTL. |
 | `config:metrics_port` | `dnsd` localhost metrics/health port (default 8054). |
 | `config:mdns_enabled` / `config:mdns_interfaces` | Enable `mdnsd` and its interface allowlist (`"all"` or a comma-separated list; it refuses to start unset). |
 | `config:acme_*`, `config:est_*` | ACME/EST endpoints + identity for `certd`. |
@@ -150,6 +157,11 @@ owning zone in the key:
 * Per-zone config: `config:zone:<zone>:serial`, `:nsec3_iters`, `:nsec3_salt`,
   `:dnssec_nsec_mode` (each defaults to the global `config:*` value)
 * Per-zone DNSSEC keys: `dnssec:<zone>:{zsk,zsk_ed25519,ksk,ksk_ed25519}`
+* Per-zone ZSK-rollover state (written by `dnsd`): `dnssec:<zone>:zsk_created`
+  (epoch the active ZSK set was created), `:zsk_rollover` (`publish|<epoch>` or
+  `commit|<epoch>`; absent when idle), `:zsk_next` / `:zsk_ed25519_next` (the
+  incoming key set, present only during a rollover), `:zsk_rollover_seen` (the
+  last manual-trigger value `dnsd` has acted on)
 
 `dnsd` picks the most specific zone for each query by longest-suffix match; that
 zone supplies the SOA, NSEC/NSEC3 denial, and signing keys. mDNS-only records

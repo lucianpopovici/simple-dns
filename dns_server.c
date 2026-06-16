@@ -16,6 +16,7 @@
  *   3597       Unknown RR type pass-through (zone:TYPE:name keys are served as-is;
  *              the \# presentation-format parser is not implemented)
  *   4033-4035  DNSSEC – ZSK, DNSKEY, RRSIG, NSEC, Algorithm 13
+ *   6781       DNSSEC operational practices – automated ZSK rollover (§4.1.1.1 Pre-Publish)
  *   4255/6594  SSHFP records
  *   4592       Wildcard records (*.label synthesis)
  *   6303       Locally served DNS zones (RFC 6303)
@@ -76,6 +77,19 @@
  *                              Per-zone DNSSEC keys (primary adopts the legacy dnssec:* keys)
  *   The legacy single-zone keys (zone:<TYPE>:<name>, dnssec:zsk, …) are migrated
  *   with tools/migrate-multizone.sh.
+ *
+ * Per-zone ZSK rollover schema (RFC 6781 Pre-Publish; written by dnsd):
+ *   dnssec:<zone>:zsk_created  Epoch the active ZSK set was created
+ *   dnssec:<zone>:zsk_rollover "publish|<epoch>" or "commit|<epoch>" (absent = idle)
+ *   dnssec:<zone>:zsk_next / :zsk_ed25519_next
+ *                              Incoming ZSK set, present only during a rollover
+ *   dnssec:<zone>:zsk_rollover_seen
+ *                              Last manual-trigger value dnsd has acted on (edge-trigger)
+ *   config:[zone:<zone>:]zsk_validity            ZSK lifetime (s); 0/unset = no auto-roll
+ *   config:[zone:<zone>:]rollover_publish_hold   Publish-phase hold (s, default 3600)
+ *   config:[zone:<zone>:]rollover_commit_hold    Commit-phase hold (s, default 3600)
+ *   config:zone:<zone>:zsk_rollover_request      Manual trigger (set a fresh value to roll now)
+ *   config:rollover_tick_secs                    Rollover engine poll interval (s, default 30)
  *
  * Build:
  *   gcc -O2 -Wall -I<openssl-inc> -o dns_server dns_server.c \
@@ -296,7 +310,24 @@ typedef struct {
     uint16_t ksk_tag;
     EVP_PKEY *ksk_ed; /* KSK Ed25519 */
     uint16_t ksk_ed_tag;
+    /* Per-zone ZSK rollover (RFC 6781 Pre-Publish). During a rollover the
+     * incoming ZSK set is pre-published in the DNSKEY RRset; the signer switches
+     * from the current to the incoming set only after the old DNSKEY has had
+     * time to propagate, and the old key is removed only after old RRSIGs have
+     * expired from caches — so a validator always has the key it needs. */
+    EVP_PKEY *zsk_next; /* incoming ZSK P-256 (rollover only) */
+    uint16_t zsk_next_tag;
+    EVP_PKEY *zsk_ed_next; /* incoming ZSK Ed25519 (rollover only) */
+    uint16_t zsk_ed_next_tag;
+    int roll_phase;     /* ROLL_NONE / ROLL_PUBLISH / ROLL_COMMIT */
+    time_t roll_since;  /* epoch the current phase was entered */
+    time_t zsk_created; /* epoch the current ZSK set was created */
 } zone_entry_t;
+
+/* ZSK rollover phases (RFC 6781 §4.1.1.1 Pre-Publish). */
+#define ROLL_NONE 0
+#define ROLL_PUBLISH 1 /* publish current+next; keep signing with current */
+#define ROLL_COMMIT 2  /* publish current+next; sign with next */
 
 static zone_entry_t g_zones[MAX_ZONES];
 static int g_zone_count = 0;
@@ -387,6 +418,10 @@ static void zones_load_from_valkey(void);
 static void zones_post_load(void);
 /* Seed/refresh the primary zone from the legacy global config:* values. */
 static void seed_primary_zone(void);
+/* Load per-zone ZSK rollover state (RFC 6781 Pre-Publish) from Valkey. */
+static void zone_rollover_load(zone_entry_t *z);
+/* Reload a zone's full DNSSEC key state live (current + rollover/next set). */
+static void zone_dnssec_reload(zone_entry_t *z);
 
 /* ==========================================================================
  * Runtime configuration
@@ -1942,7 +1977,7 @@ static void cert_current_reload(void) {
  *   config:*       reload runtime config (SOA, RRL, NSID, TSIG, TLS paths…)
  *   cert:current   hot-reload TLS + publish TLSA (replaces the old 30s poll)
  *   zone_table:*   rebuild the in-memory multi-zone list
- *   dnssec:*       flagged only — live ZSK/KSK rollover is Step 7
+ *   dnssec:*       reload that zone's keys live (current + rollover/next set)
  *
  * The thread re-runs a full catch-up after every (re)connect, so changes made
  * while it was disconnected are not missed; reconnects use capped backoff so a
@@ -1963,10 +1998,31 @@ static void keyspace_apply(const char *key) {
         zones_post_load(); /* apply per-zone config + load keys for any new zone */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
-        dns_log(LOG_WARNING,
-                "[Reload] %s changed — restart to load new DNSSEC keys "
-                "(live rollover lands in migration Step 7)\n",
-                key);
+        /* dnssec:<zone>:... — reload that zone's key state live (current set +
+         * rollover/next set). Legacy un-prefixed keys (dnssec:zsk) belong to the
+         * primary zone. */
+        char zn[256] = "";
+        const char *p = key + 7;
+        const char *colon = strchr(p, ':');
+        if (colon && (size_t) (colon - p) < sizeof(zn)) {
+            memcpy(zn, p, (size_t) (colon - p));
+            zn[colon - p] = 0;
+        }
+        zone_entry_t *z = NULL;
+        pthread_mutex_lock(&g_zones_mutex);
+        for (int i = 0; i < g_zone_count; i++) {
+            if (strcasecmp(g_zones[i].name, zn) == 0 ||
+                (!colon && strcasecmp(g_zones[i].name, g_zone_name) == 0)) {
+                z = &g_zones[i];
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_zones_mutex);
+        if (z) {
+            zone_dnssec_reload(z);
+            dns_log(LOG_INFO, "[Reload] DNSSEC keys reloaded for zone %s after %s change\n",
+                    z->name, key);
+        }
     }
 }
 
@@ -2364,6 +2420,299 @@ static void zone_dnssec_init(zone_entry_t *z) {
     snprintf(lbl, sizeof(lbl), "%s KSK-Ed25519", z->name);
     dnssec_init_key(k, primary ? "dnssec:ksk_ed25519" : NULL, &z->ksk_ed, &z->ksk_ed_tag,
                     DNS_ALG_ED25519, lbl);
+    zone_rollover_load(z);
+}
+
+/* Load an existing private key from Valkey without generating one.  Used for
+ * the incoming ("next") ZSK set during a rollover, which is absent outside a
+ * rollover.  Returns 1 on success. */
+static int dnssec_load_existing(const char *vk_key, EVP_PKEY **out, uint16_t *tag, int alg) {
+    char pem[MAX_PEM] = {0};
+    if (!(vk_get(vk_key, pem, sizeof(pem)) && strlen(pem) > 10))
+        return 0;
+    BIO *b = BIO_new_mem_buf(pem, -1);
+    EVP_PKEY *k = PEM_read_bio_PrivateKey(b, NULL, NULL, NULL);
+    BIO_free(b);
+    if (!k)
+        return 0;
+    *out = k;
+    uint8_t dkrd[68];
+    int dklen = (alg == DNS_ALG_ED25519) ? dnskey_rdata_ed25519(k, dkrd, sizeof(dkrd))
+                                         : dnskey_rdata_ecdsa(k, dkrd, sizeof(dkrd));
+    if (dklen > 0)
+        *tag = keytag(dkrd, dklen);
+    return 1;
+}
+
+/* Load the ZSK-rollover state for a zone from Valkey:
+ *   dnssec:<zone>:zsk_created   epoch the current ZSK set was created
+ *   dnssec:<zone>:zsk_rollover  "publish|<epoch>" or "commit|<epoch>" (absent = none)
+ *   dnssec:<zone>:zsk_next, :zsk_ed25519_next   incoming key set (rollover only)
+ * Loads the incoming keys into locals, then installs them under a single
+ * g_zsk_mutex hold, so a concurrent query/reload never sees a half-applied
+ * state (no transient missing key in the published DNSKEY RRset). */
+static void zone_rollover_load(zone_entry_t *z) {
+    char k[360], v[64];
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_created", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0]) {
+        z->zsk_created = (time_t) atoll(v);
+    } else {
+        z->zsk_created = time(NULL);
+        char b[32];
+        snprintf(b, sizeof(b), "%lld", (long long) z->zsk_created);
+        vk_set(k, b, 0);
+    }
+    int phase = ROLL_NONE;
+    time_t since = 0;
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0]) {
+        char ph[16] = "";
+        long long si = 0;
+        sscanf(v, "%15[^|]|%lld", ph, &si);
+        if (strcmp(ph, "publish") == 0)
+            phase = ROLL_PUBLISH;
+        else if (strcmp(ph, "commit") == 0)
+            phase = ROLL_COMMIT;
+        since = (time_t) si;
+    }
+    EVP_PKEY *nk1 = NULL, *nk2 = NULL;
+    uint16_t t1 = 0, t2 = 0;
+    if (phase != ROLL_NONE) {
+        char nk[360];
+        snprintf(nk, sizeof(nk), "dnssec:%.255s:zsk_next", z->name);
+        dnssec_load_existing(nk, &nk1, &t1, DNS_ALG_ECDSAP256SHA256);
+        snprintf(nk, sizeof(nk), "dnssec:%.255s:zsk_ed25519_next", z->name);
+        dnssec_load_existing(nk, &nk2, &t2, DNS_ALG_ED25519);
+        if (!nk1 || !nk2) {
+            dns_log(LOG_WARNING, "[Rollover] %s: incoming keys missing — aborting rollover\n",
+                    z->name);
+            if (nk1)
+                EVP_PKEY_free(nk1);
+            if (nk2)
+                EVP_PKEY_free(nk2);
+            nk1 = nk2 = NULL;
+            phase = ROLL_NONE;
+        }
+    }
+    pthread_mutex_lock(&g_zsk_mutex);
+    EVP_PKEY *old1 = z->zsk_next, *old2 = z->zsk_ed_next;
+    z->zsk_next = nk1;
+    z->zsk_ed_next = nk2;
+    z->zsk_next_tag = t1;
+    z->zsk_ed_next_tag = t2;
+    z->roll_phase = phase;
+    z->roll_since = since;
+    pthread_mutex_unlock(&g_zsk_mutex);
+    if (old1)
+        EVP_PKEY_free(old1);
+    if (old2)
+        EVP_PKEY_free(old2);
+}
+
+/* Reload a zone's full DNSSEC key state live (current set + rollover/next set),
+ * e.g. on a dnssec:<zone>:* keyspace notification or after a rollover step. */
+static void zone_dnssec_reload(zone_entry_t *z) {
+    pthread_mutex_lock(&g_zsk_mutex);
+    EVP_PKEY *old[4] = {z->zsk, z->zsk_ed, z->ksk, z->ksk_ed};
+    z->zsk = z->zsk_ed = z->ksk = z->ksk_ed = NULL;
+    pthread_mutex_unlock(&g_zsk_mutex);
+    for (int i = 0; i < 4; i++)
+        if (old[i])
+            EVP_PKEY_free(old[i]);
+    zone_dnssec_init(z); /* reloads current keys (present in Valkey) + rollover state */
+}
+
+/* ==========================================================================
+ * ZSK rollover engine (RFC 6781 §4.1.1.1 Pre-Publish)
+ *
+ * publish:  DNSKEY = {current, next}, RRSIGs by current.  Held long enough for
+ *           the old DNSKEY RRset to expire from caches (rollover_publish_hold,
+ *           ~ DNSKEY TTL) so every validator sees `next` before it is used.
+ * commit:   DNSKEY = {current, next}, RRSIGs by next.  Held long enough for
+ *           RRSIGs made by `current` to expire from caches (rollover_commit_hold
+ *           ~ max record TTL) so no validator still needs `current`.
+ * finish:   promote next -> current, drop the old key, rollover over.
+ * At no point is an in-use key absent from the published DNSKEY RRset.
+ * ======================================================================= */
+static uint32_t serial_bump(zone_entry_t *z);
+
+/* Generate a fresh private key (alg 13 or 15) as PEM.  Returns 0 on success. */
+static int dnssec_generate_pem(int alg, char *pem_out, int sz) {
+    EVP_PKEY_CTX *kctx;
+    if (alg == DNS_ALG_ED25519) {
+        kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+        if (!kctx || EVP_PKEY_keygen_init(kctx) <= 0) {
+            if (kctx)
+                EVP_PKEY_CTX_free(kctx);
+            return -1;
+        }
+    } else {
+        kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+        if (!kctx || EVP_PKEY_keygen_init(kctx) <= 0 ||
+            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1) <= 0) {
+            if (kctx)
+                EVP_PKEY_CTX_free(kctx);
+            return -1;
+        }
+    }
+    EVP_PKEY *k = NULL;
+    if (EVP_PKEY_keygen(kctx, &k) <= 0 || !k) {
+        EVP_PKEY_CTX_free(kctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(kctx);
+    BIO *b = BIO_new(BIO_s_mem());
+    if (!b || PEM_write_bio_PrivateKey(b, k, NULL, NULL, 0, NULL, NULL) != 1) {
+        if (b)
+            BIO_free(b);
+        EVP_PKEY_free(k);
+        return -1;
+    }
+    char *pp;
+    long pl = BIO_get_mem_data(b, &pp);
+    int n = (int) (pl < sz - 1 ? pl : sz - 1);
+    memcpy(pem_out, pp, n);
+    pem_out[n] = 0;
+    BIO_free(b);
+    EVP_PKEY_free(k);
+    return 0;
+}
+
+/* Read a rollover timing knob: per-zone config:zone:<z>:<suffix> overrides the
+ * global config:<suffix>, else the default. */
+static long roll_cfg(const char *zone, const char *suffix, long def) {
+    char k[360], v[64];
+    snprintf(k, sizeof(k), "config:zone:%s:%s", zone, suffix);
+    if (vk_get(k, v, sizeof(v)) && v[0])
+        return atol(v);
+    snprintf(k, sizeof(k), "config:%s", suffix);
+    if (vk_get(k, v, sizeof(v)) && v[0])
+        return atol(v);
+    return def;
+}
+
+/* Begin a rollover: generate + store the incoming ZSK set, enter `publish`. */
+static void rollover_start(zone_entry_t *z) {
+    char pem[MAX_PEM], k[360];
+    if (dnssec_generate_pem(DNS_ALG_ECDSAP256SHA256, pem, sizeof(pem)) != 0) {
+        dns_log(LOG_ERR, "[Rollover] %s: P-256 keygen failed\n", z->name);
+        return;
+    }
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_next", z->name);
+    vk_set(k, pem, 0);
+    if (dnssec_generate_pem(DNS_ALG_ED25519, pem, sizeof(pem)) != 0) {
+        dns_log(LOG_ERR, "[Rollover] %s: Ed25519 keygen failed\n", z->name);
+        return;
+    }
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_ed25519_next", z->name);
+    vk_set(k, pem, 0);
+    char st[64];
+    snprintf(st, sizeof(st), "publish|%lld", (long long) time(NULL));
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
+    vk_set(k, st, 0);
+    zone_rollover_load(z); /* bring the next keys + phase into memory */
+    serial_bump(z);        /* DNSKEY RRset changed */
+    notify_send();
+    dns_log(LOG_NOTICE, "[Rollover] %s: started — publish (new ZSK tags %u/%u)\n", z->name,
+            z->zsk_next_tag, z->zsk_ed_next_tag);
+}
+
+/* publish -> commit: keep both keys published, switch the signer to `next`. */
+static void rollover_to_commit(zone_entry_t *z) {
+    char k[360], st[64];
+    snprintf(st, sizeof(st), "commit|%lld", (long long) time(NULL));
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
+    vk_set(k, st, 0);
+    zone_rollover_load(z);
+    serial_bump(z);
+    notify_send();
+    dns_log(LOG_NOTICE, "[Rollover] %s: commit — now signing with ZSK tags %u/%u\n", z->name,
+            z->zsk_next_tag, z->zsk_ed_next_tag);
+}
+
+/* commit -> done: promote `next` to current, drop the retired key. */
+static void rollover_finish(zone_entry_t *z) {
+    char k[360], pem[MAX_PEM];
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_next", z->name);
+    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
+        char ck[360];
+        snprintf(ck, sizeof(ck), "dnssec:%.255s:zsk", z->name);
+        vk_set(ck, pem, 0);
+    }
+    vk_del(k);
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_ed25519_next", z->name);
+    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
+        char ck[360];
+        snprintf(ck, sizeof(ck), "dnssec:%.255s:zsk_ed25519", z->name);
+        vk_set(ck, pem, 0);
+    }
+    vk_del(k);
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
+    vk_del(k);
+    char now_s[32];
+    snprintf(now_s, sizeof(now_s), "%lld", (long long) time(NULL));
+    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_created", z->name);
+    vk_set(k, now_s, 0);
+    zone_dnssec_reload(z); /* current = promoted key; next/phase cleared */
+    serial_bump(z);
+    notify_send();
+    dns_log(LOG_NOTICE, "[Rollover] %s: complete — active ZSK tags %u/%u\n", z->name, z->zsk_tag,
+            z->zsk_ed_tag);
+}
+
+/* Drive each zone's rollover state machine one step (time- and request-based). */
+static void rollover_tick(void) {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_zones_mutex);
+    int n = g_zone_count;
+    pthread_mutex_unlock(&g_zones_mutex);
+    for (int i = 0; i < n; i++) {
+        zone_entry_t *z = &g_zones[i];
+        pthread_mutex_lock(&g_zsk_mutex);
+        int phase = z->roll_phase;
+        time_t since = z->roll_since, created = z->zsk_created;
+        pthread_mutex_unlock(&g_zsk_mutex);
+        if (phase == ROLL_NONE) {
+            /* Manual request: control plane sets a new value at
+             * config:zone:<z>:zsk_rollover_request; dnsd records the last value
+             * it handled in its own namespace (dnssec:*), so it is edge-triggered
+             * without dnsd writing config:*. */
+            long req = roll_cfg(z->name, "zsk_rollover_request", 0);
+            char sk[360], sv[64] = "";
+            snprintf(sk, sizeof(sk), "dnssec:%.255s:zsk_rollover_seen", z->name);
+            vk_get(sk, sv, sizeof(sv));
+            long seen = sv[0] ? atol(sv) : 0;
+            int manual = (req > 0 && req != seen);
+            long validity = roll_cfg(z->name, "zsk_validity", 0); /* 0 = no auto-roll */
+            int age_due = (validity > 0 && (now - created) >= validity);
+            if (manual || age_due) {
+                rollover_start(z);
+                if (manual) {
+                    char b[32];
+                    snprintf(b, sizeof(b), "%ld", req);
+                    vk_set(sk, b, 0);
+                }
+            }
+        } else if (phase == ROLL_PUBLISH) {
+            if ((now - since) >= roll_cfg(z->name, "rollover_publish_hold", 3600))
+                rollover_to_commit(z);
+        } else if (phase == ROLL_COMMIT) {
+            if ((now - since) >= roll_cfg(z->name, "rollover_commit_hold", 3600))
+                rollover_finish(z);
+        }
+    }
+}
+
+static void *rollover_thread(void *arg) {
+    (void) arg;
+    for (;;) {
+        long tick = roll_cfg("", "rollover_tick_secs", 30);
+        if (tick < 1)
+            tick = 1;
+        sleep((unsigned) tick);
+        rollover_tick();
+    }
+    return NULL;
 }
 /* Per-zone NSEC3 / denial config (config:zone:<z>:*), defaulting to the legacy
  * global config:* values which seed the primary zone. */
@@ -3658,12 +4007,15 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
     off = noff;
     if (!dnssec_ok || !t_zone || !t_zone->zsk)
         return off;
+    /* During a rollover's commit phase the incoming ("next") ZSK set is the
+     * active signer (RFC 6781 Pre-Publish); otherwise the current set signs. */
+    int use_next = (t_zone->roll_phase == ROLL_COMMIT && t_zone->zsk_next);
     /* Add RRSIG for ECDSA P-256 (Alg 13) */
     STAT_INC(g_stat_signed);
     {
         pthread_mutex_lock(&g_zsk_mutex);
-        EVP_PKEY *zsk = t_zone->zsk;
-        uint16_t tag = t_zone->zsk_tag;
+        EVP_PKEY *zsk = use_next ? t_zone->zsk_next : t_zone->zsk;
+        uint16_t tag = use_next ? t_zone->zsk_next_tag : t_zone->zsk_tag;
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
@@ -3682,8 +4034,8 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
     /* Add RRSIG for Ed25519 (Alg 15) */
     {
         pthread_mutex_lock(&g_zsk_mutex);
-        EVP_PKEY *zsk = t_zone->zsk_ed;
-        uint16_t tag = t_zone->zsk_ed_tag;
+        EVP_PKEY *zsk = use_next ? t_zone->zsk_ed_next : t_zone->zsk_ed;
+        uint16_t tag = use_next ? t_zone->zsk_ed_next_tag : t_zone->zsk_ed_tag;
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
@@ -3847,6 +4199,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     EVP_PKEY *g_ksk_ed = t_zone ? t_zone->ksk_ed : NULL;
     uint16_t g_ksk_tag = t_zone ? t_zone->ksk_tag : 0;
     uint16_t g_ksk_ed_tag = t_zone ? t_zone->ksk_ed_tag : 0;
+    /* Incoming ZSK set published during a rollover (NULL otherwise). */
+    int roll_active = (t_zone && t_zone->roll_phase != ROLL_NONE);
+    EVP_PKEY *g_zsk_next = roll_active ? t_zone->zsk_next : NULL;
+    EVP_PKEY *g_zsk_ed_next = roll_active ? t_zone->zsk_ed_next : NULL;
     /* DNSKEY — serve ZSK (flag 256) + KSK (flag 257), KSK signs DNSKEY RRset */
     if ((qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
         uint8_t dkrd[68];
@@ -3863,6 +4219,26 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         /* ZSK Ed25519 */
         if (g_zsk_ed && dnskey_rdata_ed25519(g_zsk_ed, dkrd, sizeof(dkrd)) > 0) {
             found = 1;
+            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
+                               dkrd, 36);
+            if (n2 > 0) {
+                off = n2;
+                answers++;
+            }
+        }
+        /* Rollover (RFC 6781 Pre-Publish): publish the incoming ZSK set
+         * alongside the current one for the whole rollover, so a validator that
+         * cached the old DNSKEY still sees it and a validator fetching the new
+         * one already has the key the RRSIG keytag points at. */
+        if (g_zsk_next && dnskey_rdata_ecdsa(g_zsk_next, dkrd, sizeof(dkrd)) > 0) {
+            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
+                               dkrd, 68);
+            if (n2 > 0) {
+                off = n2;
+                answers++;
+            }
+        }
+        if (g_zsk_ed_next && dnskey_rdata_ed25519(g_zsk_ed_next, dkrd, sizeof(dkrd)) > 0) {
             int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
                                dkrd, 36);
             if (n2 > 0) {
@@ -5790,6 +6166,15 @@ int main(int argc, char **argv) {
             dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
     }
 
+    /* Per-zone ZSK rollover engine (RFC 6781 Pre-Publish). */
+    {
+        pthread_t rtid;
+        if (pthread_create(&rtid, NULL, rollover_thread, NULL) == 0)
+            pthread_detach(rtid);
+        else
+            dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
+    }
+
     /* (mDNS moved to the mdnsd daemon — migration Step 3.) */
 
     /* Phase 6: Open unicast DNS sockets — dual-stack IPv4 + IPv6 */
@@ -6152,6 +6537,10 @@ int main(int argc, char **argv) {
             EVP_PKEY_free(z->ksk);
         if (z->ksk_ed)
             EVP_PKEY_free(z->ksk_ed);
+        if (z->zsk_next)
+            EVP_PKEY_free(z->zsk_next);
+        if (z->zsk_ed_next)
+            EVP_PKEY_free(z->zsk_ed_next);
     }
     if (g_syslog_enabled)
         closelog();

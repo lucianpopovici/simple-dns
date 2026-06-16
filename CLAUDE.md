@@ -324,7 +324,8 @@ dedicated Valkey connection, enables keyspace notifications
 (`notify-keyspace-events KEA`) and PSUBSCRIBEs to the prefixes it owns, so
 dashboard edits and `cert:current` updates take effect without a restart —
 no more SIGHUP / `POST /config`. `dnsd` watches `config:*`, `cert:current`,
-`zone_table:*` (and flags `dnssec:*` for the Step-7 rollover); `apid` watches
+`zone_table:*`, and `dnssec:*` (reloads that zone's key state live — current set
+plus any rollover/next set); `apid` watches
 `cert:current` + the TLS config keys; `mdnsd` watches `mdns:*` + `config:mdns_*`
 and re-announces. zone/ddns records are already read live per query.
 Subscribers re-run a full catch-up after every reconnect and use capped
@@ -347,7 +348,7 @@ storm.
 
 ---
 
-## Multi-zone (migration Step 7 — done; rollover pending)
+## Multi-zone (migration Step 7 — done, incl. automated ZSK rollover)
 
 `dnsd` serves multiple authoritative zones (it is no longer single-zone):
 - Records are keyed `zone:<zonename>:<type>:<name>` and per-zone config as
@@ -363,9 +364,19 @@ storm.
 - `apid` and the dashboard resolve the owning zone by longest-suffix match
   before writing `zone:<zone>:*` / `ddns:<zone>:*`.
 
-Still pending (separate follow-up commit): automated per-zone DNSSEC key
-rollover (RFC 6781) — live `dnssec:*` reload remains restart-flagged until then.
-Catalog zones (RFC 9432) for bulk provisioning are optional and not yet done.
+- Automated per-zone DNSSEC **ZSK rollover** (RFC 6781 §4.1.1.1 Pre-Publish): a
+  background engine publishes the incoming ZSK alongside the current one, switches
+  the signer to it only after the publish hold, and retires the old key only after
+  the commit hold — so a validator always holds the key its RRSIG points at. State
+  lives in `dnssec:<zone>:zsk_{created,rollover,next,ed25519_next,rollover_seen}`;
+  timing/trigger knobs in `config:[zone:<zone>:]{zsk_validity,rollover_publish_hold,
+  rollover_commit_hold,zsk_rollover_request,rollover_tick_secs}`. `dnssec:*` now
+  reloads live (no longer restart-flagged). Covered by `make check-dnssec`
+  (`tests/test_rollover.c`: per-phase no-validation-gap KAT + negative).
+
+Still pending: **KSK rollover** with CDS/CDNSKEY parent signalling (the ZSK roll
+above needs no DS coordination). Catalog zones (RFC 9432) for bulk provisioning
+are optional and not yet done.
 
 ---
 
@@ -394,7 +405,8 @@ Each step is independently shippable and must pass `make debug`, `make`, and
 7. **Add multi-zone support** in the now-minimal `dnsd`. *(Done: re-keyed
    `zone:<zone>:*` storage, longest-suffix zone selection, per-zone SOA / NSEC3
    / DNSSEC keys / AXFR / NOTIFY / UPDATE, `tools/migrate-multizone.sh`, apid +
-   dashboard zone resolution. Automated DNSSEC rollover is a follow-up.)*
+   dashboard zone resolution, plus automated per-zone ZSK rollover
+   (RFC 6781 Pre-Publish). KSK/CDS rollover is the remaining follow-up.)*
 
 After step 4, `dnsd` should be a substantially smaller, single-purpose,
 sandboxable daemon — the trusted core this architecture is designed to produce.

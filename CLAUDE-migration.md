@@ -324,9 +324,17 @@ Tasks
 - [x] Per-zone SOA, DNSSEC keys, AXFR/NOTIFY settings (per-zone ZSK/KSK loaded
       from `dnssec:<zone>:*` with legacy adoption for the primary zone; AXFR/
       IXFR/NOTIFY/UPDATE select the zone named by the request)
-- [ ] Per-zone automated DNSSEC key rollover (RFC 6781) with existing
-      CDS/CDNSKEY publication — **deferred to a follow-up commit** (live
-      `dnssec:*` reload stays restart-flagged until then)
+- [x] Per-zone automated **ZSK** rollover (RFC 6781 §4.1.1.1 Pre-Publish) —
+      background engine (`rollover_thread`/`rollover_tick`) walks each zone
+      publish→commit→done; incoming set in `dnssec:<zone>:zsk_next`/`:zsk_ed25519_next`,
+      phase in `:zsk_rollover`, age in `:zsk_created`; manual trigger
+      `config:zone:<z>:zsk_rollover_request` (edge-detected via `:zsk_rollover_seen`),
+      auto via `zsk_validity`; hold times `rollover_{publish,commit}_hold`. DNSKEY
+      RRset publishes current+next throughout; signer switches to next only in
+      commit (`emit_rr` `use_next`). `dnssec:*` now reloads live
+      (`zone_dnssec_reload`) — no longer restart-flagged.
+- [ ] **KSK** rollover with CDS/CDNSKEY parent signalling (RFC 7344/8078) —
+      remaining follow-up (ZSK roll above needs no DS coordination)
 - [ ] (Optional) catalog zones (RFC 9432) for bulk provisioning — not done
 - [x] Migration script for existing single-zone data into the new key layout
       (`tools/migrate-multizone.sh`, dry-run by default, idempotent)
@@ -340,7 +348,14 @@ Acceptance
       vs `ns1.example.local serial 6`)
 - [x] Each zone signs with its own keys; cross-zone queries are isolated
       (distinct DNSKEY RRsets per zone; SOA mname/serial isolated)
-- [ ] A scheduled ZSK rollover completes without a validation gap — **follow-up**
+- [x] A scheduled ZSK rollover completes without a validation gap — proven by
+      `tests/test_rollover.c` (run under `make check-dnssec`): for alg 13 + 15 it
+      transcribes dnsd's per-phase (published DNSKEY set, signer) policy and the
+      real resolver verifier (`dnssec_verify_rrset`) accepts every phase
+      (publish/commit/done), while the forbidden orderings (commit-before-publish,
+      retire-too-early) leave the signing key absent from the set and fail. (The
+      crypto no-gap invariant is covered; wall-clock phase-transition *timing* is
+      config-driven via the hold knobs and not exercised by an automated live test.)
 - [x] Existing single-zone deployments migrate via the script with no data loss
       (RENAME preserves TTLs; dnsd adopts legacy DNSSEC keys → DS unchanged)
 - [x] Global exit gate passes (all 4 daemons build with `EXTRA_WARN=-Werror`;
