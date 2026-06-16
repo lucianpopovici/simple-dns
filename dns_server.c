@@ -66,6 +66,9 @@
  *                              user's primary group). Only acts when run as root.
  *   config:seccomp_mode        Syscall sandbox: "audit" (default, log-only),
  *                              "enforce" (EPERM), or "off". Needs -DHAVE_SECCOMP.
+ *   config:chroot_dir          If set (env DNS_CHROOT overrides), chroot here
+ *                              after binding sockets, before the privilege drop.
+ *                              Only acts when run as root.
  *
  * Multi-zone key schema (migration Step 7) — records carry the owning zone:
  *   zone_table:<zone>          Zone SOA + transfer settings
@@ -6123,6 +6126,54 @@ static void sighup_handler(int sig) {
 }
 
 /* ==========================================================================
+ * Filesystem isolation (sandbox layer 3 — CLAUDE.md design principle #4)
+ *
+ * chroot() the daemon into a (typically empty) directory once the privileged
+ * sockets are bound and the Valkey connection + config/zones/keys are loaded,
+ * but while still root (chroot needs CAP_SYS_CHROOT) — so the request paths
+ * cannot reach the host filesystem. Followed immediately by chdir("/") so a
+ * relative path cannot escape the new root.
+ *
+ * What still works post-chroot in the default deployment: shared libraries are
+ * already mapped; OpenSSL randomness uses the getrandom(2) syscall (no
+ * /dev/urandom file); cert/zone/config data arrive over the already-open Valkey
+ * socket; and Valkey reconnects to a numeric host (the 127.0.0.1 default) take
+ * the inet_pton path in valkey_connect_to — no resolver files needed. The query
+ * log degrades to stderr if its path no longer resolves.
+ *
+ * Caveats (the operator must provision these inside the chroot if used):
+ *   - Valkey by *hostname* needs a resolver (/etc/resolv.conf, /etc/hosts,
+ *     /etc/nsswitch.conf and libnss_*.so) for reconnects — prefer an IP for
+ *     DNS_VALKEY_HOST under chroot.
+ *   - Remote syslog over TLS with peer verification needs the CA bundle.
+ *
+ * Enabled by config:chroot_dir (env DNS_CHROOT overrides). No-op when unset or
+ * not running as root. Fail-closed if set, root, and chroot fails.
+ * ======================================================================= */
+static void enter_chroot(void) {
+    char dir[512] = "";
+    vk_get("config:chroot_dir", dir, sizeof(dir));
+    const char *env_dir = getenv("DNS_CHROOT");
+    if (env_dir && env_dir[0])
+        safe_strcpy(dir, env_dir, sizeof(dir));
+    if (!dir[0])
+        return; /* not configured — no chroot */
+    if (geteuid() != 0) {
+        dns_log(LOG_WARNING, "[Chroot] config:chroot_dir set but not running as root — skipping\n");
+        return;
+    }
+    if (chroot(dir) != 0) {
+        dns_log(LOG_ERR, "[Chroot] FATAL: chroot('%s') failed: %s\n", dir, strerror(errno));
+        exit(1);
+    }
+    if (chdir("/") != 0) {
+        dns_log(LOG_ERR, "[Chroot] FATAL: chdir('/') after chroot failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    dns_log(LOG_NOTICE, "[Chroot] Confined to '%s' (now /)\n", dir);
+}
+
+/* ==========================================================================
  * Privilege drop (least privilege — CLAUDE.md design principle #4)
  *
  * Privileged resources (ports 53/853 need CAP_NET_BIND_SERVICE) are bound while
@@ -6136,40 +6187,54 @@ static void sighup_handler(int sig) {
  * DNS_USER / DNS_GROUP, defaulting to "nobody". When the group is unset the
  * account's primary group is used.
  *
+ * This is split in two so the order with enter_chroot() is correct:
+ *   priv_resolve()    looks up the account in /etc/passwd — must run BEFORE
+ *                     chroot, while the host's passwd/group databases are still
+ *                     reachable (an empty chroot has no /etc/passwd).
+ *   drop_privileges() applies the resolved numeric ids — runs AFTER chroot.
+ *
  * No-op when not started as root (development run on the high default ports).
  * Fail-closed: if started as root and the drop cannot be completed, exit rather
  * than keep serving untrusted input with full privilege.
  * ======================================================================= */
-static void drop_privileges(void) {
+typedef struct {
+    int do_drop; /* 1 = root, resolved, apply after chroot; 0 = not root, skip */
+    uid_t uid;
+    gid_t gid;
+    char user[64];
+} privdrop_plan_t;
+
+/* Resolve the privilege-drop target while the passwd/group databases are still
+ * reachable (call before enter_chroot). Fail-closed on a bad configuration. */
+static void priv_resolve(privdrop_plan_t *p) {
+    memset(p, 0, sizeof(*p));
     if (geteuid() != 0) {
         dns_log(LOG_INFO, "[Priv] Not running as root — privilege drop skipped\n");
         return;
     }
-
-    char user[64] = "";
     char group[64] = "";
-    vk_get("config:privdrop_user", user, sizeof(user));
+    vk_get("config:privdrop_user", p->user, sizeof(p->user));
     vk_get("config:privdrop_group", group, sizeof(group));
     const char *env_user = getenv("DNS_USER");
     const char *env_group = getenv("DNS_GROUP");
     if (env_user && env_user[0])
-        safe_strcpy(user, env_user, sizeof(user));
+        safe_strcpy(p->user, env_user, sizeof(p->user));
     if (env_group && env_group[0])
         safe_strcpy(group, env_group, sizeof(group));
-    if (!user[0])
-        safe_strcpy(user, "nobody", sizeof(user));
+    if (!p->user[0])
+        safe_strcpy(p->user, "nobody", sizeof(p->user));
 
     errno = 0;
-    struct passwd *pw = getpwnam(user);
+    struct passwd *pw = getpwnam(p->user);
     if (!pw) {
         dns_log(LOG_ERR,
                 "[Priv] FATAL: privdrop user '%s' not found%s — set config:privdrop_user "
                 "to a valid account\n",
-                user, errno ? " (getpwnam failed)" : "");
+                p->user, errno ? " (getpwnam failed)" : "");
         exit(1);
     }
-    uid_t target_uid = pw->pw_uid;
-    gid_t target_gid = pw->pw_gid;
+    p->uid = pw->pw_uid;
+    p->gid = pw->pw_gid;
     if (group[0]) {
         errno = 0;
         struct group *gr = getgrnam(group);
@@ -6178,12 +6243,19 @@ static void drop_privileges(void) {
                     errno ? " (getgrnam failed)" : "");
             exit(1);
         }
-        target_gid = gr->gr_gid;
+        p->gid = gr->gr_gid;
     }
-    if (target_uid == 0) {
-        dns_log(LOG_ERR, "[Priv] FATAL: privdrop user '%s' is root (uid 0) — refusing\n", user);
+    if (p->uid == 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: privdrop user '%s' is root (uid 0) — refusing\n", p->user);
         exit(1);
     }
+    p->do_drop = 1;
+}
+
+/* Apply the resolved drop (call after enter_chroot). */
+static void drop_privileges(const privdrop_plan_t *p) {
+    if (!p->do_drop)
+        return; /* not root — priv_resolve already logged the skip */
 
     /* Order matters: shed supplementary groups, then gid, then uid. Doing uid
      * first would forfeit the privilege needed for the group calls. */
@@ -6191,13 +6263,13 @@ static void drop_privileges(void) {
         dns_log(LOG_ERR, "[Priv] FATAL: setgroups failed: %s\n", strerror(errno));
         exit(1);
     }
-    if (setgid(target_gid) != 0) {
-        dns_log(LOG_ERR, "[Priv] FATAL: setgid(%u) failed: %s\n", (unsigned) target_gid,
+    if (setgid(p->gid) != 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: setgid(%u) failed: %s\n", (unsigned) p->gid,
                 strerror(errno));
         exit(1);
     }
-    if (setuid(target_uid) != 0) {
-        dns_log(LOG_ERR, "[Priv] FATAL: setuid(%u) failed: %s\n", (unsigned) target_uid,
+    if (setuid(p->uid) != 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: setuid(%u) failed: %s\n", (unsigned) p->uid,
                 strerror(errno));
         exit(1);
     }
@@ -6211,8 +6283,8 @@ static void drop_privileges(void) {
     if (prctl(PR_SET_DUMPABLE, 0) != 0)
         dns_log(LOG_WARNING, "[Priv] PR_SET_DUMPABLE failed: %s\n", strerror(errno));
 
-    dns_log(LOG_NOTICE, "[Priv] Dropped privileges to user '%s' (uid=%u gid=%u)\n", user,
-            (unsigned) target_uid, (unsigned) target_gid);
+    dns_log(LOG_NOTICE, "[Priv] Dropped privileges to user '%s' (uid=%u gid=%u)\n", p->user,
+            (unsigned) p->uid, (unsigned) p->gid);
 }
 
 /* ==========================================================================
@@ -6594,9 +6666,13 @@ int main(int argc, char **argv) {
     dns_log(LOG_INFO, "ACME/EST by certd; mDNS by mdnsd.\n");
     dns_log(LOG_INFO, "\n");
 
-    /* All privileged resources are now bound. Irreversibly drop root before
-     * serving any untrusted input (least privilege — CLAUDE.md principle #4). */
-    drop_privileges();
+    /* All privileged resources are now bound. Resolve the unprivileged account
+     * (needs the host passwd db), confine the filesystem view, then irreversibly
+     * drop root — all before serving untrusted input (CLAUDE.md principle #4). */
+    privdrop_plan_t priv_plan;
+    priv_resolve(&priv_plan);
+    enter_chroot();
+    drop_privileges(&priv_plan);
 
     /* Confine the process to the syscalls it needs (sandbox layer 2). Default
      * mode is audit (log-only) so the whitelist can be refined before enforce. */
