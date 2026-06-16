@@ -143,6 +143,7 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:rollover_publish_hold` / `config:rollover_commit_hold` | Hold times (seconds) for the publish and commit phases (defaults 3600 each; per-zone overridable via `config:zone:<zone>:*`). Size publish ≥ DNSKEY TTL and commit ≥ max record TTL. |
 | `config:metrics_port` | `dnsd` localhost metrics/health port (default 8054). |
 | `config:privdrop_user` / `config:privdrop_group` | Unprivileged account `dnsd` drops to after binding sockets (env `DNS_USER` / `DNS_GROUP` override; default user `nobody`). Only acts when started as root; fail-closed if the drop cannot complete. |
+| `config:seccomp_mode` | `dnsd` syscall sandbox: `audit` (default — non-whitelisted syscalls are logged, not blocked), `enforce` (they return `EPERM`), or `off`. Requires a build with libseccomp (`-DHAVE_SECCOMP`). |
 | `config:mdns_enabled` / `config:mdns_interfaces` | Enable `mdnsd` and its interface allowlist (`"all"` or a comma-separated list; it refuses to start unset). |
 | `config:acme_*`, `config:est_*` | ACME/EST endpoints + identity for `certd`. |
 | `config:dashboard_password_hash` | Dashboard admin password hash (see [Dashboard](#dashboard)). |

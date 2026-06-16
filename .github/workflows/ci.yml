@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev clang dnsutils
+          sudo apt-get install -y build-essential libssl-dev libseccomp-dev clang dnsutils
 
       - name: Build debug (ASan + UBSan) — compile/link check
         run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
@@ -81,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libseccomp-dev
       - name: Build with the curated warning set promoted to errors
         # EXTRA_WARN=-Werror keeps the project's curated WARN flags (incl. the
         # intentional -Wno-* for the legacy dense code) and turns them fatal —
@@ -110,7 +110,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-tools clang-tidy cppcheck libssl-dev
+          sudo apt-get install -y clang-tools clang-tidy cppcheck libssl-dev libseccomp-dev
       - name: clang static analyzer (scan-build)
         run: scan-build --status-bugs make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
       - name: cppcheck

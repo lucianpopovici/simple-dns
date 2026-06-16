@@ -80,6 +80,13 @@ WARN       := -Wall -Wextra -Wformat=2 -Wformat-overflow=2 \
 INCLUDES   := -I$(OSSL_INC)
 LIBS       := -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)
 
+# libseccomp (optional, dnsd only): the trusted core installs a syscall filter
+# when the dev package is present (-DHAVE_SECCOMP). Without it dnsd still builds,
+# just without the sandbox. Detected via pkg-config; only $(BIN)/$(BIN_DEBUG)
+# link it. CI installs libseccomp-dev so the filter is built+tested there too.
+SECCOMP_CFLAGS := $(shell pkg-config --exists libseccomp 2>/dev/null && echo -DHAVE_SECCOMP $$(pkg-config --cflags libseccomp))
+SECCOMP_LIBS   := $(shell pkg-config --exists libseccomp 2>/dev/null && pkg-config --libs libseccomp)
+
 # ── Production flags ─────────────────────────────────────────────────────────
 #   -O2          : safe optimisation level for a server daemon
 #   -fstack-protector-strong : stack-smashing protection
@@ -137,8 +144,8 @@ prod: $(BIN) sign
 
 $(BIN): $(SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
-	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo "  STRIP      $@"
 	strip --strip-unneeded \
 	      --remove-section=.comment \
@@ -156,8 +163,8 @@ debug: $(BIN_DEBUG)
 
 $(BIN_DEBUG): $(SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
-	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 
 # =============================================================================
 # certd — certificate manager sidecar (ACME + EST; migration Step 2)

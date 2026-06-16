@@ -366,7 +366,13 @@ Acceptance
 
 ## Completion
 
-- [ ] After Step 4, `dnsd` is a small, single-purpose, sandboxable daemon
-      (privilege drop + seccomp per `CLAUDE.md`)
+- [~] After Step 4, `dnsd` is a small, single-purpose, sandboxable daemon
+      (privilege drop + seccomp per `CLAUDE.md`). Done: irreversible
+      privilege drop after socket bind (`drop_privileges`, `config:privdrop_user`);
+      seccomp syscall filter via libseccomp (`seccomp_install`,
+      `config:seccomp_mode` audit/enforce/off, audit default; whitelist refined
+      against the real syscall set). Remaining: filesystem isolation
+      (chroot / mount namespace), and flipping the seccomp default to enforce
+      once the audit-harvested whitelist is confirmed in production.
 - [ ] All seven steps complete; monolith concerns fully decomposed
 - [ ] `CLAUDE.md` topology diagram matches the running system

@@ -64,6 +64,8 @@
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
  *                              user's primary group). Only acts when run as root.
+ *   config:seccomp_mode        Syscall sandbox: "audit" (default, log-only),
+ *                              "enforce" (EPERM), or "off". Needs -DHAVE_SECCOMP.
  *
  * Multi-zone key schema (migration Step 7) — records carry the owning zone:
  *   zone_table:<zone>          Zone SOA + transfer settings
@@ -125,6 +127,9 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/prctl.h>
+#ifdef HAVE_SECCOMP
+#include <seccomp.h>
+#endif
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -6210,6 +6215,119 @@ static void drop_privileges(void) {
             (unsigned) target_uid, (unsigned) target_gid);
 }
 
+/* ==========================================================================
+ * seccomp syscall filter (sandbox layer 2 — CLAUDE.md design principle #4)
+ *
+ * After privileges are dropped, confine the process to the syscalls it
+ * actually needs. The filter is whitelist-based and applied to *all* threads
+ * (libseccomp loads with TSYNC), so the already-running keyspace/rollover
+ * threads and every future per-connection worker are covered.
+ *
+ * Mode (config:seccomp_mode):
+ *   audit   (default) — default action SCMP_ACT_LOG: a non-whitelisted syscall
+ *                       is LOGGED (audit log / dmesg) but still permitted, so we
+ *                       can observe the real syscall set without risking a crash.
+ *   enforce           — default action EPERM: non-whitelisted syscalls fail.
+ *   off               — no filter.
+ *
+ * Audit-first is deliberate: the whitelist below is a starting baseline; run in
+ * audit mode, harvest what the kernel logs, then widen the list before any
+ * deployment flips to enforce.
+ *
+ * Built only when libseccomp is available at compile time (-DHAVE_SECCOMP);
+ * otherwise this is a no-op stub and dnsd runs unconfined.
+ * ======================================================================= */
+#ifdef HAVE_SECCOMP
+static void seccomp_install(void) {
+    char mode[16] = "";
+    vk_get("config:seccomp_mode", mode, sizeof(mode));
+    if (!mode[0])
+        safe_strcpy(mode, "audit", sizeof(mode));
+    if (strcmp(mode, "off") == 0) {
+        dns_log(LOG_NOTICE, "[Seccomp] disabled (config:seccomp_mode=off)\n");
+        return;
+    }
+    int enforce = (strcmp(mode, "enforce") == 0);
+    uint32_t def_act = enforce ? SCMP_ACT_ERRNO(EPERM) : SCMP_ACT_LOG;
+
+    scmp_filter_ctx ctx = seccomp_init(def_act);
+    if (!ctx) {
+        dns_log(LOG_ERR, "[Seccomp] seccomp_init failed — running unconfined\n");
+        if (enforce)
+            exit(1); /* fail closed in enforce mode */
+        return;
+    }
+
+    /* Baseline whitelist. Grouped by purpose; in audit mode anything missing is
+     * logged rather than blocked, so this is a starting point, not the final
+     * set. SCMP_SYS() resolves names to this architecture's syscall numbers. */
+    const int allow[] = {
+        /* socket I/O — UDP/TCP serving + Valkey client (incl. reconnect) */
+        SCMP_SYS(read), SCMP_SYS(write), SCMP_SYS(readv), SCMP_SYS(writev),
+        SCMP_SYS(pread64), SCMP_SYS(pwrite64),
+        SCMP_SYS(recvfrom), SCMP_SYS(sendto), SCMP_SYS(recvmsg), SCMP_SYS(sendmsg),
+        SCMP_SYS(accept), SCMP_SYS(accept4), SCMP_SYS(socket), SCMP_SYS(connect),
+        SCMP_SYS(bind), SCMP_SYS(listen), SCMP_SYS(shutdown),
+        SCMP_SYS(setsockopt), SCMP_SYS(getsockopt),
+        SCMP_SYS(getsockname), SCMP_SYS(getpeername),
+        SCMP_SYS(select), SCMP_SYS(pselect6), SCMP_SYS(poll), SCMP_SYS(ppoll),
+        SCMP_SYS(fcntl), SCMP_SYS(ioctl), SCMP_SYS(close),
+        /* filesystem — qlog reopen, /dev/urandom, CA certs, /etc/resolv.conf */
+        SCMP_SYS(openat), SCMP_SYS(open), SCMP_SYS(lseek),
+        SCMP_SYS(fstat), SCMP_SYS(stat), SCMP_SYS(lstat), SCMP_SYS(newfstatat),
+        SCMP_SYS(statx), SCMP_SYS(readlink), SCMP_SYS(readlinkat),
+        SCMP_SYS(getdents64), SCMP_SYS(access), SCMP_SYS(faccessat),
+        SCMP_SYS(faccessat2),
+        /* memory */
+        SCMP_SYS(mmap), SCMP_SYS(munmap), SCMP_SYS(mremap), SCMP_SYS(mprotect),
+        SCMP_SYS(brk), SCMP_SYS(madvise),
+        /* threads, signals, process lifecycle */
+        SCMP_SYS(clone), SCMP_SYS(clone3), SCMP_SYS(futex),
+        SCMP_SYS(set_robust_list), SCMP_SYS(get_robust_list),
+        SCMP_SYS(rt_sigaction), SCMP_SYS(rt_sigprocmask), SCMP_SYS(rt_sigreturn),
+        SCMP_SYS(sigaltstack), SCMP_SYS(set_tid_address),
+        SCMP_SYS(gettid), SCMP_SYS(getpid), SCMP_SYS(tgkill),
+        SCMP_SYS(exit), SCMP_SYS(exit_group), SCMP_SYS(restart_syscall),
+        /* time + randomness */
+        SCMP_SYS(clock_gettime), SCMP_SYS(clock_nanosleep), SCMP_SYS(nanosleep),
+        SCMP_SYS(gettimeofday), SCMP_SYS(time), SCMP_SYS(getrandom),
+        /* process/runtime info used by glibc/OpenSSL */
+        SCMP_SYS(uname), SCMP_SYS(arch_prctl), SCMP_SYS(rseq),
+        SCMP_SYS(getuid), SCMP_SYS(geteuid), SCMP_SYS(getgid), SCMP_SYS(getegid),
+        SCMP_SYS(getrlimit), SCMP_SYS(prlimit64), SCMP_SYS(sysinfo),
+        SCMP_SYS(sched_getaffinity), SCMP_SYS(sched_yield), SCMP_SYS(getcpu),
+        SCMP_SYS(membarrier), SCMP_SYS(prctl),
+    };
+    int total = (int) (sizeof(allow) / sizeof(allow[0]));
+    int skipped = 0;
+    for (int i = 0; i < total; i++) {
+        if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, allow[i], 0) != 0)
+            skipped++; /* syscall not known on this arch — fine, just skip */
+    }
+
+    if (seccomp_load(ctx) != 0) {
+        dns_log(LOG_ERR, "[Seccomp] seccomp_load failed: %s%s\n", strerror(errno),
+                enforce ? " — refusing to serve without the filter" : " — running unconfined");
+        seccomp_release(ctx);
+        if (enforce)
+            exit(1); /* fail closed */
+        return;
+    }
+    seccomp_release(ctx);
+
+    dns_log(LOG_NOTICE,
+            "[Seccomp] filter active: mode=%s, %d syscalls allowed (%d skipped). %s\n", mode,
+            total - skipped, skipped,
+            enforce ? "Disallowed syscalls return EPERM."
+                    : "Audit mode — violations are logged, not blocked "
+                      "(check the audit log / dmesg, then widen the whitelist).");
+}
+#else
+static void seccomp_install(void) {
+    dns_log(LOG_INFO, "[Seccomp] not built in (libseccomp unavailable at build time)\n");
+}
+#endif
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -6424,6 +6542,10 @@ int main(int argc, char **argv) {
     /* All privileged resources are now bound. Irreversibly drop root before
      * serving any untrusted input (least privilege — CLAUDE.md principle #4). */
     drop_privileges();
+
+    /* Confine the process to the syscalls it needs (sandbox layer 2). Default
+     * mode is audit (log-only) so the whitelist can be refined before enforce. */
+    seccomp_install();
 
     for (;;) {
         fd_set fds;
