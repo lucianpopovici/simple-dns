@@ -2209,6 +2209,26 @@ static uint16_t keytag(const uint8_t *rd, int rdlen) {
     ac += (ac >> 16) & 0xFFFF;
     return (uint16_t) (ac & 0xFFFF);
 }
+
+/* Build DS-format rdata (RFC 4034 §5.1.1) for a KSK: keytag(2) | alg(1) |
+ * digest_type=2 (SHA-256)(1) | SHA-256(owner_wire || dnskey_rdata)(32). This is
+ * the rdata of both a DS record and an RFC 7344 CDS record (identical formats),
+ * so the DS and CDS answers share one implementation and cannot diverge.
+ * `dkrd`/`dklen` is the KSK DNSKEY rdata. Writes 36 bytes; returns 36 or -1. */
+static int ds_rdata_from_dnskey(const char *owner, const uint8_t *dkrd, int dklen, uint16_t tag,
+                                int alg, uint8_t *ds_out) {
+    uint8_t hin[512];
+    int hp = name_to_wire(owner, hin, sizeof(hin));
+    if (hp <= 0 || hp + dklen > (int) sizeof(hin))
+        return -1;
+    ds_out[0] = (uint8_t) (tag >> 8);
+    ds_out[1] = (uint8_t) (tag & 0xFF);
+    ds_out[2] = (uint8_t) alg;
+    ds_out[3] = 2; /* SHA-256 */
+    memcpy(hin + hp, dkrd, (size_t) dklen);
+    sha256(hin, hp + dklen, ds_out + 4);
+    return 4 + 32;
+}
 static int label_count(const char *n) {
     if (!n || !*n)
         return 0;
@@ -4311,29 +4331,35 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         if (any_minimal && answers > 0)
             goto finish_answer;
     }
-    /* RFC 7344: CDS (child DS) — same content as DNSKEY but type=CDS */
+    /* RFC 7344: CDS (child DS) — the DS the child wants the parent to publish.
+     * Same rdata format as DS, computed over the *KSK* (the SEP that signs the
+     * DNSKEY RRset), so it matches the DS answer below. (Not the ZSK, and not
+     * DNSKEY-format rdata.) */
     if (qtype == DNS_TYPE_CDS || qtype == DNS_TYPE_ANY) {
-        uint8_t dkrd[68];
-        if (g_zsk && dnskey_rdata_ecdsa(g_zsk, dkrd, sizeof(dkrd)) > 0) {
+        uint8_t dkrd[68], dsrd[4 + 32];
+        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0 &&
+            ds_rdata_from_dnskey(qname, dkrd, 68, g_ksk_tag, DNS_ALG_ECDSAP256SHA256, dsrd) > 0) {
             found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDS, 3600, dkrd, 68, dnssec_ok,
+            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDS, 3600, dsrd, 4 + 32, dnssec_ok,
                           &answers);
         }
-        if (g_zsk_ed && dnskey_rdata_ed25519(g_zsk_ed, dkrd, sizeof(dkrd)) > 0) {
+        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0 &&
+            ds_rdata_from_dnskey(qname, dkrd, 36, g_ksk_ed_tag, DNS_ALG_ED25519, dsrd) > 0) {
             found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDNSKEY, 3600, dkrd, 36, dnssec_ok,
+            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDS, 3600, dsrd, 4 + 32, dnssec_ok,
                           &answers);
         }
     }
-    /* RFC 7344: CDNSKEY — same as DNSKEY but type=CDNSKEY */
+    /* RFC 7344: CDNSKEY — the DNSKEY the child wants the parent to publish a DS
+     * for: the KSK, in DNSKEY rdata format. */
     if (qtype == DNS_TYPE_CDNSKEY || qtype == DNS_TYPE_ANY) {
         uint8_t dkrd[68];
-        if (g_zsk && dnskey_rdata_ecdsa(g_zsk, dkrd, sizeof(dkrd)) > 0) {
+        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0) {
             found = 1;
             off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDNSKEY, 3600, dkrd, 68, dnssec_ok,
                           &answers);
         }
-        if (g_zsk_ed && dnskey_rdata_ed25519(g_zsk_ed, dkrd, sizeof(dkrd)) > 0) {
+        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0) {
             found = 1;
             off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_CDNSKEY, 3600, dkrd, 36, dnssec_ok,
                           &answers);
@@ -4343,45 +4369,25 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
      * DS rdata = keytag(2) | alg(1) | digest_type=2(SHA-256)(1) |
      * sha256(owner_wire||dnskey_rdata)(32) Only emitted at the zone apex where our KSKs live. */
     if (qtype == DNS_TYPE_DS || qtype == DNS_TYPE_ANY) {
-        uint8_t dkrd[68];
+        uint8_t dkrd[68], dsrd[4 + 32];
         /* P-256 KSK */
-        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0) {
-            uint8_t dsrd[4 + 32];
-            dsrd[0] = g_ksk_tag >> 8;
-            dsrd[1] = g_ksk_tag & 0xFF;
-            dsrd[2] = DNS_ALG_ECDSAP256SHA256;
-            dsrd[3] = 2; /* SHA-256 */
-            uint8_t hin[512];
-            int hp = name_to_wire(qname, hin, sizeof(hin));
-            if (hp > 0 && hp + 68 <= (int) sizeof(hin)) {
-                memcpy(hin + hp, dkrd, 68);
-                sha256(hin, hp + 68, dsrd + 4);
-                int n2 = emit_rr(resp, off, resp_len, qname, DNS_TYPE_DS, 3600, dsrd, 4 + 32,
-                                 dnssec_ok, &answers);
-                if (n2 > 0) {
-                    off = n2;
-                    found = 1;
-                }
+        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0 &&
+            ds_rdata_from_dnskey(qname, dkrd, 68, g_ksk_tag, DNS_ALG_ECDSAP256SHA256, dsrd) > 0) {
+            int n2 = emit_rr(resp, off, resp_len, qname, DNS_TYPE_DS, 3600, dsrd, 4 + 32, dnssec_ok,
+                             &answers);
+            if (n2 > 0) {
+                off = n2;
+                found = 1;
             }
         }
         /* Ed25519 KSK */
-        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0) {
-            uint8_t dsrd[4 + 32];
-            dsrd[0] = g_ksk_ed_tag >> 8;
-            dsrd[1] = g_ksk_ed_tag & 0xFF;
-            dsrd[2] = DNS_ALG_ED25519;
-            dsrd[3] = 2; /* SHA-256 */
-            uint8_t hin[512];
-            int hp = name_to_wire(qname, hin, sizeof(hin));
-            if (hp > 0 && hp + 36 <= (int) sizeof(hin)) {
-                memcpy(hin + hp, dkrd, 36);
-                sha256(hin, hp + 36, dsrd + 4);
-                int n2 = emit_rr(resp, off, resp_len, qname, DNS_TYPE_DS, 3600, dsrd, 4 + 32,
-                                 dnssec_ok, &answers);
-                if (n2 > 0) {
-                    off = n2;
-                    found = 1;
-                }
+        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0 &&
+            ds_rdata_from_dnskey(qname, dkrd, 36, g_ksk_ed_tag, DNS_ALG_ED25519, dsrd) > 0) {
+            int n2 = emit_rr(resp, off, resp_len, qname, DNS_TYPE_DS, 3600, dsrd, 4 + 32, dnssec_ok,
+                             &answers);
+            if (n2 > 0) {
+                off = n2;
+                found = 1;
             }
         }
     }

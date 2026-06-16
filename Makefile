@@ -118,7 +118,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -358,6 +358,25 @@ check: $(BIN_DEBUG)
 	 dig @127.0.0.1 -p 5353 example.local A   \
 	     +time=2 +tries=1 +short;             \
 	 kill $$DNS_PID 2>/dev/null || true
+
+# RFC 7344 regression: the CDS RRset must equal the DS the zone publishes, and
+# CDNSKEY must equal the zone's KSK DNSKEY(s). Guards against CDS/CDNSKEY drifting
+# back to the ZSK or to the wrong rdata format. Needs Valkey + dig.
+check-cds: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 7344 CDS==DS and CDNSKEY==KSK (requires Valkey + dig)"
+	@./$(BIN_DEBUG) > /tmp/dnsd_cds.log 2>&1 &                                          \
+	 DNS_PID=$$!;                                                                       \
+	 sleep 1;                                                                           \
+	 Z=example.local;                                                                   \
+	 dig @127.0.0.1 -p 5353 $$Z DS      +short | sort > /tmp/cds_ds.txt;                \
+	 dig @127.0.0.1 -p 5353 $$Z CDS     +short | sort > /tmp/cds_cds.txt;               \
+	 dig @127.0.0.1 -p 5353 $$Z CDNSKEY +short | sort > /tmp/cds_cdk.txt;               \
+	 dig @127.0.0.1 -p 5353 $$Z DNSKEY  +short | grep '^257' | sort > /tmp/cds_ksk.txt; \
+	 kill $$DNS_PID 2>/dev/null || true;                                                \
+	 test -s /tmp/cds_ds.txt || { echo "  FAIL  no DS/CDS emitted (zone unsigned?)"; exit 1; }; \
+	 diff /tmp/cds_ds.txt /tmp/cds_cds.txt || { echo "  FAIL  CDS != DS"; exit 1; };    \
+	 diff /tmp/cds_cdk.txt /tmp/cds_ksk.txt || { echo "  FAIL  CDNSKEY != KSK DNSKEY"; exit 1; }; \
+	 echo "  OK  CDS==DS and CDNSKEY==KSK"
 
 # =============================================================================
 # Clean

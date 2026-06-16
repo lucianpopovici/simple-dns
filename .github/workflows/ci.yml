@@ -73,6 +73,12 @@ jobs:
           dig @127.0.0.1 -p 5353 example.local A +time=2 +tries=1 +short || true
           kill "$SRV" 2>/dev/null || true
 
+      - name: RFC 7344 CDS/CDNSKEY regression (CDS==DS, CDNSKEY==KSK)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-cds OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
   warnings:
     name: Warnings as errors
     runs-on: ubuntu-latest
