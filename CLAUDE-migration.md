@@ -370,13 +370,13 @@ Acceptance
       (privilege drop + seccomp per `CLAUDE.md`). Done: irreversible
       privilege drop after socket bind (`priv_resolve` before chroot +
       `drop_privileges` after, `config:privdrop_user`); seccomp syscall filter
-      via libseccomp (`seccomp_install`, `config:seccomp_mode` audit/enforce/off,
-      audit default; whitelist refined against the real syscall set); filesystem
-      isolation via `chroot` (`enter_chroot`, `config:chroot_dir`, fail-closed,
-      resolve-before-chroot ordering). Full chain verified end-to-end in a user
-      namespace (chroot → drop to nobody → seccomp → still serves). Remaining:
-      flip the seccomp default to enforce once the audit-harvested whitelist is
-      confirmed in production; optional mount-namespace/pivot_root instead of
-      chroot.
+      via libseccomp (`seccomp_install`, `config:seccomp_mode` enforce/audit/off,
+      enforce default; whitelist audit-validated against the real syscall set,
+      harvested with strace across UDP/TCP/DoT-TLS/metrics/Valkey/rollover);
+      filesystem isolation via `chroot` (`enter_chroot`, `config:chroot_dir`,
+      fail-closed, resolve-before-chroot ordering). Full chain verified
+      end-to-end in a user namespace (chroot → drop to nobody → seccomp enforce →
+      still serves UDP/TCP/DoT/metrics). Remaining (optional):
+      mount-namespace/pivot_root instead of chroot.
 - [ ] All seven steps complete; monolith concerns fully decomposed
 - [ ] `CLAUDE.md` topology diagram matches the running system

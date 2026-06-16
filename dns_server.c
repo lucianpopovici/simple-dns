@@ -64,8 +64,8 @@
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
  *                              user's primary group). Only acts when run as root.
- *   config:seccomp_mode        Syscall sandbox: "audit" (default, log-only),
- *                              "enforce" (EPERM), or "off". Needs -DHAVE_SECCOMP.
+ *   config:seccomp_mode        Syscall sandbox: "enforce" (default, EPERM),
+ *                              "audit" (log-only), or "off". Needs -DHAVE_SECCOMP.
  *   config:chroot_dir          If set (env DNS_CHROOT overrides), chroot here
  *                              after binding sockets, before the privilege drop.
  *                              Only acts when run as root.
@@ -6296,15 +6296,21 @@ static void drop_privileges(const privdrop_plan_t *p) {
  * threads and every future per-connection worker are covered.
  *
  * Mode (config:seccomp_mode):
- *   audit   (default) — default action SCMP_ACT_LOG: a non-whitelisted syscall
- *                       is LOGGED (audit log / dmesg) but still permitted, so we
- *                       can observe the real syscall set without risking a crash.
- *   enforce           — default action EPERM: non-whitelisted syscalls fail.
+ *   enforce (default) — default action EPERM: non-whitelisted syscalls fail.
+ *                       The whitelist below was audit-validated (run under
+ *                       SCMP_ACT_LOG, syscall set harvested with strace across
+ *                       UDP/TCP/DoT-TLS/metrics/Valkey/rollover) before this was
+ *                       made the default.
+ *   audit             — default action SCMP_ACT_LOG: a non-whitelisted syscall
+ *                       is LOGGED (audit log / dmesg) but still permitted. Use
+ *                       this to re-validate the whitelist after a toolchain /
+ *                       libc / kernel change or an unusual config (e.g. Valkey by
+ *                       hostname, remote TLS syslog) before trusting enforce.
  *   off               — no filter.
  *
- * Audit-first is deliberate: the whitelist below is a starting baseline; run in
- * audit mode, harvest what the kernel logs, then widen the list before any
- * deployment flips to enforce.
+ * On a missed syscall enforce returns EPERM (not SIGKILL), so the failure
+ * surfaces as an error rather than taking the daemon down outright; if you hit
+ * one, switch to audit, harvest it, and widen the list.
  *
  * Built only when libseccomp is available at compile time (-DHAVE_SECCOMP);
  * otherwise this is a no-op stub and dnsd runs unconfined.
@@ -6314,7 +6320,8 @@ static void seccomp_install(void) {
     char mode[16] = "";
     vk_get("config:seccomp_mode", mode, sizeof(mode));
     if (!mode[0])
-        safe_strcpy(mode, "audit", sizeof(mode));
+        safe_strcpy(mode, "enforce",
+                    sizeof(mode)); /* default: enforce (whitelist audit-validated) */
     if (strcmp(mode, "off") == 0) {
         dns_log(LOG_NOTICE, "[Seccomp] disabled (config:seccomp_mode=off)\n");
         return;
@@ -6389,6 +6396,7 @@ static void seccomp_install(void) {
         SCMP_SYS(clone),
         SCMP_SYS(clone3),
         SCMP_SYS(futex),
+        SCMP_SYS(futex_waitv), /* newer glibc/kernel pthread waits (skipped if unknown) */
         SCMP_SYS(set_robust_list),
         SCMP_SYS(get_robust_list),
         SCMP_SYS(rt_sigaction),
