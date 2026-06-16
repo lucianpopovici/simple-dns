@@ -110,7 +110,8 @@ static int extract_pub(EVP_PKEY *pkey, int is_ed, uint8_t *pub) {
 
 /* Sign `data` with pkey, emitting the 64-byte DNSSEC signature (raw R||S for
  * ECDSA, the native 64-byte form for Ed25519). Returns 1 on success. */
-static int sign_data(EVP_PKEY *pkey, int is_ed, const uint8_t *data, size_t dlen, uint8_t sig64[64]) {
+static int sign_data(EVP_PKEY *pkey, int is_ed, const uint8_t *data, size_t dlen,
+                     uint8_t sig64[64]) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     uint8_t der[256];
     size_t slen = sizeof(der);
@@ -278,8 +279,10 @@ static void run_alg(uint8_t alg) {
             EVP_PKEY_free(cur);
         if (next)
             EVP_PKEY_free(next);
-        cur = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519") : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
-        next = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519") : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+        cur = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519")
+                    : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+        next = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519")
+                     : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
         uint8_t pc[80], pn[80];
         int lc = cur ? extract_pub(cur, is_ed, pc) : 0;
         int ln = next ? extract_pub(next, is_ed, pn) : 0;
