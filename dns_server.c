@@ -60,6 +60,10 @@
  *   config:cookie_secret       16-byte hex cookie secret
  *   config:axfr_allow          Comma-separated IPs/CIDRs allowed to do AXFR
  *   config:notify_targets      Comma-separated IP:port targets for NOTIFY
+ *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
+ *                              sockets (env DNS_USER overrides; default "nobody")
+ *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
+ *                              user's primary group). Only acts when run as root.
  *
  * Multi-zone key schema (migration Step 7) — records carry the owning zone:
  *   zone_table:<zone>          Zone SOA + transfer settings
@@ -118,6 +122,9 @@
 #include <syslog.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/prctl.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -6110,6 +6117,99 @@ static void sighup_handler(int sig) {
     g_reload_flag = 1;
 }
 
+/* ==========================================================================
+ * Privilege drop (least privilege — CLAUDE.md design principle #4)
+ *
+ * Privileged resources (ports 53/853 need CAP_NET_BIND_SERVICE) are bound while
+ * still root in Phase 6; we then *irreversibly* drop to an unprivileged service
+ * account before entering the request loop, so a bug in the wire/crypto path
+ * never runs with root. The persistent Valkey fd and the listening sockets stay
+ * open across the uid change; later Valkey reconnects still work (no seccomp
+ * yet). The query log degrades to stderr if it can no longer be reopened.
+ *
+ * Target account: config:privdrop_user / :privdrop_group, overridable by env
+ * DNS_USER / DNS_GROUP, defaulting to "nobody". When the group is unset the
+ * account's primary group is used.
+ *
+ * No-op when not started as root (development run on the high default ports).
+ * Fail-closed: if started as root and the drop cannot be completed, exit rather
+ * than keep serving untrusted input with full privilege.
+ * ======================================================================= */
+static void drop_privileges(void) {
+    if (geteuid() != 0) {
+        dns_log(LOG_INFO, "[Priv] Not running as root — privilege drop skipped\n");
+        return;
+    }
+
+    char user[64] = "";
+    char group[64] = "";
+    vk_get("config:privdrop_user", user, sizeof(user));
+    vk_get("config:privdrop_group", group, sizeof(group));
+    const char *env_user = getenv("DNS_USER");
+    const char *env_group = getenv("DNS_GROUP");
+    if (env_user && env_user[0])
+        safe_strcpy(user, env_user, sizeof(user));
+    if (env_group && env_group[0])
+        safe_strcpy(group, env_group, sizeof(group));
+    if (!user[0])
+        safe_strcpy(user, "nobody", sizeof(user));
+
+    errno = 0;
+    struct passwd *pw = getpwnam(user);
+    if (!pw) {
+        dns_log(LOG_ERR,
+                "[Priv] FATAL: privdrop user '%s' not found%s — set config:privdrop_user "
+                "to a valid account\n",
+                user, errno ? " (getpwnam failed)" : "");
+        exit(1);
+    }
+    uid_t target_uid = pw->pw_uid;
+    gid_t target_gid = pw->pw_gid;
+    if (group[0]) {
+        errno = 0;
+        struct group *gr = getgrnam(group);
+        if (!gr) {
+            dns_log(LOG_ERR, "[Priv] FATAL: privdrop group '%s' not found%s\n", group,
+                    errno ? " (getgrnam failed)" : "");
+            exit(1);
+        }
+        target_gid = gr->gr_gid;
+    }
+    if (target_uid == 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: privdrop user '%s' is root (uid 0) — refusing\n", user);
+        exit(1);
+    }
+
+    /* Order matters: shed supplementary groups, then gid, then uid. Doing uid
+     * first would forfeit the privilege needed for the group calls. */
+    if (setgroups(0, NULL) != 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: setgroups failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    if (setgid(target_gid) != 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: setgid(%u) failed: %s\n", (unsigned) target_gid,
+                strerror(errno));
+        exit(1);
+    }
+    if (setuid(target_uid) != 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: setuid(%u) failed: %s\n", (unsigned) target_uid,
+                strerror(errno));
+        exit(1);
+    }
+    /* Verify the drop is irreversible: regaining root must fail. */
+    if (setuid(0) == 0 || setgid(0) == 0) {
+        dns_log(LOG_ERR, "[Priv] FATAL: privileges not fully dropped (could regain root)\n");
+        exit(1);
+    }
+    /* Belt-and-suspenders: keep the DNSSEC/TSIG key material out of core dumps
+     * and ptrace by another process running as the same unprivileged user. */
+    if (prctl(PR_SET_DUMPABLE, 0) != 0)
+        dns_log(LOG_WARNING, "[Priv] PR_SET_DUMPABLE failed: %s\n", strerror(errno));
+
+    dns_log(LOG_NOTICE, "[Priv] Dropped privileges to user '%s' (uid=%u gid=%u)\n", user,
+            (unsigned) target_uid, (unsigned) target_gid);
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -6320,6 +6420,10 @@ int main(int argc, char **argv) {
     dns_log(LOG_INFO, "DoH and the management API are served by apid;\n");
     dns_log(LOG_INFO, "ACME/EST by certd; mDNS by mdnsd.\n");
     dns_log(LOG_INFO, "\n");
+
+    /* All privileged resources are now bound. Irreversibly drop root before
+     * serving any untrusted input (least privilege — CLAUDE.md principle #4). */
+    drop_privileges();
 
     for (;;) {
         fd_set fds;
