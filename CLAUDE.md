@@ -258,10 +258,21 @@ and must not share a process. Owns upstream UDP/TCP/DoT/DoH, the cache, and
 DNSSEC **validation** (validation covers the full canonical RRset per
 RFC 4034 §3.1.8.1 — guarded by `make check-dnssec`).
 
-Follow-up (not a blocker): `resolverd` does not yet get the `dnsd`-style
-privilege-drop / seccomp / mount-isolation sandbox, which is its own hardening
-task. (Its build carries `-Wno-misleading-indentation` because the dense — but
-clang-format-conformant — style trips that gcc heuristic; not a reformat TODO.)
+Sandbox (done): `resolverd` now gets the same `dnsd`-style hardening — after its
+listeners bind it drops root irreversibly, confines the filesystem
+(`chroot` default or `mountns` private mount namespace + `pivot_root`), then
+installs a `seccomp` syscall filter, all before the serve loop touches untrusted
+query/response bytes. Config is **resolverd-scoped** (it needs a different
+filesystem view and syscall set — it makes outbound connections and resolves
+upstream hostnames, so its chroot must carry resolver files + a CA bundle):
+`config:resolverd_{chroot_dir,isolation_mode,privdrop_user,privdrop_group,
+seccomp_mode}` (env `RESOLVERD_{CHROOT,ISOLATION,USER,GROUP,SECCOMP}`). The
+seccomp layer defaults to **audit** (log-only) until the whitelist is
+strace-harvested across every upstream transport on the target libc/kernel —
+run audit, confirm the audit log is clean, then switch `seccomp_mode` to
+`enforce`. (Its build carries `-Wno-misleading-indentation` because the dense —
+but clang-format-conformant — style trips that gcc heuristic; not a reformat
+TODO.)
 
 Reads/writes Valkey: its persisted cache namespace only. It does not read the
 authoritative zone.
@@ -449,8 +460,11 @@ and the `resolverd` split (`dns_client.c` → `resolverd.c`, now a first-class
 hardened daemon — see the `resolverd` section above) are **all complete**. The
 monolith is fully decomposed and every box in `CLAUDE-migration.md` is ticked.
 Remaining work is feature/quality, not migration: the optional plans
-(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,performance,sec}.md`)
-and extending the `dnsd`-style sandbox to `resolverd`.
+(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,performance,sec}.md`).
+The `dnsd`-style privilege-drop / seccomp / mount-isolation sandbox has been
+extended to `resolverd` (see the `resolverd` section above); its only remaining
+hardening task is to flip the seccomp default from `audit` to `enforce` after a
+per-deployment whitelist harvest.
 
 ---
 

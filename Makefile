@@ -80,10 +80,11 @@ WARN       := -Wall -Wextra -Wformat=2 -Wformat-overflow=2 \
 INCLUDES   := -I$(OSSL_INC)
 LIBS       := -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)
 
-# libseccomp (optional, dnsd only): the trusted core installs a syscall filter
-# when the dev package is present (-DHAVE_SECCOMP). Without it dnsd still builds,
-# just without the sandbox. Detected via pkg-config; only $(BIN)/$(BIN_DEBUG)
-# link it. CI installs libseccomp-dev so the filter is built+tested there too.
+# libseccomp (optional): dnsd and resolverd install a syscall filter when the
+# dev package is present (-DHAVE_SECCOMP). Without it they still build, just
+# without the seccomp layer (priv-drop + chroot/mountns still apply). Detected
+# via pkg-config; $(BIN)/$(BIN_DEBUG) and resolverd/resolverd_debug link it.
+# CI installs libseccomp-dev so the filter is built+tested there too.
 SECCOMP_CFLAGS := $(shell pkg-config --exists libseccomp 2>/dev/null && echo -DHAVE_SECCOMP $$(pkg-config --cflags libseccomp))
 SECCOMP_LIBS   := $(shell pkg-config --exists libseccomp 2>/dev/null && pkg-config --libs libseccomp)
 
@@ -224,13 +225,13 @@ apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 resolverd: resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
 resolverd_debug: resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"

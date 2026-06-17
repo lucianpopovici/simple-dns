@@ -411,10 +411,24 @@ Acceptance
       caching proxy on :5354 → returns dnsd's answer). Wired into CI (daemon
       build list, `-Werror` loop; dropped from the syntax-only line). The
       resolver logic was already complete in the file — this is the process
-      split, not new functionality. Follow-up (non-blocking): extend the
-      dnsd-style privilege-drop/seccomp/mount sandbox to it. (Its target carries
+      split, not new functionality. (Its target carries
       `-Wno-misleading-indentation` — the dense but clang-format-conformant style
       trips that gcc heuristic; not a reformat TODO.)
+- [x] `resolverd` sandbox (the former non-blocking follow-up): extended the
+      `dnsd`-style hardening to `resolverd` — post-bind irreversible privilege
+      drop, filesystem isolation (`chroot` default / `mountns` pivot_root), and a
+      libseccomp syscall filter, applied in `apply_sandbox()` before the proxy
+      serve loop. Resolverd-scoped config keys (`config:resolverd_{chroot_dir,
+      isolation_mode,privdrop_user,privdrop_group,seccomp_mode}`, env
+      `RESOLVERD_{CHROOT,ISOLATION,USER,GROUP,SECCOMP}`) since it needs its own
+      filesystem view + syscall set (outbound connections + upstream name
+      resolution). seccomp defaults to **audit** (whitelist mirrors dnsd's
+      audit-validated set + `recvmmsg`/`sendmmsg` for getaddrinfo) pending a
+      per-deployment harvest before flipping to `enforce`. Makefile links
+      libseccomp into `resolverd`/`resolverd_debug`. Verified: `-Werror` prod
+      build clean, no new debug warnings, `make check-resolverd` proxies dnsd's
+      answer with the filter active (`[seccomp] filter active: mode=audit, 88
+      syscalls allowed`, 0 audit denials), `check-wire`/`check-dnssec` green.
 - [x] All seven steps + the optional follow-ups + the `resolverd` split
       complete; monolith concerns fully decomposed.
 - [x] `CLAUDE.md` topology diagram matches the running system (verified: the
