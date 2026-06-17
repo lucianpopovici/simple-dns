@@ -275,8 +275,8 @@ Tasks
       request/reply `vk`) to the prefixes it owns:
       `dnsd` → `config:*`, `cert:current`, `zone_table:*`, `dnssec:*`;
       `apid` → `cert:current`, `config:tls_cert_pem/tls_key_pem/mtls_ca_pem`;
-      `mdnsd` → `mdns:*`, `config:mdns_*`. (`resolverd`/`dns_client.c` is a
-      separate role not yet split out — deferred with it.) `zone:*`/`ddns:*`
+      `mdnsd` → `mdns:*`, `config:mdns_*`. (`resolverd` watches only its own
+      `cache:*`; live config reload for it is future work.) `zone:*`/`ddns:*`
       records need no subscription: they are read live per query already.
 - [x] On notification, reload only the affected subset:
       `config:*` → `config_load_from_valkey` (+ `tls_reload` for TLS keys);
@@ -404,7 +404,19 @@ Acceptance
       (unshare moves only the calling thread; trusted keyspace/rollover threads
       stay in the parent mount ns, request workers are spawned post-pivot) is
       documented at `enter_chroot`.
-- [x] All seven steps complete; monolith concerns fully decomposed
+- [x] `resolverd` split: `dns_client.c` renamed to `resolverd.c` and given its
+      own first-class build (`make resolverd` / `resolverd_debug`, hardened
+      PROD_FLAGS, mirrors the certd/mdnsd/apid targets) plus a `make
+      check-resolverd` smoke test (dnsd authoritative upstream + resolverd
+      caching proxy on :5354 → returns dnsd's answer). Wired into CI (daemon
+      build list, `-Werror` loop; dropped from the syntax-only line). The
+      resolver logic was already complete in the file — this is the process
+      split, not new functionality. Follow-up (non-blocking): extend the
+      dnsd-style privilege-drop/seccomp/mount sandbox to it. (Its target carries
+      `-Wno-misleading-indentation` — the dense but clang-format-conformant style
+      trips that gcc heuristic; not a reformat TODO.)
+- [x] All seven steps + the optional follow-ups + the `resolverd` split
+      complete; monolith concerns fully decomposed.
 - [x] `CLAUDE.md` topology diagram matches the running system (verified: the
       diagram's dnsd / mdnsd / certd / apid / dashboard / resolverd split and
       the Valkey-only integration bus match the shipped binaries and the

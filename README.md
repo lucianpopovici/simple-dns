@@ -55,7 +55,7 @@ linked by every binary.
 | `mdnsd.c` | `mdnsd`, the mDNS/DNS-SD responder. |
 | `apid.c` | `apid`, the HTTP/HTTPS front for DoH + management. |
 | `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library. |
-| `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC validation (becomes `resolverd`). |
+| `resolverd.c` | `resolverd`, the recursive/forwarding resolver + cache + DNSSEC validation (the recursive role; formerly `dns_client.c`). |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire`. |
 | `dashboard/` | Flask control-plane UI (see [Dashboard](#dashboard)). |
 | `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`) and a libFuzzer harness (`make fuzz-wire`). |
@@ -66,7 +66,7 @@ linked by every binary.
 ```bash
 # 1. Build. `make` builds + GPG-signs dnsd (needs a signing key); for local/CI
 #    use the unsigned per-binary targets:
-make dns_server certd mdnsd apid     # stripped, hardened production binaries (unsigned)
+make dns_server certd mdnsd apid resolverd   # stripped, hardened production binaries (unsigned)
 make debug                           # dnsd ASan/UBSan build → dns_server_debug
 
 # 2. Valkey on 127.0.0.1:6379 (or set DNS_VALKEY_HOST / _PORT / _PASSWORD)
@@ -100,7 +100,7 @@ glance:
   NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078).
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
   and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
-  authenticated denial. Validation (in `dns_client.c`) covers the full
+  authenticated denial. Validation (in `resolverd.c`) covers the full
   canonical RRset per RFC 4034 §3.1.8.1. Automated per-zone ZSK rollover
   follows RFC 6781 §4.1.1.1 (Pre-Publish): the incoming key is published
   alongside the current one before the signer switches, and the old key is
@@ -255,9 +255,11 @@ to `config:query_log_path` when set.
 ```bash
 make                 # production dnsd: optimised, stripped, hardened, GPG-signed
 make dns_server      # … unsigned (no GPG key needed; for local/CI)
-make certd mdnsd apid   # the sidecars (unsigned production builds)
+make certd mdnsd apid resolverd   # the sidecars + recursive resolver (unsigned)
 make debug           # dnsd under ASan/UBSan, full symbols
 make check           # smoke test (needs Valkey + dig)
+make check-resolverd # resolverd caching proxy → dnsd (needs Valkey + dig)
+make check-catalog   # RFC 9432 catalog provision/deprovision (needs Valkey + dig)
 make check-dnssec    # DNSSEC known-answer + negative (flipped-byte) tests
 make check-wire      # name_from_wire compression/edge-case unit tests
 make fuzz-wire       # 60s libFuzzer smoke on the name parser (needs clang)

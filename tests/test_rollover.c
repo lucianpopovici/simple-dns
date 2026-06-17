@@ -11,7 +11,7 @@
  *
  * dns_server.c implements pre-publish as three (published DNSKEY set, signer)
  * states; this test transcribes those states verbatim and checks each against
- * the *real* resolver-side verifier (dnssec_verify_rrset from dns_client.c):
+ * the *real* resolver-side verifier (dnssec_verify_rrset from resolverd.c):
  *
  *   phase     published DNSKEY set     signer        from dns_server.c
  *   --------  -----------------------  ------------  -----------------------------
@@ -38,7 +38,7 @@
  */
 
 #define UNIT_TEST 1
-#include "dns_client.c"
+#include "resolverd.c"
 
 #include <openssl/core_names.h>
 

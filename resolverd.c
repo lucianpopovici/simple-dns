@@ -1,5 +1,11 @@
 /*
- * dns_client.c — Caching DNS resolver for dns_server
+ * resolverd.c — Caching/forwarding DNS resolver (the recursive role)
+ *
+ * The recursive/forwarding counterpart to the authoritative `dnsd`; kept a
+ * distinct daemon because authoritative and recursive are different DNS roles
+ * and must not share a process (CLAUDE.md). Owns upstream UDP/TCP/DoT/DoH, the
+ * cache, and DNSSEC *validation*; reads/writes only its `cache:*` Valkey
+ * namespace (never the authoritative zone). Formerly `dns_client.c`.
  *
  * A local caching resolver that:
  *   - Listens on a configurable local port (default 5354)
@@ -15,7 +21,7 @@
  *   - Prefetch: re-queries records when TTL < 10% of original
  *   - CLI: dig-like output + cache stats + cache flush/inspect commands
  *
- * Configuration (environment or dns_client.conf):
+ * Configuration (environment or resolverd.conf):
  *   UPSTREAM_HOST     Upstream dns_server IP/hostname  (default: 127.0.0.1)
  *   UPSTREAM_PORT     Upstream port                    (default: 5353)
  *   UPSTREAM_PROTO    udp | tcp | dot                  (default: udp)
@@ -31,22 +37,22 @@
  *   CACHE_NEG_TTL     Max negative TTL (seconds)       (default: 300)
  *   DOT_CA_PEM        Path to CA cert PEM for DoT      (default: system)
  *
- * Build:
- *   gcc -O2 -Wall -I<openssl-inc> -o dns_client dns_client.c \
- *       -L<openssl-lib> -lssl -lcrypto -lpthread -Wl,-rpath,<openssl-lib>
+ * Build (see the Makefile for the hardened production target):
+ *   make resolverd        # optimised, hardened
+ *   make resolverd_debug  # ASan/UBSan
  *
  * Usage (proxy mode — run as local resolver):
- *   ./dns_client
+ *   ./resolverd
  *   # Then configure your system to use 127.0.0.1:5354
  *
  * Usage (CLI / one-shot query):
- *   ./dns_client <name> [type] [options]
- *   ./dns_client example.local A
- *   ./dns_client example.local MX --upstream 10.0.0.1:5353 --dot
- *   ./dns_client --stats          # show cache statistics
- *   ./dns_client --flush          # flush entire cache
- *   ./dns_client --flush example.local A   # flush specific entry
- *   ./dns_client --dump           # dump all cached records
+ *   ./resolverd <name> [type] [options]
+ *   ./resolverd example.local A
+ *   ./resolverd example.local MX --upstream 10.0.0.1:5353 --dot
+ *   ./resolverd --stats          # show cache statistics
+ *   ./resolverd --flush          # flush entire cache
+ *   ./resolverd --flush example.local A   # flush specific entry
+ *   ./resolverd --dump           # dump all cached records
  */
 
 #ifndef _GNU_SOURCE

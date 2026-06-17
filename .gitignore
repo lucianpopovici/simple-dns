@@ -6,6 +6,8 @@ mdnsd
 mdnsd_debug
 apid
 apid_debug
+resolverd
+resolverd_debug
 
 # Secrets — never commit private keys / cert chains
 *.key

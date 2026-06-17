@@ -1,6 +1,6 @@
 /* Unit tests for name_from_wire compression handling.
  *
- * Builds against dns_client.c (all three copies of the function are
+ * Builds against resolverd.c (all three copies of the function are
  * byte-identical until the libdnswire extraction). Verifies that:
  *   - uncompressed and legitimately compressed (backward-pointer) names parse;
  *   - forward pointers, self-pointers, and pointer loops are rejected;
@@ -9,7 +9,7 @@
  * Compile:  cc -DUNIT_TEST -I. tests/test_name_from_wire.c -lssl -lcrypto -lpthread
  */
 #define UNIT_TEST 1
-#include "dns_client.c"
+#include "resolverd.c"
 
 #include <assert.h>
 

@@ -83,7 +83,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |
 | `apid.c` | **`apid`** — HTTP/HTTPS front for DoH + management (migration Step 4, done). Forwards DoH to `dnsd`; all writes go to Valkey. |
-| `dns_client.c` | Recursive/forwarding resolver + cache + DNSSEC **validation**. Becomes `resolverd`. |
+| `resolverd.c` | **`resolverd`** — recursive/forwarding resolver + cache + DNSSEC **validation** (the recursive role; formerly `dns_client.c`). Distinct daemon from `dnsd`; own `make resolverd` target + `make check-resolverd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
 | `fuzz/` | libFuzzer harness + corpus: `make fuzz-wire` (60s smoke; needs clang). |
@@ -135,7 +135,7 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
 | Change type | Read |
 |---|---|
 | Wire parsing / record encoding | `libdnswire` (`dns_wire.*`), `tests/test_name_from_wire.c`, `fuzz/` |
-| TSIG / DNSSEC | the crypto sections of `dns_server.c` / `dns_client.c`, `tests/test_dnssec_verify.c` |
+| TSIG / DNSSEC | the crypto sections of `dns_server.c` / `resolverd.c`, `tests/test_dnssec_verify.c` |
 | Process split / new daemon | this file (architecture + Valkey boundary), `CLAUDE-migration.md` |
 | Config / control plane | Valkey ownership table, `dashboard/app.py`, README schema |
 | Build / CI | `Makefile`, `.github/workflows/ci.yml` |
@@ -248,16 +248,20 @@ arbitrary outbound connections.
 
 ### `resolverd` — recursive/forwarding resolver (separate role)
 
-> **Last remaining migration item.** Steps 1–7 plus the optional follow-ups
-> (catalog zones, mount-namespace isolation) are done; carving `dns_client.c`
-> into its own `resolverd` daemon is the only piece of the target topology not
-> yet built. `dns_client.c` already implements the resolver logic — this is the
-> process split, not new functionality.
+**Done.** `resolverd.c` (renamed from `dns_client.c`) is now a first-class
+daemon with its own hardened `make resolverd` / `make resolverd_debug` targets
+and a `make check-resolverd` smoke test (proxies through `dnsd`). This was the
+last unbuilt piece of the target topology; the whole migration is now complete.
 
-This is `dns_client.c`. Keep it a distinct daemon — authoritative and recursive
-are different DNS roles and must not share a process. Owns upstream UDP/TCP/DoT/
-DoH, the cache, and DNSSEC **validation** (validation covers the full
-canonical RRset per RFC 4034 §3.1.8.1 — guarded by `make check-dnssec`).
+Keep it a distinct daemon — authoritative and recursive are different DNS roles
+and must not share a process. Owns upstream UDP/TCP/DoT/DoH, the cache, and
+DNSSEC **validation** (validation covers the full canonical RRset per
+RFC 4034 §3.1.8.1 — guarded by `make check-dnssec`).
+
+Follow-up (not a blocker): `resolverd` does not yet get the `dnsd`-style
+privilege-drop / seccomp / mount-isolation sandbox, which is its own hardening
+task. (Its build carries `-Wno-misleading-indentation` because the dense — but
+clang-format-conformant — style trips that gcc heuristic; not a reformat TODO.)
 
 Reads/writes Valkey: its persisted cache namespace only. It does not read the
 authoritative zone.
@@ -297,7 +301,7 @@ authoritative zone.
 
 Factor the duplicated primitives (`name_from_wire`, `name_to_wire`,
 `append_rr`, `get16/put16/get32/put32`, `txt_encode`, hex/base64 helpers) out of
-`dns_server.c`, `dns_client.c`, and `simple_dns.c` into one module. All three
+`dns_server.c`, `resolverd.c`, and `simple_dns.c` into one module. All three
 binaries link it. This eliminates the divergence-bug class (e.g. a parser fix
 applied to one copy but not the others).
 
@@ -440,11 +444,13 @@ Each step is independently shippable and must pass `make debug`, `make`, and
 After step 4, `dnsd` should be a substantially smaller, single-purpose,
 sandboxable daemon — the trusted core this architecture is designed to produce.
 
-Steps 1–7 and the optional follow-ups (catalog zones, mount-namespace
-isolation) are complete. **The only remaining piece of the target topology is
-splitting `dns_client.c` into the standalone `resolverd` daemon** (see the
-`resolverd` section above) — a process split of already-working resolver code,
-not new functionality.
+Steps 1–7, the optional follow-ups (catalog zones, mount-namespace isolation),
+and the `resolverd` split (`dns_client.c` → `resolverd.c`, now a first-class
+hardened daemon — see the `resolverd` section above) are **all complete**. The
+monolith is fully decomposed and every box in `CLAUDE-migration.md` is ticked.
+Remaining work is feature/quality, not migration: the optional plans
+(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,performance,sec}.md`)
+and extending the `dnsd`-style sandbox to `resolverd`.
 
 ---
 

@@ -23,7 +23,7 @@
  */
 
 #define UNIT_TEST 1
-#include "dns_client.c"
+#include "resolverd.c"
 
 #include <openssl/core_names.h>
 

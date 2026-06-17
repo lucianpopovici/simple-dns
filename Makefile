@@ -118,8 +118,8 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
-        certd certd_debug mdnsd mdnsd_debug apid apid_debug
+        check check-cds check-catalog check-resolverd check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
 # instead of a wall of confusing compiler/linker errors.
@@ -208,6 +208,28 @@ apid: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	@echo ""
+	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
+	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
+
+# =============================================================================
+# resolverd — recursive/forwarding resolver + cache + DNSSEC validation
+# (the recursive role; formerly dns_client.c). Distinct daemon from dnsd.
+# -Wno-misleading-indentation: resolverd.c is clang-format-conformant but its
+# dense one-statement-heavy style trips gcc's -Wmisleading-indentation heuristic;
+# suppress just that one warning here (as the unit-test targets already do) to
+# keep the -Werror build green. The rest of the curated WARN set still applies.
+# =============================================================================
+resolverd: resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [PROD]  $@"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(PROD_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	strip --strip-unneeded $@
+
+resolverd_debug: resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [DEBUG] $@"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) $(VERSION_FLAGS) \
 	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
@@ -312,9 +334,9 @@ uninstall:
 # Unit tests
 # =============================================================================
 # DNSSEC known-answer + negative tests.
-# Includes dns_client.c with -DUNIT_TEST, so it inherits that file's (dense,
+# Includes resolverd.c with -DUNIT_TEST, so it inherits that file's (dense,
 # pre-clang-format) style — suppress the indentation warning for now.
-check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_dnssec_verify"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
 	      $(INCLUDES) -I. -o tests/test_dnssec_verify \
@@ -328,9 +350,9 @@ check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c dns_client.c $(WI
 	./tests/test_rollover
 
 # name_from_wire compression-handling tests.
-# -Wno-unused-function: -DUNIT_TEST compiles out dns_client.c's main(), which
+# -Wno-unused-function: -DUNIT_TEST compiles out resolverd.c's main(), which
 # is the only caller of some helpers.
-check-wire: tests/test_name_from_wire.c dns_client.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
 	      $(DEBUG_FLAGS) \
@@ -412,12 +434,29 @@ check-catalog: $(BIN_DEBUG)
 	 test -z "$$A2" || { echo "  FAIL  member still served after PTR removed ($$A2)"; exit 1; }; \
 	 echo "  OK  member provisioned+signed, then deprovisioned on PTR removal"
 
+# resolverd smoke: bring up dnsd (authoritative upstream) and resolverd (caching
+# proxy, default LISTEN_PORT 5354 → upstream 127.0.0.1:5353/udp), then resolve
+# through the proxy and confirm it returns dnsd's answer. Needs Valkey + dig.
+check-resolverd: $(BIN_DEBUG) resolverd_debug
+	@echo "  CHECK  resolverd caching proxy → dnsd (requires Valkey + dig)"
+	@ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_rd.log 2>&1 &                \
+	 DNS_PID=$$!;                                                                       \
+	 ASAN_OPTIONS=detect_leaks=0 ./resolverd_debug > /tmp/resolverd_rd.log 2>&1 &       \
+	 RD_PID=$$!;                                                                        \
+	 sleep 2;                                                                           \
+	 A=$$(dig @127.0.0.1 -p 5354 example.local A +short +time=2 +tries=1);             \
+	 kill $$DNS_PID $$RD_PID 2>/dev/null || true;                                       \
+	 echo "  resolved via resolverd (:5354): A=[$$A]";                                 \
+	 test "$$A" = "192.168.1.10" || { echo "  FAIL  resolverd did not return dnsd's answer"; exit 1; }; \
+	 echo "  OK  resolverd proxied dnsd's answer"
+
 # =============================================================================
 # Clean
 # =============================================================================
 clean:
 	@echo "  CLEAN"
 	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug mdnsd mdnsd_debug apid apid_debug \
+	      resolverd resolverd_debug \
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
 	      fuzz/fuzz_name_from_wire
@@ -438,13 +477,16 @@ help:
 	@echo "  make mdnsd_debug  mDNS responder, ASan/UBSan debug build"
 	@echo "  make apid         HTTP/HTTPS front (DoH + mgmt), hardened production build"
 	@echo "  make apid_debug   apid front, ASan/UBSan debug build"
+	@echo "  make resolverd       Recursive/forwarding resolver (recursive role), hardened build"
+	@echo "  make resolverd_debug Resolver, ASan/UBSan debug build"
 	@echo "  make sign         (Re-)sign the existing production binary with GPG"
 	@echo "  make sign-openssl Sign with OpenSSL Ed25519 key (keys/codesign.key.pem)"
 	@echo "  make verify       Verify GPG and/or OpenSSL signatures"
 	@echo "  make install      Install binary + signature to \$$(DESTDIR)\$$(PREFIX)/bin"
 	@echo "  make uninstall    Remove installed files"
 	@echo "  make check        Quick smoke-test (needs Valkey)"
-	@echo "  make check-catalog  RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
+	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
+	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

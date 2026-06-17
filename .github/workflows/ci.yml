@@ -56,6 +56,7 @@ jobs:
           make certd      OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make mdnsd      OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make apid       OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make resolverd  OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Unit tests (DNSSEC known-answer/negative + name parser)
         run: |
@@ -79,6 +80,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-cds OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: resolverd caching proxy → dnsd
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-resolverd OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
   warnings:
     name: Warnings as errors
     runs-on: ubuntu-latest
@@ -94,17 +101,19 @@ jobs:
         # CLAUDE.md: "promote the current warning set", not bare -Wall -Wextra.
         run: |
           set -e
-          for t in dns_server certd mdnsd apid; do
+          for t in dns_server certd mdnsd apid resolverd; do
             make "$t" EXTRA_WARN=-Werror OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           done
           make debug EXTRA_WARN=-Werror OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           # Standalone translation units have no daemon target; syntax-check
           # them under the same flags at -O2 (surfaces format-truncation etc.).
+          # resolverd now has its own -Werror target above, so only the reference
+          # build (simple_dns.c) remains here.
           W="-Wall -Wextra -Wformat=2 -Wformat-overflow=2 -Wnull-dereference \
              -Wstack-protector -Wno-unused-parameter -Wno-missing-field-initializers \
              -Wno-implicit-fallthrough -Werror"
           gcc -std=c99 -D_GNU_SOURCE -O2 -D_FORTIFY_SOURCE=2 -fPIE $W \
-              -I"$OSSL_INC" -fsyntax-only dns_client.c simple_dns.c
+              -I"$OSSL_INC" -fsyntax-only simple_dns.c
 
   static-analysis:
     name: Static analysis
