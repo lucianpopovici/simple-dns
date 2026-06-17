@@ -248,6 +248,12 @@ arbitrary outbound connections.
 
 ### `resolverd` — recursive/forwarding resolver (separate role)
 
+> **Last remaining migration item.** Steps 1–7 plus the optional follow-ups
+> (catalog zones, mount-namespace isolation) are done; carving `dns_client.c`
+> into its own `resolverd` daemon is the only piece of the target topology not
+> yet built. `dns_client.c` already implements the resolver logic — this is the
+> process split, not new functionality.
+
 This is `dns_client.c`. Keep it a distinct daemon — authoritative and recursive
 are different DNS roles and must not share a process. Owns upstream UDP/TCP/DoT/
 DoH, the cache, and DNSSEC **validation** (validation covers the full
@@ -427,11 +433,18 @@ Each step is independently shippable and must pass `make debug`, `make`, and
 7. **Add multi-zone support** in the now-minimal `dnsd`. *(Done: re-keyed
    `zone:<zone>:*` storage, longest-suffix zone selection, per-zone SOA / NSEC3
    / DNSSEC keys / AXFR / NOTIFY / UPDATE, `tools/migrate-multizone.sh`, apid +
-   dashboard zone resolution, plus automated per-zone ZSK rollover
-   (RFC 6781 Pre-Publish). KSK/CDS rollover is the remaining follow-up.)*
+   dashboard zone resolution, automated per-zone ZSK **and** KSK rollover
+   (RFC 6781 Pre-Publish + Double-Signature, CDS/CDNSKEY per RFC 7344/8078), and
+   catalog zones (RFC 9432). All done.)*
 
 After step 4, `dnsd` should be a substantially smaller, single-purpose,
 sandboxable daemon — the trusted core this architecture is designed to produce.
+
+Steps 1–7 and the optional follow-ups (catalog zones, mount-namespace
+isolation) are complete. **The only remaining piece of the target topology is
+splitting `dns_client.c` into the standalone `resolverd` daemon** (see the
+`resolverd` section above) — a process split of already-working resolver code,
+not new functionality.
 
 ---
 
