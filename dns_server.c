@@ -40,6 +40,7 @@
  *   8945       TSIG – per-message HMAC authentication for UPDATE/AXFR/NOTIFY
  *   9018       DNS Cookies – SipHash-2-4 anti-spoofing/amplification
  *   9364       DNSSEC (consolidation RFC)
+ *   9432       Catalog Zones – bulk provisioning of member zones (consumer side)
  *   9619       QDCOUNT=1 enforcement for QUERY
  *   6762       mDNS RFC 6762 (Multicast DNS, dual-stack IPv4+IPv6)
  *   6763       DNS-SD RFC 6763 (Service Discovery / Bonjour browsing)
@@ -66,9 +67,12 @@
  *                              user's primary group). Only acts when run as root.
  *   config:seccomp_mode        Syscall sandbox: "enforce" (default, EPERM),
  *                              "audit" (log-only), or "off". Needs -DHAVE_SECCOMP.
- *   config:chroot_dir          If set (env DNS_CHROOT overrides), chroot here
- *                              after binding sockets, before the privilege drop.
- *                              Only acts when run as root.
+ *   config:chroot_dir          If set (env DNS_CHROOT overrides), confine the
+ *                              filesystem here after binding sockets, before the
+ *                              privilege drop. Only acts when run as root.
+ *   config:isolation_mode      How chroot_dir is applied (env DNS_ISOLATION
+ *                              overrides): "chroot" (default, chroot(2)) or
+ *                              "mountns" (private mount namespace + pivot_root(2)).
  *
  * Multi-zone key schema (migration Step 7) — records carry the owning zone:
  *   zone_table:<zone>          Zone SOA + transfer settings
@@ -112,6 +116,17 @@
  * expires) config:zone:<zone>:ksk_rollover_request      Manual trigger (set a fresh value to roll
  * now)
  *
+ * Catalog zones schema (RFC 9432; dnsd CONSUMES, the control plane WRITES):
+ *   A catalog is an ordinary zone (it has zone_table:<cat>) carrying:
+ *     zone:<cat>:TXT:version.<cat>          "2"  — RFC 9432 §4.1 schema version
+ *     zone:<cat>:PTR:<id>.zones.<cat>       <member-zone>  — one per member
+ *   dnsd provisions each member into its in-memory zone table (deriving SOA
+ *   names from the member, inheriting the catalog's SOA timers / AXFR ACL /
+ *   NOTIFY targets, generating dnssec:<member>:* keys), and deactivates members
+ *   the catalog stops listing. It never writes zone_table:* — provisioning is
+ *   in-memory, re-derived on each scan (boot, a config: or zone_table: change,
+ *   and the rollover tick). config:zone:<member>:serial persists a member serial.
+ *
  * Build:
  *   gcc -O2 -Wall -I<openssl-inc> -o dns_server dns_server.c \
  *       -L<openssl-lib> -lssl -lcrypto -lpthread -Wl,-rpath,<openssl-lib>
@@ -142,6 +157,11 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/prctl.h>
+#ifdef __linux__
+#include <sched.h>       /* unshare, CLONE_NEWNS */
+#include <sys/mount.h>   /* mount, umount2, MS_* */
+#include <sys/syscall.h> /* SYS_pivot_root */
+#endif
 #ifdef HAVE_SECCOMP
 #include <seccomp.h>
 #endif
@@ -361,6 +381,14 @@ typedef struct {
     int ksk_roll_phase;    /* KROLL_NONE / KROLL_DOUBLE / KROLL_RETIRE */
     time_t ksk_roll_since; /* epoch the current KSK phase was entered */
     time_t ksk_created;    /* epoch the current KSK set was created */
+    /* Catalog zones (RFC 9432). A zone provisioned from a catalog records the
+     * catalog's name here (empty = operator-defined via zone_table). When the
+     * catalog stops listing the member, dnsd deactivates the slot rather than
+     * compacting the array, so a request thread that already holds a zone
+     * pointer never dereferences freed memory. zone_for_qname skips inactive
+     * slots; a member that reappears reuses its slot by name and reactivates. */
+    int active;               /* 1 = served; 0 = deprovisioned (slot retained) */
+    char catalog_origin[256]; /* owning catalog zone, or "" if operator-defined */
 } zone_entry_t;
 
 /* ZSK rollover phases (RFC 6781 §4.1.1.1 Pre-Publish). */
@@ -394,6 +422,8 @@ static zone_entry_t *zone_for_qname(const char *qname) {
     pthread_mutex_lock(&g_zones_mutex);
     for (int i = 0; i < g_zone_count; i++) {
         zone_entry_t *z = &g_zones[i];
+        if (!z->active)
+            continue; /* deprovisioned catalog member — not served */
         size_t zl = strlen(z->name);
         if (zl == 0 || zl > ql)
             continue;
@@ -452,6 +482,7 @@ static int zone_upsert(const char *name, const char *mname, const char *rname, u
     z->soa_minimum = minimum;
     safe_strcpy(z->axfr_allow, axfr_allow ? axfr_allow : "127.0.0.1", sizeof(z->axfr_allow));
     safe_strcpy(z->notify_targets, notify_targets ? notify_targets : "", sizeof(z->notify_targets));
+    z->active = 1; /* (re)affirm the slot; catalog_origin is preserved across upserts */
     pthread_mutex_unlock(&g_zones_mutex);
     return idx;
 }
@@ -468,6 +499,11 @@ static void seed_primary_zone(void);
 static void zone_rollover_load(zone_entry_t *z);
 /* Reload a zone's full DNSSEC key state live (current + rollover/next set). */
 static void zone_dnssec_reload(zone_entry_t *z);
+/* Reconcile catalog-zone (RFC 9432) membership: provision/deprovision members. */
+static void catalog_scan_all(void);
+/* Serializes catalog scans so the boot / keyspace / rollover callers cannot
+ * interleave a provision against a deprovision for the same slot. */
+static pthread_mutex_t g_catalog_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ==========================================================================
  * Runtime configuration
@@ -2036,12 +2072,14 @@ static void keyspace_apply(const char *key) {
         config_load_from_valkey();
         seed_primary_zone(); /* propagate SOA/zone config edits to the primary zone */
         zones_post_load();   /* re-apply per-zone NSEC3 config; load keys for new zones */
+        catalog_scan_all();  /* per-zone catalog config may have changed (RFC 9432) */
         if (strstr(key, "tls_") || strstr(key, "mtls_"))
             tls_reload();
         dns_log(LOG_INFO, "[Reload] config applied after %s change\n", key);
     } else if (strncmp(key, "zone_table:", 11) == 0) {
         zones_load_from_valkey();
-        zones_post_load(); /* apply per-zone config + load keys for any new zone */
+        zones_post_load();  /* apply per-zone config + load keys for any new zone */
+        catalog_scan_all(); /* a new/removed zone_table entry may be a catalog */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         /* dnssec:<zone>:... — reload that zone's key state live (current set +
@@ -2918,6 +2956,8 @@ static void rollover_tick(void) {
     pthread_mutex_unlock(&g_zones_mutex);
     for (int i = 0; i < n; i++) {
         zone_entry_t *z = &g_zones[i];
+        if (!z->active)
+            continue; /* deprovisioned catalog member — no key rollover */
         pthread_mutex_lock(&g_zsk_mutex);
         int phase = z->roll_phase;
         time_t since = z->roll_since, created = z->zsk_created;
@@ -2983,6 +3023,9 @@ static void rollover_tick(void) {
                 ksk_rollover_finish(z);
         }
     }
+    /* Catalog membership lives under zone:* (not subscribed), so the periodic
+     * tick is the live-pickup path for RFC 9432 provisioning/deprovisioning. */
+    catalog_scan_all();
 }
 
 static void *rollover_thread(void *arg) {
@@ -3033,6 +3076,8 @@ static void zones_post_load(void) {
     int n = g_zone_count;
     pthread_mutex_unlock(&g_zones_mutex);
     for (int i = 0; i < n; i++) {
+        if (!g_zones[i].active)
+            continue; /* deprovisioned catalog member — leave its keys untouched */
         zone_apply_config(&g_zones[i]);
         if (!g_zones[i].zsk && !g_zones[i].zsk_ed && !g_zones[i].ksk && !g_zones[i].ksk_ed)
             zone_dnssec_init(&g_zones[i]);
@@ -3040,6 +3085,228 @@ static void zones_post_load(void) {
 }
 static void dnssec_init(void) {
     zones_post_load();
+}
+
+/* ==========================================================================
+ * Catalog zones (RFC 9432) — bulk provisioning of member zones
+ *
+ * A catalog zone is an ordinary authoritative zone (it has a zone_table:<cat>
+ * entry, so dnsd serves it and secondaries can AXFR it) that additionally
+ * carries the RFC 9432 schema-version record  version.<cat> TXT "2"  and a list
+ * of member zones as  <id>.zones.<cat> PTR <member-zone>.  dnsd consumes that
+ * list and provisions each member into its in-memory zone table — deriving SOA
+ * names from the member, inheriting the catalog's SOA timers / transfer ACL /
+ * NOTIFY targets, and generating per-zone DNSSEC keys via the normal path — so
+ * an operator gets a new signed zone just by adding a PTR, with no per-zone
+ * zone_table:* edit.  Members dropped from the catalog are deactivated.
+ *
+ * Boundary (CLAUDE.md): dnsd only READS the catalog (zone:<cat>:* records,
+ * written by the control plane) and writes only what it already owns for a
+ * provisioned zone (dnssec:<member>:* keys).  It never writes zone_table:* —
+ * provisioning is purely in-memory, re-derived from the catalog on every scan.
+ *
+ * Scans run at boot, on config:* / zone_table:* changes, and once per rollover
+ * tick.  Catalog membership lives under zone:* (which dnsd does not subscribe
+ * to), so the periodic tick is the live-pickup path — the same poll model a
+ * catalog consumer uses anyway.
+ * ======================================================================= */
+
+/* True if `cat` carries the RFC 9432 §4.1 schema-version record
+ * (version.<cat> TXT "2").  Creating that record is what opts a zone in. */
+static int catalog_is_catalog_zone(const char *cat) {
+    char k[768];
+    snprintf(k, sizeof(k), "zone:%.255s:TXT:version.%.255s", cat, cat);
+    char v[128] = "";
+    if (!vk_get(k, v, sizeof(v)) || !v[0])
+        return 0;
+    const char *p = strchr(v, '|'); /* value is the usual ttl|rdata */
+    p = p ? p + 1 : v;
+    while (*p == ' ' || *p == '"') /* tolerate quoting / whitespace */
+        p++;
+    return p[0] == '2' && (p[1] == 0 || p[1] == ' ' || p[1] == '"');
+}
+
+/* Enumerate member zone names from a catalog: keys
+ *   zone:<cat>:PTR:<id>.zones.<cat>  →  value = PTR target (the member zone).
+ * Returns the count and fills out[] (each NUL-terminated, <256 chars). */
+static int catalog_members(const char *cat, char out[][256], int max) {
+    char pat[768];
+    snprintf(pat, sizeof(pat), "zone:%.255s:PTR:*.zones.%.255s", cat, cat);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return 0;
+    }
+    resp_reply_t r;
+    if (resp_cmd(&vk, &r, 2, "KEYS", pat) < 0 || r.type != 5) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return 0;
+    }
+    char keys[MAX_ZONES * 4][768];
+    int maxk = (int) (sizeof(keys) / sizeof(keys[0]));
+    int nk = 0;
+    for (int i = 0; i < r.count; i++) {
+        resp_reply_t kr;
+        if (resp_parse(&vk, &kr) < 0)
+            break;
+        if (kr.type == 2 && nk < maxk)
+            safe_strcpy(keys[nk++], kr.str, sizeof(keys[0]));
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    int n = 0;
+    for (int i = 0; i < nk && n < max; i++) {
+        char v[512] = "";
+        if (!vk_get(keys[i], v, sizeof(v)) || !v[0])
+            continue;
+        const char *p = strchr(v, '|'); /* strip optional ttl| prefix */
+        p = p ? p + 1 : v;
+        char m[256];
+        safe_strcpy(m, p, sizeof(m));
+        size_t ml = strlen(m);
+        if (ml && m[ml - 1] == '.')
+            m[ml - 1] = 0; /* drop trailing dot */
+        if (!m[0])
+            continue;
+        int dup = 0; /* a member listed twice is provisioned once */
+        for (int j = 0; j < n; j++)
+            if (strcasecmp(out[j], m) == 0) {
+                dup = 1;
+                break;
+            }
+        if (!dup)
+            safe_strcpy(out[n++], m, sizeof(out[0]));
+    }
+    return n;
+}
+
+/* Find a zone slot by name (caller holds g_zones_mutex). */
+static int catalog_find_zone_idx(const char *name) {
+    for (int i = 0; i < g_zone_count; i++)
+        if (strcasecmp(g_zones[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+/* SOA/transfer template a catalog hands to its members. Copied out of the live
+ * zone_entry_t so we never read its key pointers as if they were template data. */
+typedef struct {
+    char name[256];
+    uint32_t refresh, retry, expire, minimum;
+    char axfr_allow[1024];
+    char notify_targets[1024];
+} catalog_tmpl_t;
+
+/* Provision (or re-affirm) one catalog member zone. Returns its slot index, or
+ * -1 on capacity exhaustion. Never overrides an operator-defined zone or a
+ * member owned by a different catalog, and never disturbs the SOA serial / keys
+ * of a member it has already provisioned (re-affirm is just active=1). */
+static int catalog_provision_member(const char *cat, const char *member,
+                                    const catalog_tmpl_t *tmpl) {
+    pthread_mutex_lock(&g_zones_mutex);
+    int idx = catalog_find_zone_idx(member);
+    if (idx >= 0) {
+        const char *orig = g_zones[idx].catalog_origin;
+        if (!orig[0]) { /* operator-defined zone with this name — leave it alone */
+            pthread_mutex_unlock(&g_zones_mutex);
+            return idx;
+        }
+        if (strcasecmp(orig, cat) != 0) { /* owned by another catalog */
+            pthread_mutex_unlock(&g_zones_mutex);
+            dns_log(LOG_WARNING,
+                    "[Catalog] %s: member %s already provisioned by catalog %s — skipping\n", cat,
+                    member, orig);
+            return idx;
+        }
+        g_zones[idx].active = 1; /* ours: re-affirm without touching serial/keys */
+        pthread_mutex_unlock(&g_zones_mutex);
+        return idx;
+    }
+    pthread_mutex_unlock(&g_zones_mutex);
+
+    /* Fresh provisioning: derive SOA names from the member, inherit timers / ACL
+     * / NOTIFY from the catalog, restore the persisted serial if any. */
+    char mname[300], rname[300];
+    snprintf(mname, sizeof(mname), "ns1.%.255s", member);
+    snprintf(rname, sizeof(rname), "hostmaster.%.255s", member);
+    uint32_t serial = 1;
+    char sk[600], sv[64] = "";
+    snprintf(sk, sizeof(sk), "config:zone:%.255s:serial", member);
+    if (vk_get(sk, sv, sizeof(sv)) && sv[0])
+        serial = (uint32_t) strtoul(sv, NULL, 10);
+    idx = zone_upsert(member, mname, rname, serial, tmpl->refresh, tmpl->retry, tmpl->expire,
+                      tmpl->minimum, tmpl->axfr_allow, tmpl->notify_targets);
+    if (idx < 0) {
+        dns_log(LOG_WARNING, "[Catalog] %s: cannot provision %s — zone table full (MAX_ZONES=%d)\n",
+                cat, member, MAX_ZONES);
+        return -1;
+    }
+    pthread_mutex_lock(&g_zones_mutex);
+    safe_strcpy(g_zones[idx].catalog_origin, cat, sizeof(g_zones[idx].catalog_origin));
+    g_zones[idx].active = 1;
+    pthread_mutex_unlock(&g_zones_mutex);
+    zone_apply_config(&g_zones[idx]);
+    if (!g_zones[idx].zsk && !g_zones[idx].zsk_ed && !g_zones[idx].ksk && !g_zones[idx].ksk_ed)
+        zone_dnssec_init(&g_zones[idx]);
+    dns_log(LOG_NOTICE, "[Catalog] %s: provisioned member zone %s\n", cat, member);
+    return idx;
+}
+
+/* Reconcile every catalog zone's membership against the in-memory zone table:
+ * provision newly-listed members, deactivate members no longer listed. */
+static void catalog_scan_all(void) {
+    pthread_mutex_lock(&g_catalog_mutex); /* one scan at a time (boot/keyspace/rollover) */
+
+    /* Snapshot candidate catalog zones (a catalog must be a served zone) and the
+     * template each would hand its members; detection needs Valkey, so it is done
+     * below outside g_zones_mutex. */
+    catalog_tmpl_t cand[MAX_ZONES];
+    int ncand = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && ncand < MAX_ZONES; i++) {
+        if (!g_zones[i].active || g_zones[i].catalog_origin[0])
+            continue; /* inactive, or itself a catalog member — not a catalog */
+        zone_entry_t *z = &g_zones[i];
+        catalog_tmpl_t *t = &cand[ncand++];
+        safe_strcpy(t->name, z->name, sizeof(t->name));
+        t->refresh = z->soa_refresh;
+        t->retry = z->soa_retry;
+        t->expire = z->soa_expire;
+        t->minimum = z->soa_minimum;
+        safe_strcpy(t->axfr_allow, z->axfr_allow, sizeof(t->axfr_allow));
+        safe_strcpy(t->notify_targets, z->notify_targets, sizeof(t->notify_targets));
+    }
+    pthread_mutex_unlock(&g_zones_mutex);
+
+    int seen[MAX_ZONES];
+    memset(seen, 0, sizeof(seen));
+    for (int c = 0; c < ncand; c++) {
+        if (!catalog_is_catalog_zone(cand[c].name))
+            continue;
+        char members[MAX_ZONES][256];
+        int nm = catalog_members(cand[c].name, members, MAX_ZONES);
+        for (int m = 0; m < nm; m++) {
+            if (strcasecmp(members[m], cand[c].name) == 0)
+                continue; /* a catalog cannot be its own member */
+            int idx = catalog_provision_member(cand[c].name, members[m], &cand[c]);
+            if (idx >= 0 && idx < MAX_ZONES)
+                seen[idx] = 1;
+        }
+    }
+
+    /* Deprovision: catalog-owned slots not reaffirmed this scan. */
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && i < MAX_ZONES; i++) {
+        zone_entry_t *z = &g_zones[i];
+        if (z->active && z->catalog_origin[0] && !seen[i]) {
+            z->active = 0;
+            dns_log(LOG_NOTICE,
+                    "[Catalog] deprovisioned member zone %s (no longer in catalog %s)\n", z->name,
+                    z->catalog_origin);
+        }
+    }
+    pthread_mutex_unlock(&g_zones_mutex);
+
+    pthread_mutex_unlock(&g_catalog_mutex);
 }
 
 /* ==========================================================================
@@ -6457,8 +6724,72 @@ static void sighup_handler(int sig) {
  *   - Remote syslog over TLS with peer verification needs the CA bundle.
  *
  * Enabled by config:chroot_dir (env DNS_CHROOT overrides). No-op when unset or
- * not running as root. Fail-closed if set, root, and chroot fails.
+ * not running as root. Fail-closed if set, root, and confinement fails.
+ *
+ * Mechanism (config:isolation_mode, env DNS_ISOLATION overrides):
+ *   chroot  (default) — plain chroot(2)+chdir("/"). Per-process (shares the
+ *                       fs_struct via CLONE_FS), so it confines every thread,
+ *                       including the keyspace/rollover threads already running.
+ *   mountns           — unshare(CLONE_NEWNS) a private mount namespace, make the
+ *                       propagation private so nothing leaks back to the host,
+ *                       then pivot_root(2) into the dir and detach the old root.
+ *                       Stronger than chroot (the old root is unmounted, not just
+ *                       hidden behind a directory swap an attacker might break out
+ *                       of) and a foundation for further mount restrictions.
+ *
+ *   Threading note for mountns: unshare(CLONE_NEWNS) moves only the *calling*
+ *   thread to the new mount namespace. We run it on the main thread before any
+ *   per-connection worker is spawned, so every thread that handles untrusted
+ *   request input — the UDP main loop and the TCP/DoT workers forked from it —
+ *   inherits the pivoted root. The two trusted background threads started earlier
+ *   (keyspace, rollover) stay in the parent mount namespace; they touch only the
+ *   already-open Valkey socket and never resolve attacker-controlled paths, so
+ *   the request-handling boundary still holds. Use the default `chroot` mode if
+ *   you need the confinement to cover those threads too.
  * ======================================================================= */
+#ifdef __linux__
+/* Pivot into `dir` using a private mount namespace. Fail-closed (exit) on any
+ * step, since a half-applied isolation is worse than a clear refusal. */
+static void enter_mount_namespace(const char *dir) {
+    if (unshare(CLONE_NEWNS) != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: unshare(CLONE_NEWNS) failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    /* Make every mount private so our pivot does not propagate to the host. */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: make-rprivate(/) failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    /* pivot_root requires new_root to be a mount point: bind dir onto itself. */
+    if (mount(dir, dir, NULL, MS_BIND | MS_REC, NULL) != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: bind-mount('%s') failed: %s\n", dir, strerror(errno));
+        exit(1);
+    }
+    if (chdir(dir) != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: chdir('%s') failed: %s\n", dir, strerror(errno));
+        exit(1);
+    }
+    /* pivot_root(".", ".") stacks the old root on top of the new one (the
+     * util-linux / runc idiom), so no separate put_old directory is needed. */
+    if (syscall(SYS_pivot_root, ".", ".") != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: pivot_root('%s') failed: %s\n", dir, strerror(errno));
+        exit(1);
+    }
+    /* Detach the old root (now stacked at "/") so it is fully gone, then re-anchor
+     * the working directory at the new root. */
+    if (umount2(".", MNT_DETACH) != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: umount2(old-root) failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    if (chdir("/") != 0) {
+        dns_log(LOG_ERR, "[Sandbox] FATAL: chdir('/') after pivot_root failed: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+    dns_log(LOG_NOTICE, "[Sandbox] Pivoted into '%s' via private mount namespace (now /)\n", dir);
+}
+#endif /* __linux__ */
+
 static void enter_chroot(void) {
     char dir[512] = "";
     vk_get("config:chroot_dir", dir, sizeof(dir));
@@ -6466,11 +6797,26 @@ static void enter_chroot(void) {
     if (env_dir && env_dir[0])
         safe_strcpy(dir, env_dir, sizeof(dir));
     if (!dir[0])
-        return; /* not configured — no chroot */
+        return; /* not configured — no filesystem isolation */
     if (geteuid() != 0) {
         dns_log(LOG_WARNING, "[Chroot] config:chroot_dir set but not running as root — skipping\n");
         return;
     }
+    char mode[16] = "";
+    vk_get("config:isolation_mode", mode, sizeof(mode));
+    const char *env_mode = getenv("DNS_ISOLATION");
+    if (env_mode && env_mode[0])
+        safe_strcpy(mode, env_mode, sizeof(mode));
+#ifdef __linux__
+    if (strcmp(mode, "mountns") == 0) {
+        enter_mount_namespace(dir);
+        return;
+    }
+#else
+    if (strcmp(mode, "mountns") == 0)
+        dns_log(LOG_WARNING,
+                "[Chroot] isolation_mode=mountns unsupported on this OS — using chroot\n");
+#endif
     if (chroot(dir) != 0) {
         dns_log(LOG_ERR, "[Chroot] FATAL: chroot('%s') failed: %s\n", dir, strerror(errno));
         exit(1);
@@ -6810,6 +7156,10 @@ int main(int argc, char **argv) {
 
     /* Phase 3: DNSSEC (both algorithms) */
     dnssec_init();
+
+    /* Phase 3b: Provision catalog-zone (RFC 9432) members before serving, so a
+     * member zone is signed and answerable from the first query. */
+    catalog_scan_all();
 
     /* Phase 4: Load cert if already in Valkey; ACME initial issuance is handled
      * by pki_renewal_thread after DNS sockets are open (DNS-01 requires the

@@ -118,7 +118,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -378,6 +378,40 @@ check-cds: $(BIN_DEBUG)
 	 diff /tmp/cds_cdk.txt /tmp/cds_ksk.txt || { echo "  FAIL  CDNSKEY != KSK DNSKEY"; exit 1; }; \
 	 echo "  OK  CDS==DS and CDNSKEY==KSK"
 
+# RFC 9432 catalog zones: a member listed only in a catalog (a version-"2" zone
+# with a <id>.zones.<cat> PTR) must be auto-provisioned (served + DNSSEC-signed)
+# and then deprovisioned when the PTR is removed. dnsd never writes zone_table:*
+# for the member — provisioning is in-memory, re-derived from the catalog. Needs
+# Valkey + dig + valkey-cli/redis-cli; uses throwaway names and cleans up after.
+check-catalog: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 9432 catalog provision/deprovision (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 CZ=catalog.test; MZ=member.test;                                                  \
+	 $$VC set zone_table:$$CZ "ns1.$$CZ|hostmaster.$$CZ|3|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set zone:$$CZ:TXT:version.$$CZ "300|2" >/dev/null;                           \
+	 $$VC set zone:$$CZ:PTR:m1.zones.$$CZ "300|$$MZ" >/dev/null;                       \
+	 $$VC set zone:$$MZ:A:www.$$MZ "300|10.9.8.7" >/dev/null;                          \
+	 ./$(BIN_DEBUG) > /tmp/dnsd_cat.log 2>&1 &                                         \
+	 DNS_PID=$$!;                                                                      \
+	 sleep 1.5;                                                                        \
+	 A=$$(dig @127.0.0.1 -p 5353 www.$$MZ A   +short +time=2 +tries=1);                \
+	 S=$$(dig @127.0.0.1 -p 5353 $$MZ     SOA +short +time=2 +tries=1);                \
+	 D=$$(dig @127.0.0.1 -p 5353 $$MZ     DS  +short +time=2 +tries=1);                \
+	 $$VC del zone:$$CZ:PTR:m1.zones.$$CZ >/dev/null;                                  \
+	 $$VC set config:catalog_test_poke 1 >/dev/null;                                   \
+	 sleep 1.5;                                                                        \
+	 A2=$$(dig @127.0.0.1 -p 5353 www.$$MZ A +short +time=2 +tries=1);                 \
+	 kill $$DNS_PID 2>/dev/null || true;                                               \
+	 $$VC del zone_table:$$CZ zone:$$CZ:TXT:version.$$CZ zone:$$MZ:A:www.$$MZ config:catalog_test_poke >/dev/null 2>&1; \
+	 for k in $$($$VC --scan --pattern "dnssec:$$CZ:*") $$($$VC --scan --pattern "dnssec:$$MZ:*") $$($$VC --scan --pattern "config:zone:$$MZ:*"); do $$VC del "$$k" >/dev/null 2>&1; done; \
+	 echo "  provisioned: A=[$$A] SOA=[$$S] DS=[$$D]";                                 \
+	 test "$$A" = "10.9.8.7" || { echo "  FAIL  member A not served after provisioning"; exit 1; }; \
+	 test -n "$$S" || { echo "  FAIL  member SOA not served after provisioning"; exit 1; }; \
+	 test -n "$$D" || { echo "  FAIL  member zone not DNSSEC-signed (no DS)"; exit 1; }; \
+	 test -z "$$A2" || { echo "  FAIL  member still served after PTR removed ($$A2)"; exit 1; }; \
+	 echo "  OK  member provisioned+signed, then deprovisioned on PTR removal"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -410,6 +444,7 @@ help:
 	@echo "  make install      Install binary + signature to \$$(DESTDIR)\$$(PREFIX)/bin"
 	@echo "  make uninstall    Remove installed files"
 	@echo "  make check        Quick smoke-test (needs Valkey)"
+	@echo "  make check-catalog  RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

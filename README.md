@@ -108,6 +108,13 @@ glance:
   holds the key its RRSIG points at.
 - **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, journal-based
   diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007).
+- **Multi-zone / provisioning**: `dnsd` serves multiple zones (longest-suffix
+  selection, per-zone SOA / DNSSEC keys / AXFR / UPDATE). Catalog zones
+  (RFC 9432) bulk-provision member zones: a catalog is a `zone_table:<cat>` zone
+  with `version.<cat> TXT "2"` and `<id>.zones.<cat> PTR <member>` records;
+  `dnsd` consumes it and auto-provisions each member (derived SOA, inherited
+  timers/ACL/NOTIFY, generated DNSSEC keys), deactivating members the catalog
+  drops — all in-memory, without writing `zone_table:*`.
 - **EDNS / transport**: 6891 OPT, 5001 NSID, 7828 TCP-keepalive, 7830/8467
   padding, 8914 EDE, 9018 DNS Cookies (real SipHash-2-4, BADCOOKIE handshake).
 - **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
@@ -147,7 +154,8 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:metrics_port` | `dnsd` localhost metrics/health port (default 8054). |
 | `config:privdrop_user` / `config:privdrop_group` | Unprivileged account `dnsd` drops to after binding sockets (env `DNS_USER` / `DNS_GROUP` override; default user `nobody`). Only acts when started as root; fail-closed if the drop cannot complete. |
 | `config:seccomp_mode` | `dnsd` syscall sandbox: `enforce` (default — non-whitelisted syscalls return `EPERM`), `audit` (they are logged but permitted — use to re-validate the whitelist after a toolchain/libc/kernel change or unusual config), or `off`. Requires a build with libseccomp (`-DHAVE_SECCOMP`). |
-| `config:chroot_dir` | If set (env `DNS_CHROOT` overrides), `dnsd` `chroot`s into this directory after binding sockets, before dropping privileges. Only acts when started as root; fail-closed if the `chroot` fails. With the default `127.0.0.1` Valkey it needs nothing inside the dir; a Valkey *hostname* needs resolver files (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `libnss_*.so`) for reconnects. |
+| `config:chroot_dir` | If set (env `DNS_CHROOT` overrides), `dnsd` confines its filesystem to this directory after binding sockets, before dropping privileges. Only acts when started as root; fail-closed if confinement fails. With the default `127.0.0.1` Valkey it needs nothing inside the dir; a Valkey *hostname* needs resolver files (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `libnss_*.so`) for reconnects. |
+| `config:isolation_mode` | How `config:chroot_dir` is applied (env `DNS_ISOLATION` overrides): `chroot` (default, `chroot(2)` — confines every thread) or `mountns` (a private mount namespace + `pivot_root(2)`, unmounting the old root). `mountns` confines the request-handling threads (UDP loop + TCP/DoT workers spawned after the pivot); the trusted keyspace/rollover threads, started earlier, stay in the parent mount namespace. Linux only. |
 | `config:mdns_enabled` / `config:mdns_interfaces` | Enable `mdnsd` and its interface allowlist (`"all"` or a comma-separated list; it refuses to start unset). |
 | `config:acme_*`, `config:est_*` | ACME/EST endpoints + identity for `certd`. |
 | `config:dashboard_password_hash` | Dashboard admin password hash (see [Dashboard](#dashboard)). |

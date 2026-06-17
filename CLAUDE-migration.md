@@ -305,7 +305,7 @@ Acceptance
 
 ---
 
-## Step 7 — Multi-zone support  `[~]`
+## Step 7 — Multi-zone support  `[x]`
 
 Goal: serve multiple authoritative zones from the slimmed-down `dnsd`.
 
@@ -345,7 +345,18 @@ Tasks
       `ksk_{publish,commit}_hold`. Verified end-to-end (DNSKEY 1→2→2→1 KSK sets,
       CDS==DS every phase, key rotated) + `tests/test_rollover.c` KSK no-gap
       KAT/negative for alg 13+15.
-- [ ] (Optional) catalog zones (RFC 9432) for bulk provisioning — not done
+- [x] (Optional) catalog zones (RFC 9432) for bulk provisioning — `dnsd`
+      consumes a catalog zone (an ordinary `zone_table:<cat>` zone with the
+      schema-version record `version.<cat> TXT "2"` and `<id>.zones.<cat> PTR
+      <member>` members) and provisions each member into its in-memory zone
+      table: SOA names derived from the member, SOA timers / AXFR ACL / NOTIFY
+      inherited from the catalog, `dnssec:<member>:*` keys auto-generated;
+      members dropped from the catalog are deactivated (slot retained, never
+      compacted, so no use-after-free against a live request). dnsd only READS
+      the catalog and writes only `dnssec:<member>:*` (already owned) — never
+      `zone_table:*`; provisioning is in-memory, re-derived on each scan (boot,
+      `config:` / `zone_table:` change, rollover tick — `catalog_scan_all`).
+      Guarded by `make check-catalog` (provision → served+signed → deprovision).
 - [x] Migration script for existing single-zone data into the new key layout
       (`tools/migrate-multizone.sh`, dry-run by default, idempotent)
 - [x] Dashboard updated for zone selection/management (zone column + per-record
@@ -376,17 +387,25 @@ Acceptance
 
 ## Completion
 
-- [~] After Step 4, `dnsd` is a small, single-purpose, sandboxable daemon
+- [x] After Step 4, `dnsd` is a small, single-purpose, sandboxable daemon
       (privilege drop + seccomp per `CLAUDE.md`). Done: irreversible
       privilege drop after socket bind (`priv_resolve` before chroot +
       `drop_privileges` after, `config:privdrop_user`); seccomp syscall filter
       via libseccomp (`seccomp_install`, `config:seccomp_mode` enforce/audit/off,
       enforce default; whitelist audit-validated against the real syscall set,
       harvested with strace across UDP/TCP/DoT-TLS/metrics/Valkey/rollover);
-      filesystem isolation via `chroot` (`enter_chroot`, `config:chroot_dir`,
-      fail-closed, resolve-before-chroot ordering). Full chain verified
-      end-to-end in a user namespace (chroot → drop to nobody → seccomp enforce →
-      still serves UDP/TCP/DoT/metrics). Remaining (optional):
-      mount-namespace/pivot_root instead of chroot.
-- [ ] All seven steps complete; monolith concerns fully decomposed
-- [ ] `CLAUDE.md` topology diagram matches the running system
+      filesystem isolation, mode-selectable via `config:isolation_mode`
+      (env `DNS_ISOLATION`): `chroot` (default, `enter_chroot`) or `mountns`
+      (`enter_mount_namespace` — `unshare(CLONE_NEWNS)` + make-rprivate +
+      `pivot_root` + detach old root), both fail-closed with resolve-before-
+      confine ordering. Full chain re-verified end-to-end in a user namespace
+      for *both* modes (`unshare -Urm --map-auto`: confine → drop to nobody →
+      seccomp enforce → still answers a query). The mountns threading caveat
+      (unshare moves only the calling thread; trusted keyspace/rollover threads
+      stay in the parent mount ns, request workers are spawned post-pivot) is
+      documented at `enter_chroot`.
+- [x] All seven steps complete; monolith concerns fully decomposed
+- [x] `CLAUDE.md` topology diagram matches the running system (verified: the
+      diagram's dnsd / mdnsd / certd / apid / dashboard / resolverd split and
+      the Valkey-only integration bus match the shipped binaries and the
+      ownership table)

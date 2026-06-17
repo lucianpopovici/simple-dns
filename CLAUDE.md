@@ -207,8 +207,9 @@ Reads from Valkey: `config:*`, `zone:*`, `ddns:*`, DNSSEC key material, current
 TLS `cert:*` blobs. Hot-reloads on Valkey keyspace notifications (see below).
 
 Privilege: bind sockets as root, then `setuid`/`setgid` to an unprivileged
-service account; `chroot` or mount-namespace the working dir; apply a `seccomp`
-filter to worker threads. No outbound network except to Valkey.
+service account; confine the filesystem (`config:isolation_mode`: `chroot`
+default, or `mountns` = private mount namespace + `pivot_root`); apply a
+`seccomp` filter to worker threads. No outbound network except to Valkey.
 
 ### `mdnsd` — mDNS / DNS-SD responder (link-local, low trust)
 
@@ -385,8 +386,19 @@ storm.
   construction), guarded by `make check-cds`; KSK no-gap KAT in
   `tests/test_rollover.c`.
 
-Still pending: catalog zones (RFC 9432) for bulk provisioning are optional and
-not yet done.
+- Catalog zones (RFC 9432) for bulk provisioning: `dnsd` consumes a catalog
+  zone — an ordinary `zone_table:<cat>` zone carrying the schema-version record
+  `version.<cat> TXT "2"` and one `<id>.zones.<cat> PTR <member>` per member —
+  and provisions each member into its in-memory zone table (SOA names derived
+  from the member, SOA timers / AXFR ACL / NOTIFY inherited from the catalog,
+  `dnssec:<member>:*` keys generated via the normal path). Members the catalog
+  stops listing are deactivated. dnsd only *reads* the catalog (`zone:<cat>:*`,
+  written by the control plane) and writes only `dnssec:<member>:*` (which it
+  already owns) — it never writes `zone_table:*`; provisioning is in-memory,
+  re-derived on each scan (boot, `config:` / `zone_table:` change, rollover
+  tick). Selectable filesystem isolation (`config:isolation_mode` =
+  `chroot` (default) or `mountns`, a private mount namespace + `pivot_root`)
+  rounds out the sandbox. Guarded by `make check-catalog`.
 
 ---
 
