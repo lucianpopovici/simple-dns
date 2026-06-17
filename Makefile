@@ -30,7 +30,10 @@
 # libdnswire (dns_wire.c/h) is the single shared wire-format implementation
 # (migration Step 1); every binary compiles it in.
 WIRE_SRC   := dns_wire.c
-SRC        := dns_server.c $(WIRE_SRC)
+# Shared privilege-drop / chroot / seccomp sandbox (sandbox.c/h); linked by the
+# daemons that confine themselves after binding (dnsd, resolverd).
+SANDBOX_SRC := sandbox.c
+SRC        := dns_server.c $(WIRE_SRC) $(SANDBOX_SRC)
 BIN        := dns_server
 BIN_DEBUG  := dns_server_debug
 SIG_GPG    := $(BIN).asc
@@ -80,10 +83,11 @@ WARN       := -Wall -Wextra -Wformat=2 -Wformat-overflow=2 \
 INCLUDES   := -I$(OSSL_INC)
 LIBS       := -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)
 
-# libseccomp (optional, dnsd only): the trusted core installs a syscall filter
-# when the dev package is present (-DHAVE_SECCOMP). Without it dnsd still builds,
-# just without the sandbox. Detected via pkg-config; only $(BIN)/$(BIN_DEBUG)
-# link it. CI installs libseccomp-dev so the filter is built+tested there too.
+# libseccomp (optional): dnsd and resolverd install a syscall filter when the
+# dev package is present (-DHAVE_SECCOMP). Without it they still build, just
+# without the seccomp layer (priv-drop + chroot/mountns still apply). Detected
+# via pkg-config; $(BIN)/$(BIN_DEBUG) and resolverd/resolverd_debug link it.
+# CI installs libseccomp-dev so the filter is built+tested there too.
 SECCOMP_CFLAGS := $(shell pkg-config --exists libseccomp 2>/dev/null && echo -DHAVE_SECCOMP $$(pkg-config --cflags libseccomp))
 SECCOMP_LIBS   := $(shell pkg-config --exists libseccomp 2>/dev/null && pkg-config --libs libseccomp)
 
@@ -142,7 +146,7 @@ all: prod
 # =============================================================================
 prod: $(BIN) sign
 
-$(BIN): $(SRC) dns_wire.h | ossl-sanity
+$(BIN): $(SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
 	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
 	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
@@ -161,7 +165,7 @@ $(BIN): $(SRC) dns_wire.h | ossl-sanity
 # =============================================================================
 debug: $(BIN_DEBUG)
 
-$(BIN_DEBUG): $(SRC) dns_wire.h | ossl-sanity
+$(BIN_DEBUG): $(SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
 	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
@@ -221,16 +225,16 @@ apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 # suppress just that one warning here (as the unit-test targets already do) to
 # keep the -Werror build green. The rest of the curated WARN set still applies.
 # =============================================================================
-resolverd: resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+resolverd: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
-resolverd_debug: resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+resolverd_debug: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
@@ -336,28 +340,28 @@ uninstall:
 # DNSSEC known-answer + negative tests.
 # Includes resolverd.c with -DUNIT_TEST, so it inherits that file's (dense,
 # pre-clang-format) style — suppress the indentation warning for now.
-check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_dnssec_verify"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
 	      $(INCLUDES) -I. -o tests/test_dnssec_verify \
-	      tests/test_dnssec_verify.c $(WIRE_SRC) $(LIBS)
+	      tests/test_dnssec_verify.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
 	./tests/test_dnssec_verify
 	@echo "  CC [TEST]  tests/test_rollover"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
 	      $(DEBUG_FLAGS) \
 	      $(INCLUDES) -I. -o tests/test_rollover \
-	      tests/test_rollover.c $(WIRE_SRC) $(LIBS)
+	      tests/test_rollover.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
 	./tests/test_rollover
 
 # name_from_wire compression-handling tests.
 # -Wno-unused-function: -DUNIT_TEST compiles out resolverd.c's main(), which
 # is the only caller of some helpers.
-check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
 	      $(DEBUG_FLAGS) \
 	      $(INCLUDES) -I. -o tests/test_name_from_wire \
-	      tests/test_name_from_wire.c $(WIRE_SRC) $(LIBS)
+	      tests/test_name_from_wire.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
 	./tests/test_name_from_wire
 
 # libFuzzer smoke target for the name parser (requires clang).

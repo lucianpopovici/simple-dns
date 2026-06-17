@@ -37,6 +37,14 @@
  *   CACHE_NEG_TTL     Max negative TTL (seconds)       (default: 300)
  *   DOT_CA_PEM        Path to CA cert PEM for DoT      (default: system)
  *
+ * Sandbox (Valkey config:* keys, env override in parens; applied after the
+ * listeners bind, before the proxy loop — no-op unless started as root):
+ *   config:resolverd_chroot_dir      (RESOLVERD_CHROOT)    filesystem confinement
+ *   config:resolverd_isolation_mode  (RESOLVERD_ISOLATION) chroot (default) | mountns
+ *   config:resolverd_privdrop_user   (RESOLVERD_USER)      drop target (default nobody)
+ *   config:resolverd_privdrop_group  (RESOLVERD_GROUP)     drop target group
+ *   config:resolverd_seccomp_mode    (RESOLVERD_SECCOMP)   audit (default) | enforce | off
+ *
  * Build (see the Makefile for the hardened production target):
  *   make resolverd        # optimised, hardened
  *   make resolverd_debug  # ASan/UBSan
@@ -81,6 +89,8 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/x509.h>
+#include "sandbox.h"
 
 /* =========================================================================
  * Constants
@@ -3224,6 +3234,8 @@ static void *tcp_client_thread(void *arg) {
     return NULL;
 }
 
+static void apply_sandbox(void); /* defined below; drops privs + seccomp post-bind */
+
 static void *proxy_run(void *arg) {
     (void) arg;
     int opt = 1;
@@ -3307,6 +3319,10 @@ static void *proxy_run(void *arg) {
            g_cfg.listen_port, fd4 >= 0 ? "up" : "n/a", fd6 >= 0 ? "up" : "n/a",
            tcp4 >= 0 ? "up" : "n/a", tcp6 >= 0 ? "up" : "n/a", g_cfg.upstream_host[0],
            g_cfg.upstream_port[0], g_cfg.upstream_count, proto_label);
+
+    /* All listeners are bound. Drop root, confine the filesystem, and install the
+     * syscall filter before the loop touches untrusted query/response bytes. */
+    apply_sandbox();
 
     uint8_t buf[DNS_BUF];
     for (;;) {
@@ -3572,10 +3588,28 @@ static void dot_init(void) {
     if (!g_dot_ctx)
         return;
     SSL_CTX_set_min_proto_version(g_dot_ctx, TLS1_2_VERSION);
-    if (g_cfg.dot_ca_pem[0])
-        SSL_CTX_load_verify_locations(g_dot_ctx, g_cfg.dot_ca_pem, NULL);
-    else
+    if (g_cfg.dot_ca_pem[0]) {
+        /* Explicit PEM file: loaded eagerly into the in-memory store here. */
+        if (SSL_CTX_load_verify_locations(g_dot_ctx, g_cfg.dot_ca_pem, NULL) != 1)
+            fprintf(stderr,
+                    "[dot] warning: could not load CA bundle '%s' — upstream TLS "
+                    "verification will fail\n",
+                    g_cfg.dot_ca_pem);
+    } else {
+        /* Default system trust store. SSL_CTX_set_default_verify_paths only
+         * records the path and resolves it lazily at handshake time — which,
+         * under the sandbox, happens after chroot/pivot_root has removed
+         * /etc/ssl. Eagerly load the default CA *file* now (pre-sandbox) so peer
+         * verification still works once confined; keep set_default_verify_paths
+         * as the (lazy) hashed-dir fallback. */
+        const char *cafile = X509_get_default_cert_file();
+        if (!cafile || SSL_CTX_load_verify_locations(g_dot_ctx, cafile, NULL) != 1)
+            fprintf(stderr,
+                    "[dot] warning: could not eagerly load default CA file '%s' — "
+                    "upstream TLS verification may fail under chroot\n",
+                    cafile ? cafile : "(null)");
         SSL_CTX_set_default_verify_paths(g_dot_ctx);
+    }
     SSL_CTX_set_verify(g_dot_ctx, SSL_VERIFY_PEER, NULL);
 }
 
@@ -3746,6 +3780,49 @@ static void usage(const char *prog) {
            "  %s example.local MX --proto dot --upstream 10.0.0.1:8853\n"
            "  UPSTREAM_HOST=10.0.0.1 TSIG_SECRET_B64=abc== %s --stats\n",
            prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+}
+
+/* ==========================================================================
+ * Sandbox glue — delegates to libsandbox (sandbox.c/h), shared with dnsd.
+ *
+ * resolverd is internet-facing on two sides: it parses untrusted *upstream*
+ * responses and serves untrusted *downstream* queries, so it gets the same
+ * defence-in-depth as dnsd. The hardening logic lives once in sandbox.c; this
+ * glue only resolves resolverd-scoped config and hands it over.
+ *
+ * Config is resolverd-scoped (NOT shared with dnsd's keys) because the two
+ * daemons need different filesystem views and syscall sets: resolverd makes
+ * outbound connections and resolves upstream hostnames, so its chroot must carry
+ * resolver files + a CA bundle. All config is read HERE, before sandbox_apply()
+ * chroots, so a chroot that hides the config source cannot silently weaken the
+ * filter. seccomp defaults to audit (log-only) until the whitelist is
+ * strace-harvested across every upstream transport; then switch to enforce. */
+static void resolverd_log(int level, const char *fmt, ...) {
+    (void) level;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void apply_sandbox(void) {
+    sandbox_config_t sb;
+    memset(&sb, 0, sizeof(sb));
+    vk_get("config:resolverd_chroot_dir", sb.chroot_dir, sizeof(sb.chroot_dir));
+    sandbox_env_override(sb.chroot_dir, sizeof(sb.chroot_dir), "RESOLVERD_CHROOT");
+    vk_get("config:resolverd_isolation_mode", sb.isolation_mode, sizeof(sb.isolation_mode));
+    sandbox_env_override(sb.isolation_mode, sizeof(sb.isolation_mode), "RESOLVERD_ISOLATION");
+    vk_get("config:resolverd_privdrop_user", sb.privdrop_user, sizeof(sb.privdrop_user));
+    sandbox_env_override(sb.privdrop_user, sizeof(sb.privdrop_user), "RESOLVERD_USER");
+    vk_get("config:resolverd_privdrop_group", sb.privdrop_group, sizeof(sb.privdrop_group));
+    sandbox_env_override(sb.privdrop_group, sizeof(sb.privdrop_group), "RESOLVERD_GROUP");
+    vk_get("config:resolverd_seccomp_mode", sb.seccomp_mode, sizeof(sb.seccomp_mode));
+    sandbox_env_override(sb.seccomp_mode, sizeof(sb.seccomp_mode), "RESOLVERD_SECCOMP");
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* glibc resolver for upstream hostnames */
+    sb.log = resolverd_log;
+    sb.tag = "resolverd";
+    sandbox_apply(&sb);
 }
 
 #ifndef UNIT_TEST

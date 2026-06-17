@@ -79,6 +79,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | Path | What it is |
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
+| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd` and `resolverd`. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
 | `dns_server.c` | **`dnsd`** — the authoritative core (~3600 lines). ACME/EST extracted in Step 2, mDNS in Step 3, the HTTP/DoH/portal surface in Step 4. Now: DNS/DoT + localhost `/health`+`/metrics` only. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |
@@ -258,10 +259,27 @@ and must not share a process. Owns upstream UDP/TCP/DoT/DoH, the cache, and
 DNSSEC **validation** (validation covers the full canonical RRset per
 RFC 4034 §3.1.8.1 — guarded by `make check-dnssec`).
 
-Follow-up (not a blocker): `resolverd` does not yet get the `dnsd`-style
-privilege-drop / seccomp / mount-isolation sandbox, which is its own hardening
-task. (Its build carries `-Wno-misleading-indentation` because the dense — but
-clang-format-conformant — style trips that gcc heuristic; not a reformat TODO.)
+Sandbox (done): `resolverd` gets the same `dnsd`-style hardening via the shared
+**`libsandbox`** (`sandbox.{c,h}`) — after its listeners bind it drops root
+irreversibly, confines the filesystem (`chroot` default or `mountns` private
+mount namespace + `pivot_root`), then installs a `seccomp` syscall filter, all
+before the serve loop touches untrusted query/response bytes. The hardening logic
+lives once in `sandbox.c`; `resolverd` only supplies a `sandbox_config_t`.
+Config is **resolverd-scoped** (it needs a different filesystem view and syscall
+set — it makes outbound connections and resolves upstream hostnames, so its
+chroot must carry resolver files + a CA bundle):
+`config:resolverd_{chroot_dir,isolation_mode,privdrop_user,privdrop_group,
+seccomp_mode}` (env `RESOLVERD_{CHROOT,ISOLATION,USER,GROUP,SECCOMP}`). All config
+is read **before** the chroot, so a chroot that hides Valkey cannot silently
+downgrade the seccomp mode. The seccomp layer defaults to **audit** (log-only)
+until the whitelist is strace-harvested across every upstream transport on the
+target libc/kernel — run audit, confirm the audit log is clean, then switch
+`seccomp_mode` to `enforce`. To survive the chroot, `resolverd` eagerly loads the
+TLS trust store (the system default CA *file*, or `DOT_CA_PEM`) at startup before
+confinement — `SSL_CTX_set_default_verify_paths` alone is lazy and would fail
+upstream cert verification once `/etc/ssl` is gone. (Its build carries
+`-Wno-misleading-indentation` because the dense — but clang-format-conformant —
+style trips that gcc heuristic; not a reformat TODO.)
 
 Reads/writes Valkey: its persisted cache namespace only. It does not read the
 authoritative zone.
@@ -449,8 +467,13 @@ and the `resolverd` split (`dns_client.c` → `resolverd.c`, now a first-class
 hardened daemon — see the `resolverd` section above) are **all complete**. The
 monolith is fully decomposed and every box in `CLAUDE-migration.md` is ticked.
 Remaining work is feature/quality, not migration: the optional plans
-(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,performance,sec}.md`)
-and extending the `dnsd`-style sandbox to `resolverd`.
+(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,performance,sec}.md`).
+The `dnsd`-style privilege-drop / seccomp / mount-isolation sandbox has been
+extended to `resolverd` and **factored into the shared `libsandbox`**
+(`sandbox.{c,h}`), so `dnsd` and `resolverd` now share one implementation
+(no duplicated copy to diverge). `resolverd`'s only remaining hardening task is
+to flip its seccomp default from `audit` to `enforce` after a per-deployment
+whitelist harvest.
 
 ---
 
