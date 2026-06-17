@@ -85,22 +85,12 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <ifaddrs.h>
-#include <sys/types.h>
-#include <pwd.h>
-#include <grp.h>
-#include <sys/prctl.h>
-#ifdef __linux__
-#include <sched.h>
-#include <sys/mount.h>
-#include <sys/syscall.h>
-#endif
-#ifdef HAVE_SECCOMP
-#include <seccomp.h>
-#endif
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/x509.h>
+#include "sandbox.h"
 
 /* =========================================================================
  * Constants
@@ -3598,10 +3588,28 @@ static void dot_init(void) {
     if (!g_dot_ctx)
         return;
     SSL_CTX_set_min_proto_version(g_dot_ctx, TLS1_2_VERSION);
-    if (g_cfg.dot_ca_pem[0])
-        SSL_CTX_load_verify_locations(g_dot_ctx, g_cfg.dot_ca_pem, NULL);
-    else
+    if (g_cfg.dot_ca_pem[0]) {
+        /* Explicit PEM file: loaded eagerly into the in-memory store here. */
+        if (SSL_CTX_load_verify_locations(g_dot_ctx, g_cfg.dot_ca_pem, NULL) != 1)
+            fprintf(stderr,
+                    "[dot] warning: could not load CA bundle '%s' — upstream TLS "
+                    "verification will fail\n",
+                    g_cfg.dot_ca_pem);
+    } else {
+        /* Default system trust store. SSL_CTX_set_default_verify_paths only
+         * records the path and resolves it lazily at handshake time — which,
+         * under the sandbox, happens after chroot/pivot_root has removed
+         * /etc/ssl. Eagerly load the default CA *file* now (pre-sandbox) so peer
+         * verification still works once confined; keep set_default_verify_paths
+         * as the (lazy) hashed-dir fallback. */
+        const char *cafile = X509_get_default_cert_file();
+        if (!cafile || SSL_CTX_load_verify_locations(g_dot_ctx, cafile, NULL) != 1)
+            fprintf(stderr,
+                    "[dot] warning: could not eagerly load default CA file '%s' — "
+                    "upstream TLS verification may fail under chroot\n",
+                    cafile ? cafile : "(null)");
         SSL_CTX_set_default_verify_paths(g_dot_ctx);
+    }
     SSL_CTX_set_verify(g_dot_ctx, SSL_VERIFY_PEER, NULL);
 }
 
@@ -3775,391 +3783,46 @@ static void usage(const char *prog) {
 }
 
 /* ==========================================================================
- * Sandbox (mirrors the dnsd hardening — CLAUDE.md design principle #4)
+ * Sandbox glue — delegates to libsandbox (sandbox.c/h), shared with dnsd.
  *
  * resolverd is internet-facing on two sides: it parses untrusted *upstream*
- * responses and it serves untrusted *downstream* queries. It therefore gets the
- * same defence-in-depth dnsd already has: bind the listener, irreversibly drop
- * root, confine the filesystem, then install a syscall filter — all before the
- * serve loop touches attacker-controlled input.
+ * responses and serves untrusted *downstream* queries, so it gets the same
+ * defence-in-depth as dnsd. The hardening logic lives once in sandbox.c; this
+ * glue only resolves resolverd-scoped config and hands it over.
  *
  * Config is resolverd-scoped (NOT shared with dnsd's keys) because the two
  * daemons need different filesystem views and syscall sets: resolverd makes
- * arbitrary *outbound* connections and resolves upstream hostnames, so its
- * chroot must carry resolver files + a CA bundle, while dnsd reaches only
- * Valkey. Keys (env overrides in parentheses):
- *   config:resolverd_chroot_dir      (RESOLVERD_CHROOT)
- *   config:resolverd_isolation_mode  (RESOLVERD_ISOLATION) chroot|mountns
- *   config:resolverd_privdrop_user   (RESOLVERD_USER)      default nobody
- *   config:resolverd_privdrop_group  (RESOLVERD_GROUP)
- *   config:resolverd_seccomp_mode    (RESOLVERD_SECCOMP)   enforce|audit|off
- *
- * All steps are no-ops when not started as root (development run on the high
- * default port 5354); when started as root they fail closed (exit) rather than
- * keep serving untrusted input half-confined.
- * ======================================================================= */
-
-#ifdef __linux__
-/* Pivot into `dir` using a private mount namespace. Fail-closed (exit) on any
- * step, since a half-applied isolation is worse than a clear refusal. */
-static void enter_mount_namespace(const char *dir) {
-    if (unshare(CLONE_NEWNS) != 0) {
-        fprintf(stderr, "[sandbox] FATAL: unshare(CLONE_NEWNS) failed: %s\n", strerror(errno));
-        exit(1);
-    }
-    /* Make every mount private so our pivot does not propagate to the host. */
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
-        fprintf(stderr, "[sandbox] FATAL: make-rprivate(/) failed: %s\n", strerror(errno));
-        exit(1);
-    }
-    /* pivot_root requires new_root to be a mount point: bind dir onto itself. */
-    if (mount(dir, dir, NULL, MS_BIND | MS_REC, NULL) != 0) {
-        fprintf(stderr, "[sandbox] FATAL: bind-mount('%s') failed: %s\n", dir, strerror(errno));
-        exit(1);
-    }
-    if (chdir(dir) != 0) {
-        fprintf(stderr, "[sandbox] FATAL: chdir('%s') failed: %s\n", dir, strerror(errno));
-        exit(1);
-    }
-    /* pivot_root(".", ".") stacks the old root on top of the new one (the
-     * util-linux / runc idiom), so no separate put_old directory is needed. */
-    if (syscall(SYS_pivot_root, ".", ".") != 0) {
-        fprintf(stderr, "[sandbox] FATAL: pivot_root('%s') failed: %s\n", dir, strerror(errno));
-        exit(1);
-    }
-    /* Detach the old root (now stacked at "/") so it is fully gone, then re-anchor
-     * the working directory at the new root. */
-    if (umount2(".", MNT_DETACH) != 0) {
-        fprintf(stderr, "[sandbox] FATAL: umount2(old-root) failed: %s\n", strerror(errno));
-        exit(1);
-    }
-    if (chdir("/") != 0) {
-        fprintf(stderr, "[sandbox] FATAL: chdir('/') after pivot_root failed: %s\n",
-                strerror(errno));
-        exit(1);
-    }
-    fprintf(stderr, "[sandbox] pivoted into '%s' via private mount namespace (now /)\n", dir);
-}
-#endif /* __linux__ */
-
-/* Confine the filesystem view. No-op when unset or not root; fail-closed if set,
- * root, and confinement fails. Mode selectable via config:resolverd_isolation_mode
- * (env RESOLVERD_ISOLATION): chroot (default) or mountns (Linux only). */
-static void enter_chroot(void) {
-    char dir[512] = "";
-    vk_get("config:resolverd_chroot_dir", dir, sizeof(dir));
-    const char *env_dir = getenv("RESOLVERD_CHROOT");
-    if (env_dir && env_dir[0])
-        safe_strcpy(dir, env_dir, sizeof(dir));
-    if (!dir[0])
-        return; /* not configured — no filesystem isolation */
-    if (geteuid() != 0) {
-        fprintf(stderr, "[sandbox] resolverd_chroot_dir set but not running as root — skipping\n");
-        return;
-    }
-    char mode[16] = "";
-    vk_get("config:resolverd_isolation_mode", mode, sizeof(mode));
-    const char *env_mode = getenv("RESOLVERD_ISOLATION");
-    if (env_mode && env_mode[0])
-        safe_strcpy(mode, env_mode, sizeof(mode));
-#ifdef __linux__
-    if (strcmp(mode, "mountns") == 0) {
-        enter_mount_namespace(dir);
-        return;
-    }
-#else
-    if (strcmp(mode, "mountns") == 0)
-        fprintf(stderr, "[sandbox] isolation_mode=mountns unsupported on this OS — using chroot\n");
-#endif
-    if (chroot(dir) != 0) {
-        fprintf(stderr, "[sandbox] FATAL: chroot('%s') failed: %s\n", dir, strerror(errno));
-        exit(1);
-    }
-    if (chdir("/") != 0) {
-        fprintf(stderr, "[sandbox] FATAL: chdir('/') after chroot failed: %s\n", strerror(errno));
-        exit(1);
-    }
-    fprintf(stderr, "[sandbox] confined to '%s' (now /)\n", dir);
+ * outbound connections and resolves upstream hostnames, so its chroot must carry
+ * resolver files + a CA bundle. All config is read HERE, before sandbox_apply()
+ * chroots, so a chroot that hides the config source cannot silently weaken the
+ * filter. seccomp defaults to audit (log-only) until the whitelist is
+ * strace-harvested across every upstream transport; then switch to enforce. */
+static void resolverd_log(int level, const char *fmt, ...) {
+    (void) level;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
 }
 
-/* Privilege drop, split so the order with enter_chroot() is correct:
- *   priv_resolve()    looks up the account in /etc/passwd — must run BEFORE
- *                     chroot, while the host passwd/group databases are reachable.
- *   drop_privileges() applies the resolved numeric ids — runs AFTER chroot. */
-typedef struct {
-    int do_drop; /* 1 = root, resolved, apply after chroot; 0 = not root, skip */
-    uid_t uid;
-    gid_t gid;
-    char user[64];
-} privdrop_plan_t;
-
-static void priv_resolve(privdrop_plan_t *p) {
-    memset(p, 0, sizeof(*p));
-    if (geteuid() != 0) {
-        fprintf(stderr, "[priv] not running as root — privilege drop skipped\n");
-        return;
-    }
-    char group[64] = "";
-    vk_get("config:resolverd_privdrop_user", p->user, sizeof(p->user));
-    vk_get("config:resolverd_privdrop_group", group, sizeof(group));
-    const char *env_user = getenv("RESOLVERD_USER");
-    const char *env_group = getenv("RESOLVERD_GROUP");
-    if (env_user && env_user[0])
-        safe_strcpy(p->user, env_user, sizeof(p->user));
-    if (env_group && env_group[0])
-        safe_strcpy(group, env_group, sizeof(group));
-    if (!p->user[0])
-        safe_strcpy(p->user, "nobody", sizeof(p->user));
-
-    errno = 0;
-    struct passwd *pw = getpwnam(p->user);
-    if (!pw) {
-        fprintf(stderr,
-                "[priv] FATAL: privdrop user '%s' not found%s — set "
-                "config:resolverd_privdrop_user to a valid account\n",
-                p->user, errno ? " (getpwnam failed)" : "");
-        exit(1);
-    }
-    p->uid = pw->pw_uid;
-    p->gid = pw->pw_gid;
-    if (group[0]) {
-        errno = 0;
-        struct group *gr = getgrnam(group);
-        if (!gr) {
-            fprintf(stderr, "[priv] FATAL: privdrop group '%s' not found%s\n", group,
-                    errno ? " (getgrnam failed)" : "");
-            exit(1);
-        }
-        p->gid = gr->gr_gid;
-    }
-    if (p->uid == 0) {
-        fprintf(stderr, "[priv] FATAL: privdrop user '%s' is root (uid 0) — refusing\n", p->user);
-        exit(1);
-    }
-    p->do_drop = 1;
-}
-
-static void drop_privileges(const privdrop_plan_t *p) {
-    if (!p->do_drop)
-        return; /* not root — priv_resolve already logged the skip */
-
-    /* Order matters: shed supplementary groups, then gid, then uid. Doing uid
-     * first would forfeit the privilege needed for the group calls. */
-    if (setgroups(0, NULL) != 0) {
-        fprintf(stderr, "[priv] FATAL: setgroups failed: %s\n", strerror(errno));
-        exit(1);
-    }
-    if (setgid(p->gid) != 0) {
-        fprintf(stderr, "[priv] FATAL: setgid(%u) failed: %s\n", (unsigned) p->gid, strerror(errno));
-        exit(1);
-    }
-    if (setuid(p->uid) != 0) {
-        fprintf(stderr, "[priv] FATAL: setuid(%u) failed: %s\n", (unsigned) p->uid, strerror(errno));
-        exit(1);
-    }
-    /* Verify the drop is irreversible: regaining root must fail. */
-    if (setuid(0) == 0 || setgid(0) == 0) {
-        fprintf(stderr, "[priv] FATAL: privileges not fully dropped (could regain root)\n");
-        exit(1);
-    }
-    /* Keep TSIG/cookie key material out of core dumps and ptrace by another
-     * process running as the same unprivileged user. */
-    if (prctl(PR_SET_DUMPABLE, 0) != 0)
-        fprintf(stderr, "[priv] PR_SET_DUMPABLE failed: %s\n", strerror(errno));
-
-    fprintf(stderr, "[priv] dropped privileges to user '%s' (uid=%u gid=%u)\n", p->user,
-            (unsigned) p->uid, (unsigned) p->gid);
-}
-
-/* ==========================================================================
- * seccomp syscall filter (sandbox layer 2)
- *
- * Whitelist-based, applied to all threads (libseccomp loads with TSYNC), so the
- * proxy main loop, the per-connection TCP worker threads, and the prefetch
- * workers are all covered.
- *
- * Mode (config:resolverd_seccomp_mode / env RESOLVERD_SECCOMP):
- *   audit (DEFAULT) — non-whitelisted syscalls are LOGGED (audit log / dmesg)
- *                     but permitted. resolverd's syscall set is broader and
- *                     more transport-dependent than dnsd's (it makes outbound
- *                     UDP/TCP/DoT/DoH connections and resolves upstream
- *                     hostnames via getaddrinfo), so the whitelist below is a
- *                     validated *starting point*, not yet strace-harvested
- *                     across every upstream transport on every libc/kernel.
- *                     Run in audit, exercise your real upstreams, confirm the
- *                     audit log is clean, then switch to enforce.
- *   enforce         — default action EPERM: non-whitelisted syscalls fail (as an
- *                     errno, not SIGKILL, so a miss degrades a single query
- *                     rather than killing the daemon). Fail-closed on setup error.
- *   off             — no filter.
- *
- * Built only when libseccomp is available at compile time (-DHAVE_SECCOMP);
- * otherwise a no-op stub and resolverd runs unconfined at this layer.
- * ======================================================================= */
-#ifdef HAVE_SECCOMP
-static void seccomp_install(void) {
-    char mode[16] = "";
-    vk_get("config:resolverd_seccomp_mode", mode, sizeof(mode));
-    const char *env_mode = getenv("RESOLVERD_SECCOMP");
-    if (env_mode && env_mode[0])
-        safe_strcpy(mode, env_mode, sizeof(mode));
-    if (!mode[0])
-        safe_strcpy(mode, "audit", sizeof(mode)); /* default: audit until harvest-validated */
-    if (strcmp(mode, "off") == 0) {
-        fprintf(stderr, "[seccomp] disabled (resolverd_seccomp_mode=off)\n");
-        return;
-    }
-    int enforce = (strcmp(mode, "enforce") == 0);
-    uint32_t def_act = enforce ? SCMP_ACT_ERRNO(EPERM) : SCMP_ACT_LOG;
-
-    scmp_filter_ctx ctx = seccomp_init(def_act);
-    if (!ctx) {
-        fprintf(stderr, "[seccomp] seccomp_init failed — running unconfined\n");
-        if (enforce)
-            exit(1); /* fail closed in enforce mode */
-        return;
-    }
-
-    /* Baseline whitelist. Mirrors dnsd's audit-validated set (socket I/O,
-     * filesystem for /etc resolver files + CA bundle, memory, threads/signals,
-     * time/randomness) plus the resolver-specific outbound/getaddrinfo calls
-     * (recvmmsg/sendmmsg). In audit mode anything missing is logged, not
-     * blocked, so this is a starting point. */
-    const int allow[] = {
-        /* socket I/O — downstream serving + outbound UDP/TCP/DoT/DoH upstreams */
-        SCMP_SYS(read),
-        SCMP_SYS(write),
-        SCMP_SYS(readv),
-        SCMP_SYS(writev),
-        SCMP_SYS(pread64),
-        SCMP_SYS(pwrite64),
-        SCMP_SYS(recvfrom),
-        SCMP_SYS(sendto),
-        SCMP_SYS(recvmsg),
-        SCMP_SYS(sendmsg),
-        SCMP_SYS(recvmmsg), /* glibc getaddrinfo uses these for upstream name lookup */
-        SCMP_SYS(sendmmsg),
-        SCMP_SYS(accept),
-        SCMP_SYS(accept4),
-        SCMP_SYS(socket),
-        SCMP_SYS(connect),
-        SCMP_SYS(bind),
-        SCMP_SYS(listen),
-        SCMP_SYS(shutdown),
-        SCMP_SYS(setsockopt),
-        SCMP_SYS(getsockopt),
-        SCMP_SYS(getsockname),
-        SCMP_SYS(getpeername),
-        SCMP_SYS(select),
-        SCMP_SYS(pselect6),
-        SCMP_SYS(poll),
-        SCMP_SYS(ppoll),
-        SCMP_SYS(fcntl),
-        SCMP_SYS(ioctl),
-        SCMP_SYS(close),
-        /* filesystem — /dev/urandom, CA certs, /etc/resolv.conf|hosts|nsswitch */
-        SCMP_SYS(openat),
-        SCMP_SYS(open),
-        SCMP_SYS(lseek),
-        SCMP_SYS(fstat),
-        SCMP_SYS(stat),
-        SCMP_SYS(lstat),
-        SCMP_SYS(newfstatat),
-        SCMP_SYS(statx),
-        SCMP_SYS(readlink),
-        SCMP_SYS(readlinkat),
-        SCMP_SYS(getdents64),
-        SCMP_SYS(access),
-        SCMP_SYS(faccessat),
-        SCMP_SYS(faccessat2),
-        /* memory */
-        SCMP_SYS(mmap),
-        SCMP_SYS(munmap),
-        SCMP_SYS(mremap),
-        SCMP_SYS(mprotect),
-        SCMP_SYS(brk),
-        SCMP_SYS(madvise),
-        /* threads, signals, process lifecycle — TCP/prefetch worker threads */
-        SCMP_SYS(clone),
-        SCMP_SYS(clone3),
-        SCMP_SYS(futex),
-        SCMP_SYS(futex_waitv),
-        SCMP_SYS(set_robust_list),
-        SCMP_SYS(get_robust_list),
-        SCMP_SYS(rt_sigaction),
-        SCMP_SYS(rt_sigprocmask),
-        SCMP_SYS(rt_sigreturn),
-        SCMP_SYS(sigaltstack),
-        SCMP_SYS(set_tid_address),
-        SCMP_SYS(gettid),
-        SCMP_SYS(getpid),
-        SCMP_SYS(tgkill),
-        SCMP_SYS(exit),
-        SCMP_SYS(exit_group),
-        SCMP_SYS(restart_syscall),
-        /* time + randomness */
-        SCMP_SYS(clock_gettime),
-        SCMP_SYS(clock_nanosleep),
-        SCMP_SYS(nanosleep),
-        SCMP_SYS(gettimeofday),
-        SCMP_SYS(time),
-        SCMP_SYS(getrandom),
-        /* process/runtime info used by glibc/OpenSSL */
-        SCMP_SYS(uname),
-        SCMP_SYS(arch_prctl),
-        SCMP_SYS(rseq),
-        SCMP_SYS(getuid),
-        SCMP_SYS(geteuid),
-        SCMP_SYS(getgid),
-        SCMP_SYS(getegid),
-        SCMP_SYS(getrlimit),
-        SCMP_SYS(prlimit64),
-        SCMP_SYS(sysinfo),
-        SCMP_SYS(sched_getaffinity),
-        SCMP_SYS(sched_yield),
-        SCMP_SYS(getcpu),
-        SCMP_SYS(membarrier),
-        SCMP_SYS(prctl),
-    };
-    int total = (int) (sizeof(allow) / sizeof(allow[0]));
-    int skipped = 0;
-    for (int i = 0; i < total; i++) {
-        if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, allow[i], 0) != 0)
-            skipped++; /* syscall not known on this arch — fine, just skip */
-    }
-
-    if (seccomp_load(ctx) != 0) {
-        fprintf(stderr, "[seccomp] seccomp_load failed: %s%s\n", strerror(errno),
-                enforce ? " — refusing to serve without the filter" : " — running unconfined");
-        seccomp_release(ctx);
-        if (enforce)
-            exit(1); /* fail closed */
-        return;
-    }
-    seccomp_release(ctx);
-
-    fprintf(stderr, "[seccomp] filter active: mode=%s, %d syscalls allowed (%d skipped). %s\n", mode,
-            total - skipped, skipped,
-            enforce ? "Disallowed syscalls return EPERM."
-                    : "Audit mode — violations are logged, not blocked "
-                      "(check the audit log / dmesg, then switch to enforce).");
-}
-#else
-static void seccomp_install(void) {
-    fprintf(stderr, "[seccomp] not built in (libseccomp unavailable at build time)\n");
-}
-#endif
-
-/* Apply the full sandbox: resolve the unprivileged account (needs the host
- * passwd db), confine the filesystem, irreversibly drop root, then install the
- * syscall filter — in that order. Called once after the listeners are bound and
- * before the serve loop. */
 static void apply_sandbox(void) {
-    privdrop_plan_t priv_plan;
-    priv_resolve(&priv_plan);
-    enter_chroot();
-    drop_privileges(&priv_plan);
-    seccomp_install();
+    sandbox_config_t sb;
+    memset(&sb, 0, sizeof(sb));
+    vk_get("config:resolverd_chroot_dir", sb.chroot_dir, sizeof(sb.chroot_dir));
+    sandbox_env_override(sb.chroot_dir, sizeof(sb.chroot_dir), "RESOLVERD_CHROOT");
+    vk_get("config:resolverd_isolation_mode", sb.isolation_mode, sizeof(sb.isolation_mode));
+    sandbox_env_override(sb.isolation_mode, sizeof(sb.isolation_mode), "RESOLVERD_ISOLATION");
+    vk_get("config:resolverd_privdrop_user", sb.privdrop_user, sizeof(sb.privdrop_user));
+    sandbox_env_override(sb.privdrop_user, sizeof(sb.privdrop_user), "RESOLVERD_USER");
+    vk_get("config:resolverd_privdrop_group", sb.privdrop_group, sizeof(sb.privdrop_group));
+    sandbox_env_override(sb.privdrop_group, sizeof(sb.privdrop_group), "RESOLVERD_GROUP");
+    vk_get("config:resolverd_seccomp_mode", sb.seccomp_mode, sizeof(sb.seccomp_mode));
+    sandbox_env_override(sb.seccomp_mode, sizeof(sb.seccomp_mode), "RESOLVERD_SECCOMP");
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* glibc resolver for upstream hostnames */
+    sb.log = resolverd_log;
+    sb.tag = "resolverd";
+    sandbox_apply(&sb);
 }
 
 #ifndef UNIT_TEST
