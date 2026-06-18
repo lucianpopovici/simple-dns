@@ -1501,6 +1501,117 @@ static int valkey_ensure(resp_conn_t *c) {
     return 0;
 }
 
+/* ==========================================================================
+ * In-process record cache  (config:record_cache_ttl > 0 to enable)
+ *
+ * The baseline profile showed that, after SO_REUSEPORT removed the single-thread
+ * serialization, the ceiling moved onto the shared Valkey, which a query hits
+ * ~5x (zone select, record, SOA/DNSSEC config, the stale-shadow SET). This caches
+ * per-query zone:/ddns: GET results — hits AND misses — in a shared, sharded,
+ * direct-mapped table so warm queries skip those round-trips entirely.
+ *
+ * Correctness: entries expire after record_cache_ttl seconds (bounds staleness),
+ * AND the keyspace subscriber calls rcache_invalidate() on every zone:/ddns:
+ * change (dynamic UPDATE, dashboard/apid edits), so an edit takes effect at once
+ * — not only after the TTL. Disabled by default (ttl 0 → vk_get is unchanged);
+ * the table is allocated at startup only when enabled. Values larger than
+ * RCACHE_VALLEN are simply not cached (fall through to Valkey).
+ * ======================================================================= */
+#define RCACHE_KEYLEN 640
+#define RCACHE_VALLEN 512
+#define RCACHE_LOCKS 64
+typedef struct {
+    char key[RCACHE_KEYLEN];
+    char val[RCACHE_VALLEN];
+    int hit;  /* 1 = positive (val valid); 0 = negative (key absent) */
+    int used;
+    uint64_t expiry_ms;
+} rcache_entry_t;
+static rcache_entry_t *g_rcache = NULL;
+static int g_rcache_cap = 0;
+static int g_rcache_ttl = 0;       /* seconds; 0 = disabled */
+static int g_rcache_size = 16384;  /* table entries when enabled */
+static pthread_mutex_t g_rcache_locks[RCACHE_LOCKS];
+
+static uint64_t rcache_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
+}
+static uint64_t rcache_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a 64-bit */
+    for (; *s; s++) {
+        h ^= (uint8_t) *s;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+static void rcache_init(int cap) {
+    if (cap <= 0)
+        return;
+    g_rcache = calloc((size_t) cap, sizeof(rcache_entry_t));
+    if (!g_rcache) {
+        dns_log(LOG_WARNING, "[rcache] alloc of %d entries failed — cache disabled\n", cap);
+        return;
+    }
+    g_rcache_cap = cap;
+    for (int i = 0; i < RCACHE_LOCKS; i++)
+        pthread_mutex_init(&g_rcache_locks[i], NULL);
+    dns_log(LOG_NOTICE, "[rcache] enabled: %d entries, ttl %ds (~%zu MB)\n", cap, g_rcache_ttl,
+            ((size_t) cap * sizeof(rcache_entry_t)) >> 20);
+}
+/* 1 if a fresh entry was found (sets *hit; copies val for a positive); else 0. */
+static int rcache_lookup(const char *key, char *out, int olen, int *hit) {
+    if (!g_rcache || g_rcache_ttl <= 0)
+        return 0;
+    int slot = (int) (rcache_hash(key) % (uint64_t) g_rcache_cap);
+    pthread_mutex_t *lk = &g_rcache_locks[slot % RCACHE_LOCKS];
+    int found = 0;
+    pthread_mutex_lock(lk);
+    rcache_entry_t *e = &g_rcache[slot];
+    if (e->used && e->expiry_ms > rcache_now_ms() && strcmp(e->key, key) == 0) {
+        *hit = e->hit;
+        if (e->hit)
+            safe_strcpy(out, e->val, olen);
+        found = 1;
+    }
+    pthread_mutex_unlock(lk);
+    return found;
+}
+static void rcache_store(const char *key, const char *val, int hit) {
+    if (!g_rcache || g_rcache_ttl <= 0)
+        return;
+    if (strlen(key) >= RCACHE_KEYLEN)
+        return;
+    if (hit && val && strlen(val) >= RCACHE_VALLEN)
+        return; /* value too large to cache — fall through to Valkey next time */
+    int slot = (int) (rcache_hash(key) % (uint64_t) g_rcache_cap);
+    pthread_mutex_t *lk = &g_rcache_locks[slot % RCACHE_LOCKS];
+    pthread_mutex_lock(lk);
+    rcache_entry_t *e = &g_rcache[slot];
+    safe_strcpy(e->key, key, sizeof(e->key));
+    if (hit && val)
+        safe_strcpy(e->val, val, sizeof(e->val));
+    else
+        e->val[0] = 0;
+    e->hit = hit ? 1 : 0;
+    e->used = 1;
+    e->expiry_ms = rcache_now_ms() + (uint64_t) g_rcache_ttl * 1000;
+    pthread_mutex_unlock(lk);
+}
+/* Invalidate one key — called by the keyspace subscriber on zone:/ddns: writes. */
+static void rcache_invalidate(const char *key) {
+    if (!g_rcache)
+        return;
+    int slot = (int) (rcache_hash(key) % (uint64_t) g_rcache_cap);
+    pthread_mutex_t *lk = &g_rcache_locks[slot % RCACHE_LOCKS];
+    pthread_mutex_lock(lk);
+    rcache_entry_t *e = &g_rcache[slot];
+    if (e->used && strcmp(e->key, key) == 0)
+        e->used = 0;
+    pthread_mutex_unlock(lk);
+}
+
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
@@ -1563,12 +1674,27 @@ static int vk_get_conn(resp_conn_t *c, const char *key, char *out, int olen) {
     return 1;
 }
 static int vk_get(const char *key, char *out, int olen) {
+    /* In-process cache for the hot per-query record reads (zone:/ddns:). Config
+     * reads (config:/cert:/dnssec:/acme:) are not cached — they are not on the
+     * hot path and must stay strictly live. */
+    int cacheable = (g_rcache && g_rcache_ttl > 0 &&
+                     (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0));
+    if (cacheable) {
+        int hit = 0;
+        if (rcache_lookup(key, out, olen, &hit))
+            return hit;
+    }
+    int rc;
     /* Worker threads carry a private connection → lock-free, overlapping GETs. */
-    if (t_vk_conn)
-        return vk_get_conn(t_vk_conn, key, out, olen);
-    pthread_mutex_lock(&g_vk_mutex);
-    int rc = vk_get_conn(&vk, key, out, olen);
-    pthread_mutex_unlock(&g_vk_mutex);
+    if (t_vk_conn) {
+        rc = vk_get_conn(t_vk_conn, key, out, olen);
+    } else {
+        pthread_mutex_lock(&g_vk_mutex);
+        rc = vk_get_conn(&vk, key, out, olen);
+        pthread_mutex_unlock(&g_vk_mutex);
+    }
+    if (cacheable)
+        rcache_store(key, rc ? out : NULL, rc);
     return rc;
 }
 static int vk_del(const char *key) {
@@ -1737,6 +1863,23 @@ static void config_load_from_valkey(void) {
         g_udp_workers = 1;
     if (g_udp_workers > 64)
         g_udp_workers = 64;
+    /* In-process record cache (rcache). TTL/size re-read live; the table is
+     * allocated once at startup (main) when enabled — toggling on requires a
+     * restart, the TTL value itself can change live. */
+    GI("record_cache_ttl", g_rcache_ttl);
+    GI("record_cache_size", g_rcache_size);
+    {
+        const char *e = getenv("RECORD_CACHE_TTL");
+        if (e && e[0])
+            g_rcache_ttl = atoi(e);
+        e = getenv("RECORD_CACHE_SIZE");
+        if (e && e[0])
+            g_rcache_size = atoi(e);
+    }
+    if (g_rcache_ttl < 0)
+        g_rcache_ttl = 0;
+    if (g_rcache_size < 0)
+        g_rcache_size = 0;
     G("soa_mname", g_soa_mname);
     G("soa_rname", g_soa_rname);
     GU("soa_refresh", g_soa_refresh);
@@ -2123,6 +2266,12 @@ static void keyspace_apply(const char *key) {
         zones_post_load();  /* apply per-zone config + load keys for any new zone */
         catalog_scan_all(); /* a new/removed zone_table entry may be a catalog */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
+    } else if (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0) {
+        /* Record cache invalidation: a dynamic UPDATE or dashboard/apid edit to a
+         * record must take effect at once, not only after the cache TTL. Exact-key
+         * eviction (the event carries the precise key). No-op if cache disabled.
+         * Note: "zone_table:" does not match "zone:" (5th char differs). */
+        rcache_invalidate(key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         /* dnssec:<zone>:... — reload that zone's key state live (current set +
          * rollover/next set). Legacy un-prefixed keys (dnssec:zsk) belong to the
@@ -2185,8 +2334,16 @@ static void *keyspace_watch_thread(void *arg) {
         zones_load_from_valkey();
         cert_current_reload();
 
-        static const char *prefixes[] = {"config:*", "cert:current", "zone_table:*", "dnssec:*",
+        /* zone:* / ddns:* are watched only to invalidate the record cache, so
+         * subscribe to them only when it is active (else they add no value). */
+        static const char *prefixes[] = {"config:*",     "cert:current", "zone_table:*",
+                                         "dnssec:*",     NULL,           NULL,
                                          NULL};
+        if (g_rcache && g_rcache_ttl > 0) {
+            int n = 4;
+            prefixes[n++] = "zone:*";
+            prefixes[n++] = "ddns:*";
+        }
         int subok = 1;
         for (int i = 0; prefixes[i]; i++) {
             char pat[160];
@@ -6845,6 +7002,10 @@ int main(int argc, char **argv) {
 
     /* Phase 2: Load config */
     config_load_from_valkey();
+
+    /* In-process record cache: allocate once here if enabled at boot. */
+    if (g_rcache_ttl > 0)
+        rcache_init(g_rcache_size);
 
     /* Phase 2b: Populate multi-zone table (primary seed + zone_table:*) */
     seed_primary_zone();
