@@ -581,6 +581,13 @@ static char g_nsid[256] = "";
  * Syslog configuration
  * Syslog configuration — all keys under config:syslog_*
  *
+ * Console (stdout/stderr) output:
+ *   config:console_level     "debug","info","notice","warning","err","crit"
+ *                             Messages at this level AND MORE SEVERE are printed
+ *                             to stdout/stderr. Per-query "[DNS ]" logging is at
+ *                             DEBUG, so the default (info) keeps it off the hot
+ *                             path. Env override: CONSOLE_LEVEL.   (default: info)
+ *
  * Local syslog (system logger):
  *   config:syslog_enabled    "1" / "0"                       (default: 0)
  *   config:syslog_facility   "daemon","local0".."local7",...  (default: daemon)
@@ -610,6 +617,12 @@ static char g_nsid[256] = "";
  * All remote sends are non-blocking (SO_SNDTIMEO = 2s) so a dead syslog
  * server never stalls DNS query processing.
  * ======================================================================= */
+
+/* ── Console (stdout/stderr) state ──────────────────────────────────────── */
+/* Gates the stdout/stderr log block in dns_log(). Default LOG_INFO so the
+ * per-query "[DNS ]" DEBUG log does not force a serialized fprintf+fflush on the
+ * hot path. Configurable via config:console_level / env CONSOLE_LEVEL. */
+static int g_console_level = LOG_INFO;
 
 /* ── Local syslog state ─────────────────────────────────────────────────── */
 static int g_syslog_enabled = 0;
@@ -942,6 +955,16 @@ static void dns_log(int priority, const char *fmt, ...) {
     va_list ap;
     char msg[4096];
 
+    /* Hot-path short-circuit: if this message is below every enabled sink's
+     * level, do no formatting, take no lock, do no I/O. Per-query "[DNS ]" logs
+     * are DEBUG, so at the default console level (info) this returns immediately
+     * instead of forcing a serialized fprintf+fflush under g_log_mutex. */
+    int to_console = (priority <= g_console_level);
+    int to_syslog = (g_syslog_enabled && priority <= g_syslog_level);
+    int to_remote = (g_rsyslog_port > 0 && priority <= g_rsyslog_level);
+    if (!to_console && !to_syslog && !to_remote)
+        return;
+
     /* Format the message body once */
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
@@ -955,7 +978,7 @@ static void dns_log(int priority, const char *fmt, ...) {
     pthread_mutex_lock(&g_log_mutex);
 
     /* ── 1. stdout / stderr with ISO-8601 timestamp ── */
-    {
+    if (to_console) {
         time_t now = time(NULL);
         struct tm tm_buf;
         char ts[32];
@@ -967,11 +990,11 @@ static void dns_log(int priority, const char *fmt, ...) {
     }
 
     /* ── 2. Local syslog ── */
-    if (g_syslog_enabled && priority <= g_syslog_level)
+    if (to_syslog)
         syslog(priority, "%s", msg);
 
     /* ── 3. Remote syslog ── */
-    if (g_rsyslog_port > 0 && priority <= g_rsyslog_level) {
+    if (to_remote) {
         char pkt[4096];
         int plen = rsyslog_format(pkt, sizeof(pkt), priority, msg);
         if (plen > 0 && plen < (int) sizeof(pkt))
@@ -1750,6 +1773,14 @@ static void config_load_from_valkey(void) {
     vk_get("config:tls_cert_pem", g_tls_cert_pem, sizeof(g_tls_cert_pem));
     vk_get("config:tls_key_pem", g_tls_key_pem, sizeof(g_tls_key_pem));
     vk_get("config:mtls_ca_pem", g_mtls_ca_pem, sizeof(g_mtls_ca_pem));
+    /* Console (stdout/stderr) level — env CONSOLE_LEVEL overrides config. */
+    if (vk_get("config:console_level", val, sizeof(val)) && val[0])
+        g_console_level = syslog_level_from_str(val);
+    {
+        const char *cl = getenv("CONSOLE_LEVEL");
+        if (cl && cl[0])
+            g_console_level = syslog_level_from_str(cl);
+    }
     /* Local syslog config */
     if (vk_get("config:syslog_enabled", val, sizeof(val)) && val[0])
         g_syslog_enabled = atoi(val);
