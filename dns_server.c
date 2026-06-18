@@ -504,6 +504,11 @@ static char g_valkey_pass[256] = "";
 static int g_metrics_port = METRICS_PORT_DEFAULT;
 static int g_dns_port = DNS_PORT_DEFAULT;
 static int g_dot_port = DOT_PORT_DEFAULT;
+/* SO_REUSEPORT UDP worker threads for IPv4 (config:udp_workers / env UDP_WORKERS).
+ * 1 = legacy single-threaded select() loop (default, unchanged behavior). >1 =
+ * N kernel-load-balanced worker threads, each with its own UDP socket and its
+ * own (lock-free) Valkey connection. */
+static int g_udp_workers = 1;
 static int g_http_port = HTTP_PORT_DEFAULT;
 static int g_https_port = HTTPS_PORT_DEFAULT;
 static char g_ddns_secret[256] = "changeme";
@@ -1269,6 +1274,10 @@ typedef struct {
     int rlen, rpos;
 } resp_conn_t;
 static resp_conn_t vk;
+/* When non-NULL, vk_get() uses this thread-private connection instead of the
+ * shared `vk` + g_vk_mutex, so a UDP worker's per-query GET (+ stale SET) runs
+ * lock-free and overlaps with other workers. Set by udp_worker_thread(). */
+static __thread resp_conn_t *t_vk_conn = NULL;
 
 static int resp_fill(resp_conn_t *c) {
     if (c->rpos > 0 && c->rlen > c->rpos) {
@@ -1514,34 +1523,31 @@ static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_unlock(&g_vk_mutex);
     return r.type == 0;
 }
-static int vk_get(const char *key, char *out, int olen) {
-    pthread_mutex_lock(&g_vk_mutex);
-    int connected = (valkey_ensure(&vk) >= 0);
-    if (!connected) {
+/* Core GET on a specific connection — does NO locking. The caller supplies
+ * either the shared `vk` (while holding g_vk_mutex) or a thread-private
+ * connection (no lock needed). Behavior is identical to the historical vk_get:
+ * GET, RFC 8767 stale-shadow read on Valkey-unreachable, stale-shadow write on
+ * hit. */
+static int vk_get_conn(resp_conn_t *c, const char *key, char *out, int olen) {
+    if (valkey_ensure(c) < 0) {
         /* Valkey unreachable — try RFC 8767 stale shadow key */
-        pthread_mutex_unlock(&g_vk_mutex);
         char skey[640];
         snprintf(skey, sizeof(skey), "stale:%s", key);
-        pthread_mutex_lock(&g_vk_mutex);
-        if (valkey_ensure(&vk) >= 0) {
+        if (valkey_ensure(c) >= 0) {
             resp_reply_t rs;
-            if (resp_cmd(&vk, &rs, 2, "GET", skey) >= 0 && rs.type == 2) {
+            if (resp_cmd(c, &rs, 2, "GET", skey) >= 0 && rs.type == 2) {
                 safe_strcpy(out, rs.str, olen);
-                pthread_mutex_unlock(&g_vk_mutex);
                 dns_log(LOG_DEBUG, "[RFC8767] Serving stale data for %s\n", key);
                 return 1;
             }
         }
-        pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
     resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "GET", key) < 0) {
-        vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
+    if (resp_cmd(c, &r, 2, "GET", key) < 0) {
+        c->fd = -1;
         return 0;
     }
-    pthread_mutex_unlock(&g_vk_mutex);
     if (r.type != 2)
         return 0;
     safe_strcpy(out, r.str, olen);
@@ -1549,16 +1555,21 @@ static int vk_get(const char *key, char *out, int olen) {
     {
         char skey[640];
         snprintf(skey, sizeof(skey), "stale:%s", key);
-        pthread_mutex_lock(&g_vk_mutex);
-        if (valkey_ensure(&vk) >= 0) {
-            char ts[16];
-            snprintf(ts, sizeof(ts), "%u", 7u * 86400);
-            resp_reply_t sw;
-            resp_cmd(&vk, &sw, 5, "SET", skey, out, "EX", ts);
-        }
-        pthread_mutex_unlock(&g_vk_mutex);
+        char ts[16];
+        snprintf(ts, sizeof(ts), "%u", 7u * 86400);
+        resp_reply_t sw;
+        resp_cmd(c, &sw, 5, "SET", skey, out, "EX", ts);
     }
     return 1;
+}
+static int vk_get(const char *key, char *out, int olen) {
+    /* Worker threads carry a private connection → lock-free, overlapping GETs. */
+    if (t_vk_conn)
+        return vk_get_conn(t_vk_conn, key, out, olen);
+    pthread_mutex_lock(&g_vk_mutex);
+    int rc = vk_get_conn(&vk, key, out, olen);
+    pthread_mutex_unlock(&g_vk_mutex);
+    return rc;
 }
 static int vk_del(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
@@ -1716,6 +1727,16 @@ static void config_load_from_valkey(void) {
     GI("http_port", g_http_port);
     GI("https_port", g_https_port);
     GI("metrics_port", g_metrics_port);
+    GI("udp_workers", g_udp_workers);
+    {
+        const char *uw = getenv("UDP_WORKERS");
+        if (uw && uw[0])
+            g_udp_workers = atoi(uw);
+    }
+    if (g_udp_workers < 1)
+        g_udp_workers = 1;
+    if (g_udp_workers > 64)
+        g_udp_workers = 64;
     G("soa_mname", g_soa_mname);
     G("soa_rname", g_soa_rname);
     GU("soa_refresh", g_soa_refresh);
@@ -6722,6 +6743,78 @@ static void sighup_handler(int sig) {
     g_reload_flag = 1;
 }
 
+/* ── SO_REUSEPORT UDP worker model (config:udp_workers > 1) ──────────────────
+ * Each worker owns its own IPv4 UDP socket bound to the DNS port with
+ * SO_REUSEPORT (the kernel hashes datagrams across them) and its own Valkey
+ * connection (t_vk_conn → lock-free vk_get). This breaks the single-threaded,
+ * one-packet-in-flight serialization that caps the legacy select() loop:
+ * workers' blocking Valkey round-trips now overlap. dns_process() is already
+ * thread-safe (it runs in DoT worker threads and uses __thread request state).
+ * IPv6/TCP/DoT/metrics stay on the main select loop. */
+typedef struct {
+    int sock;
+    int id;
+} udp_worker_t;
+
+static int make_reuseport_udp_socket(int port) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0)
+        return -1;
+    int one = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0 ||
+        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0) {
+        close(s);
+        return -1;
+    }
+    struct sockaddr_in sa = {.sin_family = AF_INET,
+                             .sin_port = htons(port),
+                             .sin_addr.s_addr = INADDR_ANY};
+    if (bind(s, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+static void *udp_worker_thread(void *arg) {
+    udp_worker_t *w = (udp_worker_t *) arg;
+    /* This worker's private Valkey connection — vk_get() now runs lock-free. */
+    resp_conn_t conn = {.fd = -1};
+    t_vk_conn = &conn;
+    uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
+    for (;;) {
+        struct sockaddr_in cli;
+        socklen_t clen = sizeof(cli);
+        ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
+        if (nn <= 0) {
+            if (nn < 0 && errno == EINTR)
+                continue;
+            continue;
+        }
+        char cip2[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &cli.sin_addr, cip2, sizeof(cip2));
+        char qn[256] = "?";
+        uint16_t qt = 0;
+        int a = name_from_wire(pkt, (int) nn, 12, qn, sizeof(qn));
+        if (a >= 0 && a + 1 < nn)
+            qt = get16(pkt, a);
+        dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip2, type2str(qt), qn);
+        struct timespec _qt0, _qt1;
+        clock_gettime(CLOCK_MONOTONIC, &_qt0);
+        int rlen = dns_process(pkt, (int) nn, resp, sizeof(resp), 0, &cli.sin_addr);
+        clock_gettime(CLOCK_MONOTONIC, &_qt1);
+        long _rtt = (long) ((_qt1.tv_sec - _qt0.tv_sec) * 1000000L +
+                            (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
+        if (rlen > 0) {
+            sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
+            uint8_t _rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
+            int _an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
+            qlog_write(cip2, qn, qt, _rc, _an, _rtt, "udp");
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -6848,13 +6941,20 @@ int main(int argc, char **argv) {
             }
         }
     }
-    int dns_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (dns_sock < 0) {
-        perror("dns socket");
-        return 1;
-    }
-    setsockopt(dns_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    {
+    /* IPv4 UDP: legacy single socket (workers<=1) handled by the select loop,
+     * OR N SO_REUSEPORT sockets (workers>1) handled by worker threads. Bind here
+     * — before the sandbox / privilege drop — so privileged ports still work;
+     * the worker threads are spawned post-sandbox using these pre-bound fds. */
+    int dns_sock = -1;
+    int worker_socks[64];
+    int n_worker_socks = 0;
+    if (g_udp_workers <= 1) {
+        dns_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (dns_sock < 0) {
+            perror("dns socket");
+            return 1;
+        }
+        setsockopt(dns_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         struct sockaddr_in sa = {.sin_family = AF_INET,
                                  .sin_port = htons(g_dns_port),
                                  .sin_addr.s_addr = INADDR_ANY};
@@ -6862,6 +6962,19 @@ int main(int argc, char **argv) {
             perror("dns bind");
             return 1;
         }
+    } else {
+        for (int i = 0; i < g_udp_workers; i++) {
+            int ws = make_reuseport_udp_socket(g_dns_port);
+            if (ws < 0)
+                break; /* keep however many bound; need at least one */
+            worker_socks[n_worker_socks++] = ws;
+        }
+        if (n_worker_socks == 0) {
+            perror("dns reuseport bind");
+            return 1;
+        }
+        dns_log(LOG_INFO, "[UDP ] %d/%d SO_REUSEPORT worker sockets bound on :%d\n",
+                n_worker_socks, g_udp_workers, g_dns_port);
     }
     int dot_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (dot_sock < 0) {
@@ -6960,10 +7073,35 @@ int main(int argc, char **argv) {
     sb.tag = "dnsd";
     sandbox_apply(&sb);
 
+    /* Spawn IPv4 UDP worker threads (workers>1) on the pre-bound REUSEPORT
+     * sockets. Post-sandbox is fine: dnsd already pthread_create()s DoT threads
+     * and reconnects to Valkey after sandboxing, so the seccomp whitelist covers
+     * clone/socket/connect/recvfrom/sendto. */
+    if (g_udp_workers > 1) {
+        int started = 0;
+        for (int i = 0; i < n_worker_socks; i++) {
+            udp_worker_t *w = malloc(sizeof(*w));
+            if (!w)
+                continue;
+            w->sock = worker_socks[i];
+            w->id = i;
+            pthread_t wt;
+            if (pthread_create(&wt, NULL, udp_worker_thread, w) == 0) {
+                pthread_detach(wt);
+                started++;
+            } else {
+                free(w);
+            }
+        }
+        dns_log(LOG_NOTICE, "[UDP ] %d UDP worker threads serving IPv4 :%d\n", started,
+                g_dns_port);
+    }
+
     for (;;) {
         fd_set fds;
         FD_ZERO(&fds);
-        FD_SET(dns_sock, &fds);
+        if (dns_sock >= 0)
+            FD_SET(dns_sock, &fds);
         FD_SET(dot_sock, &fds);
         FD_SET(metrics_sock, &fds);
         if (tcp_dns_sock >= 0)
@@ -7009,7 +7147,7 @@ int main(int argc, char **argv) {
             dns_log(LOG_NOTICE, "[SIGHUP] Reload complete\n");
         }
 
-        if (FD_ISSET(dns_sock, &fds)) {
+        if (dns_sock >= 0 && FD_ISSET(dns_sock, &fds)) {
             uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
             struct sockaddr_in cli;
             socklen_t clen = sizeof(cli);
