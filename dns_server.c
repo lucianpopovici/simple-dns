@@ -1527,22 +1527,23 @@ static int valkey_ensure(resp_conn_t *c) {
 #define RCACHE_KEYLEN 640
 #define RCACHE_VALLEN 512
 #define RCACHE_LOCKS 64
-#define RCACHE_WAYS 4 /* set-associative: WAYS entries per bucket so colliding
-                       * keys coexist instead of evicting each other (a query
-                       * caches both ddns: and zone: per name → ~2x entries, which
-                       * thrashed a direct-mapped table). */
+#define RCACHE_WAYS                                                                                \
+    4 /* set-associative: WAYS entries per bucket so colliding                                     \
+       * keys coexist instead of evicting each other (a query                                      \
+       * caches both ddns: and zone: per name → ~2x entries, which                               \
+       * thrashed a direct-mapped table). */
 typedef struct {
     char key[RCACHE_KEYLEN];
     char val[RCACHE_VALLEN];
-    int hit;  /* 1 = positive (val valid); 0 = negative (key absent) */
+    int hit; /* 1 = positive (val valid); 0 = negative (key absent) */
     int used;
     uint64_t expiry_ms;
 } rcache_entry_t;
 static rcache_entry_t *g_rcache = NULL;
-static int g_rcache_cap = 0;        /* total entries (buckets * RCACHE_WAYS) */
-static int g_rcache_buckets = 0;    /* number of sets */
-static int g_rcache_ttl = 0;        /* seconds; 0 = disabled */
-static int g_rcache_size = 16384;   /* requested entries when enabled */
+static int g_rcache_cap = 0;      /* total entries (buckets * RCACHE_WAYS) */
+static int g_rcache_buckets = 0;  /* number of sets */
+static int g_rcache_ttl = 0;      /* seconds; 0 = disabled */
+static int g_rcache_size = 16384; /* requested entries when enabled */
 static pthread_mutex_t g_rcache_locks[RCACHE_LOCKS];
 
 /* RFC 8767 stale-shadow write throttle. The shadow (stale:<key>, 7-day TTL) only
@@ -2402,9 +2403,8 @@ static void *keyspace_watch_thread(void *arg) {
 
         /* zone:* / ddns:* are watched only to invalidate the record cache, so
          * subscribe to them only when it is active (else they add no value). */
-        static const char *prefixes[] = {"config:*",     "cert:current", "zone_table:*",
-                                         "dnssec:*",     NULL,           NULL,
-                                         NULL};
+        static const char *prefixes[] = {
+            "config:*", "cert:current", "zone_table:*", "dnssec:*", NULL, NULL, NULL};
         if (g_rcache && g_rcache_ttl > 0) {
             int n = 4;
             prefixes[n++] = "zone:*";
@@ -7050,8 +7050,8 @@ static void *udp_worker_thread(void *arg) {
      * sendmmsg. Buffers are heap-allocated once per worker. */
     if (batch > UDP_BATCH_MAX)
         batch = UDP_BATCH_MAX;
-    uint8_t(*rxbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
-    uint8_t(*txbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
+    uint8_t (*rxbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
+    uint8_t (*txbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
     struct sockaddr_in *addrs = malloc((size_t) batch * sizeof(*addrs));
     struct mmsghdr *rxmsgs = malloc((size_t) batch * sizeof(*rxmsgs));
     struct iovec *rxiov = malloc((size_t) batch * sizeof(*rxiov));
@@ -7272,8 +7272,8 @@ int main(int argc, char **argv) {
             perror("dns reuseport bind");
             return 1;
         }
-        dns_log(LOG_INFO, "[UDP ] %d/%d SO_REUSEPORT worker sockets bound on :%d\n",
-                n_worker_socks, g_udp_workers, g_dns_port);
+        dns_log(LOG_INFO, "[UDP ] %d/%d SO_REUSEPORT worker sockets bound on :%d\n", n_worker_socks,
+                g_udp_workers, g_dns_port);
     }
     int dot_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (dot_sock < 0) {
@@ -7392,8 +7392,7 @@ int main(int argc, char **argv) {
                 free(w);
             }
         }
-        dns_log(LOG_NOTICE, "[UDP ] %d UDP worker threads serving IPv4 :%d\n", started,
-                g_dns_port);
+        dns_log(LOG_NOTICE, "[UDP ] %d UDP worker threads serving IPv4 :%d\n", started, g_dns_port);
     }
 
     for (;;) {
