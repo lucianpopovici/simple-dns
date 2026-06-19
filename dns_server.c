@@ -509,6 +509,13 @@ static int g_dot_port = DOT_PORT_DEFAULT;
  * N kernel-load-balanced worker threads, each with its own UDP socket and its
  * own (lock-free) Valkey connection. */
 static int g_udp_workers = 1;
+/* recvmmsg/sendmmsg batch size for the worker path (config:udp_rx_batch / env
+ * UDP_RX_BATCH). 1 = per-packet recvfrom/sendto (default). >1 amortizes the
+ * per-packet syscall cost by draining up to N datagrams per recvmmsg and
+ * replying with one sendmmsg. Uses MSG_WAITFORONE so latency is unaffected at
+ * low load (returns as soon as ≥1 datagram is ready). Worker path only. */
+static int g_udp_rx_batch = 1;
+#define UDP_BATCH_MAX 64
 static int g_http_port = HTTP_PORT_DEFAULT;
 static int g_https_port = HTTPS_PORT_DEFAULT;
 static char g_ddns_secret[256] = "changeme";
@@ -1501,6 +1508,156 @@ static int valkey_ensure(resp_conn_t *c) {
     return 0;
 }
 
+/* ==========================================================================
+ * In-process record cache  (config:record_cache_ttl > 0 to enable)
+ *
+ * The baseline profile showed that, after SO_REUSEPORT removed the single-thread
+ * serialization, the ceiling moved onto the shared Valkey, which a query hits
+ * ~5x (zone select, record, SOA/DNSSEC config, the stale-shadow SET). This caches
+ * per-query zone:/ddns: GET results — hits AND misses — in a shared, sharded,
+ * direct-mapped table so warm queries skip those round-trips entirely.
+ *
+ * Correctness: entries expire after record_cache_ttl seconds (bounds staleness),
+ * AND the keyspace subscriber calls rcache_invalidate() on every zone:/ddns:
+ * change (dynamic UPDATE, dashboard/apid edits), so an edit takes effect at once
+ * — not only after the TTL. Disabled by default (ttl 0 → vk_get is unchanged);
+ * the table is allocated at startup only when enabled. Values larger than
+ * RCACHE_VALLEN are simply not cached (fall through to Valkey).
+ * ======================================================================= */
+#define RCACHE_KEYLEN 640
+#define RCACHE_VALLEN 512
+#define RCACHE_LOCKS 64
+#define RCACHE_WAYS                                                                                \
+    4 /* set-associative: WAYS entries per bucket so colliding                                     \
+       * keys coexist instead of evicting each other (a query                                      \
+       * caches both ddns: and zone: per name → ~2x entries, which                               \
+       * thrashed a direct-mapped table). */
+typedef struct {
+    char key[RCACHE_KEYLEN];
+    char val[RCACHE_VALLEN];
+    int hit; /* 1 = positive (val valid); 0 = negative (key absent) */
+    int used;
+    uint64_t expiry_ms;
+} rcache_entry_t;
+static rcache_entry_t *g_rcache = NULL;
+static int g_rcache_cap = 0;      /* total entries (buckets * RCACHE_WAYS) */
+static int g_rcache_buckets = 0;  /* number of sets */
+static int g_rcache_ttl = 0;      /* seconds; 0 = disabled */
+static int g_rcache_size = 16384; /* requested entries when enabled */
+static pthread_mutex_t g_rcache_locks[RCACHE_LOCKS];
+
+/* RFC 8767 stale-shadow write throttle. The shadow (stale:<key>, 7-day TTL) only
+ * needs to be recent-ish for outage survival, but it was rewritten on EVERY
+ * successful GET — a Valkey write per read. Write it on ~1/N reads instead.
+ * 1 = write every GET (legacy), 0 = never write shadows. Per-thread counter, so
+ * each worker refreshes independently. */
+static int g_stale_sample = 16;
+static __thread unsigned t_stale_ctr = 0;
+
+static uint64_t rcache_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
+}
+static uint64_t rcache_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a 64-bit */
+    for (; *s; s++) {
+        h ^= (uint8_t) *s;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+static void rcache_init(int cap) {
+    if (cap < RCACHE_WAYS)
+        return;
+    int buckets = cap / RCACHE_WAYS;
+    int total = buckets * RCACHE_WAYS;
+    g_rcache = calloc((size_t) total, sizeof(rcache_entry_t));
+    if (!g_rcache) {
+        dns_log(LOG_WARNING, "[rcache] alloc of %d entries failed — cache disabled\n", total);
+        return;
+    }
+    g_rcache_cap = total;
+    g_rcache_buckets = buckets;
+    for (int i = 0; i < RCACHE_LOCKS; i++)
+        pthread_mutex_init(&g_rcache_locks[i], NULL);
+    dns_log(LOG_NOTICE, "[rcache] enabled: %d entries (%d sets x %d ways), ttl %ds (~%zu MB)\n",
+            total, buckets, RCACHE_WAYS, g_rcache_ttl,
+            ((size_t) total * sizeof(rcache_entry_t)) >> 20);
+}
+/* 1 if a fresh entry was found (sets *hit; copies val for a positive); else 0. */
+static int rcache_lookup(const char *key, char *out, int olen, int *hit) {
+    if (!g_rcache || g_rcache_ttl <= 0)
+        return 0;
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_rcache_buckets);
+    rcache_entry_t *set = &g_rcache[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_rcache_locks[bucket % RCACHE_LOCKS];
+    int found = 0;
+    pthread_mutex_lock(lk);
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        rcache_entry_t *e = &set[w];
+        if (e->used && e->expiry_ms > rcache_now_ms() && strcmp(e->key, key) == 0) {
+            *hit = e->hit;
+            if (e->hit)
+                safe_strcpy(out, e->val, olen);
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(lk);
+    return found;
+}
+static void rcache_store(const char *key, const char *val, int hit) {
+    if (!g_rcache || g_rcache_ttl <= 0)
+        return;
+    if (strlen(key) >= RCACHE_KEYLEN)
+        return;
+    if (hit && val && strlen(val) >= RCACHE_VALLEN)
+        return; /* value too large to cache — fall through to Valkey next time */
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_rcache_buckets);
+    rcache_entry_t *set = &g_rcache[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_rcache_locks[bucket % RCACHE_LOCKS];
+    uint64_t now = rcache_now_ms();
+    pthread_mutex_lock(lk);
+    /* Pick a way: an existing entry for this key, else a free/expired slot, else
+     * the one expiring soonest (approx-LRU eviction within the set). */
+    rcache_entry_t *victim = &set[0];
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        rcache_entry_t *e = &set[w];
+        if ((e->used && strcmp(e->key, key) == 0) || !e->used || e->expiry_ms <= now) {
+            victim = e;
+            break;
+        }
+        if (e->expiry_ms < victim->expiry_ms)
+            victim = e;
+    }
+    safe_strcpy(victim->key, key, sizeof(victim->key));
+    if (hit && val)
+        safe_strcpy(victim->val, val, sizeof(victim->val));
+    else
+        victim->val[0] = 0;
+    victim->hit = hit ? 1 : 0;
+    victim->used = 1;
+    victim->expiry_ms = now + (uint64_t) g_rcache_ttl * 1000;
+    pthread_mutex_unlock(lk);
+}
+/* Invalidate one key — called by the keyspace subscriber on zone:/ddns: writes. */
+static void rcache_invalidate(const char *key) {
+    if (!g_rcache)
+        return;
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_rcache_buckets);
+    rcache_entry_t *set = &g_rcache[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_rcache_locks[bucket % RCACHE_LOCKS];
+    pthread_mutex_lock(lk);
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        if (set[w].used && strcmp(set[w].key, key) == 0) {
+            set[w].used = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(lk);
+}
+
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
@@ -1551,8 +1708,10 @@ static int vk_get_conn(resp_conn_t *c, const char *key, char *out, int olen) {
     if (r.type != 2)
         return 0;
     safe_strcpy(out, r.str, olen);
-    /* Write stale shadow key: 7-day TTL — used when Valkey is unreachable */
-    {
+    /* Refresh the RFC 8767 stale shadow (7-day TTL) on ~1/g_stale_sample reads to
+     * avoid a Valkey write per read. The shadow only needs to be recent enough to
+     * serve during a Valkey outage; the read-side serve-stale path is unchanged. */
+    if (g_stale_sample > 0 && (++t_stale_ctr % (unsigned) g_stale_sample) == 0) {
         char skey[640];
         snprintf(skey, sizeof(skey), "stale:%s", key);
         char ts[16];
@@ -1563,12 +1722,27 @@ static int vk_get_conn(resp_conn_t *c, const char *key, char *out, int olen) {
     return 1;
 }
 static int vk_get(const char *key, char *out, int olen) {
+    /* In-process cache for the hot per-query record reads (zone:/ddns:). Config
+     * reads (config:/cert:/dnssec:/acme:) are not cached — they are not on the
+     * hot path and must stay strictly live. */
+    int cacheable = (g_rcache && g_rcache_ttl > 0 &&
+                     (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0));
+    if (cacheable) {
+        int hit = 0;
+        if (rcache_lookup(key, out, olen, &hit))
+            return hit;
+    }
+    int rc;
     /* Worker threads carry a private connection → lock-free, overlapping GETs. */
-    if (t_vk_conn)
-        return vk_get_conn(t_vk_conn, key, out, olen);
-    pthread_mutex_lock(&g_vk_mutex);
-    int rc = vk_get_conn(&vk, key, out, olen);
-    pthread_mutex_unlock(&g_vk_mutex);
+    if (t_vk_conn) {
+        rc = vk_get_conn(t_vk_conn, key, out, olen);
+    } else {
+        pthread_mutex_lock(&g_vk_mutex);
+        rc = vk_get_conn(&vk, key, out, olen);
+        pthread_mutex_unlock(&g_vk_mutex);
+    }
+    if (cacheable)
+        rcache_store(key, rc ? out : NULL, rc);
     return rc;
 }
 static int vk_del(const char *key) {
@@ -1737,6 +1911,42 @@ static void config_load_from_valkey(void) {
         g_udp_workers = 1;
     if (g_udp_workers > 64)
         g_udp_workers = 64;
+    GI("udp_rx_batch", g_udp_rx_batch);
+    {
+        const char *rb = getenv("UDP_RX_BATCH");
+        if (rb && rb[0])
+            g_udp_rx_batch = atoi(rb);
+    }
+    if (g_udp_rx_batch < 1)
+        g_udp_rx_batch = 1;
+    if (g_udp_rx_batch > UDP_BATCH_MAX)
+        g_udp_rx_batch = UDP_BATCH_MAX;
+    /* In-process record cache (rcache). TTL/size re-read live; the table is
+     * allocated once at startup (main) when enabled — toggling on requires a
+     * restart, the TTL value itself can change live. */
+    GI("record_cache_ttl", g_rcache_ttl);
+    GI("record_cache_size", g_rcache_size);
+    {
+        const char *e = getenv("RECORD_CACHE_TTL");
+        if (e && e[0])
+            g_rcache_ttl = atoi(e);
+        e = getenv("RECORD_CACHE_SIZE");
+        if (e && e[0])
+            g_rcache_size = atoi(e);
+    }
+    if (g_rcache_ttl < 0)
+        g_rcache_ttl = 0;
+    if (g_rcache_size < 0)
+        g_rcache_size = 0;
+    /* Stale-shadow write throttle (1 = every GET, N = ~1/N, 0 = off). */
+    GI("stale_refresh_sample", g_stale_sample);
+    {
+        const char *e = getenv("STALE_REFRESH_SAMPLE");
+        if (e && e[0])
+            g_stale_sample = atoi(e);
+    }
+    if (g_stale_sample < 0)
+        g_stale_sample = 0;
     G("soa_mname", g_soa_mname);
     G("soa_rname", g_soa_rname);
     GU("soa_refresh", g_soa_refresh);
@@ -2123,6 +2333,12 @@ static void keyspace_apply(const char *key) {
         zones_post_load();  /* apply per-zone config + load keys for any new zone */
         catalog_scan_all(); /* a new/removed zone_table entry may be a catalog */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
+    } else if (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0) {
+        /* Record cache invalidation: a dynamic UPDATE or dashboard/apid edit to a
+         * record must take effect at once, not only after the cache TTL. Exact-key
+         * eviction (the event carries the precise key). No-op if cache disabled.
+         * Note: "zone_table:" does not match "zone:" (5th char differs). */
+        rcache_invalidate(key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         /* dnssec:<zone>:... — reload that zone's key state live (current set +
          * rollover/next set). Legacy un-prefixed keys (dnssec:zsk) belong to the
@@ -2185,8 +2401,15 @@ static void *keyspace_watch_thread(void *arg) {
         zones_load_from_valkey();
         cert_current_reload();
 
-        static const char *prefixes[] = {"config:*", "cert:current", "zone_table:*", "dnssec:*",
-                                         NULL};
+        /* zone:* / ddns:* are watched only to invalidate the record cache, so
+         * subscribe to them only when it is active (else they add no value). */
+        static const char *prefixes[] = {
+            "config:*", "cert:current", "zone_table:*", "dnssec:*", NULL, NULL, NULL};
+        if (g_rcache && g_rcache_ttl > 0) {
+            int n = 4;
+            prefixes[n++] = "zone:*";
+            prefixes[n++] = "ddns:*";
+        }
         int subok = 1;
         for (int i = 0; prefixes[i]; i++) {
             char pat[160];
@@ -6776,40 +6999,115 @@ static int make_reuseport_udp_socket(int port) {
     return s;
 }
 
+/* Parse, log, resolve one IPv4 UDP query. Returns response length (0 = drop).
+ * Shared by the per-packet and the recvmmsg/sendmmsg worker loops. */
+static int udp_serve_one(const uint8_t *pkt, int nn, const struct sockaddr_in *cli, uint8_t *resp,
+                         int resp_cap) {
+    char cip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &cli->sin_addr, cip, sizeof(cip));
+    char qn[256] = "?";
+    uint16_t qt = 0;
+    int a = name_from_wire(pkt, nn, 12, qn, sizeof(qn));
+    if (a >= 0 && a + 1 < nn)
+        qt = get16(pkt, a);
+    dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip, type2str(qt), qn);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rlen = dns_process(pkt, nn, resp, resp_cap, 0, &cli->sin_addr);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+    if (rlen > 0) {
+        uint8_t rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
+        int an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
+        qlog_write(cip, qn, qt, rc, an, rtt, "udp");
+    }
+    return rlen;
+}
+
 static void *udp_worker_thread(void *arg) {
     udp_worker_t *w = (udp_worker_t *) arg;
     /* This worker's private Valkey connection — vk_get() now runs lock-free. */
     resp_conn_t conn = {.fd = -1};
     t_vk_conn = &conn;
-    uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
-    for (;;) {
-        struct sockaddr_in cli;
-        socklen_t clen = sizeof(cli);
-        ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
-        if (nn <= 0) {
-            if (nn < 0 && errno == EINTR)
+
+    int batch = g_udp_rx_batch;
+    if (batch <= 1) {
+        /* Per-packet path (default). */
+        uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
+        for (;;) {
+            struct sockaddr_in cli;
+            socklen_t clen = sizeof(cli);
+            ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
+            if (nn <= 0)
                 continue;
-            continue;
+            int rlen = udp_serve_one(pkt, (int) nn, &cli, resp, sizeof(resp));
+            if (rlen > 0)
+                sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
         }
-        char cip2[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &cli.sin_addr, cip2, sizeof(cip2));
-        char qn[256] = "?";
-        uint16_t qt = 0;
-        int a = name_from_wire(pkt, (int) nn, 12, qn, sizeof(qn));
-        if (a >= 0 && a + 1 < nn)
-            qt = get16(pkt, a);
-        dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip2, type2str(qt), qn);
-        struct timespec _qt0, _qt1;
-        clock_gettime(CLOCK_MONOTONIC, &_qt0);
-        int rlen = dns_process(pkt, (int) nn, resp, sizeof(resp), 0, &cli.sin_addr);
-        clock_gettime(CLOCK_MONOTONIC, &_qt1);
-        long _rtt =
-            (long) ((_qt1.tv_sec - _qt0.tv_sec) * 1000000L + (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
-        if (rlen > 0) {
-            sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
-            uint8_t _rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
-            int _an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
-            qlog_write(cip2, qn, qt, _rc, _an, _rtt, "udp");
+    }
+
+    /* Batched path: recvmmsg up to `batch` datagrams per syscall, reply with one
+     * sendmmsg. Buffers are heap-allocated once per worker. */
+    if (batch > UDP_BATCH_MAX)
+        batch = UDP_BATCH_MAX;
+    /* typedef avoids a `uint8_t (*p)[BUF_SIZE]` declarator, which different
+     * clang-format versions render with/without a space before `(`. */
+    typedef uint8_t batchbuf_t[BUF_SIZE];
+    batchbuf_t *rxbuf = malloc((size_t) batch * sizeof(batchbuf_t));
+    batchbuf_t *txbuf = malloc((size_t) batch * sizeof(batchbuf_t));
+    struct sockaddr_in *addrs = malloc((size_t) batch * sizeof(*addrs));
+    struct mmsghdr *rxmsgs = malloc((size_t) batch * sizeof(*rxmsgs));
+    struct iovec *rxiov = malloc((size_t) batch * sizeof(*rxiov));
+    struct mmsghdr *txmsgs = malloc((size_t) batch * sizeof(*txmsgs));
+    struct iovec *txiov = malloc((size_t) batch * sizeof(*txiov));
+    if (!rxbuf || !txbuf || !addrs || !rxmsgs || !rxiov || !txmsgs || !txiov) {
+        dns_log(LOG_ERR, "[UDP ] worker %d: batch alloc failed — exiting worker\n", w->id);
+        free(rxbuf);
+        free(txbuf);
+        free(addrs);
+        free(rxmsgs);
+        free(rxiov);
+        free(txmsgs);
+        free(txiov);
+        return NULL;
+    }
+    for (;;) {
+        for (int i = 0; i < batch; i++) {
+            rxiov[i].iov_base = rxbuf[i];
+            rxiov[i].iov_len = BUF_SIZE;
+            memset(&rxmsgs[i].msg_hdr, 0, sizeof(rxmsgs[i].msg_hdr));
+            rxmsgs[i].msg_hdr.msg_name = &addrs[i];
+            rxmsgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            rxmsgs[i].msg_hdr.msg_iov = &rxiov[i];
+            rxmsgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        int n = recvmmsg(w->sock, rxmsgs, batch, MSG_WAITFORONE, NULL);
+        if (n <= 0)
+            continue;
+        int nt = 0;
+        for (int i = 0; i < n; i++) {
+            int nn = (int) rxmsgs[i].msg_len;
+            if (nn <= 0)
+                continue;
+            int rlen = udp_serve_one(rxbuf[i], nn, &addrs[i], txbuf[nt], BUF_SIZE);
+            if (rlen <= 0)
+                continue;
+            txiov[nt].iov_base = txbuf[nt];
+            txiov[nt].iov_len = (size_t) rlen;
+            memset(&txmsgs[nt].msg_hdr, 0, sizeof(txmsgs[nt].msg_hdr));
+            txmsgs[nt].msg_hdr.msg_name = &addrs[i];
+            txmsgs[nt].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            txmsgs[nt].msg_hdr.msg_iov = &txiov[nt];
+            txmsgs[nt].msg_hdr.msg_iovlen = 1;
+            nt++;
+        }
+        /* sendmmsg may send fewer than nt; loop until all are flushed. */
+        int sent = 0;
+        while (sent < nt) {
+            int s = sendmmsg(w->sock, txmsgs + sent, nt - sent, 0);
+            if (s <= 0)
+                break;
+            sent += s;
         }
     }
     return NULL;
@@ -6845,6 +7143,10 @@ int main(int argc, char **argv) {
 
     /* Phase 2: Load config */
     config_load_from_valkey();
+
+    /* In-process record cache: allocate once here if enabled at boot. */
+    if (g_rcache_ttl > 0)
+        rcache_init(g_rcache_size);
 
     /* Phase 2b: Populate multi-zone table (primary seed + zone_table:*) */
     seed_primary_zone();
