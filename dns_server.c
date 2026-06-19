@@ -6803,8 +6803,8 @@ static void *udp_worker_thread(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &_qt0);
         int rlen = dns_process(pkt, (int) nn, resp, sizeof(resp), 0, &cli.sin_addr);
         clock_gettime(CLOCK_MONOTONIC, &_qt1);
-        long _rtt = (long) ((_qt1.tv_sec - _qt0.tv_sec) * 1000000L +
-                            (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
+        long _rtt =
+            (long) ((_qt1.tv_sec - _qt0.tv_sec) * 1000000L + (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
         if (rlen > 0) {
             sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
             uint8_t _rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
@@ -6973,8 +6973,8 @@ int main(int argc, char **argv) {
             perror("dns reuseport bind");
             return 1;
         }
-        dns_log(LOG_INFO, "[UDP ] %d/%d SO_REUSEPORT worker sockets bound on :%d\n",
-                n_worker_socks, g_udp_workers, g_dns_port);
+        dns_log(LOG_INFO, "[UDP ] %d/%d SO_REUSEPORT worker sockets bound on :%d\n", n_worker_socks,
+                g_udp_workers, g_dns_port);
     }
     int dot_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (dot_sock < 0) {
@@ -7093,8 +7093,7 @@ int main(int argc, char **argv) {
                 free(w);
             }
         }
-        dns_log(LOG_NOTICE, "[UDP ] %d UDP worker threads serving IPv4 :%d\n", started,
-                g_dns_port);
+        dns_log(LOG_NOTICE, "[UDP ] %d UDP worker threads serving IPv4 :%d\n", started, g_dns_port);
     }
 
     for (;;) {
