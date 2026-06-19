@@ -1538,6 +1538,14 @@ static int g_rcache_ttl = 0;        /* seconds; 0 = disabled */
 static int g_rcache_size = 16384;   /* requested entries when enabled */
 static pthread_mutex_t g_rcache_locks[RCACHE_LOCKS];
 
+/* RFC 8767 stale-shadow write throttle. The shadow (stale:<key>, 7-day TTL) only
+ * needs to be recent-ish for outage survival, but it was rewritten on EVERY
+ * successful GET — a Valkey write per read. Write it on ~1/N reads instead.
+ * 1 = write every GET (legacy), 0 = never write shadows. Per-thread counter, so
+ * each worker refreshes independently. */
+static int g_stale_sample = 16;
+static __thread unsigned t_stale_ctr = 0;
+
 static uint64_t rcache_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1692,8 +1700,10 @@ static int vk_get_conn(resp_conn_t *c, const char *key, char *out, int olen) {
     if (r.type != 2)
         return 0;
     safe_strcpy(out, r.str, olen);
-    /* Write stale shadow key: 7-day TTL — used when Valkey is unreachable */
-    {
+    /* Refresh the RFC 8767 stale shadow (7-day TTL) on ~1/g_stale_sample reads to
+     * avoid a Valkey write per read. The shadow only needs to be recent enough to
+     * serve during a Valkey outage; the read-side serve-stale path is unchanged. */
+    if (g_stale_sample > 0 && (++t_stale_ctr % (unsigned) g_stale_sample) == 0) {
         char skey[640];
         snprintf(skey, sizeof(skey), "stale:%s", key);
         char ts[16];
@@ -1910,6 +1920,15 @@ static void config_load_from_valkey(void) {
         g_rcache_ttl = 0;
     if (g_rcache_size < 0)
         g_rcache_size = 0;
+    /* Stale-shadow write throttle (1 = every GET, N = ~1/N, 0 = off). */
+    GI("stale_refresh_sample", g_stale_sample);
+    {
+        const char *e = getenv("STALE_REFRESH_SAMPLE");
+        if (e && e[0])
+            g_stale_sample = atoi(e);
+    }
+    if (g_stale_sample < 0)
+        g_stale_sample = 0;
     G("soa_mname", g_soa_mname);
     G("soa_rname", g_soa_rname);
     GU("soa_refresh", g_soa_refresh);
