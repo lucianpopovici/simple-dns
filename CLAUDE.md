@@ -11,7 +11,7 @@ Use this file to guide refactoring. Do not attempt the whole split in one pass �
 follow the migration order at the bottom. Each step must leave the system
 buildable and passing `make check`.
 
-> `CLAUDE-migration.md` is the step-by-step tracker. The prerequisite defect
+> `specs/CLAUDE-migration.md` is the step-by-step tracker. The prerequisite defect
 > fixes (DNSSEC validation, `strtok` thread-safety, etc.) are **complete** —
 > their spec is archived untracked at `specs/CLAUDE-fixes.md`; the work itself
 > is documented in the migration tracker's Step 0 and the git history.
@@ -127,7 +127,7 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
    > The targets (created in migration Step 1): `make check-wire` (parser unit
    > tests), `make fuzz-wire` (60s libFuzzer smoke on `name_from_wire`; needs
    > clang), `make check-dnssec` (DNSSEC/TSIG known-answer + negative tests).
-3. Confirm the relevant **Acceptance** boxes in `CLAUDE-migration.md` are
+3. Confirm the relevant **Acceptance** boxes in `specs/CLAUDE-migration.md` are
    satisfied.
 4. Update any spec that changed: RFC list, Valkey schema, ownership table.
 
@@ -137,7 +137,7 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
 |---|---|
 | Wire parsing / record encoding | `libdnswire` (`dns_wire.*`), `tests/test_name_from_wire.c`, `fuzz/` |
 | TSIG / DNSSEC | the crypto sections of `dns_server.c` / `resolverd.c`, `tests/test_dnssec_verify.c` |
-| Process split / new daemon | this file (architecture + Valkey boundary), `CLAUDE-migration.md` |
+| Process split / new daemon | this file (architecture + Valkey boundary), `specs/CLAUDE-migration.md` |
 | Config / control plane | Valkey ownership table, `dashboard/app.py`, README schema |
 | Build / CI | `Makefile`, `.github/workflows/ci.yml` |
 
@@ -287,7 +287,7 @@ authoritative zone.
 ### Control plane: `apid` + `dashboard`
 
 - **Done (migration Step 4):** `apid.c`. Instead of nginx/envoy the project
-  uses a small in-house front (decision recorded in `CLAUDE-migration.md`).
+  uses a small in-house front (decision recorded in `specs/CLAUDE-migration.md`).
   `apid` terminates HTTP/HTTPS, serves DoH by forwarding the DNS message to
   `dnsd`'s loopback DNS port (UDP, TCP retry on truncation — it never parses
   DNS payloads), and serves the management API by writing **Valkey only**
@@ -465,9 +465,12 @@ sandboxable daemon — the trusted core this architecture is designed to produce
 Steps 1–7, the optional follow-ups (catalog zones, mount-namespace isolation),
 and the `resolverd` split (`dns_client.c` → `resolverd.c`, now a first-class
 hardened daemon — see the `resolverd` section above) are **all complete**. The
-monolith is fully decomposed and every box in `CLAUDE-migration.md` is ticked.
+monolith is fully decomposed and every box in `specs/CLAUDE-migration.md` is ticked.
 Remaining work is feature/quality, not migration: the optional plans
-(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,performance,sec}.md`).
+(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,sec}.md`). The
+performance work (baseline + SO_REUSEPORT workers, in-process record cache,
+stale-shadow throttle, recvmmsg/sendmmsg batching) is done and archived at
+`specs/CLAUDE-performance.md`.
 The `dnsd`-style privilege-drop / seccomp / mount-isolation sandbox has been
 extended to `resolverd` and **factored into the shared `libsandbox`**
 (`sandbox.{c,h}`), so `dnsd` and `resolverd` now share one implementation
