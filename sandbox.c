@@ -265,6 +265,12 @@ static void seccomp_install(const sandbox_config_t *cfg) {
         SCMP_SYS(sendto),
         SCMP_SYS(recvmsg),
         SCMP_SYS(sendmsg),
+        /* batched variants of recvfrom/sendto — dnsd's recvmmsg/sendmmsg UDP
+         * worker batching (and glibc getaddrinfo's parallel A/AAAA stub). No more
+         * powerful than recvfrom/sendto above; also listed in getaddrinfo_extra,
+         * whose redundant re-add for resolverd is a harmless no-op. */
+        SCMP_SYS(recvmmsg),
+        SCMP_SYS(sendmmsg),
         SCMP_SYS(accept),
         SCMP_SYS(accept4),
         SCMP_SYS(socket),

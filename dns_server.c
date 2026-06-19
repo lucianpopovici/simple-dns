@@ -509,6 +509,13 @@ static int g_dot_port = DOT_PORT_DEFAULT;
  * N kernel-load-balanced worker threads, each with its own UDP socket and its
  * own (lock-free) Valkey connection. */
 static int g_udp_workers = 1;
+/* recvmmsg/sendmmsg batch size for the worker path (config:udp_rx_batch / env
+ * UDP_RX_BATCH). 1 = per-packet recvfrom/sendto (default). >1 amortizes the
+ * per-packet syscall cost by draining up to N datagrams per recvmmsg and
+ * replying with one sendmmsg. Uses MSG_WAITFORONE so latency is unaffected at
+ * low load (returns as soon as ≥1 datagram is ready). Worker path only. */
+static int g_udp_rx_batch = 1;
+#define UDP_BATCH_MAX 64
 static int g_http_port = HTTP_PORT_DEFAULT;
 static int g_https_port = HTTPS_PORT_DEFAULT;
 static char g_ddns_secret[256] = "changeme";
@@ -1903,6 +1910,16 @@ static void config_load_from_valkey(void) {
         g_udp_workers = 1;
     if (g_udp_workers > 64)
         g_udp_workers = 64;
+    GI("udp_rx_batch", g_udp_rx_batch);
+    {
+        const char *rb = getenv("UDP_RX_BATCH");
+        if (rb && rb[0])
+            g_udp_rx_batch = atoi(rb);
+    }
+    if (g_udp_rx_batch < 1)
+        g_udp_rx_batch = 1;
+    if (g_udp_rx_batch > UDP_BATCH_MAX)
+        g_udp_rx_batch = UDP_BATCH_MAX;
     /* In-process record cache (rcache). TTL/size re-read live; the table is
      * allocated once at startup (main) when enabled — toggling on requires a
      * restart, the TTL value itself can change live. */
@@ -6982,40 +6999,112 @@ static int make_reuseport_udp_socket(int port) {
     return s;
 }
 
+/* Parse, log, resolve one IPv4 UDP query. Returns response length (0 = drop).
+ * Shared by the per-packet and the recvmmsg/sendmmsg worker loops. */
+static int udp_serve_one(const uint8_t *pkt, int nn, const struct sockaddr_in *cli, uint8_t *resp,
+                         int resp_cap) {
+    char cip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &cli->sin_addr, cip, sizeof(cip));
+    char qn[256] = "?";
+    uint16_t qt = 0;
+    int a = name_from_wire(pkt, nn, 12, qn, sizeof(qn));
+    if (a >= 0 && a + 1 < nn)
+        qt = get16(pkt, a);
+    dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip, type2str(qt), qn);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rlen = dns_process(pkt, nn, resp, resp_cap, 0, &cli->sin_addr);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+    if (rlen > 0) {
+        uint8_t rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
+        int an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
+        qlog_write(cip, qn, qt, rc, an, rtt, "udp");
+    }
+    return rlen;
+}
+
 static void *udp_worker_thread(void *arg) {
     udp_worker_t *w = (udp_worker_t *) arg;
     /* This worker's private Valkey connection — vk_get() now runs lock-free. */
     resp_conn_t conn = {.fd = -1};
     t_vk_conn = &conn;
-    uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
-    for (;;) {
-        struct sockaddr_in cli;
-        socklen_t clen = sizeof(cli);
-        ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
-        if (nn <= 0) {
-            if (nn < 0 && errno == EINTR)
+
+    int batch = g_udp_rx_batch;
+    if (batch <= 1) {
+        /* Per-packet path (default). */
+        uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
+        for (;;) {
+            struct sockaddr_in cli;
+            socklen_t clen = sizeof(cli);
+            ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
+            if (nn <= 0)
                 continue;
-            continue;
+            int rlen = udp_serve_one(pkt, (int) nn, &cli, resp, sizeof(resp));
+            if (rlen > 0)
+                sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
         }
-        char cip2[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &cli.sin_addr, cip2, sizeof(cip2));
-        char qn[256] = "?";
-        uint16_t qt = 0;
-        int a = name_from_wire(pkt, (int) nn, 12, qn, sizeof(qn));
-        if (a >= 0 && a + 1 < nn)
-            qt = get16(pkt, a);
-        dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip2, type2str(qt), qn);
-        struct timespec _qt0, _qt1;
-        clock_gettime(CLOCK_MONOTONIC, &_qt0);
-        int rlen = dns_process(pkt, (int) nn, resp, sizeof(resp), 0, &cli.sin_addr);
-        clock_gettime(CLOCK_MONOTONIC, &_qt1);
-        long _rtt = (long) ((_qt1.tv_sec - _qt0.tv_sec) * 1000000L +
-                            (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
-        if (rlen > 0) {
-            sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
-            uint8_t _rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
-            int _an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
-            qlog_write(cip2, qn, qt, _rc, _an, _rtt, "udp");
+    }
+
+    /* Batched path: recvmmsg up to `batch` datagrams per syscall, reply with one
+     * sendmmsg. Buffers are heap-allocated once per worker. */
+    if (batch > UDP_BATCH_MAX)
+        batch = UDP_BATCH_MAX;
+    uint8_t(*rxbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
+    uint8_t(*txbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
+    struct sockaddr_in *addrs = malloc((size_t) batch * sizeof(*addrs));
+    struct mmsghdr *rxmsgs = malloc((size_t) batch * sizeof(*rxmsgs));
+    struct iovec *rxiov = malloc((size_t) batch * sizeof(*rxiov));
+    struct mmsghdr *txmsgs = malloc((size_t) batch * sizeof(*txmsgs));
+    struct iovec *txiov = malloc((size_t) batch * sizeof(*txiov));
+    if (!rxbuf || !txbuf || !addrs || !rxmsgs || !rxiov || !txmsgs || !txiov) {
+        dns_log(LOG_ERR, "[UDP ] worker %d: batch alloc failed — exiting worker\n", w->id);
+        free(rxbuf);
+        free(txbuf);
+        free(addrs);
+        free(rxmsgs);
+        free(rxiov);
+        free(txmsgs);
+        free(txiov);
+        return NULL;
+    }
+    for (;;) {
+        for (int i = 0; i < batch; i++) {
+            rxiov[i].iov_base = rxbuf[i];
+            rxiov[i].iov_len = BUF_SIZE;
+            memset(&rxmsgs[i].msg_hdr, 0, sizeof(rxmsgs[i].msg_hdr));
+            rxmsgs[i].msg_hdr.msg_name = &addrs[i];
+            rxmsgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            rxmsgs[i].msg_hdr.msg_iov = &rxiov[i];
+            rxmsgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        int n = recvmmsg(w->sock, rxmsgs, batch, MSG_WAITFORONE, NULL);
+        if (n <= 0)
+            continue;
+        int nt = 0;
+        for (int i = 0; i < n; i++) {
+            int nn = (int) rxmsgs[i].msg_len;
+            if (nn <= 0)
+                continue;
+            int rlen = udp_serve_one(rxbuf[i], nn, &addrs[i], txbuf[nt], BUF_SIZE);
+            if (rlen <= 0)
+                continue;
+            txiov[nt].iov_base = txbuf[nt];
+            txiov[nt].iov_len = (size_t) rlen;
+            memset(&txmsgs[nt].msg_hdr, 0, sizeof(txmsgs[nt].msg_hdr));
+            txmsgs[nt].msg_hdr.msg_name = &addrs[i];
+            txmsgs[nt].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            txmsgs[nt].msg_hdr.msg_iov = &txiov[nt];
+            txmsgs[nt].msg_hdr.msg_iovlen = 1;
+            nt++;
+        }
+        /* sendmmsg may send fewer than nt; loop until all are flushed. */
+        int sent = 0;
+        while (sent < nt) {
+            int s = sendmmsg(w->sock, txmsgs + sent, nt - sent, 0);
+            if (s <= 0)
+                break;
+            sent += s;
         }
     }
     return NULL;
