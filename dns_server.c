@@ -7050,8 +7050,11 @@ static void *udp_worker_thread(void *arg) {
      * sendmmsg. Buffers are heap-allocated once per worker. */
     if (batch > UDP_BATCH_MAX)
         batch = UDP_BATCH_MAX;
-    uint8_t (*rxbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
-    uint8_t (*txbuf)[BUF_SIZE] = malloc((size_t) batch * BUF_SIZE);
+    /* typedef avoids a `uint8_t (*p)[BUF_SIZE]` declarator, which different
+     * clang-format versions render with/without a space before `(`. */
+    typedef uint8_t batchbuf_t[BUF_SIZE];
+    batchbuf_t *rxbuf = malloc((size_t) batch * sizeof(batchbuf_t));
+    batchbuf_t *txbuf = malloc((size_t) batch * sizeof(batchbuf_t));
     struct sockaddr_in *addrs = malloc((size_t) batch * sizeof(*addrs));
     struct mmsghdr *rxmsgs = malloc((size_t) batch * sizeof(*rxmsgs));
     struct iovec *rxiov = malloc((size_t) batch * sizeof(*rxiov));
