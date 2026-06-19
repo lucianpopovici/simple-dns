@@ -1520,6 +1520,10 @@ static int valkey_ensure(resp_conn_t *c) {
 #define RCACHE_KEYLEN 640
 #define RCACHE_VALLEN 512
 #define RCACHE_LOCKS 64
+#define RCACHE_WAYS 4 /* set-associative: WAYS entries per bucket so colliding
+                       * keys coexist instead of evicting each other (a query
+                       * caches both ddns: and zone: per name → ~2x entries, which
+                       * thrashed a direct-mapped table). */
 typedef struct {
     char key[RCACHE_KEYLEN];
     char val[RCACHE_VALLEN];
@@ -1528,9 +1532,10 @@ typedef struct {
     uint64_t expiry_ms;
 } rcache_entry_t;
 static rcache_entry_t *g_rcache = NULL;
-static int g_rcache_cap = 0;
-static int g_rcache_ttl = 0;       /* seconds; 0 = disabled */
-static int g_rcache_size = 16384;  /* table entries when enabled */
+static int g_rcache_cap = 0;        /* total entries (buckets * RCACHE_WAYS) */
+static int g_rcache_buckets = 0;    /* number of sets */
+static int g_rcache_ttl = 0;        /* seconds; 0 = disabled */
+static int g_rcache_size = 16384;   /* requested entries when enabled */
 static pthread_mutex_t g_rcache_locks[RCACHE_LOCKS];
 
 static uint64_t rcache_now_ms(void) {
@@ -1547,33 +1552,41 @@ static uint64_t rcache_hash(const char *s) {
     return h;
 }
 static void rcache_init(int cap) {
-    if (cap <= 0)
+    if (cap < RCACHE_WAYS)
         return;
-    g_rcache = calloc((size_t) cap, sizeof(rcache_entry_t));
+    int buckets = cap / RCACHE_WAYS;
+    int total = buckets * RCACHE_WAYS;
+    g_rcache = calloc((size_t) total, sizeof(rcache_entry_t));
     if (!g_rcache) {
-        dns_log(LOG_WARNING, "[rcache] alloc of %d entries failed — cache disabled\n", cap);
+        dns_log(LOG_WARNING, "[rcache] alloc of %d entries failed — cache disabled\n", total);
         return;
     }
-    g_rcache_cap = cap;
+    g_rcache_cap = total;
+    g_rcache_buckets = buckets;
     for (int i = 0; i < RCACHE_LOCKS; i++)
         pthread_mutex_init(&g_rcache_locks[i], NULL);
-    dns_log(LOG_NOTICE, "[rcache] enabled: %d entries, ttl %ds (~%zu MB)\n", cap, g_rcache_ttl,
-            ((size_t) cap * sizeof(rcache_entry_t)) >> 20);
+    dns_log(LOG_NOTICE, "[rcache] enabled: %d entries (%d sets x %d ways), ttl %ds (~%zu MB)\n",
+            total, buckets, RCACHE_WAYS, g_rcache_ttl,
+            ((size_t) total * sizeof(rcache_entry_t)) >> 20);
 }
 /* 1 if a fresh entry was found (sets *hit; copies val for a positive); else 0. */
 static int rcache_lookup(const char *key, char *out, int olen, int *hit) {
     if (!g_rcache || g_rcache_ttl <= 0)
         return 0;
-    int slot = (int) (rcache_hash(key) % (uint64_t) g_rcache_cap);
-    pthread_mutex_t *lk = &g_rcache_locks[slot % RCACHE_LOCKS];
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_rcache_buckets);
+    rcache_entry_t *set = &g_rcache[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_rcache_locks[bucket % RCACHE_LOCKS];
     int found = 0;
     pthread_mutex_lock(lk);
-    rcache_entry_t *e = &g_rcache[slot];
-    if (e->used && e->expiry_ms > rcache_now_ms() && strcmp(e->key, key) == 0) {
-        *hit = e->hit;
-        if (e->hit)
-            safe_strcpy(out, e->val, olen);
-        found = 1;
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        rcache_entry_t *e = &set[w];
+        if (e->used && e->expiry_ms > rcache_now_ms() && strcmp(e->key, key) == 0) {
+            *hit = e->hit;
+            if (e->hit)
+                safe_strcpy(out, e->val, olen);
+            found = 1;
+            break;
+        }
     }
     pthread_mutex_unlock(lk);
     return found;
@@ -1585,30 +1598,47 @@ static void rcache_store(const char *key, const char *val, int hit) {
         return;
     if (hit && val && strlen(val) >= RCACHE_VALLEN)
         return; /* value too large to cache — fall through to Valkey next time */
-    int slot = (int) (rcache_hash(key) % (uint64_t) g_rcache_cap);
-    pthread_mutex_t *lk = &g_rcache_locks[slot % RCACHE_LOCKS];
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_rcache_buckets);
+    rcache_entry_t *set = &g_rcache[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_rcache_locks[bucket % RCACHE_LOCKS];
+    uint64_t now = rcache_now_ms();
     pthread_mutex_lock(lk);
-    rcache_entry_t *e = &g_rcache[slot];
-    safe_strcpy(e->key, key, sizeof(e->key));
+    /* Pick a way: an existing entry for this key, else a free/expired slot, else
+     * the one expiring soonest (approx-LRU eviction within the set). */
+    rcache_entry_t *victim = &set[0];
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        rcache_entry_t *e = &set[w];
+        if ((e->used && strcmp(e->key, key) == 0) || !e->used || e->expiry_ms <= now) {
+            victim = e;
+            break;
+        }
+        if (e->expiry_ms < victim->expiry_ms)
+            victim = e;
+    }
+    safe_strcpy(victim->key, key, sizeof(victim->key));
     if (hit && val)
-        safe_strcpy(e->val, val, sizeof(e->val));
+        safe_strcpy(victim->val, val, sizeof(victim->val));
     else
-        e->val[0] = 0;
-    e->hit = hit ? 1 : 0;
-    e->used = 1;
-    e->expiry_ms = rcache_now_ms() + (uint64_t) g_rcache_ttl * 1000;
+        victim->val[0] = 0;
+    victim->hit = hit ? 1 : 0;
+    victim->used = 1;
+    victim->expiry_ms = now + (uint64_t) g_rcache_ttl * 1000;
     pthread_mutex_unlock(lk);
 }
 /* Invalidate one key — called by the keyspace subscriber on zone:/ddns: writes. */
 static void rcache_invalidate(const char *key) {
     if (!g_rcache)
         return;
-    int slot = (int) (rcache_hash(key) % (uint64_t) g_rcache_cap);
-    pthread_mutex_t *lk = &g_rcache_locks[slot % RCACHE_LOCKS];
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_rcache_buckets);
+    rcache_entry_t *set = &g_rcache[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_rcache_locks[bucket % RCACHE_LOCKS];
     pthread_mutex_lock(lk);
-    rcache_entry_t *e = &g_rcache[slot];
-    if (e->used && strcmp(e->key, key) == 0)
-        e->used = 0;
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        if (set[w].used && strcmp(set[w].key, key) == 0) {
+            set[w].used = 0;
+            break;
+        }
+    }
     pthread_mutex_unlock(lk);
 }
 
