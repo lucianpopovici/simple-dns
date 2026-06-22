@@ -14,6 +14,35 @@ relying on resolver behaviour:
 2. **Health checks (phase 2)** — stop emitting addresses whose backing
    service is down.
 
+## Implementation status (2026-06-22)
+
+Gap 1 (rotation) is **implemented** on branch `loadbalance-rotation`. The plan's
+line numbers below are stale (pre multi-zone / pre forwarder) but its premise
+held: A/AAAA multi-IP RRsets (`zone:<zone>:A|AAAA:<name>` = `ttl|ip|ip|...`)
+were emitted in stored order with no rotation.
+
+- **Gap 1 (rotation): done.** `config:lb_mode` = `none` (default) | `rr` | `random`.
+  New `emit_addr_rrset()` collects the addresses, picks a start offset (atomic
+  shared round-robin cursor for `rr`, `rand()` for `random`), and emits each via
+  `emit_rr`. Replaced the two real multi-IP sites (`zone:A`, `zone:AAAA`); the
+  wildcard-Valkey path is single-address in the current code, and `ddns:*` /
+  `static_zone[]` are single-record — left as-is. Rotation is signature-neutral:
+  `emit_rr` signs each address RR independently (verified: `+dnssec` returns all
+  RRSIGs, alg 13 + 15, regardless of order). `config:lb_mode` is local serving
+  policy, read via the live-reload config path; documented in the dns_server.c
+  schema header and shown in the startup banner.
+- **Gap 2 (health checks): deferred** — explicitly phase-2 / optional ("only if
+  needed; rotation alone covers the common case"). Not built.
+
+Test: `make check-lb` (wired into CI) provisions a 3-address A RRset and asserts
+`rr` rotates the emission order (≥2 distinct first-addresses) while keeping all 3
+addresses and intact RRSIGs, and that `none` is stable. Depends on the live
+DNSSEC fix in PR #8 for the RRSIG assertion.
+
+> Note: this work surfaced — via the RRSIG assertion — that live DNSSEC was
+> entirely broken (DO-bit misparse + Ed25519 signing crash); fixed separately in
+> PR #8 and landed before this.
+
 ## Current state (verified in source)
 
 | Fact | Where |

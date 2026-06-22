@@ -98,6 +98,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-forwarder OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: A/AAAA load-balancing rotation
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-lb OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
   warnings:
     name: Warnings as errors
     runs-on: ubuntu-latest

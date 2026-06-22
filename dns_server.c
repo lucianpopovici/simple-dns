@@ -71,6 +71,9 @@
  *                              tried in order until one answers.
  *   config:forward_allow       IPs/CIDRs allowed recursion (empty = disabled).
  *   config:forward_timeout_ms  Per-upstream wait in ms (default 1500).
+ *   config:lb_mode             A/AAAA RRset rotation: none (default) | rr
+ *                              (round-robin) | random. Local serving policy
+ *                              only — not zone data, never travels in AXFR/IXFR.
  *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
@@ -147,6 +150,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -551,6 +555,17 @@ static int g_forward_timeout_ms = 1500; /* config:forward_timeout_ms — per-ups
 #define FWD_MAX_INFLIGHT 256
 static int g_fwd_inflight = 0;
 static pthread_mutex_t g_fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Server-side load balancing for A/AAAA RRsets (CLAUDE-loadbalance.md Gap 1).
+ * Local serving policy only — not zone data, so it does not travel in AXFR/IXFR
+ * and may differ per instance. Rotation never invalidates DNSSEC: emit_rr signs
+ * each address RR independently, so reordering the RRset is signature-neutral. */
+typedef enum { LB_NONE = 0, LB_RR, LB_RANDOM } lb_mode_t;
+static lb_mode_t g_lb_mode = LB_NONE; /* config:lb_mode: none|rr|random */
+/* One shared round-robin cursor across all names still yields a uniform
+ * per-name distribution; atomic so concurrent workers stay race-free. */
+static _Atomic uint32_t g_lb_counter = 0;
+#define LB_MAX_ADDRS 32 /* cap addresses rotated per RRset (values are <=256 B) */
 
 /* Structured query log */
 static char g_query_log_path[512] = ""; /* "" = disabled */
@@ -2076,6 +2091,19 @@ static void config_load_from_valkey(void) {
     } else if (g_forward_enabled && !g_forward_allow[0]) {
         dns_log(LOG_WARNING, "[FORWARD] forward_enabled=1 but forward_allow is empty — "
                              "forwarding stays DISABLED (fail closed).\n");
+    }
+    /* Load-balancing rotation for A/AAAA RRsets (CLAUDE-loadbalance.md Gap 1). */
+    g_lb_mode = LB_NONE;
+    {
+        char lb[32] = "";
+        if (vk_get("config:lb_mode", lb, sizeof(lb)) && lb[0]) {
+            if (strcasecmp(lb, "rr") == 0)
+                g_lb_mode = LB_RR;
+            else if (strcasecmp(lb, "random") == 0)
+                g_lb_mode = LB_RANDOM;
+            else if (strcasecmp(lb, "none") != 0)
+                dns_log(LOG_WARNING, "[LB] unknown lb_mode '%s' — rotation disabled\n", lb);
+        }
     }
     /* TSIG secret (base64) */
     if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
@@ -4996,6 +5024,46 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
     return off;
 }
 
+/* Emit a multi-address A/AAAA RRset from a stored "ttl|ip|ip|..." value,
+ * applying load-balancing rotation (config:lb_mode) to the emission order
+ * (CLAUDE-loadbalance.md Gap 1). `val` is mutated (tokenised) in place.
+ * Rotation is signature-neutral: emit_rr signs each address RR on its own. */
+static int emit_addr_rrset(uint8_t *resp, int off, int resp_len, const char *name, uint16_t type,
+                           char *val, int dnssec_ok, int *answers) {
+    const int af = (type == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
+    const uint16_t addrlen = (type == DNS_TYPE_AAAA) ? 16 : 4;
+    uint32_t ttl = DEFAULT_TTL;
+    char *pipe = strchr(val, '|');
+    if (pipe) {
+        ttl = (uint32_t) atoi(val);
+        pipe++;
+    } else {
+        pipe = val;
+    }
+    /* 1. collect */
+    char *ips[LB_MAX_ADDRS];
+    int n = 0;
+    char *sp = NULL;
+    for (char *ip = strtok_r(pipe, "|", &sp); ip && n < LB_MAX_ADDRS; ip = strtok_r(NULL, "|", &sp))
+        ips[n++] = ip;
+    if (n == 0)
+        return off;
+    /* 2. pick rotation start */
+    int start = 0;
+    if (g_lb_mode == LB_RR)
+        start = (int) (atomic_fetch_add(&g_lb_counter, 1u) % (uint32_t) n);
+    else if (g_lb_mode == LB_RANDOM)
+        start = rand() % n;
+    /* 3. emit rotated */
+    for (int i = 0; i < n; i++) {
+        const char *ip = ips[(start + i) % n];
+        uint8_t rd[16];
+        if (inet_pton(af, ip, rd) == 1)
+            off = emit_rr(resp, off, resp_len, name, type, ttl, rd, addrlen, dnssec_ok, answers);
+    }
+    return off;
+}
+
 /* Add SOA to authority section (RFC 2308 negative caching) */
 static int add_soa_authority(uint8_t *resp, int off, int resp_len, int dnssec_ok, int *auth_count) {
     uint8_t soa_rd[512];
@@ -5699,25 +5767,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         zkey(k, sizeof(k), "A", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
-            uint32_t ttl = DEFAULT_TTL;
-            char *pipe = strchr(val, '|');
-            if (pipe) {
-                ttl = (uint32_t) atoi(val);
-                pipe++;
-            } else
-                pipe = val;
-            char *sp12 = NULL;
-            char *ip = strtok_r(pipe, "|", &sp12);
-            while (ip) {
-                struct in_addr a4;
-                if (inet_pton(AF_INET, ip, &a4) == 1) {
-                    uint8_t rd[4];
-                    memcpy(rd, &a4, 4);
-                    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_A, ttl, rd, 4, dnssec_ok,
-                                  &answers);
-                }
-                ip = strtok_r(NULL, "|", &sp12);
-            }
+            off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, val, dnssec_ok, &answers);
         }
     }
     /* Dynamic AAAA */
@@ -5740,25 +5790,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         zkey(k, sizeof(k), "AAAA", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
-            uint32_t ttl = DEFAULT_TTL;
-            char *pipe = strchr(val, '|');
-            if (pipe) {
-                ttl = (uint32_t) atoi(val);
-                pipe++;
-            } else
-                pipe = val;
-            char *sp13 = NULL;
-            char *ip = strtok_r(pipe, "|", &sp13);
-            while (ip) {
-                struct in6_addr a6;
-                if (inet_pton(AF_INET6, ip, &a6) == 1) {
-                    uint8_t rd[16];
-                    memcpy(rd, &a6, 16);
-                    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_AAAA, ttl, rd, 16, dnssec_ok,
+            off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, val, dnssec_ok,
                                   &answers);
-                }
-                ip = strtok_r(NULL, "|", &sp13);
-            }
         }
     }
     /* Provisioned record types from Valkey */
@@ -7836,6 +7869,8 @@ int main(int argc, char **argv) {
             g_rrl_enabled ? "enabled" : "disabled", g_rrl_rate, g_rrl_window);
     dns_log(LOG_INFO, "║  Forwarding (out-of-zone)                   %s               ║\n",
             (g_forward_enabled && g_forward_allow[0]) ? "ENABLED " : "disabled");
+    dns_log(LOG_INFO, "║  A/AAAA load-balancing                      %-20s       ║\n",
+            g_lb_mode == LB_RR ? "round-robin" : (g_lb_mode == LB_RANDOM ? "random" : "none"));
     dns_log(LOG_INFO, "║  DNS Cookies                                enabled               ║\n");
     dns_log(LOG_INFO, "║  NSID                                       %-20s       ║\n", g_nsid);
     dns_log(LOG_INFO, "║  Authenticated denial                       %s                ║\n",

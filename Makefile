@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -532,6 +532,49 @@ check-forwarder: $(BIN_DEBUG)
 	 test "$$SPOOFED" -ge 1  || { echo "  FAIL  RFC 5452: forged upstream ID was not rejected (expected SERVFAIL)"; exit 1; }; \
 	 echo "  OK  forward+RA, failover, RD-gating, in-zone AA, fail-closed, TC->TCP, anti-spoof"
 
+# A/AAAA load-balancing rotation (CLAUDE-loadbalance.md Gap 1). Provision a
+# 3-address A RRset, then assert: with config:lb_mode=rr the emission order
+# rotates across queries (>=2 distinct first-addresses) while all 3 addresses
+# are always present and DNSSEC RRSIGs are still emitted (per-RR signing is
+# rotation-neutral); with lb_mode=none the order is stable. Needs Valkey + dig
+# + valkey-cli; uses a throwaway name and restores config:lb_mode afterward.
+check-lb: $(BIN_DEBUG)
+	@echo "  CHECK  A/AAAA load-balancing rotation (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 QN=lb.example.local; REC=zone:example.local:A:$$QN;                               \
+	 SAVE_LB=$$($$VC get config:lb_mode);                                              \
+	 $$VC set $$REC "30|10.0.0.1|10.0.0.2|10.0.0.3" >/dev/null;                        \
+	 $$VC set config:lb_mode rr >/dev/null;                                            \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_lb1.log 2>&1 & DNS=$$!;     \
+	 sleep 1.5;                                                                        \
+	 FIRSTS=""; NLINES_MIN=9;                                                          \
+	 for i in 1 2 3 4 5 6; do                                                          \
+	   OUT=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1);        \
+	   F=$$(echo "$$OUT" | head -1);                                                   \
+	   C=$$(echo "$$OUT" | grep -c '^10\.0\.0\.');                                     \
+	   FIRSTS="$$FIRSTS $$F";                                                          \
+	   if [ "$$C" -lt 3 ]; then NLINES_MIN=0; fi;                                      \
+	 done;                                                                             \
+	 DISTINCT=$$(echo $$FIRSTS | tr ' ' '\n' | sort -u | grep -c '^10\.0\.0\.');       \
+	 SIGS=$$(dig +dnssec +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC set config:lb_mode none >/dev/null;                                          \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_lb2.log 2>&1 & DNS=$$!;     \
+	 sleep 1.5;                                                                        \
+	 N1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | head -1); \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | head -1); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del $$REC >/dev/null;                                                        \
+	 if [ -n "$$SAVE_LB" ]; then $$VC set config:lb_mode "$$SAVE_LB" >/dev/null; else $$VC del config:lb_mode >/dev/null; fi; \
+	 echo "  rr: first-addr sequence =$$FIRSTS  (distinct=$$DISTINCT, all3each=$$NLINES_MIN, rrsigs=$$SIGS)"; \
+	 echo "  none: first-addr q1=$$N1 q2=$$N2";                                        \
+	 test "$$DISTINCT" -ge 2     || { echo "  FAIL  rr mode did not rotate the RRset (distinct first-addr < 2)"; exit 1; }; \
+	 test "$$NLINES_MIN" -ge 3   || { echo "  FAIL  rotation dropped addresses (a response had <3 A records)"; exit 1; }; \
+	 test "$$SIGS" -ge 1         || { echo "  FAIL  +dnssec returned no RRSIG for the rotated RRset"; exit 1; }; \
+	 test -n "$$N1" -a "$$N1" = "$$N2" || { echo "  FAIL  lb_mode=none not stable ($$N1 vs $$N2)"; exit 1; }; \
+	 echo "  OK  rr rotates (all addrs kept, RRSIGs intact), none is stable"
+
 # resolverd smoke: bring up dnsd (authoritative upstream) and resolverd (caching
 # proxy, default LISTEN_PORT 5354 → upstream 127.0.0.1:5353/udp), then resolve
 # through the proxy and confirm it returns dnsd's answer. Needs Valkey + dig.
@@ -585,6 +628,7 @@ help:
 	@echo "  make check        Quick smoke-test (needs Valkey)"
 	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
+	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
