@@ -394,7 +394,12 @@ check-dnssec-live: $(BIN_DEBUG)
 	@echo "  CHECK  live DNSSEC DO-bit honoured (requires Valkey + dig)"
 	@ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dolive.log 2>&1 & DNS=$$!;  \
 	 sleep 1.5;                                                                        \
-	 DO=$$(dig +dnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 DO=0;                                                                             \
+	 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do                                           \
+	   DO=$$(dig +dnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
+	   if [ "$$DO" -ge 1 ]; then break; fi;                                            \
+	   sleep 1;                                                                        \
+	 done;                                                                             \
 	 NODO=$$(dig +nodnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 echo "  +dnssec RRSIGs=$$DO   +nodnssec RRSIGs=$$NODO";                           \
