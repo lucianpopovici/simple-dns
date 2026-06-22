@@ -542,10 +542,10 @@ static int g_rrl_slip = 2;   /* send TC every slip-th excess response */
  * g_forward_enabled (fail closed — a public instance must never become an open
  * resolver). dnsd normally reaches nothing but Valkey; this is the one opt-in
  * outbound path, for internal-only deployments. */
-static int g_forward_enabled = 0;            /* config:forward_enabled */
-static char g_forwarders[1024] = "";         /* config:forwarders — ip[:port],... (port 53 default) */
-static char g_forward_allow[1024] = "";      /* config:forward_allow — IPs/CIDRs allowed recursion */
-static int g_forward_timeout_ms = 1500;      /* config:forward_timeout_ms — per-upstream wait */
+static int g_forward_enabled = 0;       /* config:forward_enabled */
+static char g_forwarders[1024] = "";    /* config:forwarders — ip[:port],... (port 53 default) */
+static char g_forward_allow[1024] = ""; /* config:forward_allow — IPs/CIDRs allowed recursion */
+static int g_forward_timeout_ms = 1500; /* config:forward_timeout_ms — per-upstream wait */
 /* Cap concurrent forward worker threads so a dead/slow upstream cannot
  * accumulate threads under load; over the cap we answer SERVFAIL immediately. */
 #define FWD_MAX_INFLIGHT 256
@@ -1097,16 +1097,16 @@ static pthread_mutex_t g_zsk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_soa_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Query statistics (Prometheus) */
-static uint64_t g_stat_queries = 0;  /* total queries received */
-static uint64_t g_stat_noerror = 0;  /* NOERROR responses */
-static uint64_t g_stat_nxdomain = 0; /* NXDOMAIN responses */
-static uint64_t g_stat_refused = 0;  /* REFUSED (out-of-zone) */
-static uint64_t g_stat_servfail = 0; /* SERVFAIL responses */
-static uint64_t g_stat_rrl_drop = 0; /* RRL: dropped */
-static uint64_t g_stat_rrl_tc = 0;   /* RRL: truncated */
-static uint64_t g_stat_axfr = 0;     /* AXFR transfers completed */
-static uint64_t g_stat_ddns = 0;     /* DDNS updates accepted */
-static uint64_t g_stat_signed = 0;   /* RRSIGs generated */
+static uint64_t g_stat_queries = 0;      /* total queries received */
+static uint64_t g_stat_noerror = 0;      /* NOERROR responses */
+static uint64_t g_stat_nxdomain = 0;     /* NXDOMAIN responses */
+static uint64_t g_stat_refused = 0;      /* REFUSED (out-of-zone) */
+static uint64_t g_stat_servfail = 0;     /* SERVFAIL responses */
+static uint64_t g_stat_rrl_drop = 0;     /* RRL: dropped */
+static uint64_t g_stat_rrl_tc = 0;       /* RRL: truncated */
+static uint64_t g_stat_axfr = 0;         /* AXFR transfers completed */
+static uint64_t g_stat_ddns = 0;         /* DDNS updates accepted */
+static uint64_t g_stat_signed = 0;       /* RRSIGs generated */
 static uint64_t g_stat_forwarded = 0;    /* queries answered via an upstream forwarder */
 static uint64_t g_stat_forward_fail = 0; /* forward attempts that failed (all upstreams) */
 static pthread_mutex_t g_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -5061,7 +5061,8 @@ static int fwd_exchange_udp(const uint8_t *query, int qlen, uint8_t *resp, int r
     for (;;) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        long elapsed =
+            (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
         int remaining = g_forward_timeout_ms - (int) elapsed;
         if (remaining <= 0)
             break;
@@ -5069,7 +5070,7 @@ static int fwd_exchange_udp(const uint8_t *query, int qlen, uint8_t *resp, int r
         int pr = poll(&pfd, 1, remaining);
         if (pr <= 0)
             break; /* timeout or error */
-        struct sockaddr_in from;
+        struct sockaddr_in from = {0};
         socklen_t fl = sizeof(from);
         ssize_t n = recvfrom(s, resp, (size_t) resp_len, 0, (struct sockaddr *) &from, &fl);
         if (n < 12)
@@ -7338,7 +7339,7 @@ static int make_reuseport_udp_socket(int port) {
  * socket is safe. The in-flight count is capped so a dead upstream cannot
  * accumulate threads. */
 typedef struct {
-    int sock;                 /* listener fd to reply on */
+    int sock;                    /* listener fd to reply on */
     struct sockaddr_storage cli; /* client to reply to (v4 or v6) */
     socklen_t clen;
     struct in_addr cip; /* client v4 addr for RRL keying (0 = non-mapped v6) */
