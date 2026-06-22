@@ -50,6 +50,20 @@ Name hygiene: put discovered names under a dedicated sub-domain
 
 ## Server-side gaps
 
+> **Status (2026-06-22):** Gap 1 is **done** (branch `axfr-completeness`). The
+> rest of this file's line numbers are stale (pre multi-zone / forwarder) but
+> the gaps were re-verified open against current code. Gap 1 fix: `axfr_thread`
+> now calls `axfr_send_runtime()`, which enumerates `zone:<zone>:*` (every
+> provisioned type) and `ddns:<zone>:A/AAAA` (leases, TTL = remaining expiry)
+> and sends each as a chained AXFR message. The per-type value→rdata encoding
+> was factored out of `build_query_resp` into a shared `stored_rdata()` so the
+> transfer and the live query path can't diverge. Also fixed a latent bug that
+> made AXFR unusable with strict clients: response messages never echoed the
+> request ID (RFC 5936 §2.2) — `dig` aborted with "ID mismatch". Guarded by
+> `make check-axfr` (multi-IP A + TXT + ddns lease all transfer; SOA brackets).
+> Remaining discovery gaps (2 serial-churn/journal, 3 suffix ACL, 4 PTR) and the
+> IXFR id-echo are still open.
+
 ### Gap 1 — AXFR does not transfer runtime records **(blocker, also for CLAUDE.md)**
 
 `axfr_thread`'s full-transfer path (3415–3448) sends only the
