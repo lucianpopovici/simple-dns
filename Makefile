@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -407,6 +407,41 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
 
+# AXFR completeness (CLAUDE-discovery.md Gap 1). A full transfer historically
+# carried only the compile-time static_zone[] + DNSKEY + SOA; records
+# provisioned at runtime (zone:<zone>:* from the mgmt API/DDNS, ddns:<zone>:*
+# dynamic leases) were served locally but never transferred, leaving a secondary
+# with a near-empty zone. Provision a multi-IP A, a TXT, and a ddns A lease,
+# AXFR the zone, and assert all three appear (and the transfer completes — each
+# message must echo the request ID, RFC 5936). Needs Valkey + dig + valkey-cli.
+check-axfr: $(BIN_DEBUG)
+	@echo "  CHECK  AXFR transfers runtime records (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 Z=example.local;                                                                  \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
+	 $$VC set zone:$$Z:A:web.$$Z "120|10.1.2.3|10.1.2.4" >/dev/null;                   \
+	 $$VC set zone:$$Z:TXT:info.$$Z "120|hello-axfr" >/dev/null;                       \
+	 $$VC set ddns:$$Z:A:dyn.$$Z 10.9.9.9 EX 300 >/dev/null;                           \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_axfr.log 2>&1 & DNS=$$!;    \
+	 sleep 1.5;                                                                        \
+	 OUT=$$(dig +noall +answer @127.0.0.1 -p 5353 $$Z AXFR +time=5 +tries=1);          \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z ddns:$$Z:A:dyn.$$Z >/dev/null;  \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 A1=$$(echo "$$OUT" | grep -c "^web\.$$Z\..*A.10\.1\.2\.3");                        \
+	 A2=$$(echo "$$OUT" | grep -c "^web\.$$Z\..*A.10\.1\.2\.4");                        \
+	 TX=$$(echo "$$OUT" | grep -c "^info\.$$Z\..*TXT.*hello-axfr");                     \
+	 DY=$$(echo "$$OUT" | grep -c "^dyn\.$$Z\..*A.10\.9\.9\.9");                        \
+	 SO=$$(echo "$$OUT" | grep -c "[[:space:]]SOA[[:space:]]");                         \
+	 echo "  transferred: web/.3=$$A1 web/.4=$$A2 info-TXT=$$TX ddns-dyn=$$DY soa_count=$$SO"; \
+	 test "$$A1" -ge 1 -a "$$A2" -ge 1 || { echo "  FAIL  multi-IP zone:A not fully transferred"; exit 1; }; \
+	 test "$$TX" -ge 1 || { echo "  FAIL  provisioned zone:TXT not transferred"; exit 1; }; \
+	 test "$$DY" -ge 1 || { echo "  FAIL  ddns:* dynamic lease not transferred"; exit 1; }; \
+	 test "$$SO" -ge 2 || { echo "  FAIL  transfer did not complete (need opening+closing SOA; ID echo?)"; exit 1; }; \
+	 echo "  OK  runtime zone:* and ddns:* records present; transfer bracketed by SOA"
+
 # RFC 7344 regression: the CDS RRset must equal the DS the zone publishes, and
 # CDNSKEY must equal the zone's KSK DNSKEY(s). Guards against CDS/CDNSKEY drifting
 # back to the ZSK or to the wrong rdata format. Needs Valkey + dig.
@@ -629,6 +664,7 @@ help:
 	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
+	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"

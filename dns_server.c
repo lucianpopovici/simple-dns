@@ -5024,6 +5024,206 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
     return off;
 }
 
+/* Convert a stored record value (the part AFTER the optional "ttl|" prefix) to
+ * wire rdata for `type`. `pipe` is mutated (tokenised in place). Returns the
+ * rdata length, or -1 if `type` is not value-encoded here or on a conversion
+ * error. Shared by the live query path (build_query_resp) and AXFR
+ * (axfr_send_runtime) so the per-type encodings can never diverge. A/AAAA are
+ * NOT handled here — they are multi-address and parsed by their callers. */
+static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
+    switch (type) {
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_NS:
+        case DNS_TYPE_DNAME: {
+            int n = name_to_wire(pipe, rd, rdcap);
+            if (n < 0)
+                return -1;
+            return n;
+        }
+        case DNS_TYPE_MX: {
+            char *sp = strchr(pipe, '|');
+            uint16_t pref = 10;
+            if (sp) {
+                pref = (uint16_t) atoi(pipe);
+                pipe = sp + 1;
+            }
+            rd[0] = pref >> 8;
+            rd[1] = pref & 0xFF;
+            int n = name_to_wire(pipe, rd + 2, rdcap - 2);
+            if (n < 0)
+                return -1;
+            return 2 + n;
+        }
+        case DNS_TYPE_TXT: {
+            int tl = txt_encode(pipe, rd, rdcap);
+            if (tl < 0)
+                return -1;
+            return tl;
+        }
+        case DNS_TYPE_SRV: { /* prio|weight|port|target */
+            uint16_t prio = 0, weight = 0, port = 0;
+            char target[256] = "";
+            char *sp14 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp14);
+            if (tok)
+                prio = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp14);
+            if (tok)
+                weight = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp14);
+            if (tok)
+                port = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp14);
+            if (tok)
+                safe_strcpy(target, tok, sizeof(target));
+            rd[0] = prio >> 8;
+            rd[1] = prio & 0xFF;
+            rd[2] = weight >> 8;
+            rd[3] = weight & 0xFF;
+            rd[4] = port >> 8;
+            rd[5] = port & 0xFF;
+            int n = name_to_wire(target, rd + 6, rdcap - 6);
+            if (n < 0)
+                return -1;
+            return 6 + n;
+        }
+        case DNS_TYPE_CAA: { /* flags|tag|value */
+            uint8_t flags = 0;
+            char tag[64] = "", caaval[256] = "";
+            char *sp15 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp15);
+            if (tok)
+                flags = (uint8_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp15);
+            if (tok)
+                safe_strcpy(tag, tok, sizeof(tag));
+            tok = strtok_r(NULL, "|", &sp15);
+            if (tok)
+                safe_strcpy(caaval, tok, sizeof(caaval));
+            int tl = (int) strlen(tag);
+            rd[0] = flags;
+            rd[1] = (uint8_t) tl;
+            memcpy(rd + 2, tag, tl);
+            memcpy(rd + 2 + tl, caaval, strlen(caaval));
+            return 2 + tl + (int) strlen(caaval);
+        }
+        case DNS_TYPE_SSHFP: { /* alg|fptype|fingerprint_hex */
+            uint8_t alg = 0, fptype = 0;
+            uint8_t fp[64] = {0};
+            int fplen = 0;
+            char *sp16 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp16);
+            if (tok)
+                alg = (uint8_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp16);
+            if (tok)
+                fptype = (uint8_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp16);
+            if (tok)
+                fplen = hex_dec(tok, fp, sizeof(fp));
+            rd[0] = alg;
+            rd[1] = fptype;
+            memcpy(rd + 2, fp, fplen);
+            return 2 + fplen;
+        }
+        case DNS_TYPE_TLSA: { /* usage|selector|mtype|data_hex */
+            uint8_t usage = 0, sel = 0, mtype = 0;
+            uint8_t data[512] = {0};
+            int dlen = 0;
+            char *sp17 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp17);
+            if (tok)
+                usage = (uint8_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp17);
+            if (tok)
+                sel = (uint8_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp17);
+            if (tok)
+                mtype = (uint8_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp17);
+            if (tok)
+                dlen = hex_dec(tok, data, sizeof(data));
+            rd[0] = usage;
+            rd[1] = sel;
+            rd[2] = mtype;
+            memcpy(rd + 3, data, dlen);
+            return 3 + dlen;
+        }
+        case DNS_TYPE_LOC: { /* raw hex of wire rdata */
+            return hex_dec(pipe, rd, rdcap);
+        }
+        case DNS_TYPE_URI: { /* priority|weight|target */
+            uint16_t prio = 0, weight = 0;
+            char *sp18 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp18);
+            if (tok)
+                prio = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp18);
+            if (tok)
+                weight = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp18);
+            if (!tok)
+                tok = "";
+            /* RFC 7553: priority(2)+weight(2)+target(variable, no length prefix) */
+            int tlen = (int) strlen(tok);
+            if (tlen > 255)
+                tlen = 255;
+            rd[0] = prio >> 8;
+            rd[1] = prio & 0xFF;
+            rd[2] = weight >> 8;
+            rd[3] = weight & 0xFF;
+            memcpy(rd + 4, tok, tlen);
+            return 4 + tlen;
+        }
+        case DNS_TYPE_NAPTR: { /* order|pref|flags|service|regexp|replacement */
+            uint16_t order2 = 0, pref2 = 0;
+            char flags2[64] = "", svc2[64] = "", re2[256] = "", repl2[256] = "";
+            char *sp19 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp19);
+            if (tok)
+                order2 = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp19);
+            if (tok)
+                pref2 = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp19);
+            if (tok)
+                safe_strcpy(flags2, tok, sizeof(flags2));
+            tok = strtok_r(NULL, "|", &sp19);
+            if (tok)
+                safe_strcpy(svc2, tok, sizeof(svc2));
+            tok = strtok_r(NULL, "|", &sp19);
+            if (tok)
+                safe_strcpy(re2, tok, sizeof(re2));
+            tok = strtok_r(NULL, "|", &sp19);
+            if (tok)
+                safe_strcpy(repl2, tok, sizeof(repl2));
+            int rp2 = 0;
+            rd[rp2++] = order2 >> 8;
+            rd[rp2++] = order2 & 0xFF;
+            rd[rp2++] = pref2 >> 8;
+            rd[rp2++] = pref2 & 0xFF;
+            int fl = (int) strlen(flags2);
+            rd[rp2++] = (uint8_t) fl;
+            memcpy(rd + rp2, flags2, fl);
+            rp2 += fl;
+            int sl2 = (int) strlen(svc2);
+            rd[rp2++] = (uint8_t) sl2;
+            memcpy(rd + rp2, svc2, sl2);
+            rp2 += sl2;
+            int rl = (int) strlen(re2);
+            rd[rp2++] = (uint8_t) rl;
+            memcpy(rd + rp2, re2, rl);
+            rp2 += rl;
+            int nn2 = name_to_wire(repl2[0] ? repl2 : ".", rd + rp2, rdcap - rp2);
+            if (nn2 > 0)
+                rp2 += nn2;
+            return rp2;
+        }
+        default:
+            return -1;
+    }
+}
+
 /* Emit a multi-address A/AAAA RRset from a stored "ttl|ip|ip|..." value,
  * applying load-balancing rotation (config:lb_mode) to the emission order
  * (CLAUDE-loadbalance.md Gap 1). `val` is mutated (tokenised) in place.
@@ -5827,221 +6027,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             } else
                 pipe = val;
             uint8_t rd[512];
-            uint16_t rdlen = 0;
-            switch (pt) {
-                case DNS_TYPE_CNAME:
-                case DNS_TYPE_NS:
-                case DNS_TYPE_DNAME: {
-                    int n = name_to_wire(pipe, rd, sizeof(rd));
-                    if (n < 0)
-                        continue;
-                    rdlen = (uint16_t) n;
-                    break;
-                }
-                case DNS_TYPE_MX: {
-                    char *sp = strchr(pipe, '|');
-                    uint16_t pref = 10;
-                    if (sp) {
-                        pref = (uint16_t) atoi(pipe);
-                        pipe = sp + 1;
-                    }
-                    rd[0] = pref >> 8;
-                    rd[1] = pref & 0xFF;
-                    int n = name_to_wire(pipe, rd + 2, sizeof(rd) - 2);
-                    if (n < 0)
-                        continue;
-                    rdlen = (uint16_t) (2 + n);
-                    break;
-                }
-                case DNS_TYPE_TXT: {
-                    int tl = txt_encode(pipe, rd, (int) sizeof(rd));
-                    if (tl < 0)
-                        continue;
-                    rdlen = (uint16_t) tl;
-                    break;
-                }
-                case DNS_TYPE_SRV: { /* ttl|prio|weight|port|target */
-                    uint16_t prio = 0, weight = 0, port = 0;
-                    char target[256] = "";
-                    char *p2 = pipe;
-                    char *sp14 = NULL;
-                    char *tok = strtok_r(p2, "|", &sp14);
-                    if (tok) {
-                        prio = (uint16_t) atoi(tok);
-                    }
-                    tok = strtok_r(NULL, "|", &sp14);
-                    if (tok) {
-                        weight = (uint16_t) atoi(tok);
-                    }
-                    tok = strtok_r(NULL, "|", &sp14);
-                    if (tok) {
-                        port = (uint16_t) atoi(tok);
-                    }
-                    tok = strtok_r(NULL, "|", &sp14);
-                    if (tok)
-                        safe_strcpy(target, tok, sizeof(target));
-                    rd[0] = prio >> 8;
-                    rd[1] = prio & 0xFF;
-                    rd[2] = weight >> 8;
-                    rd[3] = weight & 0xFF;
-                    rd[4] = port >> 8;
-                    rd[5] = port & 0xFF;
-                    int n = name_to_wire(target, rd + 6, sizeof(rd) - 6);
-                    if (n < 0)
-                        continue;
-                    rdlen = (uint16_t) (6 + n);
-                    break;
-                }
-                case DNS_TYPE_CAA: { /* ttl|flags|tag|value */
-                    uint8_t flags = 0;
-                    char tag[64] = "", caaval[256] = "";
-                    char *p2 = pipe;
-                    char *sp15 = NULL;
-                    char *tok = strtok_r(p2, "|", &sp15);
-                    if (tok) {
-                        flags = (uint8_t) atoi(tok);
-                    }
-                    tok = strtok_r(NULL, "|", &sp15);
-                    if (tok)
-                        safe_strcpy(tag, tok, sizeof(tag));
-                    tok = strtok_r(NULL, "|", &sp15);
-                    if (tok)
-                        safe_strcpy(caaval, tok, sizeof(caaval));
-                    rd[0] = flags;
-                    rd[1] = (uint8_t) strlen(tag);
-                    memcpy(rd + 2, tag, strlen(tag));
-                    int tl = (int) strlen(tag);
-                    memcpy(rd + 2 + tl, caaval, strlen(caaval));
-                    rdlen = (uint16_t) (2 + tl + (int) strlen(caaval));
-                    break;
-                }
-                case DNS_TYPE_SSHFP: { /* ttl|alg|fptype|fingerprint_hex */
-                    uint8_t alg = 0, fptype = 0;
-                    uint8_t fp[64] = {0};
-                    int fplen = 0;
-                    char *p2 = pipe;
-                    char *sp16 = NULL;
-                    char *tok = strtok_r(p2, "|", &sp16);
-                    if (tok)
-                        alg = (uint8_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp16);
-                    if (tok)
-                        fptype = (uint8_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp16);
-                    if (tok)
-                        fplen = hex_dec(tok, fp, sizeof(fp));
-                    rd[0] = alg;
-                    rd[1] = fptype;
-                    memcpy(rd + 2, fp, fplen);
-                    rdlen = (uint16_t) (2 + fplen);
-                    break;
-                }
-                case DNS_TYPE_TLSA: { /* ttl|usage|selector|mtype|data_hex */
-                    uint8_t usage = 0, sel = 0, mtype = 0;
-                    uint8_t data[512] = {0};
-                    int dlen = 0;
-                    char *p2 = pipe;
-                    char *sp17 = NULL;
-                    char *tok = strtok_r(p2, "|", &sp17);
-                    if (tok)
-                        usage = (uint8_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp17);
-                    if (tok)
-                        sel = (uint8_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp17);
-                    if (tok)
-                        mtype = (uint8_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp17);
-                    if (tok)
-                        dlen = hex_dec(tok, data, sizeof(data));
-                    rd[0] = usage;
-                    rd[1] = sel;
-                    rd[2] = mtype;
-                    memcpy(rd + 3, data, dlen);
-                    rdlen = (uint16_t) (3 + dlen);
-                    break;
-                }
-                case DNS_TYPE_LOC: { /* stored as raw hex of wire rdata */
-                    int lo = hex_dec(pipe, rd, sizeof(rd));
-                    rdlen = (uint16_t) lo;
-                    break;
-                }
-                case DNS_TYPE_URI: { /* ttl|priority|weight|target */
-                    uint16_t prio = 0, weight = 0;
-                    char *p2 = pipe;
-                    char *sp18 = NULL;
-                    char *tok = strtok_r(p2, "|", &sp18);
-                    if (tok)
-                        prio = (uint16_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp18);
-                    if (tok)
-                        weight = (uint16_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp18);
-                    if (!tok)
-                        tok = "";
-                    /* RFC 7553: priority(2)+weight(2)+target(variable, no length prefix) */
-                    int tlen = (int) strlen(tok);
-                    if (tlen > 255)
-                        tlen = 255;
-                    rd[0] = prio >> 8;
-                    rd[1] = prio & 0xFF;
-                    rd[2] = weight >> 8;
-                    rd[3] = weight & 0xFF;
-                    memcpy(rd + 4, tok, tlen);
-                    rdlen = (uint16_t) (4 + tlen);
-                    break;
-                }
-                case DNS_TYPE_NAPTR: { /* ttl|order|pref|flags|service|regexp|replacement */
-                    /* stored as raw packed value: order|pref|flags|service|regexp|replacement */
-                    uint16_t order2 = 0, pref2 = 0;
-                    char flags2[64] = "", svc2[64] = "", re2[256] = "", repl2[256] = "";
-                    char *p2 = pipe;
-                    char *sp19 = NULL;
-                    char *tok = strtok_r(p2, "|", &sp19);
-                    if (tok)
-                        order2 = (uint16_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp19);
-                    if (tok)
-                        pref2 = (uint16_t) atoi(tok);
-                    tok = strtok_r(NULL, "|", &sp19);
-                    if (tok)
-                        safe_strcpy(flags2, tok, sizeof(flags2));
-                    tok = strtok_r(NULL, "|", &sp19);
-                    if (tok)
-                        safe_strcpy(svc2, tok, sizeof(svc2));
-                    tok = strtok_r(NULL, "|", &sp19);
-                    if (tok)
-                        safe_strcpy(re2, tok, sizeof(re2));
-                    tok = strtok_r(NULL, "|", &sp19);
-                    if (tok)
-                        safe_strcpy(repl2, tok, sizeof(repl2));
-                    int rp2 = 0;
-                    rd[rp2++] = order2 >> 8;
-                    rd[rp2++] = order2 & 0xFF;
-                    rd[rp2++] = pref2 >> 8;
-                    rd[rp2++] = pref2 & 0xFF;
-                    /* flags length-prefixed string */
-                    int fl = (int) strlen(flags2);
-                    rd[rp2++] = (uint8_t) fl;
-                    memcpy(rd + rp2, flags2, fl);
-                    rp2 += fl;
-                    int sl2 = (int) strlen(svc2);
-                    rd[rp2++] = (uint8_t) sl2;
-                    memcpy(rd + rp2, svc2, sl2);
-                    rp2 += sl2;
-                    int rl = (int) strlen(re2);
-                    rd[rp2++] = (uint8_t) rl;
-                    memcpy(rd + rp2, re2, rl);
-                    rp2 += rl;
-                    int nn2 = name_to_wire(repl2[0] ? repl2 : ".", rd + rp2, sizeof(rd) - rp2);
-                    if (nn2 > 0)
-                        rp2 += nn2;
-                    rdlen = (uint16_t) rp2;
-                    break;
-                }
-                default:
-                    continue;
-            }
+            int rl = stored_rdata(pt, pipe, rd, (int) sizeof(rd));
+            if (rl < 0)
+                continue;
+            uint16_t rdlen = (uint16_t) rl;
             off = emit_rr(resp, off, resp_len, qname, pt, ttl, rd, rdlen, dnssec_ok, &answers);
             if (any_minimal && answers > 0)
                 goto finish_answer;
@@ -6688,6 +6677,141 @@ static int tcp_send_msg(int fd, SSL *ssl, const uint8_t *msg, int len) {
     return 0;
 }
 
+/* Collect all Valkey keys matching `pattern` (KEYS) into a freshly malloc'd
+ * array of malloc'd strings. Returns the count; the caller frees each element
+ * and the array. *out is NULL on error/empty. Keys are gathered under the lock
+ * and returned, so the (slow) per-key fetch + network send happens unlocked. */
+static int vk_list_keys(const char *pattern, char ***out) {
+    *out = NULL;
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return 0;
+    }
+    resp_reply_t r;
+    if (resp_cmd(&vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5 || r.count <= 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return 0;
+    }
+    char **arr = malloc((size_t) r.count * sizeof(char *));
+    int n = 0;
+    for (int i = 0; i < r.count; i++) {
+        resp_reply_t kr;
+        if (resp_parse(&vk, &kr) < 0)
+            break;
+        if (kr.type == 2 && arr)
+            arr[n++] = strdup(kr.str);
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!arr)
+        return 0;
+    *out = arr;
+    return n;
+}
+
+/* Send one AXFR record message (one RR, with TSIG MAC chaining). Each message
+ * must echo the request ID (RFC 5936 §2.2). */
+static void axfr_emit_one(int fd, SSL *ssl, uint16_t qid, const char *name, uint16_t type,
+                          uint32_t ttl, const uint8_t *rd, uint16_t rdlen, uint8_t mac[64],
+                          int *maclen) {
+    uint8_t mb[BUF_SIZE];
+    compress_reset();
+    memset(mb, 0, 12);
+    dns_hdr_t *mh = (dns_hdr_t *) mb;
+    mh->id = htons(qid);
+    mh->flags = htons(DNS_QR | DNS_AA);
+    mh->ancount = htons(1);
+    int mo = append_rr(mb, 12, sizeof(mb), name, type, DNS_CLASS_IN, ttl, rd, rdlen);
+    if (mo < 0)
+        return;
+    tsig_axfr_mid(mb, mo, mac, maclen);
+    tcp_send_msg(fd, ssl, mb, mo);
+}
+
+/* Append every runtime record of `zname` to an in-progress AXFR: the
+ * zone:<zname>:* records (every provisioned type) and the ddns:<zname>:A/AAAA
+ * dynamic leases (TTL = remaining lease). These are served locally but were
+ * historically omitted from transfers, leaving a secondary with a near-empty
+ * zone (CLAUDE-discovery.md Gap 1). Reuses stored_rdata() so the wire encoding
+ * matches the live query path exactly. */
+static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname, uint8_t mac[64],
+                              int *maclen) {
+    static const struct {
+        const char *ts;
+        uint16_t t;
+    } ztypes[] = {
+        {"A", DNS_TYPE_A},       {"AAAA", DNS_TYPE_AAAA},   {"CNAME", DNS_TYPE_CNAME},
+        {"MX", DNS_TYPE_MX},     {"TXT", DNS_TYPE_TXT},     {"NS", DNS_TYPE_NS},
+        {"SRV", DNS_TYPE_SRV},   {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
+        {"TLSA", DNS_TYPE_TLSA}, {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
+        {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR},
+    };
+    const int nz = (int) (sizeof(ztypes) / sizeof(ztypes[0]));
+    for (int pass = 0; pass < 2; pass++) {
+        const char *ns = (pass == 0) ? "zone" : "ddns";
+        const int ntypes = (pass == 0) ? nz : 2; /* ddns: only A/AAAA */
+        for (int ti = 0; ti < ntypes; ti++) {
+            char prefix[768], pat[800];
+            int pl = snprintf(prefix, sizeof(prefix), "%s:%s:%s:", ns, zname, ztypes[ti].ts);
+            snprintf(pat, sizeof(pat), "%s*", prefix);
+            char **keys = NULL;
+            int nk = vk_list_keys(pat, &keys);
+            for (int i = 0; i < nk; i++) {
+                const char *name = keys[i] + pl; /* strip "ns:zname:TYPE:" */
+                char val[768];
+                if (!vk_get(keys[i], val, sizeof(val)) || !val[0])
+                    continue;
+                uint16_t T = ztypes[ti].t;
+                if (T == DNS_TYPE_A || T == DNS_TYPE_AAAA) {
+                    const int af = (T == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
+                    const uint16_t alen = (T == DNS_TYPE_AAAA) ? 16 : 4;
+                    if (pass == 1) { /* ddns: bare IP, TTL = remaining lease */
+                        long tl = vk_ttl(keys[i]);
+                        if (tl < 1)
+                            tl = 1;
+                        uint8_t rd[16];
+                        if (inet_pton(af, val, rd) == 1)
+                            axfr_emit_one(fd, ssl, qid, name, T, (uint32_t) tl, rd, alen, mac,
+                                          maclen);
+                    } else { /* zone: ttl|ip|ip|... */
+                        uint32_t ttl = DEFAULT_TTL;
+                        char *pipe = strchr(val, '|');
+                        if (pipe) {
+                            ttl = (uint32_t) atoi(val);
+                            pipe++;
+                        } else {
+                            pipe = val;
+                        }
+                        char *sp = NULL;
+                        for (char *ip = strtok_r(pipe, "|", &sp); ip;
+                             ip = strtok_r(NULL, "|", &sp)) {
+                            uint8_t rd[16];
+                            if (inet_pton(af, ip, rd) == 1)
+                                axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, alen, mac, maclen);
+                        }
+                    }
+                } else { /* rich provisioned types via the shared encoder */
+                    uint32_t ttl = DEFAULT_TTL;
+                    char *pipe = strchr(val, '|');
+                    if (pipe) {
+                        ttl = (uint32_t) atoi(val);
+                        pipe++;
+                    } else {
+                        pipe = val;
+                    }
+                    uint8_t rd[512];
+                    int rl = stored_rdata(T, pipe, rd, (int) sizeof(rd));
+                    if (rl > 0)
+                        axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, (uint16_t) rl, mac, maclen);
+                }
+            }
+            for (int i = 0; i < nk; i++)
+                free(keys[i]);
+            free(keys);
+        }
+    }
+}
+
 static void *axfr_thread(void *arg) {
     axfr_conn_t c;
     memcpy(&c, arg, sizeof(c));
@@ -6843,6 +6967,7 @@ static void *axfr_thread(void *arg) {
     compress_reset();
     memset(buf, 0, 12);
     dns_hdr_t *rh = (dns_hdr_t *) buf;
+    rh->id = htons(c.query_id);
     rh->flags = htons(DNS_QR | DNS_AA);
     rh->ancount = htons(1);
     int off = 12;
@@ -6918,6 +7043,7 @@ static void *axfr_thread(void *arg) {
         compress_reset();
         memset(mb, 0, 12);
         dns_hdr_t *mh = (dns_hdr_t *) mb;
+        mh->id = htons(c.query_id);
         mh->flags = htons(DNS_QR | DNS_AA);
         mh->ancount = htons(1);
         int mo = 12;
@@ -6925,6 +7051,11 @@ static void *axfr_thread(void *arg) {
         tsig_axfr_mid(mb, mo, axfr_mac, &axfr_mac_len);
         tcp_send_msg(c.fd, c.ssl, mb, mo);
     }
+
+    /* Send all runtime records (zone:<zone>:* + ddns:<zone>:A/AAAA) — the
+     * provisioning / DDNS / discovery data that the static_zone[] loop above
+     * does not cover (CLAUDE-discovery.md Gap 1). */
+    axfr_send_runtime(c.fd, c.ssl, c.query_id, zname, axfr_mac, &axfr_mac_len);
 
     /* Send DNSKEY records */
     {
@@ -6936,6 +7067,7 @@ static void *axfr_thread(void *arg) {
             compress_reset();
             memset(mb, 0, 12);
             dns_hdr_t *mh = (dns_hdr_t *) mb;
+            mh->id = htons(c.query_id);
             mh->flags = htons(DNS_QR | DNS_AA);
             mh->ancount = htons(1);
             int mo = 12;
@@ -6949,6 +7081,7 @@ static void *axfr_thread(void *arg) {
             compress_reset();
             memset(mb, 0, 12);
             dns_hdr_t *mh = (dns_hdr_t *) mb;
+            mh->id = htons(c.query_id);
             mh->flags = htons(DNS_QR | DNS_AA);
             mh->ancount = htons(1);
             int mo = 12;
@@ -6965,6 +7098,7 @@ static void *axfr_thread(void *arg) {
         compress_reset();
         memset(mb, 0, 12);
         dns_hdr_t *mh = (dns_hdr_t *) mb;
+        mh->id = htons(c.query_id);
         mh->flags = htons(DNS_QR | DNS_AA);
         mh->ancount = htons(1);
         int mo = 12;
