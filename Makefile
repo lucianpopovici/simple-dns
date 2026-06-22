@@ -401,9 +401,6 @@ check-dnssec-live: $(BIN_DEBUG)
 	   sleep 1;                                                                        \
 	 done;                                                                             \
 	 NODO=$$(dig +nodnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
-	 echo "  --- diag: dig +dnssec response ---";                                      \
-	 dig +dnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | sed -n '1,20p'; \
-	 echo "  --- diag: dnsd log tail ---"; tail -8 /tmp/dnsd_dolive.log;               \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 echo "  +dnssec RRSIGs=$$DO   +nodnssec RRSIGs=$$NODO";                           \
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
