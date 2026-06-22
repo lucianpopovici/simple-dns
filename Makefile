@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-dot-mtls check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -407,6 +407,54 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
 
+# mTLS on the DoT/transfer listener (hidden-master plan Gap 1). With
+# config:dot_require_client_cert=1 + a CA, the DoT port must reject a TLS client
+# that presents no client cert (TLS "certificate required" alert) and accept one
+# that presents a CA-signed cert; with the flag off the port stays open for
+# ordinary RFC 7858 clients. Uses openssl to mint a throwaway CA + server +
+# client cert and openssl s_client to probe the handshake. Needs Valkey +
+# openssl; restores the TLS config afterward.
+check-dot-mtls: $(BIN_DEBUG)
+	@echo "  CHECK  mTLS on the DoT/transfer listener (requires Valkey + openssl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };  \
+	 D=$$(mktemp -d);                                                                  \
+	 EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes";                     \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=test-ca" >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=dns.test" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=secondary1" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);  \
+	 SAVE_A=$$($$VC get config:mtls_ca_pem); SAVE_R=$$($$VC get config:dot_require_client_cert); \
+	 $$VC set config:tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null;                     \
+	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                      \
+	 $$VC set config:mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                       \
+	 $$VC set config:dot_require_client_cert 1 >/dev/null;                             \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dotm.log 2>&1 & DNS=$$!;    \
+	 sleep 1.5;                                                                        \
+	 NOCERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
+	 WITHCERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -cert $$D/cli.pem -key $$D/cli.key -CAfile $$D/ca.pem 2>&1 | grep -c "Verify return code: 0"); \
+	 WC_ALERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -cert $$D/cli.pem -key $$D/cli.key -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC set config:dot_require_client_cert 0 >/dev/null;                             \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dotm2.log 2>&1 & DNS=$$!;   \
+	 sleep 1.5;                                                                        \
+	 OPEN=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "Verify return code: 0"); \
+	 OPEN_ALERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_A" ]; then $$VC set config:mtls_ca_pem "$$SAVE_A" >/dev/null; else $$VC del config:mtls_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_R" ]; then $$VC set config:dot_require_client_cert "$$SAVE_R" >/dev/null; else $$VC del config:dot_require_client_cert >/dev/null; fi; \
+	 rm -rf $$D;                                                                       \
+	 echo "  mTLS on:  no-cert refused=$$NOCERT  with-cert ok=$$WITHCERT (alert=$$WC_ALERT)  | mTLS off: no-cert open=$$OPEN (alert=$$OPEN_ALERT)"; \
+	 test "$$NOCERT" -ge 1   || { echo "  FAIL  mTLS on: no-cert client was NOT refused"; exit 1; }; \
+	 test "$$WITHCERT" -ge 1 -a "$$WC_ALERT" -eq 0 || { echo "  FAIL  mTLS on: valid client cert was not accepted"; exit 1; }; \
+	 test "$$OPEN" -ge 1 -a "$$OPEN_ALERT" -eq 0 || { echo "  FAIL  mTLS off: ordinary DoT client was refused (should stay open)"; exit 1; }; \
+	 echo "  OK  mTLS refuses no-cert, accepts CA-signed cert, and stays open when disabled"
+
 # AXFR completeness (CLAUDE-discovery.md Gap 1). A full transfer historically
 # carried only the compile-time static_zone[] + DNSKEY + SOA; records
 # provisioned at runtime (zone:<zone>:* from the mgmt API/DDNS, ddns:<zone>:*
@@ -665,6 +713,7 @@ help:
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
+	@echo "  make check-dot-mtls  mTLS on the DoT/transfer listener (needs Valkey + openssl)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"

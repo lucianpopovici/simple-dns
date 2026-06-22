@@ -35,6 +35,18 @@ Everything below is missing and is required for the two-role deployment.
 
 ---
 
+> **Status (2026-06-22):** This file's "what works" table and line numbers are
+> stale (pre multi-zone / forwarder); the gaps were re-verified open against
+> current code. **Gap 1 is done** (branch `dot-mtls`): `config:dot_require_client_cert`
+> (default 0); when 1 + `config:mtls_ca_pem` is set, `tls_reload` builds the DoT
+> context with `SSL_VERIFY_PEER | FAIL_IF_NO_PEER_CERT`, so a transfer client
+> without a CA-signed cert can't complete the handshake. Fail-safe: an empty CA
+> never silently locks clients out (warns instead). Live-reloads on the config
+> key. Guarded by `make check-dot-mtls`. **Discovery Gap 1 (AXFR completeness)
+> shipped first (PR #10)** — a secondary now has real content to pull. Remaining
+> HM gaps (2 role config, 3+4 transfer client + TSIG chain verify, 5 NOTIFY
+> action, 6 refresh loop, 7 write-refusal, 8 key guard) are still open.
+
 ## Gap 1 — mTLS on the DoT/transfer listener (master side)
 
 ### What's wrong
