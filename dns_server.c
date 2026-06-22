@@ -2800,29 +2800,56 @@ static int make_rrsig(const char *owner, uint16_t rrtype, uint32_t ttl, const ui
     rr[rp++] = rrdata_len & 0xFF;
     memcpy(rr + rp, rrdata, rrdata_len);
     rp += rrdata_len;
-    /* Sign */
+    /* Sign. All OpenSSL return values are checked — fail closed on any error
+     * rather than emit a bogus signature. */
     EVP_MD_CTX *mc = EVP_MD_CTX_new();
     if (!mc) {
         free(rr);
         return -1;
     }
-    const EVP_MD *md = (alg == DNS_ALG_ED25519) ? NULL : EVP_sha256();
-    EVP_DigestSignInit(mc, NULL, md, NULL, zsk);
-    EVP_DigestSignUpdate(mc, hdr, hp);
-    EVP_DigestSignUpdate(mc, rr, rp);
-    free(rr);
     size_t sl = 0;
-    EVP_DigestSignFinal(mc, NULL, &sl);
-    if (sl == 0) {
-        EVP_MD_CTX_free(mc);
-        return -1;
+    uint8_t *der = NULL;
+    if (alg == DNS_ALG_ED25519) {
+        /* Ed25519 (RFC 8080) is a one-shot algorithm: it does NOT support the
+         * streaming EVP_DigestSignUpdate/Final API — that misuse returns an
+         * error on some OpenSSL builds and crashes inside libcrypto on others.
+         * Assemble the full signed message and use the one-shot EVP_DigestSign. */
+        int msglen = hp + rp;
+        uint8_t *msg = malloc((size_t) msglen);
+        if (!msg) {
+            EVP_MD_CTX_free(mc);
+            free(rr);
+            return -1;
+        }
+        memcpy(msg, hdr, (size_t) hp);
+        memcpy(msg + hp, rr, (size_t) rp);
+        free(rr);
+        if (EVP_DigestSignInit(mc, NULL, NULL, NULL, zsk) != 1 ||
+            EVP_DigestSign(mc, NULL, &sl, msg, (size_t) msglen) != 1 || sl == 0 ||
+            (der = malloc(sl)) == NULL || EVP_DigestSign(mc, der, &sl, msg, (size_t) msglen) != 1) {
+            EVP_MD_CTX_free(mc);
+            free(msg);
+            free(der);
+            return -1;
+        }
+        free(msg);
+    } else {
+        /* ECDSA-P256 (alg 13): SHA-256 digest, streaming API is fine. */
+        if (EVP_DigestSignInit(mc, NULL, EVP_sha256(), NULL, zsk) != 1 ||
+            EVP_DigestSignUpdate(mc, hdr, (size_t) hp) != 1 ||
+            EVP_DigestSignUpdate(mc, rr, (size_t) rp) != 1) {
+            EVP_MD_CTX_free(mc);
+            free(rr);
+            return -1;
+        }
+        free(rr);
+        if (EVP_DigestSignFinal(mc, NULL, &sl) != 1 || sl == 0 || (der = malloc(sl)) == NULL ||
+            EVP_DigestSignFinal(mc, der, &sl) != 1) {
+            EVP_MD_CTX_free(mc);
+            free(der);
+            return -1;
+        }
     }
-    uint8_t *der = malloc(sl);
-    if (!der) {
-        EVP_MD_CTX_free(mc);
-        return -1;
-    }
-    EVP_DigestSignFinal(mc, der, &sl);
     EVP_MD_CTX_free(mc);
     memcpy(outbuf, hdr, hp);
     if (alg == DNS_ALG_ED25519) {
@@ -4682,8 +4709,12 @@ static void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
         if (rtype == DNS_TYPE_OPT) {
             ei->present = 1;
             ei->max_udp = get16(pkt, off + 2);
+            /* OPT RR TTL field (RFC 6891 §6.1.3): ext-RCODE(off+4) | VERSION
+             * (off+5) | flags(off+6,off+7). DO is the top bit of the 2-octet
+             * flags, i.e. off+6 — NOT off+4 (that is the extended RCODE, always
+             * 0 here, which silently disabled DNSSEC for every live query). */
             ei->version = pkt[off + 5];
-            ei->do_bit = (pkt[off + 4] & 0x80) ? 1 : 0;
+            ei->do_bit = (pkt[off + 6] & 0x80) ? 1 : 0;
             uint16_t rdlen = get16(pkt, off + 8);
             int rp = off + 10;
             while (rp + 4 <= off + 10 + rdlen && rp + 4 <= plen) {
