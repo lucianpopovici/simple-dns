@@ -13,6 +13,75 @@ with forwarding on would be an open resolver (abuse + amplification
 target).  This feature is for internal deployments; the public secondaries
 from `CLAUDE.md` must keep it disabled.
 
+## Implementation status (2026-06-22)
+
+Gaps 1–3 are **implemented** in `dns_server.c` but **uncommitted on `main`**
+(not yet on a branch / in a PR). The build is clean (`-Wall -Wextra
+-Wformat=2`, no warnings). What landed:
+
+- **Gap 1 (config + ACL):** done. `config:forward_{enabled,allow,timeout_ms}`
+  and `config:forwarders` plumbed in `config_load_from_valkey`; `axfr_ip_allowed`
+  refactored to call a shared `ip_list_allowed(list, ip)`.
+- **Gap 2 (forward path):** done. `forward_query` + `fwd_exchange_udp` /
+  `fwd_exchange_tcp` (RFC 5452 source/ID/question validation, fresh ephemeral
+  socket per exchange), TC→TCP retry for TCP clients, RA set on relayed
+  replies. UDP is dispatched off the listener to detached workers
+  (`forward_dispatch_udp` / `fwd_worker_thread`) wired into all three UDP paths
+  (single-select loop, SO_REUSEPORT worker, recvmmsg batch) with an
+  `FWD_MAX_INFLIGHT 256` cap → SERVFAIL over the cap.
+- **Gap 3 (guard rails):** done. Fail-closed on empty `forward_allow`, loud
+  startup warning, `zone_role=secondary` extra warning, RRL applied to
+  forwarded responses in the worker, `"fwd"` qlog proto, Prometheus
+  `dns_forward_total{ok,fail}` + `dns_forward_enabled`.
+- **Gap 4 (cache):** **not started** (was always phase-2 / optional).
+
+### Bug found + fixed while adding the test (2026-06-22)
+
+The `make check-forwarder` smoke test (below) immediately caught a **fatal
+byte-order bug** in the forward path: `get16()` already returns a host-order
+value, but six new sites wrapped it in `ntohs()` (a double swap). The worst was
+the upstream-reply QDCOUNT check `ntohs(get16(resp, 4)) != 1` — on
+little-endian it compared `256 != 1`, so **every** upstream reply was rejected
+and every forwarded query returned SERVFAIL after the full timeout. The other
+five (rcode/TC/RA flag reads + the `"fwd"` qlog rcode/ancount) were corrected to
+bare `get16()`. Lesson: the happy-path `dig` would never have shown this — the
+test is what surfaced it.
+
+> The same `ntohs(get16(resp, …))` double swap existed pre-forwarder in the
+> *committed* qlog rcode/ancount logging on the normal UDP/DoT/UDP6 paths (4
+> sites, 8 lines) — cosmetic (wrong values in the query log only), now fixed in
+> the same pass to bare `get16()`. Verified via `config:query_log_path`: a
+> BADCOOKIE first leg now logs `rcode:7` and the real answer `rcode:0
+> answers:1` (was `answers:256`). After the fix there are **zero**
+> `ntohs(get16` / `ntohl(get32` sites left in `dns_server.c`.
+
+### Remaining work — Definition of Done (per `CLAUDE.md`)
+
+This change touches the trusted core's wire-relay + a new outbound network
+path, so it hits the security-sensitive gate. Status:
+
+- [x] **Tests** — `make check-forwarder` added (stub upstream
+      `tests/fwd_upstream.py` + dnsd): asserts out-of-zone A is forwarded with
+      RA set, `+norecurse` is REFUSED (RD gating), in-zone stays authoritative
+      (AA, never forwarded), and a non-matching `forward_allow` fails closed
+      (REFUSED). Still TODO: wire it into CI (`.github/workflows/ci.yml`), and
+      add the failover-to-2nd-upstream + TC→TCP cases.
+- [~] **Hostile-input evidence** — the RFC 5452 reply validation
+      (`fwd_reply_valid`: ID + byte-identical question; `fwd_exchange_udp`:
+      source addr/port match, off-path forgeries discarded until deadline) is
+      implemented and partially exercised. Still TODO: an explicit negative test
+      (spoofed source / wrong ID / mismatched question must be ignored) and an
+      oversized TCP length-prefix case.
+- [x] **Docs sync** — RFC 5452 added to the dns_server.c "Implemented RFCs"
+      header; `config:forward_*` keys documented in the schema header. The
+      `CLAUDE.md` Valkey ownership table already covers them via its `config:*`
+      wildcard row (writers: dashboard/apid; reader: dnsd) — no table edit
+      needed.
+- [ ] **Branch + PR + second reviewer** — still uncommitted on `main`. Move onto
+      a feature branch and open a PR; the security-sensitive gate requires a
+      second reviewer and the hostile-input test evidence above in the PR.
+- [ ] **Gap 4 cache** — only if upstream latency/load demands it.
+
 ## Current state (verified in source)
 
 | Fact | Where |

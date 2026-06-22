@@ -42,6 +42,8 @@
  *   9364       DNSSEC (consolidation RFC)
  *   9432       Catalog Zones – bulk provisioning of member zones (consumer side)
  *   9619       QDCOUNT=1 enforcement for QUERY
+ *   5452       Forwarder upstream-reply validation (source addr/port + ID +
+ *              question match; random ephemeral source port) — anti-spoofing
  *   6762       mDNS RFC 6762 (Multicast DNS, dual-stack IPv4+IPv6)
  *   6763       DNS-SD RFC 6763 (Service Discovery / Bonjour browsing)
  *   7030       EST  RFC 7030 (Enrollment over Secure Transport, mTLS)
@@ -61,6 +63,14 @@
  *   config:cookie_secret       16-byte hex cookie secret
  *   config:axfr_allow          Comma-separated IPs/CIDRs allowed to do AXFR
  *   config:notify_targets      Comma-separated IP:port targets for NOTIFY
+ *   config:forward_enabled     "1" to forward out-of-zone queries (default: 0).
+ *                              OFF + ACL-gated: an open resolver is an abuse
+ *                              target. Empty config:forward_allow disables it
+ *                              regardless (fail closed). Internal use only.
+ *   config:forwarders          Upstream resolvers "ip[:port],..." (default :53),
+ *                              tried in order until one answers.
+ *   config:forward_allow       IPs/CIDRs allowed recursion (empty = disabled).
+ *   config:forward_timeout_ms  Per-upstream wait in ms (default 1500).
  *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
@@ -146,6 +156,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -238,6 +249,7 @@
 #define DNS_AA 0x0400
 #define DNS_TC 0x0200
 #define DNS_RD 0x0100
+#define DNS_RA 0x0080 /* Recursion Available — set on relayed forwarder responses */
 #define DNS_AD 0x0020 /* RFC 4035 §3.1.6 — Authenticated Data */
 #define DNS_OPCODE_QUERY 0x0000
 #define DNS_OPCODE_NOTIFY 0x2000
@@ -524,6 +536,21 @@ static int g_rrl_enabled = 0;
 static int g_rrl_rate = 5;   /* max responses/window */
 static int g_rrl_window = 1; /* window in seconds */
 static int g_rrl_slip = 2;   /* send TC every slip-th excess response */
+
+/* Out-of-zone forwarding (CLAUDE-forwarder.md). OFF by default and gated by a
+ * client ACL: an empty g_forward_allow disables forwarding regardless of
+ * g_forward_enabled (fail closed — a public instance must never become an open
+ * resolver). dnsd normally reaches nothing but Valkey; this is the one opt-in
+ * outbound path, for internal-only deployments. */
+static int g_forward_enabled = 0;            /* config:forward_enabled */
+static char g_forwarders[1024] = "";         /* config:forwarders — ip[:port],... (port 53 default) */
+static char g_forward_allow[1024] = "";      /* config:forward_allow — IPs/CIDRs allowed recursion */
+static int g_forward_timeout_ms = 1500;      /* config:forward_timeout_ms — per-upstream wait */
+/* Cap concurrent forward worker threads so a dead/slow upstream cannot
+ * accumulate threads under load; over the cap we answer SERVFAIL immediately. */
+#define FWD_MAX_INFLIGHT 256
+static int g_fwd_inflight = 0;
+static pthread_mutex_t g_fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Structured query log */
 static char g_query_log_path[512] = ""; /* "" = disabled */
@@ -1080,6 +1107,8 @@ static uint64_t g_stat_rrl_tc = 0;   /* RRL: truncated */
 static uint64_t g_stat_axfr = 0;     /* AXFR transfers completed */
 static uint64_t g_stat_ddns = 0;     /* DDNS updates accepted */
 static uint64_t g_stat_signed = 0;   /* RRSIGs generated */
+static uint64_t g_stat_forwarded = 0;    /* queries answered via an upstream forwarder */
+static uint64_t g_stat_forward_fail = 0; /* forward attempts that failed (all upstreams) */
 static pthread_mutex_t g_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define STAT_INC(c)                                                                                \
     do {                                                                                           \
@@ -1135,6 +1164,44 @@ static int is_local_zone(const char *qname) {
             return 1;
         if (ql > zl + 1 && lq[ql - zl - 1] == '.' && strcmp(lq + ql - zl, z) == 0)
             return 1;
+    }
+    return 0;
+}
+
+/* Returns 1 if IPv4 address `ip` matches any entry in a comma-separated list of
+ * IPs and /8-/32 CIDRs (e.g. "10.0.0.0/8, 192.168.1.5"). Shared by the AXFR ACL
+ * and the forwarder client ACL (CLAUDE-forwarder.md Gap 1). An empty/blank list
+ * matches nothing (fail closed). */
+static int ip_list_allowed(const char *list, const struct in_addr *ip) {
+    if (!list || !list[0])
+        return 0;
+    char allow[1024];
+    safe_strcpy(allow, list, sizeof(allow));
+    char *sp = NULL;
+    for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        while (*tok == ' ')
+            tok++;
+        char *slash = strchr(tok, '/');
+        if (slash) {
+            int bits = atoi(slash + 1);
+            *slash = 0;
+            if (bits < 0)
+                bits = 0;
+            if (bits > 32)
+                bits = 32;
+            struct in_addr net;
+            if (inet_pton(AF_INET, tok, &net) != 1)
+                continue;
+            uint32_t mask = bits ? htonl(~((1u << (32 - bits)) - 1)) : 0u;
+            if (bits == 32)
+                mask = 0xFFFFFFFFu;
+            if ((ip->s_addr & mask) == (net.s_addr & mask))
+                return 1;
+        } else {
+            struct in_addr a;
+            if (inet_pton(AF_INET, tok, &a) == 1 && a.s_addr == ip->s_addr)
+                return 1;
+        }
     }
     return 0;
 }
@@ -1978,6 +2045,37 @@ static void config_load_from_valkey(void) {
             g_rrl_window = atoi(rrl_val);
         if (vk_get("config:rrl_slip", rrl_val, sizeof(rrl_val)))
             g_rrl_slip = atoi(rrl_val);
+    }
+    /* Out-of-zone forwarding (CLAUDE-forwarder.md). */
+    g_forward_enabled = 0;
+    g_forwarders[0] = 0;
+    g_forward_allow[0] = 0;
+    g_forward_timeout_ms = 1500;
+    GI("forward_enabled", g_forward_enabled);
+    G("forwarders", g_forwarders);
+    G("forward_allow", g_forward_allow);
+    GI("forward_timeout_ms", g_forward_timeout_ms);
+    if (g_forward_timeout_ms < 100)
+        g_forward_timeout_ms = 100;
+    if (g_forward_timeout_ms > 30000)
+        g_forward_timeout_ms = 30000;
+    /* Guard rails (CLAUDE-forwarder.md Gap 3): make an open-resolver
+     * misconfiguration impossible to enable silently. */
+    if (g_forward_enabled && g_forward_allow[0]) {
+        dns_log(LOG_WARNING,
+                "[FORWARD] *** RECURSION ENABLED *** out-of-zone queries are forwarded to "
+                "[%s] for clients in [%s] (timeout %dms). Keep this OFF on any public-facing "
+                "instance — an open resolver is an amplification/abuse target.\n",
+                g_forwarders[0] ? g_forwarders : "(none configured!)", g_forward_allow,
+                g_forward_timeout_ms);
+        char role[64] = "";
+        if (vk_get("config:zone_role", role, sizeof(role)) && strcasecmp(role, "secondary") == 0)
+            dns_log(LOG_WARNING,
+                    "[FORWARD] zone_role=secondary (public-facing) AND forwarding is enabled — "
+                    "ensure this secondary is internal-only.\n");
+    } else if (g_forward_enabled && !g_forward_allow[0]) {
+        dns_log(LOG_WARNING, "[FORWARD] forward_enabled=1 but forward_allow is empty — "
+                             "forwarding stays DISABLED (fail closed).\n");
     }
     /* TSIG secret (base64) */
     if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
@@ -4903,6 +5001,246 @@ static int add_nsec3_denial(uint8_t *resp, int off, int resp_len, const char *qn
     return off;
 }
 
+/* ==========================================================================
+ * Out-of-zone forwarder (CLAUDE-forwarder.md) — relay queries we are not
+ * authoritative for to one or more upstream resolvers. OFF by default and
+ * gated by a client ACL (see g_forward_*). This is NOT a validating resolver:
+ * DO-bit queries pass through unsigned-verified; clients do their own DNSSEC
+ * validation. The trusted core only relays bytes — it never parses the answer
+ * RRs beyond the header/question echo it validates for anti-spoofing.
+ * ======================================================================= */
+
+/* Read exactly `n` bytes from a (blocking, timeout-armed) TCP socket. Returns 0
+ * on success, -1 on EOF/error/timeout. */
+static int fwd_read_full(int fd, uint8_t *buf, int n) {
+    int got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, buf + got, (size_t) (n - got), 0);
+        if (r <= 0)
+            return -1;
+        got += (int) r;
+    }
+    return 0;
+}
+
+/* Validate an upstream reply against the original query (RFC 5452): the ID must
+ * match and the (single) question must be byte-identical to ours. `qsec` points
+ * at the original question section (qname+qtype+qclass), `qsec_len` its length.
+ * Returns 1 if the reply is acceptable. */
+static int fwd_reply_valid(const uint8_t *resp, int rlen, uint16_t qid, const uint8_t *qsec,
+                           int qsec_len) {
+    if (rlen < 12)
+        return 0;
+    if (get16(resp, 0) != qid)
+        return 0;
+    if (get16(resp, 4) != 1) /* QDCOUNT must echo our single question */
+        return 0;
+    if (rlen < 12 + qsec_len)
+        return 0;
+    if (memcmp(resp + 12, qsec, (size_t) qsec_len) != 0)
+        return 0;
+    return 1;
+}
+
+/* One UDP exchange with a single upstream. Fresh socket → OS-random ephemeral
+ * source port (anti-spoofing). Returns reply length, or -1 on timeout/invalid.
+ * Off-path spoofed packets are discarded and we keep waiting until the deadline,
+ * so a flood of forgeries cannot knock out the legitimate answer. */
+static int fwd_exchange_udp(const uint8_t *query, int qlen, uint8_t *resp, int resp_len,
+                            const struct sockaddr_in *up, uint16_t qid, const uint8_t *qsec,
+                            int qsec_len) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0)
+        return -1;
+    if (sendto(s, query, (size_t) qlen, 0, (const struct sockaddr *) up, sizeof(*up)) != qlen) {
+        close(s);
+        return -1;
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        int remaining = g_forward_timeout_ms - (int) elapsed;
+        if (remaining <= 0)
+            break;
+        struct pollfd pfd = {.fd = s, .events = POLLIN};
+        int pr = poll(&pfd, 1, remaining);
+        if (pr <= 0)
+            break; /* timeout or error */
+        struct sockaddr_in from;
+        socklen_t fl = sizeof(from);
+        ssize_t n = recvfrom(s, resp, (size_t) resp_len, 0, (struct sockaddr *) &from, &fl);
+        if (n < 12)
+            continue;
+        /* Source must be the forwarder we queried (RFC 5452). */
+        if (fl != sizeof(from) || from.sin_addr.s_addr != up->sin_addr.s_addr ||
+            from.sin_port != up->sin_port)
+            continue;
+        if (!fwd_reply_valid(resp, (int) n, qid, qsec, qsec_len))
+            continue;
+        close(s);
+        return (int) n;
+    }
+    close(s);
+    return -1;
+}
+
+/* One TCP exchange with a single upstream (used to follow a truncated UDP reply
+ * when the client can carry the full answer). Length-prefixed framing per
+ * RFC 1035 §4.2.2. Returns reply length, or -1 on failure. */
+static int fwd_exchange_tcp(const uint8_t *query, int qlen, uint8_t *resp, int resp_len,
+                            const struct sockaddr_in *up, uint16_t qid, const uint8_t *qsec,
+                            int qsec_len) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0)
+        return -1;
+    struct timeval tv = {.tv_sec = g_forward_timeout_ms / 1000,
+                         .tv_usec = (g_forward_timeout_ms % 1000) * 1000};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(s, (const struct sockaddr *) up, sizeof(*up)) != 0) {
+        close(s);
+        return -1;
+    }
+    uint8_t lb[2] = {(uint8_t) (qlen >> 8), (uint8_t) (qlen & 0xFF)};
+    if (send(s, lb, 2, 0) != 2 || send(s, query, (size_t) qlen, 0) != qlen) {
+        close(s);
+        return -1;
+    }
+    if (fwd_read_full(s, lb, 2) != 0) {
+        close(s);
+        return -1;
+    }
+    int rlen = (lb[0] << 8) | lb[1];
+    if (rlen < 12 || rlen > resp_len) {
+        close(s);
+        return -1;
+    }
+    if (fwd_read_full(s, resp, rlen) != 0) {
+        close(s);
+        return -1;
+    }
+    close(s);
+    if (!fwd_reply_valid(resp, rlen, qid, qsec, qsec_len))
+        return -1;
+    return rlen;
+}
+
+/* Build a minimal SERVFAIL response echoing the original ID/question, with RD
+ * copied and RA set. Used when every forwarder fails. Returns its length. */
+static int fwd_servfail(const uint8_t *query, int qlen, uint8_t *resp, int resp_len) {
+    int qsec_len = 0;
+    char qn[256];
+    int after = name_from_wire(query, qlen, 12, qn, sizeof(qn));
+    if (after > 0 && after + 4 <= qlen)
+        qsec_len = after - 12 + 4;
+    dns_hdr_t *rh = (dns_hdr_t *) resp;
+    rh->id = ((const dns_hdr_t *) query)->id;
+    uint16_t rd = (ntohs(((const dns_hdr_t *) query)->flags) & DNS_RD);
+    rh->flags = htons(DNS_QR | rd | DNS_RA | DNS_RCODE_SERVFAIL);
+    rh->qdcount = htons(qsec_len ? 1 : 0);
+    rh->ancount = rh->nscount = rh->arcount = 0;
+    int off = 12;
+    if (qsec_len && 12 + qsec_len <= resp_len) {
+        memcpy(resp + 12, query + 12, (size_t) qsec_len);
+        off = 12 + qsec_len;
+    }
+    return off;
+}
+
+/* Relay one query to the configured upstreams, in order. The original query
+ * bytes are sent unchanged (EDNS/DO pass through). On a valid reply we set RA
+ * and return it verbatim; on truncation with a TCP-capable client we retry the
+ * same forwarder over TCP. Always returns a valid response (SERVFAIL on total
+ * failure) so callers can relay it directly. */
+static int forward_query(const uint8_t *query, int qlen, uint8_t *resp, int resp_len, int is_tcp) {
+    char qn[256];
+    int after = name_from_wire(query, qlen, 12, qn, sizeof(qn));
+    if (after < 0 || after + 4 > qlen) {
+        STAT_INC(g_stat_forward_fail);
+        return fwd_servfail(query, qlen, resp, resp_len);
+    }
+    int qsec_len = after - 12 + 4; /* qname + qtype + qclass */
+    uint16_t qid = get16(query, 0);
+    const uint8_t *qsec = query + 12;
+
+    char list[1024];
+    safe_strcpy(list, g_forwarders, sizeof(list));
+    char *sp = NULL;
+    for (char *tok = strtok_r(list, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        while (*tok == ' ')
+            tok++;
+        char ipbuf[128];
+        safe_strcpy(ipbuf, tok, sizeof(ipbuf));
+        /* Strip a trailing space. */
+        for (char *e = ipbuf + strlen(ipbuf); e > ipbuf && e[-1] == ' '; e--)
+            e[-1] = 0;
+        int port = DNS_PORT_DEFAULT;
+        char *colon = strchr(ipbuf, ':'); /* IPv4[:port] only */
+        if (colon) {
+            *colon = 0;
+            int p = atoi(colon + 1);
+            if (p > 0 && p <= 65535)
+                port = p;
+        }
+        struct sockaddr_in up = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
+        if (inet_pton(AF_INET, ipbuf, &up.sin_addr) != 1)
+            continue;
+        int n = fwd_exchange_udp(query, qlen, resp, resp_len, &up, qid, qsec, qsec_len);
+        if (n < 0)
+            continue; /* timeout/invalid — try the next forwarder */
+        uint8_t rc = (uint8_t) (get16(resp, 2) & 0xF);
+        /* Treat SERVFAIL as a failure and fall through to the next upstream. */
+        if (rc == DNS_RCODE_SERVFAIL)
+            continue;
+        /* Follow truncation over TCP only if the client itself is on TCP. */
+        if (is_tcp && (get16(resp, 2) & DNS_TC)) {
+            int t = fwd_exchange_tcp(query, qlen, resp, resp_len, &up, qid, qsec, qsec_len);
+            if (t > 0)
+                n = t;
+        }
+        /* Set RA on the relayed response; everything else is verbatim. */
+        put16(resp, 2, (uint16_t) (get16(resp, 2) | DNS_RA));
+        STAT_INC(g_stat_forwarded);
+        return n;
+    }
+    STAT_INC(g_stat_forward_fail);
+    return fwd_servfail(query, qlen, resp, resp_len);
+}
+
+/* Cheap pre-dispatch predicate for the UDP listeners: would this raw query be
+ * forwarded? (enabled + QUERY opcode + RD set + single question + client in ACL
+ * + name out-of-zone and not locally served). Mirrors the decision in
+ * build_query_resp so a forwardable UDP query is dispatched to a worker thread
+ * rather than blocking the listener. */
+static int forward_should(const uint8_t *pkt, int plen, const struct in_addr *cip) {
+    if (!g_forward_enabled || !g_forward_allow[0])
+        return 0; /* fail closed */
+    if (plen < 12)
+        return 0;
+    const dns_hdr_t *h = (const dns_hdr_t *) pkt;
+    uint16_t flags = ntohs(h->flags);
+    if ((flags & DNS_OPCODE_MASK) != DNS_OPCODE_QUERY)
+        return 0;
+    if (!(flags & DNS_RD))
+        return 0;
+    if (ntohs(h->qdcount) != 1)
+        return 0;
+    if (!ip_list_allowed(g_forward_allow, cip))
+        return 0;
+    char qname[256];
+    int after = name_from_wire(pkt, plen, 12, qname, sizeof(qname));
+    if (after < 0)
+        return 0;
+    if (zone_for_qname(qname) != NULL)
+        return 0; /* authoritative for it */
+    if (is_local_zone(qname))
+        return 0; /* RFC 6303 locally served */
+    return 1;
+}
+
 static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int resp_len, int is_tcp,
                             const struct in_addr *cip) {
     if (qlen < 12)
@@ -4968,6 +5306,19 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         t_zone = zone_for_qname(qname);
         int in_zone = (t_zone != NULL);
         if (!in_zone && !is_local_zone(qname)) {
+            /* Out-of-zone forwarding (CLAUDE-forwarder.md Gap 2). Only here for
+             * TCP/DoT/DoH, which already run one thread per connection so the
+             * 1.5s upstream wait is contained. UDP is dispatched to a worker
+             * thread *before* dns_process (forward_should/forward_dispatch_udp)
+             * so it never blocks a listener — by the time a UDP query reaches
+             * here it is, by construction, not forwardable, so it falls through
+             * to REFUSED exactly as before. */
+            if (is_tcp && g_forward_enabled && (ntohs(qh->flags) & DNS_RD) && g_forward_allow[0] &&
+                ip_list_allowed(g_forward_allow, cip)) {
+                int fr = forward_query(query, qlen, resp, resp_len, is_tcp);
+                if (fr > 0)
+                    return fr;
+            }
             rh->flags = htons(DNS_QR | DNS_RCODE_REFUSED);
             rh->qdcount = htons(1);
             /* Copy question section so the client knows which query was refused */
@@ -6251,38 +6602,10 @@ typedef struct {
     char zone[256]; /* requested zone (AXFR/IXFR question name) */
 } axfr_conn_t;
 
+/* Thin wrapper kept for the AXFR call site; the matching logic lives once in
+ * ip_list_allowed() (CLAUDE-forwarder.md Gap 1). */
 static int axfr_ip_allowed(const struct in_addr *cip, const char *allow_list) {
-    char allow[1024];
-    safe_strcpy(allow, allow_list, sizeof(allow));
-    char *sp22 = NULL;
-    char *tok = strtok_r(allow, ",", &sp22);
-    while (tok) {
-        while (*tok == ' ')
-            tok++;
-        /* Simple exact match or /8-/32 CIDR */
-        char *slash = strchr(tok, '/');
-        if (slash) {
-            int bits = atoi(slash + 1);
-            *slash = 0;
-            if (bits < 0)
-                bits = 0;
-            if (bits > 32)
-                bits = 32;
-            struct in_addr net;
-            inet_pton(AF_INET, tok, &net);
-            uint32_t mask = bits ? htonl(~((1u << (32 - bits)) - 1)) : 0u;
-            if (bits == 32)
-                mask = 0xFFFFFFFFu;
-            if ((cip->s_addr & mask) == (net.s_addr & mask))
-                return 1;
-        } else {
-            struct in_addr a;
-            if (inet_pton(AF_INET, tok, &a) == 1 && a.s_addr == cip->s_addr)
-                return 1;
-        }
-        tok = strtok_r(NULL, ",", &sp22);
-    }
-    return 0;
+    return ip_list_allowed(allow_list, cip);
 }
 
 /* Send one DNS message over TCP (2-byte length prefix) */
@@ -6824,8 +7147,8 @@ static void *dot_thread(void *arg) {
         if (rlen < 0)
             break;
         if (rlen >= 4) {
-            uint8_t _rc = ntohs(get16(resp, 2)) & 0xF;
-            int _an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
+            uint8_t _rc = get16(resp, 2) & 0xF;
+            int _an = rlen >= 8 ? get16(resp, 6) : 0;
             qlog_write(cip, qn, qt, _rc, _an, _drtt, "dot");
         }
         uint8_t rlb[2];
@@ -6918,7 +7241,7 @@ static void handle_metrics(int fd) {
     pthread_mutex_lock(&g_stat_mutex);
     uint64_t sq = g_stat_queries, sn = g_stat_noerror, snx = g_stat_nxdomain, sr = g_stat_refused,
              ss = g_stat_servfail, rd = g_stat_rrl_drop, rt = g_stat_rrl_tc, ax = g_stat_axfr,
-             dd = g_stat_ddns, si = g_stat_signed;
+             dd = g_stat_ddns, si = g_stat_signed, fw = g_stat_forwarded, ff = g_stat_forward_fail;
     pthread_mutex_unlock(&g_stat_mutex);
     snprintf(body, sizeof(body),
              "# HELP dns_queries_total Total DNS queries received\n"
@@ -6943,16 +7266,24 @@ static void handle_metrics(int fd) {
              "# HELP dns_dnssec_signatures_total DNSSEC RRSIGs generated\n"
              "# TYPE dns_dnssec_signatures_total counter\n"
              "dns_dnssec_signatures_total %llu\n"
+             "# HELP dns_forward_total Out-of-zone queries forwarded by outcome\n"
+             "# TYPE dns_forward_total counter\n"
+             "dns_forward_total{result=\"ok\"}   %llu\n"
+             "dns_forward_total{result=\"fail\"} %llu\n"
              "# HELP dns_zone_serial Current SOA serial\n"
              "# TYPE dns_zone_serial gauge\n"
              "dns_zone_serial %u\n"
              "# HELP dns_rrl_enabled Whether RRL is active\n"
              "# TYPE dns_rrl_enabled gauge\n"
-             "dns_rrl_enabled %d\n",
+             "dns_rrl_enabled %d\n"
+             "# HELP dns_forward_enabled Whether out-of-zone forwarding is active\n"
+             "# TYPE dns_forward_enabled gauge\n"
+             "dns_forward_enabled %d\n",
              (unsigned long long) sq, (unsigned long long) sn, (unsigned long long) snx,
              (unsigned long long) sr, (unsigned long long) ss, (unsigned long long) rd,
              (unsigned long long) rt, (unsigned long long) ax, (unsigned long long) dd,
-             (unsigned long long) si, g_soa_serial, g_rrl_enabled);
+             (unsigned long long) si, (unsigned long long) fw, (unsigned long long) ff,
+             g_soa_serial, g_rrl_enabled, (g_forward_enabled && g_forward_allow[0]) ? 1 : 0);
     metrics_send(fd, 200, "text/plain; version=0.0.4", body);
 }
 
@@ -6999,6 +7330,126 @@ static int make_reuseport_udp_socket(int port) {
     return s;
 }
 
+/* ── UDP out-of-zone forwarding off the listener thread (CLAUDE-forwarder.md) ──
+ * A forwardable UDP query is handed to a short-lived detached worker so the
+ * upstream round-trip (up to forward_timeout_ms) never blocks the single-thread
+ * select() loop (nor stalls a SO_REUSEPORT worker's recv queue). The worker
+ * replies with sendto() on the shared listener fd — concurrent sendto on a UDP
+ * socket is safe. The in-flight count is capped so a dead upstream cannot
+ * accumulate threads. */
+typedef struct {
+    int sock;                 /* listener fd to reply on */
+    struct sockaddr_storage cli; /* client to reply to (v4 or v6) */
+    socklen_t clen;
+    struct in_addr cip; /* client v4 addr for RRL keying (0 = non-mapped v6) */
+    int plen;
+    uint8_t pkt[BUF_SIZE];
+} fwd_work_t;
+
+static void *fwd_worker_thread(void *arg) {
+    fwd_work_t *w = (fwd_work_t *) arg;
+    uint8_t resp[BUF_SIZE];
+    char cipstr[INET6_ADDRSTRLEN] = "?";
+    char qn[256] = "?";
+    uint16_t qt = 0;
+    int a = name_from_wire(w->pkt, w->plen, 12, qn, sizeof(qn));
+    if (a >= 0 && a + 1 < w->plen)
+        qt = get16(w->pkt, a);
+    if (w->cli.ss_family == AF_INET6)
+        inet_ntop(AF_INET6, &((struct sockaddr_in6 *) &w->cli)->sin6_addr, cipstr, sizeof(cipstr));
+    else
+        inet_ntop(AF_INET, &((struct sockaddr_in *) &w->cli)->sin_addr, cipstr, sizeof(cipstr));
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rlen = forward_query(w->pkt, w->plen, resp, sizeof(resp), 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+    if (rlen > 0) {
+        /* RRL covers forwarded responses too (Gap 3). */
+        int rrl_action = g_rrl_enabled ? rrl_check(&w->cip, qn) : 0;
+        if (rrl_action == 1) {
+            dns_log(LOG_DEBUG, "[RRL] DROP fwd %s %s\n", type2str(qt), qn);
+            STAT_INC(g_stat_rrl_drop);
+        } else {
+            if (rrl_action == 2) {
+                /* Truncate to header+question so the client retries over TCP. */
+                dns_log(LOG_DEBUG, "[RRL] TC fwd %s %s\n", type2str(qt), qn);
+                STAT_INC(g_stat_rrl_tc);
+                dns_hdr_t *rh = (dns_hdr_t *) resp;
+                rh->flags = htons(ntohs(rh->flags) | DNS_TC);
+                rh->ancount = rh->nscount = rh->arcount = 0;
+                int qa = name_from_wire(resp, rlen, 12, qn, sizeof(qn));
+                rlen = (qa > 0) ? 12 + (qa - 12) + 4 : 12;
+            }
+            sendto(w->sock, resp, (size_t) rlen, 0, (struct sockaddr *) &w->cli, w->clen);
+            uint8_t rc = rlen >= 4 ? (get16(resp, 2) & 0xF) : 2;
+            int an = rlen >= 8 ? get16(resp, 6) : 0;
+            qlog_write(cipstr, qn, qt, rc, an, rtt, "fwd");
+        }
+    }
+    pthread_mutex_lock(&g_fwd_mutex);
+    g_fwd_inflight--;
+    pthread_mutex_unlock(&g_fwd_mutex);
+    free(w);
+    return NULL;
+}
+
+/* Reply SERVFAIL directly on the listener fd (used when we can't dispatch). */
+static void fwd_servfail_now(int sock, const uint8_t *pkt, int plen, const struct sockaddr *cli,
+                             socklen_t clen) {
+    uint8_t sf[512];
+    int n = fwd_servfail(pkt, plen, sf, sizeof(sf));
+    if (n > 0)
+        sendto(sock, sf, (size_t) n, 0, cli, clen);
+    STAT_INC(g_stat_forward_fail);
+}
+
+/* If this raw UDP query should be forwarded, dispatch it to a worker thread (or
+ * answer SERVFAIL when over the in-flight cap / on failure) and return 1. Return
+ * 0 when the caller should keep handling the query normally. */
+static int forward_dispatch_udp(int sock, const uint8_t *pkt, int plen, const struct sockaddr *cli,
+                                socklen_t clen, const struct in_addr *cip) {
+    if (!forward_should(pkt, plen, cip))
+        return 0;
+    if (plen > (int) BUF_SIZE)
+        return 0; /* shouldn't happen; let the normal path REFUSE it */
+    pthread_mutex_lock(&g_fwd_mutex);
+    int over = (g_fwd_inflight >= FWD_MAX_INFLIGHT);
+    if (!over)
+        g_fwd_inflight++;
+    pthread_mutex_unlock(&g_fwd_mutex);
+    if (over) {
+        dns_log(LOG_WARNING, "[FORWARD] in-flight cap (%d) reached — SERVFAIL\n", FWD_MAX_INFLIGHT);
+        fwd_servfail_now(sock, pkt, plen, cli, clen);
+        return 1;
+    }
+    fwd_work_t *w = malloc(sizeof(*w));
+    if (!w) {
+        pthread_mutex_lock(&g_fwd_mutex);
+        g_fwd_inflight--;
+        pthread_mutex_unlock(&g_fwd_mutex);
+        fwd_servfail_now(sock, pkt, plen, cli, clen);
+        return 1;
+    }
+    w->sock = sock;
+    memcpy(&w->cli, cli, clen);
+    w->clen = clen;
+    w->cip = *cip;
+    w->plen = plen;
+    memcpy(w->pkt, pkt, (size_t) plen);
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, fwd_worker_thread, w) != 0) {
+        free(w);
+        pthread_mutex_lock(&g_fwd_mutex);
+        g_fwd_inflight--;
+        pthread_mutex_unlock(&g_fwd_mutex);
+        fwd_servfail_now(sock, pkt, plen, cli, clen);
+        return 1;
+    }
+    pthread_detach(tid);
+    return 1;
+}
+
 /* Parse, log, resolve one IPv4 UDP query. Returns response length (0 = drop).
  * Shared by the per-packet and the recvmmsg/sendmmsg worker loops. */
 static int udp_serve_one(const uint8_t *pkt, int nn, const struct sockaddr_in *cli, uint8_t *resp,
@@ -7017,8 +7468,8 @@ static int udp_serve_one(const uint8_t *pkt, int nn, const struct sockaddr_in *c
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
     if (rlen > 0) {
-        uint8_t rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
-        int an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
+        uint8_t rc = rlen >= 4 ? (get16(resp, 2) & 0xF) : 2;
+        int an = rlen >= 8 ? get16(resp, 6) : 0;
         qlog_write(cip, qn, qt, rc, an, rtt, "udp");
     }
     return rlen;
@@ -7039,6 +7490,11 @@ static void *udp_worker_thread(void *arg) {
             socklen_t clen = sizeof(cli);
             ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
             if (nn <= 0)
+                continue;
+            /* Out-of-zone forward → off-thread, so a slow upstream cannot stall
+             * this worker's recv queue. */
+            if (forward_dispatch_udp(w->sock, pkt, (int) nn, (struct sockaddr *) &cli, clen,
+                                     &cli.sin_addr))
                 continue;
             int rlen = udp_serve_one(pkt, (int) nn, &cli, resp, sizeof(resp));
             if (rlen > 0)
@@ -7088,6 +7544,11 @@ static void *udp_worker_thread(void *arg) {
         for (int i = 0; i < n; i++) {
             int nn = (int) rxmsgs[i].msg_len;
             if (nn <= 0)
+                continue;
+            /* Forwardable queries are dispatched off-thread (they reply
+             * themselves) and excluded from this sendmmsg batch. */
+            if (forward_dispatch_udp(w->sock, rxbuf[i], nn, (struct sockaddr *) &addrs[i],
+                                     sizeof(addrs[i]), &addrs[i].sin_addr))
                 continue;
             int rlen = udp_serve_one(rxbuf[i], nn, &addrs[i], txbuf[nt], BUF_SIZE);
             if (rlen <= 0)
@@ -7341,6 +7802,8 @@ int main(int argc, char **argv) {
             g_tsig_secret_len ? "enabled" : "disabled");
     dns_log(LOG_INFO, "║  RRL                                        %s (rate=%d/win=%ds)  ║\n",
             g_rrl_enabled ? "enabled" : "disabled", g_rrl_rate, g_rrl_window);
+    dns_log(LOG_INFO, "║  Forwarding (out-of-zone)                   %s               ║\n",
+            (g_forward_enabled && g_forward_allow[0]) ? "ENABLED " : "disabled");
     dns_log(LOG_INFO, "║  DNS Cookies                                enabled               ║\n");
     dns_log(LOG_INFO, "║  NSID                                       %-20s       ║\n", g_nsid);
     dns_log(LOG_INFO, "║  Authenticated denial                       %s                ║\n",
@@ -7453,7 +7916,10 @@ int main(int argc, char **argv) {
             struct sockaddr_in cli;
             socklen_t clen = sizeof(cli);
             ssize_t nn = recvfrom(dns_sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
-            if (nn > 0) {
+            if (nn > 0 && forward_dispatch_udp(dns_sock, pkt, (int) nn, (struct sockaddr *) &cli,
+                                               clen, &cli.sin_addr)) {
+                /* forwarded off-thread; nothing more to do in the select loop */
+            } else if (nn > 0) {
                 char cip2[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &cli.sin_addr, cip2, sizeof(cip2));
                 char qn[256] = "?";
@@ -7470,8 +7936,8 @@ int main(int argc, char **argv) {
                                     (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
                 if (rlen > 0) {
                     sendto(dns_sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
-                    uint8_t _rc = rlen >= 4 ? (ntohs(get16(resp, 2)) & 0xF) : 2;
-                    int _an = rlen >= 8 ? ntohs(get16(resp, 6)) : 0;
+                    uint8_t _rc = rlen >= 4 ? (get16(resp, 2) & 0xF) : 2;
+                    int _an = rlen >= 8 ? get16(resp, 6) : 0;
                     qlog_write(cip2, qn, qt, _rc, _an, _rtt, "udp");
                 }
             }
@@ -7493,10 +7959,16 @@ int main(int argc, char **argv) {
                 if (a6 >= 0 && a6 + 1 < (int) nn6)
                     qt6 = get16(pkt6, a6);
                 dns_log(LOG_DEBUG, "[DNS6] %s  %s %s\n", cip6, type2str(qt6), qn6);
-                /* Map IPv4-mapped addresses for cookie/logging */
+                /* Map IPv4-mapped addresses for cookie/logging/ACL. The forward
+                 * ACL is IPv4-only, so a non-mapped v6 client (dummy4 == 0) will
+                 * never match it and falls through to the normal path (fail
+                 * closed). */
                 struct in_addr dummy4 = {.s_addr = 0};
                 if (IN6_IS_ADDR_V4MAPPED(&cli6.sin6_addr))
                     memcpy(&dummy4, ((uint8_t *) &cli6.sin6_addr) + 12, 4);
+                if (forward_dispatch_udp(dns6_sock, pkt6, (int) nn6, (struct sockaddr *) &cli6, cl6,
+                                         &dummy4))
+                    continue;
                 struct timespec _t0, _t1;
                 clock_gettime(CLOCK_MONOTONIC, &_t0);
                 int rlen6 = dns_process(pkt6, (int) nn6, resp6, sizeof(resp6), 0, &dummy4);
@@ -7505,8 +7977,8 @@ int main(int argc, char **argv) {
                                      (_t1.tv_nsec - _t0.tv_nsec) / 1000L);
                 if (rlen6 > 0) {
                     sendto(dns6_sock, resp6, rlen6, 0, (struct sockaddr *) &cli6, cl6);
-                    uint8_t _rc6 = rlen6 >= 4 ? (ntohs(get16(resp6, 2)) & 0xF) : 2;
-                    int _an6 = rlen6 >= 8 ? ntohs(get16(resp6, 6)) : 0;
+                    uint8_t _rc6 = rlen6 >= 4 ? (get16(resp6, 2) & 0xF) : 2;
+                    int _an6 = rlen6 >= 8 ? get16(resp6, 6) : 0;
                     qlog_write(cip6, qn6, qt6, _rc6, _an6, _rtt6, "udp6");
                 }
             }
