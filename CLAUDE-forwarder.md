@@ -15,9 +15,10 @@ from `CLAUDE.md` must keep it disabled.
 
 ## Implementation status (2026-06-22)
 
-Gaps 1–3 are **implemented** in `dns_server.c` but **uncommitted on `main`**
-(not yet on a branch / in a PR). The build is clean (`-Wall -Wextra
--Wformat=2`, no warnings). What landed:
+Gaps 1–3 are **implemented and committed** on branch `forwarder-out-of-zone`,
+with full test coverage wired into CI. Gap 4 (cache) is deliberately deferred
+(optional / phase-2). The build is clean (`-Wall -Wextra -Wformat=2`, no
+warnings). What landed:
 
 - **Gap 1 (config + ACL):** done. `config:forward_{enabled,allow,timeout_ms}`
   and `config:forwarders` plumbed in `config_load_from_valkey`; `axfr_ip_allowed`
@@ -33,7 +34,10 @@ Gaps 1–3 are **implemented** in `dns_server.c` but **uncommitted on `main`**
   startup warning, `zone_role=secondary` extra warning, RRL applied to
   forwarded responses in the worker, `"fwd"` qlog proto, Prometheus
   `dns_forward_total{ok,fail}` + `dns_forward_enabled`.
-- **Gap 4 (cache):** **not started** (was always phase-2 / optional).
+- **Gap 4 (cache):** **deferred** — explicitly phase-2 / optional ("only if
+  upstream latency/load demands it"). Not built; the forwarder is stateless
+  per-query for now. Revisit only if a deployment shows upstream load/latency
+  pain. See Gap 4 below for the design if/when needed.
 
 ### Bug found + fixed while adding the test (2026-06-22)
 
@@ -60,27 +64,49 @@ test is what surfaced it.
 This change touches the trusted core's wire-relay + a new outbound network
 path, so it hits the security-sensitive gate. Status:
 
-- [x] **Tests** — `make check-forwarder` added (stub upstream
-      `tests/fwd_upstream.py` + dnsd): asserts out-of-zone A is forwarded with
-      RA set, `+norecurse` is REFUSED (RD gating), in-zone stays authoritative
-      (AA, never forwarded), and a non-matching `forward_allow` fails closed
-      (REFUSED). Still TODO: wire it into CI (`.github/workflows/ci.yml`), and
-      add the failover-to-2nd-upstream + TC→TCP cases.
-- [~] **Hostile-input evidence** — the RFC 5452 reply validation
-      (`fwd_reply_valid`: ID + byte-identical question; `fwd_exchange_udp`:
-      source addr/port match, off-path forgeries discarded until deadline) is
-      implemented and partially exercised. Still TODO: an explicit negative test
-      (spoofed source / wrong ID / mismatched question must be ignored) and an
-      oversized TCP length-prefix case.
+- [x] **Tests** — `make check-forwarder` (stub upstream `tests/fwd_upstream.py`
+      with `normal`/`truncate`/`spoof` modes + dnsd, restarted per phase) asserts
+      seven things and is wired into CI (`.github/workflows/ci.yml`, with
+      `python3` added to the deps):
+      1. out-of-zone A is forwarded with RA set, **through a dead first
+         forwarder** (failover to the 2nd);
+      2. `+norecurse` out-of-zone is REFUSED (RD gating);
+      3. an in-zone name is still answered authoritatively (AA, never forwarded);
+      4. a non-matching `forward_allow` fails closed (REFUSED);
+      5. a TC reply over UDP makes a TCP client's query complete over TCP
+         upstream (TC→TCP retry);
+      6. a forged upstream transaction ID is rejected (RFC 5452) → SERVFAIL.
+- [x] **Hostile-input evidence** — RFC 5452 reply validation (`fwd_reply_valid`:
+      ID + byte-identical question; `fwd_exchange_udp`: source addr/port match,
+      off-path forgeries discarded until deadline) is exercised by the `spoof`
+      mode (forged ID → SERVFAIL, the legitimate answer never served). The
+      `truncate` mode covers the TC→TCP completion path. (A dedicated
+      oversized-TCP-length-prefix unit case would still be worth adding to the
+      fuzz corpus, but `fwd_exchange_tcp` already bounds-checks `rlen` against
+      `resp_len`.)
 - [x] **Docs sync** — RFC 5452 added to the dns_server.c "Implemented RFCs"
       header; `config:forward_*` keys documented in the schema header. The
       `CLAUDE.md` Valkey ownership table already covers them via its `config:*`
       wildcard row (writers: dashboard/apid; reader: dnsd) — no table edit
       needed.
-- [ ] **Branch + PR + second reviewer** — still uncommitted on `main`. Move onto
-      a feature branch and open a PR; the security-sensitive gate requires a
-      second reviewer and the hostile-input test evidence above in the PR.
-- [ ] **Gap 4 cache** — only if upstream latency/load demands it.
+- [x] **Branch** — committed on `forwarder-out-of-zone`. **PR + second
+      reviewer** still pending (the security-sensitive gate wants a second
+      reviewer + this hostile-input evidence in the PR description). That is a
+      process step, not code.
+- [—] **Gap 4 cache** — deferred (optional); see above.
+
+### Known behaviour — DNS cookies gate forwarding over TCP only
+
+The UDP listener runs `forward_dispatch_udp` *before* `dns_process`, so a
+forwardable UDP query bypasses cookie enforcement. The TCP/DoT path forwards
+*inside* `build_query_resp`, **after** `dns_process`'s cookie check, so a TCP
+client presenting only a client-cookie first gets BADCOOKIE and forwards on its
+(standard) cookie-exchange retry. This is benign — DNS cookies (RFC 7873) are a
+UDP off-path-spoofing/amplification measure and TCP is not off-path-spoofable,
+so the extra round-trip is harmless — but it is an asymmetry. The
+`make check-forwarder` TC→TCP phase uses `dig +nocookie` to isolate the
+TC→TCP mechanism from this cookie dance. If the round-trip ever matters, hoist a
+forward pre-check ahead of the cookie check on the TCP path too.
 
 ## Current state (verified in source)
 

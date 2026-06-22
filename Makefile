@@ -438,54 +438,77 @@ check-catalog: $(BIN_DEBUG)
 	 test -z "$$A2" || { echo "  FAIL  member still served after PTR removed ($$A2)"; exit 1; }; \
 	 echo "  OK  member provisioned+signed, then deprovisioned on PTR removal"
 
-# Out-of-zone forwarding (CLAUDE-forwarder.md). Bring up a stub upstream
-# (tests/fwd_upstream.py, answers any A with a fixed address) and a dnsd
-# configured to forward out-of-zone queries to it for localhost clients, then
-# assert: (1) an out-of-zone A is relayed with RA set; (2) +norecurse is REFUSED
-# (RD gating); (3) an in-zone name is still answered authoritatively (AA, never
-# forwarded); (4) fail-closed — with a non-matching forward_allow the same
-# out-of-zone query is REFUSED. Needs Valkey + dig + valkey-cli + python3; uses
-# throwaway config keys and restores forwarding config afterward.
-FWD_UP_PORT ?= 5399
+# Out-of-zone forwarding (CLAUDE-forwarder.md). Bring up three stub upstreams
+# (tests/fwd_upstream.py: a normal responder, a truncate-only responder, and a
+# spoofing responder) and a dnsd configured to forward out-of-zone queries to
+# them for localhost clients, then assert, restarting dnsd per phase so each
+# reads fresh config:
+#   1. forward + RA, *through* a dead first forwarder (failover to the 2nd);
+#   2. +norecurse out-of-zone is REFUSED (RD gating);
+#   3. an in-zone name is still answered authoritatively (AA, never forwarded);
+#   4. fail-closed — a non-matching forward_allow REFUSEs the same query;
+#   5. TC over UDP makes a TCP client's query complete over TCP upstream;
+#   6. a forged upstream transaction ID is rejected (RFC 5452) -> SERVFAIL.
+# Needs Valkey + dig + valkey-cli + python3; uses throwaway config keys and
+# restores the forwarding config afterward.
 check-forwarder: $(BIN_DEBUG)
-	@echo "  CHECK  out-of-zone forwarding (requires Valkey + dig + python3)"
+	@echo "  CHECK  out-of-zone forwarding + failover + TC->TCP + RFC 5452 anti-spoof"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
-	 UP=$(FWD_UP_PORT); ANS=203.0.113.45; QN=forwarded.example.net;                    \
+	 ANS=203.0.113.45; QN=forwarded.example.net;                                       \
+	 NORM=5399; TRUNC=5397; SPOOF=5396; DEAD=5398;                                     \
 	 SAVE_EN=$$($$VC get config:forward_enabled);                                      \
 	 SAVE_FW=$$($$VC get config:forwarders);                                           \
 	 SAVE_AL=$$($$VC get config:forward_allow);                                        \
-	 python3 tests/fwd_upstream.py 127.0.0.1 $$UP $$ANS > /tmp/fwd_up.log 2>&1 &        \
-	 UP_PID=$$!;                                                                       \
+	 SAVE_TO=$$($$VC get config:forward_timeout_ms);                                   \
+	 python3 tests/fwd_upstream.py 127.0.0.1 $$NORM  $$ANS normal   >/tmp/fwd_norm.log  2>&1 & P1=$$!; \
+	 python3 tests/fwd_upstream.py 127.0.0.1 $$TRUNC $$ANS truncate >/tmp/fwd_trunc.log 2>&1 & P2=$$!; \
+	 python3 tests/fwd_upstream.py 127.0.0.1 $$SPOOF $$ANS spoof    >/tmp/fwd_spoof.log 2>&1 & P3=$$!; \
 	 $$VC set config:forward_enabled 1 >/dev/null;                                     \
-	 $$VC set config:forwarders 127.0.0.1:$$UP >/dev/null;                             \
+	 $$VC set config:forward_timeout_ms 600 >/dev/null;                                \
+	 sleep 0.3;                                                                        \
 	 $$VC set config:forward_allow 127.0.0.0/8 >/dev/null;                             \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd.log 2>&1 &              \
-	 DNS_PID=$$!;                                                                      \
+	 $$VC set config:forwarders 127.0.0.1:$$DEAD,127.0.0.1:$$NORM >/dev/null;          \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd1.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 FWD=$$(dig @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1);                           \
+	 FWD=$$(dig +nocookie @127.0.0.1 -p 5353 $$QN A +time=3 +tries=1);                 \
 	 FWD_A=$$(echo "$$FWD" | awk '/^'$$QN'\./ && $$4=="A"{print $$5; exit}');          \
-	 FWD_RA=$$(echo "$$FWD" | grep -c ' ra;\| ra,\|flags:.* ra');                      \
+	 FWD_RA=$$(echo "$$FWD" | grep -Ec 'flags:.* ra');                                 \
 	 NR=$$(dig @127.0.0.1 -p 5353 $$QN A +norecurse +time=2 +tries=1 | grep -c 'status: REFUSED'); \
-	 IN=$$(dig @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'flags:.* aa'); \
-	 kill $$DNS_PID 2>/dev/null || true; sleep 0.3;                                    \
+	 IN=$$(dig @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -Ec 'flags:.* aa'); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:forward_allow 192.0.2.0/24 >/dev/null;                            \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd2.log 2>&1 &             \
-	 DNS_PID2=$$!;                                                                     \
+	 $$VC set config:forwarders 127.0.0.1:$$NORM >/dev/null;                           \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd2.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
 	 CLOSED=$$(dig @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | grep -c 'status: REFUSED'); \
-	 kill $$DNS_PID2 $$UP_PID 2>/dev/null || true;                                     \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC set config:forward_allow 127.0.0.0/8 >/dev/null;                             \
+	 $$VC set config:forwarders 127.0.0.1:$$TRUNC >/dev/null;                          \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd3.log 2>&1 & DNS=$$!;    \
+	 sleep 1.5;                                                                        \
+	 TCPA=$$(dig +tcp +nocookie @127.0.0.1 -p 5353 $$QN A +time=3 +tries=1 | awk '/^'$$QN'\./ && $$4=="A"{print $$5; exit}'); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC set config:forwarders 127.0.0.1:$$SPOOF >/dev/null;                          \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd4.log 2>&1 & DNS=$$!;    \
+	 sleep 1.5;                                                                        \
+	 SPOOFED=$$(dig +nocookie @127.0.0.1 -p 5353 $$QN A +time=3 +tries=1 | grep -c 'status: SERVFAIL'); \
+	 kill $$DNS $$P1 $$P2 $$P3 2>/dev/null || true;                                    \
 	 if [ -n "$$SAVE_EN" ]; then $$VC set config:forward_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:forward_enabled >/dev/null; fi; \
 	 if [ -n "$$SAVE_FW" ]; then $$VC set config:forwarders "$$SAVE_FW" >/dev/null; else $$VC del config:forwarders >/dev/null; fi; \
 	 if [ -n "$$SAVE_AL" ]; then $$VC set config:forward_allow "$$SAVE_AL" >/dev/null; else $$VC del config:forward_allow >/dev/null; fi; \
-	 echo "  forwarded: A=[$$FWD_A] ra=$$FWD_RA  norecurse_refused=$$NR  in_zone_aa=$$IN  failclosed_refused=$$CLOSED"; \
-	 test "$$FWD_A" = "$$ANS" || { echo "  FAIL  out-of-zone query not forwarded (expected $$ANS)"; exit 1; }; \
+	 if [ -n "$$SAVE_TO" ]; then $$VC set config:forward_timeout_ms "$$SAVE_TO" >/dev/null; else $$VC del config:forward_timeout_ms >/dev/null; fi; \
+	 echo "  forward+failover: A=[$$FWD_A] ra=$$FWD_RA  norecurse_refused=$$NR  in_zone_aa=$$IN"; \
+	 echo "  fail-closed_refused=$$CLOSED  tc->tcp A=[$$TCPA]  spoofed_id_servfail=$$SPOOFED"; \
+	 test "$$FWD_A" = "$$ANS" || { echo "  FAIL  out-of-zone not forwarded / failover broken (expected $$ANS)"; exit 1; }; \
 	 test "$$FWD_RA" -ge 1   || { echo "  FAIL  forwarded reply missing RA flag"; exit 1; }; \
 	 test "$$NR" -ge 1       || { echo "  FAIL  +norecurse out-of-zone not REFUSED"; exit 1; }; \
 	 test "$$IN" -ge 1       || { echo "  FAIL  in-zone query no longer authoritative (AA)"; exit 1; }; \
 	 test "$$CLOSED" -ge 1   || { echo "  FAIL  fail-closed: out-of-ACL client was not REFUSED"; exit 1; }; \
-	 echo "  OK  forward+RA, RD-gating, in-zone AA preserved, out-of-ACL fail-closed"
+	 test "$$TCPA" = "$$ANS"  || { echo "  FAIL  TC->TCP: TCP client did not get the full forwarded answer"; exit 1; }; \
+	 test "$$SPOOFED" -ge 1  || { echo "  FAIL  RFC 5452: forged upstream ID was not rejected (expected SERVFAIL)"; exit 1; }; \
+	 echo "  OK  forward+RA, failover, RD-gating, in-zone AA, fail-closed, TC->TCP, anti-spoof"
 
 # resolverd smoke: bring up dnsd (authoritative upstream) and resolverd (caching
 # proxy, default LISTEN_PORT 5354 → upstream 127.0.0.1:5353/udp), then resolve

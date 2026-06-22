@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev libseccomp-dev clang dnsutils
+          sudo apt-get install -y build-essential libssl-dev libseccomp-dev clang dnsutils python3
 
       - name: Build debug (ASan + UBSan) — compile/link check
         run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
@@ -85,6 +85,12 @@ jobs:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-resolverd OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Out-of-zone forwarding (failover + TC→TCP + RFC 5452 anti-spoof)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-forwarder OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
   warnings:
     name: Warnings as errors
