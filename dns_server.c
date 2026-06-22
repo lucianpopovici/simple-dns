@@ -74,6 +74,11 @@
  *   config:lb_mode             A/AAAA RRset rotation: none (default) | rr
  *                              (round-robin) | random. Local serving policy
  *                              only — not zone data, never travels in AXFR/IXFR.
+ *   config:dot_require_client_cert  "1" to require a verified client cert (mTLS)
+ *                              on the DoT/transfer listener (needs
+ *                              config:mtls_ca_pem). Default 0 — keep OFF on
+ *                              public instances; ON on a hidden master to gate
+ *                              AXFR/IXFR to the secondaries only.
  *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
@@ -612,6 +617,12 @@ static void qlog_open(void) {
 static char g_tls_cert_pem[MAX_PEM] = "";
 static char g_tls_key_pem[MAX_PEM] = "";
 static char g_mtls_ca_pem[MAX_PEM] = "";
+/* config:dot_require_client_cert — when 1 (and config:mtls_ca_pem is set), the
+ * DoT/transfer listener requires a verified client cert (mTLS). OFF by default:
+ * a public-facing instance shares the DoT port with ordinary RFC 7858 clients
+ * that present no cert. On a hidden master (only secondaries connect) it can be
+ * switched on globally to lock down AXFR/IXFR (hidden-master plan Gap 1). */
+static int g_dot_require_client_cert = 0;
 
 /* SOA parameters */
 static char g_soa_mname[256] = "ns1.example.local";
@@ -2130,6 +2141,8 @@ static void config_load_from_valkey(void) {
     vk_get("config:tls_cert_pem", g_tls_cert_pem, sizeof(g_tls_cert_pem));
     vk_get("config:tls_key_pem", g_tls_key_pem, sizeof(g_tls_key_pem));
     vk_get("config:mtls_ca_pem", g_mtls_ca_pem, sizeof(g_mtls_ca_pem));
+    g_dot_require_client_cert = 0;
+    GI("dot_require_client_cert", g_dot_require_client_cert);
     /* Console (stdout/stderr) level — env CONSOLE_LEVEL overrides config. */
     if (vk_get("config:console_level", val, sizeof(val)) && val[0])
         g_console_level = syslog_level_from_str(val);
@@ -2274,7 +2287,19 @@ static void tls_reload(void) {
         SSL_CTX_free(g_dot_ctx);
         g_dot_ctx = NULL;
     }
-    g_dot_ctx = tls_ctx_from_pem(g_tls_cert_pem, g_tls_key_pem, NULL, 0);
+    /* mTLS on the DoT/transfer listener (hidden-master plan Gap 1): require a
+     * verified client cert only when explicitly enabled AND a CA is configured —
+     * otherwise stay open for ordinary RFC 7858 clients (fail safe: a missing CA
+     * never silently locks out clients). */
+    int dot_mtls = (g_dot_require_client_cert && g_mtls_ca_pem[0]);
+    g_dot_ctx =
+        tls_ctx_from_pem(g_tls_cert_pem, g_tls_key_pem, dot_mtls ? g_mtls_ca_pem : NULL, dot_mtls);
+    if (g_dot_require_client_cert && !g_mtls_ca_pem[0])
+        dns_log(LOG_WARNING, "[DoT] dot_require_client_cert=1 but config:mtls_ca_pem is empty — "
+                             "client-cert verification NOT enforced (no CA to verify against)\n");
+    else if (dot_mtls)
+        dns_log(LOG_NOTICE,
+                "[DoT] client-cert verification REQUIRED (mTLS) on the DoT/transfer listener\n");
     /* RFC 7858 §3.2: advertise "dot" ALPN on the DoT listener */
     if (g_dot_ctx) {
         static const uint8_t dot_alpn[] = {3, 'd', 'o', 't'};
@@ -2451,7 +2476,7 @@ static void keyspace_apply(const char *key) {
         seed_primary_zone(); /* propagate SOA/zone config edits to the primary zone */
         zones_post_load();   /* re-apply per-zone NSEC3 config; load keys for new zones */
         catalog_scan_all();  /* per-zone catalog config may have changed (RFC 9432) */
-        if (strstr(key, "tls_") || strstr(key, "mtls_"))
+        if (strstr(key, "tls_") || strstr(key, "mtls_") || strstr(key, "dot_require_client_cert"))
             tls_reload();
         dns_log(LOG_INFO, "[Reload] config applied after %s change\n", key);
     } else if (strncmp(key, "zone_table:", 11) == 0) {
@@ -7978,6 +8003,8 @@ int main(int argc, char **argv) {
             g_dns_port);
     dns_log(LOG_INFO, "║  DoT  TCP DNS-over-TLS + AXFR              :%d  %s           ║\n",
             g_dot_port, g_dot_ctx ? "TLS " : "----");
+    dns_log(LOG_INFO, "║  DoT client-cert (mTLS) required            %-20s       ║\n",
+            (g_dot_require_client_cert && g_mtls_ca_pem[0]) ? "yes" : "no");
     dns_log(LOG_INFO, "║  metrics/health (localhost, read-only)     :%d                   ║\n",
             g_metrics_port);
     dns_log(LOG_INFO, "║  DoH + management API now served by apid                          ║\n");
