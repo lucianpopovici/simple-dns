@@ -4682,8 +4682,12 @@ static void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
         if (rtype == DNS_TYPE_OPT) {
             ei->present = 1;
             ei->max_udp = get16(pkt, off + 2);
+            /* OPT RR TTL field (RFC 6891 §6.1.3): ext-RCODE(off+4) | VERSION
+             * (off+5) | flags(off+6,off+7). DO is the top bit of the 2-octet
+             * flags, i.e. off+6 — NOT off+4 (that is the extended RCODE, always
+             * 0 here, which silently disabled DNSSEC for every live query). */
             ei->version = pkt[off + 5];
-            ei->do_bit = (pkt[off + 4] & 0x80) ? 1 : 0;
+            ei->do_bit = (pkt[off + 6] & 0x80) ? 1 : 0;
             uint16_t rdlen = get16(pkt, off + 8);
             int rp = off + 10;
             while (rp + 4 <= off + 10 + rdlen && rp + 4 <= plen) {

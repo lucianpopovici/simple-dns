@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -384,6 +384,23 @@ check: $(BIN_DEBUG)
 	 dig @127.0.0.1 -p 5353 example.local A   \
 	     +time=2 +tries=1 +short;             \
 	 kill $$DNS_PID 2>/dev/null || true
+
+# Live DNSSEC regression (guards the EDNS DO-bit parse, RFC 6891 §6.1.3). A
+# query with the DO bit set must return RRSIGs; the same query WITHOUT DO must
+# not. A misparsed DO bit silently strips DNSSEC from every live response while
+# the unit tests (check-dnssec) still pass — so this exercises the live path.
+# Needs Valkey + dig.
+check-dnssec-live: $(BIN_DEBUG)
+	@echo "  CHECK  live DNSSEC DO-bit honoured (requires Valkey + dig)"
+	@ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dolive.log 2>&1 & DNS=$$!;  \
+	 sleep 1.5;                                                                        \
+	 DO=$$(dig +dnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 NODO=$$(dig +nodnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 echo "  +dnssec RRSIGs=$$DO   +nodnssec RRSIGs=$$NODO";                           \
+	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
+	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
+	 echo "  OK  RRSIGs returned iff the DO bit is set"
 
 # RFC 7344 regression: the CDS RRset must equal the DS the zone publishes, and
 # CDNSKEY must equal the zone's KSK DNSKEY(s). Guards against CDS/CDNSKEY drifting
