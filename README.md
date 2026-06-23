@@ -107,8 +107,10 @@ glance:
   alongside the current one before the signer switches, and the old key is
   retired only after old signatures expire from caches — so a validator always
   holds the key its RRSIG points at.
-- **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, journal-based
-  diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007). A
+- **Dynamic operation**: NOTIFY (1996) — TSIG-signed and retried in the
+  background until the secondary acknowledges — AXFR (5936), IXFR (1995,
+  journal-based diffs), UPDATE (2136) with TSIG (8945) and the zone-authority
+  check (3007). A
   lease-expiry sweeper turns a silently-expiring `ddns:*` lease into a real
   replicated deletion (serial bump + IXFR delete + NOTIFY) so secondaries don't
   keep serving a dead workload's name.
