@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ptr check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -628,6 +628,56 @@ check-ddns-acl: $(BIN_DEBUG)
 	 test -n "$$S1" -a "$$S1" = "$$S2" || { echo "  FAIL  refresh (same IP) churned the serial ($$S1 -> $$S2)"; exit 1; }; \
 	 test "$$S3" != "$$S2" || { echo "  FAIL  changed IP did not bump the serial ($$S2 -> $$S3)"; exit 1; }; \
 	 echo "  OK  suffix ACL enforced; refresh is serial-neutral; real change bumps serial"
+
+# PTR / reverse zones (CLAUDE-discovery.md Gap 4). Configures a reverse zone
+# 0.0.10.in-addr.arpa and checks four things: (1) a statically-provisioned
+# zone:<rev>:PTR:* answers a PTR query; (2) with config:ddns_auto_ptr=1 a forward
+# A UPDATE auto-creates the matching reverse PTR lease; (3) both PTR records
+# travel in an AXFR of the reverse zone (static via zone:, lease via ddns:);
+# (4) deleting the forward A retracts the auto-PTR. Needs Valkey + dig + nsupdate.
+check-ptr: $(BIN_DEBUG)
+	@echo "  CHECK  PTR/reverse zones: serve + auto-PTR + AXFR + retract (Valkey + dig + nsupdate)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
+	 FWD=example.local; REV=0.0.10.in-addr.arpa;                                       \
+	 HOST=ptrhost.dyn.$$FWD; IP=10.0.0.42; REVNAME=42.0.0.10.in-addr.arpa;             \
+	 STATREV=99.0.0.10.in-addr.arpa; STATTGT=static.$$FWD;                             \
+	 REV6=8.b.d.0.1.0.0.2.ip6.arpa; HOST6=ptr6.dyn.$$FWD; IP6=2001:db8::5;             \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_AP=$$($$VC get config:ddns_auto_ptr); \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
+	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 $$VC set config:ddns_auto_ptr 1 >/dev/null;                                       \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
+	 $$VC set zone_table:$$REV "ns1.$$REV|hostmaster.$$REV|10|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set zone_table:$$REV6 "ns1.$$REV6|hostmaster.$$REV6|10|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set zone:$$REV:PTR:$$STATREV "120|$$STATTGT" >/dev/null;                     \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ptr.log 2>&1 & DNS=$$!;     \
+	 sleep 1.5;                                                                        \
+	 STAT=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$STATREV PTR +time=2 +tries=1 | head -1); \
+	 printf 'server 127.0.0.1 5353\nzone %s\nupdate add %s 60 A %s\nsend\n' "$$FWD" "$$HOST" "$$IP" | nsupdate >/dev/null 2>&1; \
+	 printf 'server 127.0.0.1 5353\nzone %s\nupdate add %s 60 AAAA %s\nsend\n' "$$FWD" "$$HOST6" "$$IP6" | nsupdate >/dev/null 2>&1; \
+	 sleep 0.3;                                                                        \
+	 AUTO=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$REVNAME PTR +time=2 +tries=1 | head -1); \
+	 AX=$$(dig +nocookie @127.0.0.1 -p 5353 $$REV AXFR +time=3 +tries=1 | awk '$$4=="PTR"{print $$1" "$$5}'); \
+	 AUTO6=$$(dig +nocookie @127.0.0.1 -p 5353 $$REV6 AXFR +time=3 +tries=1 | awk '$$4=="PTR"{print $$5}' | head -1); \
+	 printf 'server 127.0.0.1 5353\nzone %s\nupdate delete %s A\nsend\n' "$$FWD" "$$HOST" | nsupdate >/dev/null 2>&1; \
+	 sleep 0.3;                                                                        \
+	 GONE=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$REVNAME PTR +time=2 +tries=1 | head -1); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone_table:$$REV zone_table:$$REV6 zone:$$REV:PTR:$$STATREV ddns:$$REV:PTR:$$REVNAME ddns:$$FWD:A:$$HOST ddns:$$FWD:AAAA:$$HOST6 config:zone:$$REV:serial config:zone:$$REV6:serial >/dev/null; \
+	 for k in $$($$VC --scan --pattern "dnssec:$$REV:*") $$($$VC --scan --pattern "dnssec:$$REV6:*") $$($$VC --scan --pattern "ddns:$$REV6:*") $$($$VC --scan --pattern "ixfr:$$REV:*") $$($$VC --scan --pattern "ixfr:$$REV6:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_AP" ]; then $$VC set config:ddns_auto_ptr "$$SAVE_AP" >/dev/null; else $$VC del config:ddns_auto_ptr >/dev/null; fi; \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 echo "  static=[$$STAT] auto=[$$AUTO] auto6=[$$AUTO6] gone=[$$GONE]"; echo "$$AX" | sed 's/^/    AXFR PTR /'; \
+	 test "$$STAT" = "$$STATTGT." || { echo "  FAIL  static PTR not served (got [$$STAT])"; exit 1; }; \
+	 test "$$AUTO" = "$$HOST." || { echo "  FAIL  auto-PTR not created on forward UPDATE (got [$$AUTO])"; exit 1; }; \
+	 test "$$AUTO6" = "$$HOST6." || { echo "  FAIL  IPv6 auto-PTR wrong/missing (nibble order?) (got [$$AUTO6])"; exit 1; }; \
+	 echo "$$AX" | grep -q "^$$STATREV. $$STATTGT.$$" || { echo "  FAIL  static PTR missing from AXFR"; exit 1; }; \
+	 echo "$$AX" | grep -q "^$$REVNAME. $$HOST.$$" || { echo "  FAIL  auto-PTR lease missing from AXFR"; exit 1; }; \
+	 test -z "$$GONE" || { echo "  FAIL  auto-PTR not retracted after forward delete (still [$$GONE])"; exit 1; }; \
+	 echo "  OK  reverse zone served (static+auto, v4+v6), PTRs transfer in AXFR, retract on delete"
 
 # mTLS on the DoT/transfer listener (hidden-master plan Gap 1). With
 # config:dot_require_client_cert=1 + a CA, the DoT port must reject a TLS client

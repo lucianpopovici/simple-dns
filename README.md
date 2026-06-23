@@ -109,6 +109,11 @@ glance:
   holds the key its RRSIG points at.
 - **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, journal-based
   diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007).
+- **Reverse DNS**: `dnsd` serves `in-addr.arpa` / `ip6.arpa` zones (PTR queries
+  + AXFR) like any other zone (longest-suffix selection). With
+  `config:ddns_auto_ptr` set, a forward A/AAAA DDNS registration also creates and
+  retracts the matching reverse PTR lease in whichever reverse zone is configured
+  locally — so discovered hosts get reverse DNS automatically.
 - **Multi-zone / provisioning**: `dnsd` serves multiple zones (longest-suffix
   selection, per-zone SOA / DNSSEC keys / AXFR / UPDATE). Catalog zones
   (RFC 9432) bulk-provision member zones: a catalog is a `zone_table:<cat>` zone
@@ -143,6 +148,7 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
 | `config:notify_targets` | Comma-separated `IP:port` recipients for NOTIFY on zone change. |
+| `config:ddns_auto_ptr` | When set, a forward A/AAAA DDNS registration also maintains the matching reverse PTR lease in the locally-configured `in-addr.arpa` / `ip6.arpa` zone. |
 | `config:nsid` | NSID string reported via EDNS option 3. |
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
 | `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
