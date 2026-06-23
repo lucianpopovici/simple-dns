@@ -113,6 +113,9 @@
  *                               SSHFP ttl|alg|fptype|fp_hex; TLSA ttl|usage|sel|mtype|hex;
  *                               DNAME ttl|target; LOC ttl|loc_wire_hex; …)
  *   ddns:<zone>:<TYPE>:<name>  Dynamic record (RFC 2136 / HTTP /update)
+ *   ixfr:<zone>:journal        RFC 1995 IXFR journal (RPUSH list, capped at
+ *                              IXFR_JOURNAL_MAX): "<from>|<to>|<A|D>|<name>|<value>"
+ *                              per A/AAAA change; a gap forces AXFR fallback.
  *   config:zone:<zone>:serial  Per-zone SOA serial counter (primary keeps config:zone_serial)
  *   config:zone:<zone>:nsec3_iters / :nsec3_salt / :dnssec_nsec_mode
  *                              Per-zone denial config (defaults from the global config:* values)
@@ -325,7 +328,7 @@
  * KSK signs the DNSKEY RRset.  Loaded from dnssec:<zone>:* at startup. */
 
 /* Forward declarations for helpers used before their definitions */
-static void ixfr_journal_append(uint32_t, uint32_t, char, const char *, const char *);
+static void ixfr_journal_append(const char *, uint32_t, uint32_t, char, const char *, const char *);
 static void notify_send(void);
 /* Wire + Valkey helpers used by early code (multi-zone, NSEC) */
 static int vk_set(const char *, const char *, uint32_t);
@@ -4717,9 +4720,9 @@ static int rrl_check(const struct in_addr *cip, const char *qname) {
 /* ==========================================================================
  * SOA record builder
  * ======================================================================= */
-static int build_soa_rdata(uint8_t *rd, int rdlen) {
-    /* Emit SOA for the current request's zone (t_zone), falling back to the
-     * legacy single-zone globals when no zone has been selected. */
+/* Emit SOA rdata for the current zone (t_zone) but with an explicit serial —
+ * used to frame IXFR difference sequences (the old/new serial of each step). */
+static int build_soa_rdata_serial(uint8_t *rd, int rdlen, uint32_t serial) {
     const char *mname = (t_zone && t_zone->soa_mname[0]) ? t_zone->soa_mname : g_soa_mname;
     const char *rname = (t_zone && t_zone->soa_rname[0]) ? t_zone->soa_rname : g_soa_rname;
     int pos = 0;
@@ -4733,9 +4736,9 @@ static int build_soa_rdata(uint8_t *rd, int rdlen) {
     pos += n;
     if (pos + 20 > rdlen)
         return -1;
-    pthread_mutex_lock(&g_soa_mutex);
-    put32(rd, pos, t_zone ? t_zone->soa_serial : g_soa_serial);
+    put32(rd, pos, serial);
     pos += 4;
+    pthread_mutex_lock(&g_soa_mutex);
     put32(rd, pos, t_zone ? t_zone->soa_refresh : g_soa_refresh);
     pos += 4;
     put32(rd, pos, t_zone ? t_zone->soa_retry : g_soa_retry);
@@ -4746,6 +4749,15 @@ static int build_soa_rdata(uint8_t *rd, int rdlen) {
     pos += 4;
     pthread_mutex_unlock(&g_soa_mutex);
     return pos;
+}
+
+static int build_soa_rdata(uint8_t *rd, int rdlen) {
+    /* Emit SOA for the current request's zone (t_zone), falling back to the
+     * legacy single-zone globals when no zone has been selected. */
+    pthread_mutex_lock(&g_soa_mutex);
+    uint32_t serial = t_zone ? t_zone->soa_serial : g_soa_serial;
+    pthread_mutex_unlock(&g_soa_mutex);
+    return build_soa_rdata_serial(rd, rdlen, serial);
 }
 
 /* SOA minimum TTL for the current zone (used for negative-cache TTLs). */
@@ -6609,7 +6621,8 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 if (changed) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
                     uint32_t next = serial_bump(t_zone);
-                    ixfr_journal_append(prev, next, 'A', un, ip);
+                    ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A', un,
+                                        ip);
                 }
                 dns_log(LOG_NOTICE, "[DDNS] A %s->%s%s\n", un, ip, changed ? "" : " (refresh)");
                 STAT_INC(g_stat_ddns);
@@ -6623,7 +6636,8 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 if (changed) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
                     uint32_t next = serial_bump(t_zone);
-                    ixfr_journal_append(prev, next, 'A', un, ip6);
+                    ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A', un,
+                                        ip6);
                 }
                 dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s%s\n", un, ip6, changed ? "" : " (refresh)");
             } else if (ut == DNS_TYPE_TXT && rdlen >= 1) {
@@ -6683,31 +6697,56 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                         target);
             }
         } else if ((uc == DNS_CLASS_ANY || uc == DNS_CLASS_NONE) && rdlen == 0) {
+            const char *zn = t_zone ? t_zone->name : g_zone_name;
+            int other = 0; /* a non-journaled type was deleted → single serial bump below */
+            /* A/AAAA deletes are journaled (op 'D') so a secondary can apply them
+             * incrementally; capture the old value before removing it. */
             if (ut == DNS_TYPE_A || ut == DNS_TYPE_ANY) {
                 dkey(k, sizeof(k), "A", un);
+                char old[64] = "";
+                int had = vk_get(k, old, sizeof(old)) && old[0];
                 vk_del(k);
+                if (had) {
+                    uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
+                    uint32_t next = serial_bump(t_zone);
+                    ixfr_journal_append(zn, prev, next, 'D', un, old);
+                }
             }
             if (ut == DNS_TYPE_AAAA || ut == DNS_TYPE_ANY) {
                 dkey(k, sizeof(k), "AAAA", un);
+                char old[INET6_ADDRSTRLEN] = "";
+                int had = vk_get(k, old, sizeof(old)) && old[0];
                 vk_del(k);
+                if (had) {
+                    uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
+                    uint32_t next = serial_bump(t_zone);
+                    ixfr_journal_append(zn, prev, next, 'D', un, old);
+                }
             }
             if (ut == DNS_TYPE_TXT || ut == DNS_TYPE_ANY) {
                 zkey(k, sizeof(k), "TXT", un);
                 vk_del(k);
+                other = 1;
             }
             if (ut == DNS_TYPE_CNAME || ut == DNS_TYPE_ANY) {
                 zkey(k, sizeof(k), "CNAME", un);
                 vk_del(k);
+                other = 1;
             }
             if (ut == DNS_TYPE_MX || ut == DNS_TYPE_ANY) {
                 zkey(k, sizeof(k), "MX", un);
                 vk_del(k);
+                other = 1;
             }
             if (ut == DNS_TYPE_SRV || ut == DNS_TYPE_ANY) {
                 zkey(k, sizeof(k), "SRV", un);
                 vk_del(k);
+                other = 1;
             }
-            serial_bump(t_zone);
+            /* Non-journaled types bump the serial once; this intentionally leaves
+             * a gap in the IXFR chain so those serials force an AXFR fallback. */
+            if (other)
+                serial_bump(t_zone);
         }
     }
     /* Append TSIG to response */
@@ -6723,82 +6762,117 @@ formerr:
 /* ==========================================================================
  * RFC 1995 IXFR — Incremental Zone Transfer
  *
- * Journal stored in Valkey as a list:
- *   ixfr:journal  — RPUSH entries of the form:
+ * Per-zone journal stored in Valkey as a list:
+ *   ixfr:<zone>:journal  — RPUSH entries of the form:
  *       "<from_serial>|<to_serial>|A|<name>|<value>"   (add)
  *       "<from_serial>|<to_serial>|D|<name>|<value>"   (delete)
- * Capped at IXFR_JOURNAL_MAX entries; older entries are dropped.
- * When IXFR is requested the server:
- *   1. Reads all journal entries from the requested serial onward.
- *   2. If the full diff is available: sends SOA + diff + SOA.
- *   3. Otherwise: falls back to AXFR.
+ * Each entry records a single A/AAAA change and the serial transition it
+ * caused (to_serial == from_serial's successor).  Capped at IXFR_JOURNAL_MAX
+ * entries; older entries are dropped.  Only A/AAAA DDNS changes are journaled;
+ * any other mutation bumps the serial WITHOUT a journal entry, which leaves a
+ * gap in the serial chain — ixfr_journal_fetch() detects the gap and the
+ * server falls back to AXFR (RFC 1995 §4), so a partial diff is never sent.
  * ======================================================================= */
 #define IXFR_JOURNAL_MAX 4096
-#define IXFR_JOURNAL_KEY "ixfr:journal"
 
-/* Append one change record to the IXFR journal */
-static void ixfr_journal_append(uint32_t from_serial, uint32_t to_serial, char op, const char *name,
-                                const char *value) {
+/* Build the per-zone journal key (ixfr:<zone>:journal). */
+static void ixfr_journal_key(char *out, size_t cap, const char *zone) {
+    snprintf(out, cap, "ixfr:%.200s:journal", (zone && zone[0]) ? zone : g_zone_name);
+}
+
+/* Append one A/AAAA change to `zone`'s IXFR journal. */
+static void ixfr_journal_append(const char *zone, uint32_t from_serial, uint32_t to_serial, char op,
+                                const char *name, const char *value) {
+    char key[256];
+    ixfr_journal_key(key, sizeof(key), zone);
     char entry[1024];
     snprintf(entry, sizeof(entry), "%u|%u|%c|%s|%s", from_serial, to_serial, op, name, value);
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) >= 0) {
         resp_reply_t r;
-        resp_cmd(&vk, &r, 3, "RPUSH", IXFR_JOURNAL_KEY, entry);
-        /* Trim to max size */
+        resp_cmd(&vk, &r, 3, "RPUSH", key, entry);
+        /* Trim to the most-recent IXFR_JOURNAL_MAX entries. */
         if (r.type == 3 && r.integer > IXFR_JOURNAL_MAX) {
-            char trim[32];
-            snprintf(trim, sizeof(trim), "%d", IXFR_JOURNAL_MAX);
             resp_reply_t r2;
             char ltrim_idx[32];
             snprintf(ltrim_idx, sizeof(ltrim_idx), "%d", -IXFR_JOURNAL_MAX);
-            resp_cmd(&vk, &r2, 4, "LTRIM", IXFR_JOURNAL_KEY, ltrim_idx, "-1");
+            resp_cmd(&vk, &r2, 4, "LTRIM", key, ltrim_idx, "-1");
         }
     }
     pthread_mutex_unlock(&g_vk_mutex);
 }
 
-/* Retrieve journal entries from from_serial onward.
- * Returns count of entries placed in out_entries (caller frees each).
- * Returns -1 if serial not in journal (fall back to AXFR). */
-static int ixfr_journal_fetch(uint32_t from_serial, char **out_entries, int max_entries) {
+/* Fetch the journal entries forming a CONTIGUOUS serial chain from `from_serial`
+ * up to `current_serial` for `zone`.  Returns the entry count (>=1) on success,
+ * with each entry strdup'd into out_entries (caller frees).  Returns -1 if no
+ * such complete chain exists — a missing start serial, a gap (a non-journaled
+ * mutation), or a chain that does not reach current_serial — in which case the
+ * caller must fall back to AXFR so the secondary is never left inconsistent. */
+static int ixfr_journal_fetch(const char *zone, uint32_t from_serial, uint32_t current_serial,
+                              char **out_entries, int max_entries) {
+    char key[256];
+    ixfr_journal_key(key, sizeof(key), zone);
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
     }
     resp_reply_t r;
-    resp_cmd(&vk, &r, 4, "LRANGE", IXFR_JOURNAL_KEY, "0", "-1");
-    if (r.type != 5) {
+    resp_cmd(&vk, &r, 4, "LRANGE", key, "0", "-1");
+    if (r.type != 5 || r.count <= 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
     }
-    int count = r.count, found = -1, n = 0;
+    int count = r.count;
+    char **all = calloc((size_t) count, sizeof(char *));
+    int na = 0;
     for (int i = 0; i < count; i++) {
         resp_reply_t er;
-        resp_parse(&vk, &er);
-        if (er.type != 2)
-            continue;
-        uint32_t fs = 0;
-        sscanf(er.str, "%u|", &fs);
-        if (fs == from_serial)
-            found = i;
-        if (found >= 0) {
-            if (n < max_entries) {
-                char *dup = strdup(er.str);
-                if (!dup) {
-                    pthread_mutex_unlock(&g_vk_mutex);
-                    for (int j = 0; j < n; j++)
-                        free(out_entries[j]);
-                    return -1;
-                }
-                out_entries[n++] = dup;
-            }
-            /* else: entry beyond max_entries is intentionally skipped */
+        if (resp_parse(&vk, &er) < 0)
+            break;
+        if (er.type == 2 && all) {
+            char *dup = strdup(er.str);
+            if (dup)
+                all[na++] = dup;
         }
     }
     pthread_mutex_unlock(&g_vk_mutex);
-    return (found >= 0) ? n : -1;
+    if (!all)
+        return -1;
+    /* Walk a contiguous chain: find the entry whose from_serial == from_serial,
+     * then require each subsequent entry to start where the previous one ended,
+     * until we reach current_serial. Any gap aborts the chain (→ AXFR). */
+    int n = 0, ok = 0, started = 0;
+    uint32_t want = from_serial;
+    for (int i = 0; i < na; i++) {
+        uint32_t fs = 0, ts = 0;
+        if (sscanf(all[i], "%u|%u|", &fs, &ts) != 2)
+            continue;
+        if (!started) {
+            if (fs != from_serial)
+                continue; /* keep scanning for the chain start */
+            started = 1;
+        } else if (fs != want) {
+            break; /* gap in the serial chain — incomplete diff */
+        }
+        if (n >= max_entries)
+            break; /* too many changes — ok stays 0, fall back to AXFR */
+        out_entries[n++] = strdup(all[i]);
+        want = ts;
+        if (ts == current_serial) {
+            ok = 1;
+            break;
+        }
+    }
+    for (int i = 0; i < na; i++)
+        free(all[i]);
+    free(all);
+    if (!ok) {
+        for (int j = 0; j < n; j++)
+            free(out_entries[j]);
+        return -1;
+    }
+    return n;
 }
 
 /* ==========================================================================
@@ -6981,6 +7055,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
  * the channel — and therefore the data — is authenticated.
  * ======================================================================= */
 #define XFR_MAX_RECORDS 50000
+#define XFR_MAX_DIFFS 8192 /* cap on incremental (IXFR) changes applied in one pull */
 
 typedef struct {
     char name[256];
@@ -6988,6 +7063,15 @@ typedef struct {
     uint32_t ttl;
     char val[600]; /* store value; for A/AAAA the bare address (grouped on apply) */
 } xfr_rec_t;
+
+/* One change from an incremental (IXFR) response: op 'A' = add, 'D' = delete. */
+typedef struct {
+    char op;
+    char name[256];
+    uint16_t type;
+    uint32_t ttl;
+    char val[600];
+} xfr_diff_t;
 
 /* Read exactly n bytes from a plain fd or an SSL conn. 0 on success, -1 else. */
 static int xfr_read_full(int fd, SSL *ssl, uint8_t *buf, int n) {
@@ -7121,6 +7205,86 @@ static void xfr_apply(const char *zone, xfr_rec_t *recs, int n, uint32_t serial)
         vk_set(key, val, 0);
     }
     free(written);
+    xfr_set_serial(zone, serial);
+}
+
+/* Read the local SOA serial for `zone` (0 if unknown / first ever pull). */
+static uint32_t xfr_get_serial(const char *zone) {
+    uint32_t s = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        if (strcasecmp(g_zones[i].name, zone) == 0) {
+            s = g_zones[i].soa_serial;
+            break;
+        }
+    pthread_mutex_unlock(&g_zones_mutex);
+    return s;
+}
+
+/* Apply one incremental (IXFR) change to the local zone:<zone>:* store. A/AAAA
+ * records are grouped per owner as "ttl|ip|ip…": an add appends the IP (if not
+ * already present), a delete removes it (deleting the key when the last IP
+ * goes). Other types: add overwrites, delete removes the key. */
+static void xfr_apply_one_diff(const char *zone, char op, const char *name, uint16_t type,
+                               uint32_t ttl, const char *val) {
+    char key[900];
+    snprintf(key, sizeof(key), "zone:%.255s:%.16s:%.255s", zone, type2str(type), name);
+    if (type != DNS_TYPE_A && type != DNS_TYPE_AAAA) {
+        if (op == 'A') {
+            char v[1024];
+            snprintf(v, sizeof(v), "%u|%s", ttl, val);
+            vk_set(key, v, 0);
+        } else {
+            vk_del(key);
+        }
+        return;
+    }
+    /* A/AAAA: rebuild the grouped "ttl|ip|ip…" value. */
+    char cur[1024] = "";
+    vk_get(key, cur, sizeof(cur));
+    uint32_t out_ttl = ttl ? ttl : DEFAULT_TTL;
+    char ips[64][INET6_ADDRSTRLEN];
+    int nip = 0;
+    if (cur[0]) {
+        char *sp = NULL;
+        char *tok = strtok_r(cur, "|", &sp);
+        if (tok) {
+            out_ttl = (uint32_t) strtoul(tok, NULL, 10); /* first field is the TTL */
+            for (tok = strtok_r(NULL, "|", &sp); tok && nip < 64; tok = strtok_r(NULL, "|", &sp))
+                safe_strcpy(ips[nip++], tok, sizeof(ips[0]));
+        }
+    }
+    int present = 0;
+    for (int i = 0; i < nip; i++)
+        if (strcasecmp(ips[i], val) == 0) {
+            present = i + 1;
+            break;
+        }
+    if (op == 'A') {
+        if (ttl)
+            out_ttl = ttl;
+        if (!present && nip < 64)
+            safe_strcpy(ips[nip++], val, sizeof(ips[0]));
+    } else if (present) { /* delete: drop the matching IP */
+        for (int i = present - 1; i < nip - 1; i++)
+            safe_strcpy(ips[i], ips[i + 1], sizeof(ips[0]));
+        nip--;
+    }
+    if (nip == 0) {
+        vk_del(key);
+        return;
+    }
+    char v[1024];
+    int off = snprintf(v, sizeof(v), "%u", out_ttl);
+    for (int i = 0; i < nip && off < (int) sizeof(v) - 1; i++)
+        off += snprintf(v + off, sizeof(v) - off, "|%s", ips[i]);
+    vk_set(key, v, 0);
+}
+
+/* Apply an ordered list of incremental changes, then adopt the master serial. */
+static void xfr_apply_diffs(const char *zone, xfr_diff_t *d, int n, uint32_t serial) {
+    for (int i = 0; i < n; i++)
+        xfr_apply_one_diff(zone, d[i].op, d[i].name, d[i].type, d[i].ttl, d[i].val);
     xfr_set_serial(zone, serial);
 }
 
@@ -7335,7 +7499,13 @@ static int xfr_pull(const char *zone) {
             return -1;
         }
     }
-    /* Build + send the AXFR query (id 0x5858 "XX"). */
+    /* Build + send the transfer query (id 0x5858 "XX"). Request IXFR (RFC 1995)
+     * when we already hold a serial — carrying it as an SOA in the authority
+     * section — so the master can answer with just the diff; the master may
+     * still reply with a full AXFR-style transfer, which we detect below and
+     * apply as a full replace. The very first pull (serial 0) asks for AXFR. */
+    uint32_t local_serial = xfr_get_serial(zone);
+    int want_ixfr = (local_serial > 0);
     uint8_t q[600];
     memset(q, 0, 12);
     dns_hdr_t *qh = (dns_hdr_t *) q;
@@ -7353,10 +7523,42 @@ static int xfr_pull(const char *zone) {
         return -1;
     }
     qo += 12;
-    put16(q, qo, DNS_TYPE_AXFR);
+    put16(q, qo, want_ixfr ? DNS_TYPE_IXFR : DNS_TYPE_AXFR);
     qo += 2;
     put16(q, qo, DNS_CLASS_IN);
     qo += 2;
+    if (want_ixfr) {
+        /* Authority section: SOA carrying our current serial (RFC 1995 §3). */
+        int an = name_to_wire(zone, q + qo, (int) sizeof(q) - qo);
+        if (an > 0) {
+            qo += an;
+            put16(q, qo, DNS_TYPE_SOA);
+            qo += 2;
+            put16(q, qo, DNS_CLASS_IN);
+            qo += 2;
+            put32(q, qo, 0); /* TTL */
+            qo += 4;
+            int rdlen_off = qo;
+            qo += 2; /* rdlen placeholder */
+            int rdstart = qo;
+            int nn = name_to_wire(zone, q + qo, (int) sizeof(q) - qo); /* mname */
+            qo += (nn > 0) ? nn : 0;
+            nn = name_to_wire(zone, q + qo, (int) sizeof(q) - qo); /* rname */
+            qo += (nn > 0) ? nn : 0;
+            put32(q, qo, local_serial);
+            qo += 4;
+            put32(q, qo, 3600);
+            qo += 4;
+            put32(q, qo, 900);
+            qo += 4;
+            put32(q, qo, 604800);
+            qo += 4;
+            put32(q, qo, 300);
+            qo += 4;
+            put16(q, rdlen_off, (uint16_t) (qo - rdstart));
+            qh->nscount = htons(1);
+        }
+    }
     /* TSIG-sign the request (RFC 8945, Gap 4) if a key is configured; the
      * request MAC seeds the response-chain verification below. */
     uint8_t prior[64];
@@ -7373,15 +7575,27 @@ static int xfr_pull(const char *zone) {
         close(fd);
         return -1;
     }
-    /* Read the AXFR stream; collect RRs until the closing (2nd apex) SOA. */
+    /* Read the transfer stream. Both AXFR and IXFR responses open and close with
+     * SOA(current); the structure is told apart by what follows the opening SOA:
+     *   - a data RR  → AXFR-style full transfer (collect records, full replace);
+     *   - an SOA RR  → incremental, a series of difference sequences
+     *                  [ SOA(old), deletions, SOA(new), additions ].
+     * SOA framing parity drives the section: counting SOAs after the opening,
+     * an even count begins a deletion section (or is the closing SOA when its
+     * serial equals the target), an odd count begins an addition section. */
     xfr_rec_t *recs = malloc(sizeof(xfr_rec_t) * XFR_MAX_RECORDS);
-    int nrec = 0, soa_seen = 0, ok = 0, overflow = 0;
-    uint32_t serial = 0;
+    xfr_diff_t *diffs = malloc(sizeof(xfr_diff_t) * XFR_MAX_DIFFS);
+    int nrec = 0, ndiff = 0, ok = 0, overflow = 0;
+    int soa_count = 0;   /* total SOAs seen */
+    int mode = 0;        /* 0 unknown, 1 AXFR-style full, 2 incremental */
+    int in_add = 0;      /* current incremental section: 1 = additions, 0 = deletions */
+    int done = 0;        /* saw the closing SOA(target) */
+    uint32_t target = 0; /* serial we will converge to (first/opening SOA) */
     /* TSIG chain state (Gap 4): require verification when a key is configured. */
     int tsig = (g_tsig_secret_len > 0), tsig_fail = 0, last_signed = 0, unsigned_run = 0;
     uint8_t *msg = malloc(65536);
-    if (recs && msg) {
-        while (soa_seen < 2) {
+    if (recs && diffs && msg) {
+        while (!done) {
             uint8_t mlb[2];
             if (xfr_read_full(fd, ssl, mlb, 2) != 0)
                 break;
@@ -7413,7 +7627,7 @@ static int xfr_pull(const char *zone) {
                     goto stream_done;
                 off = a + 4;
             }
-            for (int i = 0; i < an && soa_seen < 2; i++) {
+            for (int i = 0; i < an && !done; i++) {
                 char rname[256];
                 int a = name_from_wire(msg, mlen, off, rname, sizeof(rname));
                 if (a < 0 || a + 10 > mlen)
@@ -7426,37 +7640,68 @@ static int xfr_pull(const char *zone) {
                     goto stream_done;
                 off = rdoff + rdlen;
                 if (rtype == DNS_TYPE_SOA) {
-                    if (soa_seen == 0) { /* SOA rdata: mname, rname, serial, … */
-                        char nm[256];
-                        int p = name_from_wire(msg, mlen, rdoff, nm, sizeof(nm));
-                        if (p > 0)
-                            p = name_from_wire(msg, mlen, p, nm, sizeof(nm));
-                        if (p > 0 && p + 4 <= mlen)
-                            serial = get32(msg, p);
+                    uint32_t s = 0;
+                    char nm[256];
+                    int p = name_from_wire(msg, mlen, rdoff, nm, sizeof(nm));
+                    if (p > 0)
+                        p = name_from_wire(msg, mlen, p, nm, sizeof(nm));
+                    if (p > 0 && p + 4 <= mlen)
+                        s = get32(msg, p);
+                    soa_count++;
+                    if (soa_count == 1) { /* opening SOA → the target serial */
+                        target = s;
+                        continue;
                     }
-                    soa_seen++;
+                    /* An even-count SOA whose serial is the target is the closer. */
+                    if ((soa_count % 2 == 0) && s == target) {
+                        done = 1;
+                        break;
+                    }
+                    if (mode == 0)
+                        mode = 2;                  /* a 2nd SOA before any data RR → incremental */
+                    in_add = (soa_count % 2 == 1); /* odd: additions, even: deletions */
                     continue;
                 }
-                if (soa_seen != 1)
-                    continue; /* only records between the bracketing SOAs */
+                /* Data RR. */
+                if (soa_count == 1 && mode == 0)
+                    mode = 1; /* data right after the opening SOA → full AXFR */
                 char val[600];
                 if (xfr_rdata_to_store(msg, mlen, rtype, rdoff, rdlen, val, sizeof(val)) != 0)
                     continue; /* unsupported type — skip */
-                if (nrec >= XFR_MAX_RECORDS) {
-                    overflow = 1;
-                    goto stream_done;
+                if (mode == 2) {
+                    if (ndiff >= XFR_MAX_DIFFS) {
+                        overflow = 1;
+                        goto stream_done;
+                    }
+                    diffs[ndiff].op = in_add ? 'A' : 'D';
+                    safe_strcpy(diffs[ndiff].name, rname, sizeof(diffs[ndiff].name));
+                    diffs[ndiff].type = rtype;
+                    diffs[ndiff].ttl = rttl;
+                    safe_strcpy(diffs[ndiff].val, val, sizeof(diffs[ndiff].val));
+                    ndiff++;
+                } else { /* AXFR full transfer (or still-unknown — treated as full) */
+                    if (nrec >= XFR_MAX_RECORDS) {
+                        overflow = 1;
+                        goto stream_done;
+                    }
+                    safe_strcpy(recs[nrec].name, rname, sizeof(recs[nrec].name));
+                    recs[nrec].type = rtype;
+                    recs[nrec].ttl = rttl;
+                    safe_strcpy(recs[nrec].val, val, sizeof(recs[nrec].val));
+                    nrec++;
                 }
-                safe_strcpy(recs[nrec].name, rname, sizeof(recs[nrec].name));
-                recs[nrec].type = rtype;
-                recs[nrec].ttl = rttl;
-                safe_strcpy(recs[nrec].val, val, sizeof(recs[nrec].val));
-                nrec++;
             }
         }
-    stream_done:
+    stream_done:;
         /* When TSIG is configured the transfer must verify and the final message
          * must be signed (RFC 8945 §5.3.1); otherwise reject (no apply). */
-        ok = (soa_seen >= 2 && !overflow && (!tsig || (!tsig_fail && last_signed)));
+        int tsig_ok = (!tsig || (!tsig_fail && last_signed));
+        /* A single opening SOA whose serial matches ours (no closing SOA needed)
+         * is the "already up to date" reply — success, nothing to apply. */
+        int up_to_date = (!done && soa_count == 1 && target == local_serial && tsig_ok);
+        if (up_to_date)
+            done = 1;
+        ok = up_to_date || (done && !overflow && tsig_ok);
     }
     if (ssl) {
         SSL_shutdown(ssl);
@@ -7464,21 +7709,38 @@ static int xfr_pull(const char *zone) {
         SSL_CTX_free(cctx);
     }
     close(fd);
-    if (ok) {
-        xfr_apply(zone, recs, nrec, serial);
+    if (ok && mode == 2) {
+        xfr_apply_diffs(zone, diffs, ndiff, target);
+        dns_log(LOG_NOTICE, "[XFR] %s: IXFR from %s:%d complete — %d changes, serial %u\n", zone,
+                g_primary_host, g_primary_port, ndiff, target);
+    } else if (ok && soa_count == 1 && target == local_serial) {
+        dns_log(LOG_NOTICE, "[XFR] %s: already current at serial %u (%s:%d)\n", zone, target,
+                g_primary_host, g_primary_port);
+    } else if (ok) {
+        xfr_apply(zone, recs, nrec, target);
         dns_log(LOG_NOTICE, "[XFR] %s: AXFR from %s:%d complete — %d records, serial %u\n", zone,
-                g_primary_host, g_primary_port, nrec, serial);
+                g_primary_host, g_primary_port, nrec, target);
     } else {
-        dns_log(LOG_WARNING, "[XFR] %s: AXFR from %s:%d failed (incomplete) — store unchanged\n",
-                zone, g_primary_host, g_primary_port);
+        dns_log(LOG_WARNING,
+                "[XFR] %s: transfer from %s:%d failed (incomplete) — store unchanged\n", zone,
+                g_primary_host, g_primary_port);
     }
     free(recs);
+    free(diffs);
     free(msg);
     return ok ? 0 : -1;
 }
 
-/* Wake the refresh thread for an immediate re-check (Gap 5, NOTIFY path). */
+/* Wake the refresh thread for an immediate re-check (Gap 5, NOTIFY path).
+ * RFC 1996 §4.7: a NOTIFY makes the secondary behave as if the SOA refresh
+ * timer had expired, so force every zone due now — otherwise a zone with a
+ * normal (long) refresh interval would ignore the NOTIFY until its timer
+ * eventually elapsed, defeating the prompt-notification / IXFR re-pull. */
 static void xfr_refresh_kick(void) {
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        g_zones[i].xfr_next_check = 0;
+    pthread_mutex_unlock(&g_zones_mutex);
     pthread_mutex_lock(&g_xfr_mutex);
     g_xfr_wake = 1;
     pthread_cond_signal(&g_xfr_cond);
@@ -7582,54 +7844,44 @@ static void *axfr_thread(void *arg) {
     uint8_t soa_rd[512];
     int soa_len = build_soa_rdata(soa_rd, sizeof(soa_rd));
 
-    /* ── IXFR path (RFC 1995) ── */
+    /* ── IXFR path (RFC 1995) ──
+     * Response framing: SOA(current), then one difference sequence per journaled
+     * change [ SOA(from), <deleted RR>, SOA(to), <added RR> ], then SOA(current).
+     * The op field selects the deletion vs addition section so a 'D' entry is a
+     * real delete and an 'A' a real add (the previous code emitted every change
+     * as an addition inside the deletion section). */
     if (c.ixfr && c.ixfr_serial > 0 && c.ixfr_serial < t_zone->soa_serial) {
         char *entries[IXFR_JOURNAL_MAX];
-        int ne = 0;
-        ne = ixfr_journal_fetch(c.ixfr_serial, entries, IXFR_JOURNAL_MAX);
+        int ne =
+            ixfr_journal_fetch(zname, c.ixfr_serial, t_zone->soa_serial, entries, IXFR_JOURNAL_MAX);
         if (ne > 0) {
-            /* Send: current SOA, del-SOA(old), adds, new-SOA */
             uint8_t mb[BUF_SIZE];
             int mo;
             uint8_t ixfr_mac[64];
             int ixfr_mac_len = 0;
-            /* Opening SOA */
+            /* Opening SOA(current) — first (signed) message, echoes the question. */
             compress_reset();
             memset(mb, 0, 12);
             dns_hdr_t *mh = (dns_hdr_t *) mb;
+            mh->id = htons(c.query_id);
             mh->flags = htons(DNS_QR | DNS_AA);
-            mh->ancount = htons(1);
             mo = 12;
+            int qn = name_to_wire(zname, mb + mo, (int) sizeof(mb) - mo);
+            if (qn > 0) {
+                mo += qn;
+                put16(mb, mo, DNS_TYPE_IXFR);
+                mo += 2;
+                put16(mb, mo, DNS_CLASS_IN);
+                mo += 2;
+                mh->qdcount = htons(1);
+            }
+            mh->ancount = htons(1);
             if (soa_len > 0)
                 mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
                                t_zone->soa_minimum, soa_rd, (uint16_t) soa_len);
             mo = tsig_axfr_first(mb, mo, sizeof(mb), c.query_id, ixfr_mac, &ixfr_mac_len);
             tcp_send_msg(c.fd, c.ssl, mb, mo);
-            /* Old SOA (the one being replaced) */
-            uint8_t old_soa[512];
-            int old_soa_len = 0;
-            { /* build SOA with from_serial */
-                pthread_mutex_lock(&g_soa_mutex);
-                uint32_t saved = t_zone->soa_serial;
-                t_zone->soa_serial = c.ixfr_serial;
-                pthread_mutex_unlock(&g_soa_mutex);
-                old_soa_len = build_soa_rdata(old_soa, sizeof(old_soa));
-                pthread_mutex_lock(&g_soa_mutex);
-                t_zone->soa_serial = saved;
-                pthread_mutex_unlock(&g_soa_mutex);
-            }
-            compress_reset();
-            memset(mb, 0, 12);
-            mh = (dns_hdr_t *) mb;
-            mh->flags = htons(DNS_QR | DNS_AA);
-            mh->ancount = htons(1);
-            mo = 12;
-            if (old_soa_len > 0)
-                mo = append_rr(mb, mo, sizeof(mb), zname, DNS_TYPE_SOA, DNS_CLASS_IN,
-                               t_zone->soa_minimum, old_soa, (uint16_t) old_soa_len);
-            tsig_axfr_mid(mb, mo, ixfr_mac, &ixfr_mac_len);
-            tcp_send_msg(c.fd, c.ssl, mb, mo);
-            /* Changes */
+            /* One difference sequence per journal entry. */
             for (int ei = 0; ei < ne; ei++) {
                 char *e = entries[ei];
                 if (!e)
@@ -7639,37 +7891,48 @@ static void *axfr_thread(void *arg) {
                 char ename[256] = "";
                 char eval[256] = "";
                 sscanf(e, "%u|%u|%c|%255[^|]|%255[^\n]", &fs, &ts, &op, ename, eval);
-                /* only A/AAAA for now; emit as ADD record */
+                uint16_t rtype = 0;
+                uint8_t rd[16];
+                uint16_t rdlen = 0;
                 struct in_addr a4;
                 struct in6_addr a6;
-                compress_reset();
-                memset(mb, 0, 12);
-                mh = (dns_hdr_t *) mb;
-                mh->flags = htons(DNS_QR | DNS_AA);
-                mh->ancount = htons(1);
-                mo = 12;
                 if (inet_pton(AF_INET, eval, &a4) == 1) {
-                    uint8_t rd[4];
+                    rtype = DNS_TYPE_A;
                     memcpy(rd, &a4, 4);
-                    mo = append_rr(mb, mo, sizeof(mb), ename, DNS_TYPE_A, DNS_CLASS_IN, DEFAULT_TTL,
-                                   rd, 4);
+                    rdlen = 4;
                 } else if (inet_pton(AF_INET6, eval, &a6) == 1) {
-                    uint8_t rd[16];
+                    rtype = DNS_TYPE_AAAA;
                     memcpy(rd, &a6, 16);
-                    mo = append_rr(mb, mo, sizeof(mb), ename, DNS_TYPE_AAAA, DNS_CLASS_IN,
-                                   DEFAULT_TTL, rd, 16);
+                    rdlen = 16;
                 } else {
                     free(e);
                     continue;
                 }
-                tsig_axfr_mid(mb, mo, ixfr_mac, &ixfr_mac_len);
-                tcp_send_msg(c.fd, c.ssl, mb, mo);
+                uint8_t soa_from[512];
+                uint8_t soa_to[512];
+                int from_len = build_soa_rdata_serial(soa_from, sizeof(soa_from), fs);
+                int to_len = build_soa_rdata_serial(soa_to, sizeof(soa_to), ts);
+                /* SOA(from): begins this step's deletion section. */
+                if (from_len > 0)
+                    axfr_emit_one(c.fd, c.ssl, c.query_id, zname, DNS_TYPE_SOA, t_zone->soa_minimum,
+                                  soa_from, (uint16_t) from_len, ixfr_mac, &ixfr_mac_len);
+                if (op == 'D')
+                    axfr_emit_one(c.fd, c.ssl, c.query_id, ename, rtype, DEFAULT_TTL, rd, rdlen,
+                                  ixfr_mac, &ixfr_mac_len);
+                /* SOA(to): begins this step's addition section. */
+                if (to_len > 0)
+                    axfr_emit_one(c.fd, c.ssl, c.query_id, zname, DNS_TYPE_SOA, t_zone->soa_minimum,
+                                  soa_to, (uint16_t) to_len, ixfr_mac, &ixfr_mac_len);
+                if (op == 'A')
+                    axfr_emit_one(c.fd, c.ssl, c.query_id, ename, rtype, DEFAULT_TTL, rd, rdlen,
+                                  ixfr_mac, &ixfr_mac_len);
                 free(e);
             }
-            /* Closing new SOA */
+            /* Closing SOA(current) — final (signed) message. */
             compress_reset();
             memset(mb, 0, 12);
             mh = (dns_hdr_t *) mb;
+            mh->id = htons(c.query_id);
             mh->flags = htons(DNS_QR | DNS_AA);
             mh->ancount = htons(1);
             mo = 12;
@@ -7680,6 +7943,7 @@ static void *axfr_thread(void *arg) {
             tcp_send_msg(c.fd, c.ssl, mb, mo);
             dns_log(LOG_NOTICE, "[IXFR] Sent %d changes serial %u->%u to %s\n", ne, c.ixfr_serial,
                     t_zone->soa_serial, cip);
+            STAT_INC(g_stat_axfr);
             goto done;
         }
         dns_log(LOG_NOTICE, "[IXFR] Serial %u not in journal, falling back to AXFR\n",
@@ -7690,6 +7954,7 @@ static void *axfr_thread(void *arg) {
         compress_reset();
         memset(mb, 0, 12);
         dns_hdr_t *mh = (dns_hdr_t *) mb;
+        mh->id = htons(c.query_id);
         mh->flags = htons(DNS_QR | DNS_AA);
         mh->ancount = htons(1);
         int mo = 12;
