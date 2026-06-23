@@ -85,6 +85,12 @@
  *   config:zone_role           "primary" (default) or "secondary". A secondary
  *                              is a read-only replica: UPDATE → NOTAUTH and it
  *                              never generates DNSSEC keys (load-only).
+ *   config:primary_host        Master a secondary pulls each zone from at start.
+ *   config:primary_port        Master port (default 53).
+ *   config:primary_tls         "1" to pull over TLS (DoT); verify the master
+ *                              against config:xfr_ca_pem and present
+ *                              config:xfr_client_cert_pem/xfr_client_key_pem
+ *                              (mTLS) if set. Use TLS until transfer TSIG lands.
  *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
@@ -641,6 +647,15 @@ static char g_mtls_ca_pem[MAX_PEM] = "";
  * that present no cert. On a hidden master (only secondaries connect) it can be
  * switched on globally to lock down AXFR/IXFR (hidden-master plan Gap 1). */
 static int g_dot_require_client_cert = 0;
+
+/* Secondary transfer-client config (hidden-master plan Gap 3). A secondary
+ * (config:zone_role=secondary) pulls each zone from this master at startup. */
+static char g_primary_host[256] = "";            /* config:primary_host */
+static int g_primary_port = 53;                  /* config:primary_port */
+static int g_primary_tls = 0;                    /* config:primary_tls (DoT) */
+static char g_xfr_ca_pem[MAX_PEM] = "";          /* config:xfr_ca_pem — verify master */
+static char g_xfr_client_cert_pem[MAX_PEM] = ""; /* config:xfr_client_cert_pem — our mTLS id */
+static char g_xfr_client_key_pem[MAX_PEM] = "";  /* config:xfr_client_key_pem */
 
 /* SOA parameters */
 static char g_soa_mname[256] = "ns1.example.local";
@@ -2016,6 +2031,17 @@ static void config_load_from_valkey(void) {
         if (vk_get("config:zone_role", role, sizeof(role)) && strcasecmp(role, "secondary") == 0)
             g_zone_secondary = 1;
     }
+    /* Secondary transfer-client config (hidden-master plan Gap 3). */
+    g_primary_host[0] = 0;
+    g_primary_port = 53;
+    g_primary_tls = 0;
+    g_xfr_ca_pem[0] = g_xfr_client_cert_pem[0] = g_xfr_client_key_pem[0] = 0;
+    G("primary_host", g_primary_host);
+    GI("primary_port", g_primary_port);
+    GI("primary_tls", g_primary_tls);
+    vk_get("config:xfr_ca_pem", g_xfr_ca_pem, sizeof(g_xfr_ca_pem));
+    vk_get("config:xfr_client_cert_pem", g_xfr_client_cert_pem, sizeof(g_xfr_client_cert_pem));
+    vk_get("config:xfr_client_key_pem", g_xfr_client_key_pem, sizeof(g_xfr_client_key_pem));
     GI("dns_port", g_dns_port);
     GI("dot_port", g_dot_port);
     GI("http_port", g_http_port);
@@ -6919,6 +6945,378 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
     }
 }
 
+/* ==========================================================================
+ * Zone transfer CLIENT — a secondary pulls AXFR from the master.
+ * hidden-master plan Gap 3. AXFR over plain TCP or TLS (server-cert verified
+ * against config:xfr_ca_pem, optional client cert / mTLS). The transferred
+ * RRset replaces the local zone:<zone>:* store, but only after a COMPLETE
+ * transfer (the closing SOA) — a partial/failed pull leaves the old data
+ * intact. TSIG signing + chained-response verification is Gap 4 (next); until
+ * then run the transfer over TLS (config:primary_tls=1 + config:xfr_ca_pem) so
+ * the channel — and therefore the data — is authenticated.
+ * ======================================================================= */
+#define XFR_MAX_RECORDS 50000
+
+typedef struct {
+    char name[256];
+    uint16_t type;
+    uint32_t ttl;
+    char val[600]; /* store value; for A/AAAA the bare address (grouped on apply) */
+} xfr_rec_t;
+
+/* Read exactly n bytes from a plain fd or an SSL conn. 0 on success, -1 else. */
+static int xfr_read_full(int fd, SSL *ssl, uint8_t *buf, int n) {
+    int got = 0;
+    while (got < n) {
+        int r = ssl ? SSL_read(ssl, buf + got, n - got)
+                    : (int) recv(fd, buf + got, (size_t) (n - got), 0);
+        if (r <= 0)
+            return -1;
+        got += r;
+    }
+    return 0;
+}
+
+/* Convert a received RR's wire rdata to its store-string for `type`. Returns 0
+ * (val filled) on success, -1 if the type is not replicated into zone:* (skip).
+ * For A/AAAA, val is the bare address; apply groups them into ttl|ip|ip. */
+static int xfr_rdata_to_store(const uint8_t *pkt, int plen, uint16_t type, int rdoff, int rdlen,
+                              char *val, int valcap) {
+    switch (type) {
+        case DNS_TYPE_A:
+            if (rdlen != 4)
+                return -1;
+            snprintf(val, valcap, "%u.%u.%u.%u", pkt[rdoff], pkt[rdoff + 1], pkt[rdoff + 2],
+                     pkt[rdoff + 3]);
+            return 0;
+        case DNS_TYPE_AAAA: {
+            char b[INET6_ADDRSTRLEN];
+            if (rdlen != 16 || !inet_ntop(AF_INET6, pkt + rdoff, b, sizeof(b)))
+                return -1;
+            safe_strcpy(val, b, valcap);
+            return 0;
+        }
+        case DNS_TYPE_NS:
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_DNAME: {
+            char tgt[256];
+            if (name_from_wire(pkt, plen, rdoff, tgt, sizeof(tgt)) < 0)
+                return -1;
+            safe_strcpy(val, tgt, valcap);
+            return 0;
+        }
+        case DNS_TYPE_MX: {
+            char tgt[256];
+            if (rdlen < 3 || name_from_wire(pkt, plen, rdoff + 2, tgt, sizeof(tgt)) < 0)
+                return -1;
+            snprintf(val, valcap, "%u|%s", get16(pkt, rdoff), tgt);
+            return 0;
+        }
+        case DNS_TYPE_TXT: {
+            int sl = (rdlen >= 1) ? pkt[rdoff] : -1;
+            if (sl < 0 || sl > rdlen - 1)
+                return -1;
+            if (sl >= valcap)
+                sl = valcap - 1;
+            memcpy(val, pkt + rdoff + 1, (size_t) sl);
+            val[sl] = 0;
+            return 0;
+        }
+        case DNS_TYPE_SRV: {
+            char tgt[256];
+            if (rdlen < 7 || name_from_wire(pkt, plen, rdoff + 6, tgt, sizeof(tgt)) < 0)
+                return -1;
+            snprintf(val, valcap, "%u|%u|%u|%s", get16(pkt, rdoff), get16(pkt, rdoff + 2),
+                     get16(pkt, rdoff + 4), tgt);
+            return 0;
+        }
+        default:
+            return -1; /* SOA/DNSKEY/RRSIG/NSEC/… not replicated into zone:* */
+    }
+}
+
+/* Persist `zone`'s SOA serial to the master's value (never generated locally on
+ * a secondary — the master's serial is authoritative). */
+static void xfr_set_serial(const char *zone, uint32_t serial) {
+    char ikey[320], buf[32];
+    int primary = (strcasecmp(zone, g_zone_name) == 0);
+    if (primary)
+        safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
+    else
+        snprintf(ikey, sizeof(ikey), "config:zone:%.255s:serial", zone);
+    snprintf(buf, sizeof(buf), "%u", serial);
+    vk_set(ikey, buf, 0);
+    pthread_mutex_lock(&g_soa_mutex);
+    if (primary)
+        g_soa_serial = serial;
+    pthread_mutex_unlock(&g_soa_mutex);
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        if (strcasecmp(g_zones[i].name, zone) == 0)
+            g_zones[i].soa_serial = serial;
+    pthread_mutex_unlock(&g_zones_mutex);
+}
+
+/* Replace zone:<zone>:* with the transferred RRset (delete-then-write, grouping
+ * A/AAAA by owner), then adopt the master's serial. Called only on a complete
+ * transfer. */
+static void xfr_apply(const char *zone, xfr_rec_t *recs, int n, uint32_t serial) {
+    char pat[768];
+    snprintf(pat, sizeof(pat), "zone:%.255s:*", zone);
+    char **old = NULL;
+    int no = vk_list_keys(pat, &old);
+    for (int i = 0; i < no; i++)
+        vk_del(old[i]);
+    for (int i = 0; i < no; i++)
+        free(old[i]);
+    free(old);
+    char *written = calloc((size_t) (n > 0 ? n : 1), 1);
+    if (!written)
+        return;
+    for (int i = 0; i < n; i++) {
+        if (written[i])
+            continue;
+        char key[900], val[1024];
+        snprintf(key, sizeof(key), "zone:%.255s:%.16s:%.255s", zone, type2str(recs[i].type),
+                 recs[i].name);
+        if (recs[i].type == DNS_TYPE_A || recs[i].type == DNS_TYPE_AAAA) {
+            int off = snprintf(val, sizeof(val), "%u", recs[i].ttl);
+            for (int j = i; j < n; j++) {
+                if (!written[j] && recs[j].type == recs[i].type &&
+                    strcasecmp(recs[j].name, recs[i].name) == 0) {
+                    if (off < (int) sizeof(val) - 1)
+                        off += snprintf(val + off, sizeof(val) - off, "|%s", recs[j].val);
+                    written[j] = 1;
+                }
+            }
+        } else {
+            snprintf(val, sizeof(val), "%u|%s", recs[i].ttl, recs[i].val);
+            written[i] = 1;
+        }
+        vk_set(key, val, 0);
+    }
+    free(written);
+    xfr_set_serial(zone, serial);
+}
+
+/* Build a TLS client context for the transfer (server-cert verify against
+ * xfr_ca_pem; present a client cert if configured). NULL on error. */
+static SSL_CTX *xfr_client_ctx(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx)
+        return NULL;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (g_xfr_ca_pem[0]) {
+        X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+        BIO *b = BIO_new_mem_buf(g_xfr_ca_pem, -1);
+        X509 *cax;
+        while ((cax = PEM_read_bio_X509(b, NULL, NULL, NULL)) != NULL) {
+            X509_STORE_add_cert(store, cax);
+            X509_free(cax);
+        }
+        BIO_free(b);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    }
+    if (g_xfr_client_cert_pem[0] && g_xfr_client_key_pem[0]) {
+        BIO *cb = BIO_new_mem_buf(g_xfr_client_cert_pem, -1);
+        X509 *cc = PEM_read_bio_X509(cb, NULL, NULL, NULL);
+        if (cc) {
+            SSL_CTX_use_certificate(ctx, cc);
+            X509_free(cc);
+        }
+        BIO_free(cb);
+        BIO *kb = BIO_new_mem_buf(g_xfr_client_key_pem, -1);
+        EVP_PKEY *pk = PEM_read_bio_PrivateKey(kb, NULL, NULL, NULL);
+        if (pk) {
+            SSL_CTX_use_PrivateKey(ctx, pk);
+            EVP_PKEY_free(pk);
+        }
+        BIO_free(kb);
+    }
+    return ctx;
+}
+
+/* Pull `zone` from the configured master via AXFR and replace the local store.
+ * Returns 0 on success, -1 on any failure (store left untouched on failure). */
+static int xfr_pull(const char *zone) {
+    if (!g_primary_host[0])
+        return -1;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", g_primary_port);
+    if (getaddrinfo(g_primary_host, portstr, &hints, &res) != 0 || !res)
+        return -1;
+    int fd = socket(res->ai_family, SOCK_STREAM, 0);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd);
+        freeaddrinfo(res);
+        return -1;
+    }
+    freeaddrinfo(res);
+    SSL_CTX *cctx = NULL;
+    SSL *ssl = NULL;
+    if (g_primary_tls) {
+        cctx = xfr_client_ctx();
+        if (!cctx) {
+            close(fd);
+            return -1;
+        }
+        ssl = SSL_new(cctx);
+        SSL_set_fd(ssl, fd);
+        SSL_set_tlsext_host_name(ssl, g_primary_host);
+        static const uint8_t alpn[] = {3, 'd', 'o', 't'};
+        SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+        if (SSL_connect(ssl) <= 0 || (g_xfr_ca_pem[0] && SSL_get_verify_result(ssl) != X509_V_OK)) {
+            dns_log(LOG_WARNING, "[XFR] %s: TLS handshake/verify to %s failed\n", zone,
+                    g_primary_host);
+            SSL_free(ssl);
+            SSL_CTX_free(cctx);
+            close(fd);
+            return -1;
+        }
+    }
+    /* Build + send the AXFR query (id 0x5858 "XX"). */
+    uint8_t q[600];
+    memset(q, 0, 12);
+    dns_hdr_t *qh = (dns_hdr_t *) q;
+    uint16_t qid = 0x5858;
+    qh->id = htons(qid);
+    qh->flags = 0; /* opcode QUERY, no RD (a transfer is not a recursive query) */
+    qh->qdcount = htons(1);
+    int qo = name_to_wire(zone, q + 12, sizeof(q) - 12);
+    if (qo < 0) {
+        if (ssl) {
+            SSL_free(ssl);
+            SSL_CTX_free(cctx);
+        }
+        close(fd);
+        return -1;
+    }
+    qo += 12;
+    put16(q, qo, DNS_TYPE_AXFR);
+    qo += 2;
+    put16(q, qo, DNS_CLASS_IN);
+    qo += 2;
+    uint8_t lb[2] = {(uint8_t) (qo >> 8), (uint8_t) (qo & 0xFF)};
+    int sok = ssl ? (SSL_write(ssl, lb, 2) == 2 && SSL_write(ssl, q, qo) == qo)
+                  : (send(fd, lb, 2, 0) == 2 && send(fd, q, qo, 0) == qo);
+    if (!sok) {
+        if (ssl) {
+            SSL_free(ssl);
+            SSL_CTX_free(cctx);
+        }
+        close(fd);
+        return -1;
+    }
+    /* Read the AXFR stream; collect RRs until the closing (2nd apex) SOA. */
+    xfr_rec_t *recs = malloc(sizeof(xfr_rec_t) * XFR_MAX_RECORDS);
+    int nrec = 0, soa_seen = 0, ok = 0, overflow = 0;
+    uint32_t serial = 0;
+    uint8_t *msg = malloc(65536);
+    if (recs && msg) {
+        while (soa_seen < 2) {
+            uint8_t mlb[2];
+            if (xfr_read_full(fd, ssl, mlb, 2) != 0)
+                break;
+            int mlen = (mlb[0] << 8) | mlb[1];
+            if (mlen < 12 || mlen > 65535 || xfr_read_full(fd, ssl, msg, mlen) != 0)
+                break;
+            int qd = (int) ntohs(((dns_hdr_t *) msg)->qdcount);
+            int an = (int) ntohs(((dns_hdr_t *) msg)->ancount);
+            int off = 12;
+            for (int i = 0; i < qd; i++) { /* skip question section */
+                char tmpn[256];
+                int a = name_from_wire(msg, mlen, off, tmpn, sizeof(tmpn));
+                if (a < 0 || a + 4 > mlen)
+                    goto stream_done;
+                off = a + 4;
+            }
+            for (int i = 0; i < an && soa_seen < 2; i++) {
+                char rname[256];
+                int a = name_from_wire(msg, mlen, off, rname, sizeof(rname));
+                if (a < 0 || a + 10 > mlen)
+                    goto stream_done;
+                uint16_t rtype = get16(msg, a);
+                uint32_t rttl = get32(msg, a + 4);
+                uint16_t rdlen = get16(msg, a + 8);
+                int rdoff = a + 10;
+                if (rdoff + rdlen > mlen)
+                    goto stream_done;
+                off = rdoff + rdlen;
+                if (rtype == DNS_TYPE_SOA) {
+                    if (soa_seen == 0) { /* SOA rdata: mname, rname, serial, … */
+                        char nm[256];
+                        int p = name_from_wire(msg, mlen, rdoff, nm, sizeof(nm));
+                        if (p > 0)
+                            p = name_from_wire(msg, mlen, p, nm, sizeof(nm));
+                        if (p > 0 && p + 4 <= mlen)
+                            serial = get32(msg, p);
+                    }
+                    soa_seen++;
+                    continue;
+                }
+                if (soa_seen != 1)
+                    continue; /* only records between the bracketing SOAs */
+                char val[600];
+                if (xfr_rdata_to_store(msg, mlen, rtype, rdoff, rdlen, val, sizeof(val)) != 0)
+                    continue; /* unsupported type — skip */
+                if (nrec >= XFR_MAX_RECORDS) {
+                    overflow = 1;
+                    goto stream_done;
+                }
+                safe_strcpy(recs[nrec].name, rname, sizeof(recs[nrec].name));
+                recs[nrec].type = rtype;
+                recs[nrec].ttl = rttl;
+                safe_strcpy(recs[nrec].val, val, sizeof(recs[nrec].val));
+                nrec++;
+            }
+        }
+    stream_done:
+        ok = (soa_seen >= 2 && !overflow);
+    }
+    if (ssl) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        SSL_CTX_free(cctx);
+    }
+    close(fd);
+    if (ok) {
+        xfr_apply(zone, recs, nrec, serial);
+        dns_log(LOG_NOTICE, "[XFR] %s: AXFR from %s:%d complete — %d records, serial %u\n", zone,
+                g_primary_host, g_primary_port, nrec, serial);
+    } else {
+        dns_log(LOG_WARNING, "[XFR] %s: AXFR from %s:%d failed (incomplete) — store unchanged\n",
+                zone, g_primary_host, g_primary_port);
+    }
+    free(recs);
+    free(msg);
+    return ok ? 0 : -1;
+}
+
+/* Startup pull: a secondary loads every configured zone from the master once.
+ * Runs in a detached thread so a slow/unreachable master never blocks startup. */
+static void *xfr_startup_thread(void *arg) {
+    (void) arg;
+    char names[MAX_ZONES][256];
+    int nz = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && nz < MAX_ZONES; i++)
+        safe_strcpy(names[nz++], g_zones[i].name, sizeof(names[0]));
+    pthread_mutex_unlock(&g_zones_mutex);
+    for (int i = 0; i < nz; i++)
+        xfr_pull(names[i]);
+    return NULL;
+}
+
 static void *axfr_thread(void *arg) {
     axfr_conn_t c;
     memcpy(&c, arg, sizeof(c));
@@ -7953,6 +8351,17 @@ int main(int argc, char **argv) {
             dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
     }
 
+    /* Secondary: pull every zone from the master once at startup (hidden-master
+     * plan Gap 3). Detached so an unreachable master never blocks the server;
+     * periodic refresh + NOTIFY-triggered re-pull are Gap 6/5. */
+    if (g_zone_secondary && g_primary_host[0]) {
+        pthread_t xtid;
+        if (pthread_create(&xtid, NULL, xfr_startup_thread, NULL) == 0)
+            pthread_detach(xtid);
+        else
+            dns_log(LOG_ERR, "[XFR] Failed to start transfer-client thread\n");
+    }
+
     /* (mDNS moved to the mdnsd daemon — migration Step 3.) */
 
     /* Phase 6: Open unicast DNS sockets — dual-stack IPv4 + IPv6 */
@@ -8089,6 +8498,9 @@ int main(int argc, char **argv) {
             (g_dot_require_client_cert && g_mtls_ca_pem[0]) ? "yes" : "no");
     dns_log(LOG_INFO, "║  Zone role                                  %-20s       ║\n",
             g_zone_secondary ? "secondary (read-only)" : "primary");
+    if (g_zone_secondary && g_primary_host[0])
+        dns_log(LOG_INFO, "║  Pull zones from master                     %s:%-5d%s║\n",
+                g_primary_host, g_primary_port, g_primary_tls ? " (TLS)   " : "        ");
     dns_log(LOG_INFO, "║  metrics/health (localhost, read-only)     :%d                   ║\n",
             g_metrics_port);
     dns_log(LOG_INFO, "║  DoH + management API now served by apid                          ║\n");
