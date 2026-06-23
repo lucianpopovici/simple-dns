@@ -46,6 +46,17 @@ Everything below is missing and is required for the two-role deployment.
 > shipped first (PR #10)** — a secondary now has real content to pull. Remaining
 > HM gaps (2 role config, 3+4 transfer client + TSIG chain verify, 5 NOTIFY
 > action, 6 refresh loop, 7 write-refusal, 8 key guard) are still open.
+>
+> **Gaps 2/7/8 done** (branch `zone-role-guards`): `config:zone_role`
+> (`primary` default | `secondary`) → `g_zone_secondary`. On a secondary:
+> `handle_update` returns NOTAUTH immediately (Gap 7); `dnssec_init_key`
+> load-only — if a zone's keys are absent it logs loudly and serves unsigned
+> rather than minting a divergent trust anchor (Gap 8). Guarded by
+> `make check-role`. Scaffolding only for the transfer mesh — the `primary_host`
+> / `xfr_*` config keys land with the transfer client (Gap 3). NOTE: the mgmt-API
+> write 403 half of Gap 7 belongs to `apid` (not dnsd); `serial_bump` still runs
+> for DNSSEC rollover/TLSA on a secondary (a secondary shouldn't run rollover —
+> tie off with Gap 6).
 
 ## Gap 1 — mTLS on the DoT/transfer listener (master side)
 

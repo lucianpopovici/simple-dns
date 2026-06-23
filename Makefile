@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-dot-mtls check-ddns-acl check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -406,6 +406,47 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
+
+# Secondary-role guards (hidden-master plan Gap 2/7/8). With
+# config:zone_role=secondary the instance is a read-only replica: an RFC 2136
+# UPDATE is refused with NOTAUTH (never applied locally), and a zone with no
+# DNSSEC keys is served UNSIGNED rather than minting a divergent trust anchor
+# (a primary, by contrast, generates the keys). Uses a throwaway zone + nsupdate;
+# clears config:tsig_secret_b64 for the run. Needs Valkey + dig + nsupdate.
+check-role: $(BIN_DEBUG)
+	@echo "  CHECK  secondary role: UPDATE→NOTAUTH + no DNSSEC keygen (Valkey + dig + nsupdate)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
+	 Z=roletest.local;                                                                 \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_ROLE=$$($$VC get config:zone_role); \
+	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|3|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set config:zone_role secondary >/dev/null;                                   \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_role1.log 2>&1 & DNS=$$!;   \
+	 sleep 1.5;                                                                        \
+	 NA=$$(printf 'server 127.0.0.1 5353\nzone example.local\nupdate add r1.example.local 60 A 10.0.0.5\nsend\n' | nsupdate 2>&1 | grep -c -i notauth); \
+	 R1=$$(dig +short +nocookie @127.0.0.1 -p 5353 r1.example.local A +time=2 +tries=1);\
+	 SEC_DK=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z DNSKEY +time=2 +tries=1 | grep -c '^25'); \
+	 GUARD=$$(grep -c "ABSENT on a secondary" /tmp/dnsd_role1.log);                     \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC set config:zone_role primary >/dev/null;                                     \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_role2.log 2>&1 & DNS=$$!;   \
+	 sleep 2;                                                                          \
+	 PRI_DK=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z DNSKEY +time=2 +tries=1 | grep -c '^25'); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone_table:$$Z >/dev/null;                                               \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_ROLE" ]; then $$VC set config:zone_role "$$SAVE_ROLE" >/dev/null; else $$VC del config:zone_role >/dev/null; fi; \
+	 echo "  secondary: update_notauth=$$NA r1=[$$R1] dnskey=$$SEC_DK keyguard_log=$$GUARD | primary: dnskey=$$PRI_DK"; \
+	 test "$$NA" -ge 1 || { echo "  FAIL  secondary did not refuse UPDATE with NOTAUTH"; exit 1; }; \
+	 test -z "$$R1" || { echo "  FAIL  secondary applied a local UPDATE ($$R1)"; exit 1; }; \
+	 test "$$SEC_DK" -eq 0 || { echo "  FAIL  secondary minted DNSKEY for a keyless zone"; exit 1; }; \
+	 test "$$GUARD" -ge 1 || { echo "  FAIL  secondary key-guard did not log"; exit 1; }; \
+	 test "$$PRI_DK" -ge 1 || { echo "  FAIL  primary did not generate DNSKEY (control)"; exit 1; }; \
+	 echo "  OK  secondary refuses UPDATE + serves unsigned (no keygen); primary signs"
 
 # DDNS suffix ACL + serial-churn skip (CLAUDE-discovery.md Gap 3). With
 # config:ddns_allow_suffix set, RFC 2136 UPDATE may only touch names under that
@@ -754,6 +795,7 @@ help:
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
 	@echo "  make check-dot-mtls  mTLS on the DoT/transfer listener (needs Valkey + openssl)"
 	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
+	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
