@@ -79,6 +79,9 @@
  *                              config:mtls_ca_pem). Default 0 — keep OFF on
  *                              public instances; ON on a hidden master to gate
  *                              AXFR/IXFR to the secondaries only.
+ *   config:ddns_allow_suffix   When set (e.g. ".dyn.corp.local"), RFC 2136
+ *                              UPDATE may only touch names at/under this suffix;
+ *                              everything else is REFUSED. Empty = unrestricted.
  *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
@@ -540,6 +543,12 @@ static int g_udp_rx_batch = 1;
 static int g_http_port = HTTP_PORT_DEFAULT;
 static int g_https_port = HTTPS_PORT_DEFAULT;
 static char g_ddns_secret[256] = "changeme";
+/* config:ddns_allow_suffix — when non-empty, RFC 2136 UPDATE may only touch
+ * names at or under this suffix (e.g. ".dyn.corp.local"). One shared TSIG key
+ * otherwise lets any registrant overwrite any name (apex, www, …); the suffix
+ * confines dynamic registrants to a sub-domain so static/infra names are immune
+ * (CLAUDE-discovery.md Gap 3). Empty = no restriction (legacy behaviour). */
+static char g_ddns_allow_suffix[256] = "";
 /* RRL configuration (rate limiting) */
 static int g_rrl_enabled = 0;
 static int g_rrl_rate = 5;   /* max responses/window */
@@ -1989,6 +1998,8 @@ static void config_load_from_valkey(void) {
             d = (uint32_t) atol(val);                                                              \
     } while (0)
     G("ddns_secret", g_ddns_secret);
+    g_ddns_allow_suffix[0] = 0;
+    G("ddns_allow_suffix", g_ddns_allow_suffix);
     GI("dns_port", g_dns_port);
     GI("dot_port", g_dot_port);
     GI("http_port", g_http_port);
@@ -6383,6 +6394,26 @@ static int prereq_rrset_exists(const char *name, uint16_t rtype) {
     return 0;
 }
 
+/* RFC 2136 / discovery Gap 3: is `name` permitted by config:ddns_allow_suffix?
+ * Empty suffix = unrestricted (legacy). Otherwise `name` must equal the suffix
+ * (a leading dot is ignored) or sit strictly under it at a label boundary.
+ * Case-insensitive. */
+static int ddns_name_allowed(const char *name) {
+    if (!g_ddns_allow_suffix[0])
+        return 1;
+    const char *suf = g_ddns_allow_suffix;
+    while (*suf == '.')
+        suf++; /* normalise ".dyn.corp.local" -> "dyn.corp.local" */
+    size_t nl = strlen(name), sl = strlen(suf);
+    if (sl == 0)
+        return 1;
+    if (nl == sl)
+        return strcasecmp(name, suf) == 0;
+    if (nl > sl + 1)
+        return name[nl - sl - 1] == '.' && strcasecmp(name + nl - sl, suf) == 0;
+    return 0;
+}
+
 /* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
@@ -6468,31 +6499,47 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
             goto formerr;
         const uint8_t *rd = pkt + off;
         off += rdlen;
+        /* discovery Gap 3: confine dynamic registrants to config:ddns_allow_suffix
+         * so a shared TSIG key cannot overwrite apex/infrastructure names. Refuse
+         * the whole update (don't partially apply) if any name is out of bounds. */
+        if (!ddns_name_allowed(un)) {
+            dns_log(LOG_WARNING, "[DDNS] REFUSED update of %s — outside ddns_allow_suffix [%s]\n",
+                    un, g_ddns_allow_suffix);
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
+            return tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+        }
         char k[768];
         if (uc == DNS_CLASS_IN && rdlen > 0) {
             if (ut == DNS_TYPE_A && rdlen == 4) {
                 char ip[32];
                 snprintf(ip, sizeof(ip), "%d.%d.%d.%d", rd[0], rd[1], rd[2], rd[3]);
                 dkey(k, sizeof(k), "A", un);
+                /* discovery Gap 3: a lease refresh re-stores the same IP — renew
+                 * the TTL but skip the serial bump + journal when unchanged, so a
+                 * fleet refreshing every TTL/2 doesn't churn the serial/IXFR. */
+                char old[64] = "";
+                int changed = !(vk_get(k, old, sizeof(old)) && strcmp(old, ip) == 0);
                 vk_set(k, ip, uttl ? uttl : DEFAULT_TTL);
-                {
+                if (changed) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
                     uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(prev, next, 'A', un, ip);
                 }
-                dns_log(LOG_NOTICE, "[DDNS] A %s->%s\n", un, ip);
+                dns_log(LOG_NOTICE, "[DDNS] A %s->%s%s\n", un, ip, changed ? "" : " (refresh)");
                 STAT_INC(g_stat_ddns);
             } else if (ut == DNS_TYPE_AAAA && rdlen == 16) {
                 char ip6[INET6_ADDRSTRLEN];
                 inet_ntop(AF_INET6, rd, ip6, sizeof(ip6));
                 dkey(k, sizeof(k), "AAAA", un);
+                char old[INET6_ADDRSTRLEN] = "";
+                int changed = !(vk_get(k, old, sizeof(old)) && strcmp(old, ip6) == 0);
                 vk_set(k, ip6, uttl ? uttl : DEFAULT_TTL);
-                {
+                if (changed) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
                     uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(prev, next, 'A', un, ip6);
                 }
-                dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s\n", un, ip6);
+                dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s%s\n", un, ip6, changed ? "" : " (refresh)");
             } else if (ut == DNS_TYPE_TXT && rdlen >= 1) {
                 uint8_t sl = rd[0];
                 /* sl is uint8_t (<= 255), so only the rdlen bound matters */
