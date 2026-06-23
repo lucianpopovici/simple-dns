@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-dot-mtls check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-dot-mtls check-ddns-acl check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -406,6 +406,45 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
+
+# DDNS suffix ACL + serial-churn skip (CLAUDE-discovery.md Gap 3). With
+# config:ddns_allow_suffix set, RFC 2136 UPDATE may only touch names under that
+# suffix (others REFUSED); and a lease refresh that re-stores the same address
+# renews the TTL without bumping the SOA serial (only a real change does). Uses
+# nsupdate; clears config:tsig_secret_b64 for the run so the test exercises the
+# ACL/churn logic without TSIG plumbing (both are TSIG-independent). Needs
+# Valkey + dig + nsupdate; restores config afterward.
+check-ddns-acl: $(BIN_DEBUG)
+	@echo "  CHECK  DDNS suffix ACL + serial-churn skip (requires Valkey + dig + nsupdate)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
+	 Z=example.local; FQDN=web1.dyn.$$Z;                                               \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_SX=$$($$VC get config:ddns_allow_suffix); \
+	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 $$VC set config:ddns_allow_suffix ".dyn.$$Z" >/dev/null;                          \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ddns.log 2>&1 & DNS=$$!;    \
+	 sleep 1.5;                                                                        \
+	 printf 'server 127.0.0.1 5353\nzone %s\nupdate add %s 60 A 10.0.0.1\nsend\n' "$$Z" "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 IN=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$FQDN A +time=2 +tries=1);         \
+	 OUT=$$(printf 'server 127.0.0.1 5353\nzone %s\nupdate add www.%s 60 A 6.6.6.6\nsend\n' "$$Z" "$$Z" | nsupdate 2>&1 | grep -c -i refused); \
+	 WWW=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.$$Z A +time=2 +tries=1 | head -1); \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 printf 'server 127.0.0.1 5353\nupdate add %s 60 A 10.0.0.1\nsend\n' "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 S2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 printf 'server 127.0.0.1 5353\nupdate add %s 60 A 10.0.0.77\nsend\n' "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 S3=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del config:ddns_allow_suffix ddns:$$Z:A:$$FQDN >/dev/null;                   \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; fi; \
+	 echo "  in-suffix A=[$$IN]  out-of-suffix refused=$$OUT www=[$$WWW]  serial S1=$$S1 S2=$$S2 S3=$$S3"; \
+	 test "$$IN" = "10.0.0.1" || { echo "  FAIL  in-suffix UPDATE not applied"; exit 1; }; \
+	 test "$$OUT" -ge 1 || { echo "  FAIL  out-of-suffix UPDATE was not REFUSED"; exit 1; }; \
+	 test "$$WWW" != "6.6.6.6" || { echo "  FAIL  out-of-suffix UPDATE leaked into the zone"; exit 1; }; \
+	 test -n "$$S1" -a "$$S1" = "$$S2" || { echo "  FAIL  refresh (same IP) churned the serial ($$S1 -> $$S2)"; exit 1; }; \
+	 test "$$S3" != "$$S2" || { echo "  FAIL  changed IP did not bump the serial ($$S2 -> $$S3)"; exit 1; }; \
+	 echo "  OK  suffix ACL enforced; refresh is serial-neutral; real change bumps serial"
 
 # mTLS on the DoT/transfer listener (hidden-master plan Gap 1). With
 # config:dot_require_client_cert=1 + a CA, the DoT port must reject a TLS client
@@ -714,6 +753,7 @@ help:
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
 	@echo "  make check-dot-mtls  mTLS on the DoT/transfer listener (needs Valkey + openssl)"
+	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"

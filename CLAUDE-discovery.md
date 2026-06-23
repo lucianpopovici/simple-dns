@@ -61,8 +61,17 @@ Name hygiene: put discovered names under a dedicated sub-domain
 > made AXFR unusable with strict clients: response messages never echoed the
 > request ID (RFC 5936 §2.2) — `dig` aborted with "ID mismatch". Guarded by
 > `make check-axfr` (multi-IP A + TXT + ddns lease all transfer; SOA brackets).
-> Remaining discovery gaps (2 serial-churn/journal, 3 suffix ACL, 4 PTR) and the
-> IXFR id-echo are still open.
+>
+> **Gap 3 is done** (branch `ddns-suffix-acl`): `config:ddns_allow_suffix` —
+> when set (e.g. `.dyn.corp.local`), RFC 2136 UPDATE may only touch names at/
+> under that suffix; anything else is REFUSED (whole update, fail-closed) via
+> `ddns_name_allowed()`. Serial-churn: the A/AAAA add paths compare the stored
+> value first and skip the `serial_bump` + IXFR journal when the address is
+> unchanged (lease TTL is still renewed) — a fleet refreshing every TTL/2 no
+> longer churns the serial. Guarded by `make check-ddns-acl`. NOTE: the REST
+> `/update` half of Gap 3 lives in `apid` now (not dnsd) and would need its own
+> suffix check. Remaining discovery gaps: 2 (sweeper + journal deletes), 4 (PTR,
+> needs reverse zones) and the IXFR id-echo.
 
 ### Gap 1 — AXFR does not transfer runtime records **(blocker, also for CLAUDE.md)**
 
