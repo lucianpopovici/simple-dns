@@ -82,6 +82,9 @@
  *   config:ddns_allow_suffix   When set (e.g. ".dyn.corp.local"), RFC 2136
  *                              UPDATE may only touch names at/under this suffix;
  *                              everything else is REFUSED. Empty = unrestricted.
+ *   config:zone_role           "primary" (default) or "secondary". A secondary
+ *                              is a read-only replica: UPDATE → NOTAUTH and it
+ *                              never generates DNSSEC keys (load-only).
  *   config:privdrop_user       Unprivileged user dnsd setuids to after binding
  *                              sockets (env DNS_USER overrides; default "nobody")
  *   config:privdrop_group      Unprivileged group (env DNS_GROUP; default = the
@@ -277,6 +280,7 @@
 #define DNS_RCODE_YXDOMAIN 6
 #define DNS_RCODE_YXRRSET 7 /* RFC 2136: RRset should not exist but does */
 #define DNS_RCODE_NXRRSET 8 /* RFC 2136: RRset should exist but does not */
+#define DNS_RCODE_NOTAUTH 9 /* RFC 2136 §2.2: server not authoritative / not authorized */
 #define DNS_RCODE_NOTZONE 10
 #define DNS_RCODE_BADVERS 16
 #define DNS_RCODE_BADSIG 17
@@ -549,6 +553,11 @@ static char g_ddns_secret[256] = "changeme";
  * confines dynamic registrants to a sub-domain so static/infra names are immune
  * (CLAUDE-discovery.md Gap 3). Empty = no restriction (legacy behaviour). */
 static char g_ddns_allow_suffix[256] = "";
+/* config:zone_role — "primary" (default) or "secondary". A secondary is a
+ * read-only replica: it pulls the zone from a master and must refuse all local
+ * writes (UPDATE → NOTAUTH) and never mint its own DNSSEC keys (it would publish
+ * a trust anchor that diverges from the master's). Hidden-master plan Gap 2/7/8. */
+static int g_zone_secondary = 0;
 /* RRL configuration (rate limiting) */
 static int g_rrl_enabled = 0;
 static int g_rrl_rate = 5;   /* max responses/window */
@@ -2000,6 +2009,13 @@ static void config_load_from_valkey(void) {
     G("ddns_secret", g_ddns_secret);
     g_ddns_allow_suffix[0] = 0;
     G("ddns_allow_suffix", g_ddns_allow_suffix);
+    /* Role: a "secondary" is a read-only replica (hidden-master plan Gap 2). */
+    g_zone_secondary = 0;
+    {
+        char role[64] = "";
+        if (vk_get("config:zone_role", role, sizeof(role)) && strcasecmp(role, "secondary") == 0)
+            g_zone_secondary = 1;
+    }
     GI("dns_port", g_dns_port);
     GI("dot_port", g_dot_port);
     GI("http_port", g_http_port);
@@ -2105,8 +2121,7 @@ static void config_load_from_valkey(void) {
                 "instance — an open resolver is an amplification/abuse target.\n",
                 g_forwarders[0] ? g_forwarders : "(none configured!)", g_forward_allow,
                 g_forward_timeout_ms);
-        char role[64] = "";
-        if (vk_get("config:zone_role", role, sizeof(role)) && strcasecmp(role, "secondary") == 0)
+        if (g_zone_secondary)
             dns_log(LOG_WARNING,
                     "[FORWARD] zone_role=secondary (public-facing) AND forwarding is enabled — "
                     "ensure this secondary is internal-only.\n");
@@ -2949,6 +2964,17 @@ static void dnssec_init_key(const char *vk_key, const char *legacy_key, EVP_PKEY
         *out = PEM_read_bio_PrivateKey(b, NULL, NULL, NULL);
         pthread_mutex_unlock(&g_zsk_mutex);
         BIO_free(b);
+    }
+    /* A secondary must LOAD keys (replicated from the master out of band) but
+     * never GENERATE them: a freshly minted key would publish a DNSKEY/DS that
+     * diverges from the parent's DS, breaking validation for clients hitting
+     * this replica. Serve unsigned instead, loudly. Hidden-master plan Gap 8. */
+    if (!*out && g_zone_secondary) {
+        dns_log(LOG_WARNING,
+                "[DNSSEC] %s ABSENT on a secondary — NOT generating (would fork the trust "
+                "anchor). Replicate the master's dnssec:* keys before start; serving unsigned.\n",
+                label);
+        return;
     }
     if (!*out) {
         dns_log(LOG_INFO, "[DNSSEC] Generating %s...\n", label);
@@ -6425,6 +6451,15 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
     rh->id = h->id;
     rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOERROR);
     rh->qdcount = rh->ancount = rh->nscount = rh->arcount = 0;
+    /* A secondary is a read-only replica: never apply a local UPDATE (it would
+     * fork the zone from the master and corrupt IXFR history). RFC 2136 §6 lets
+     * a secondary forward to the primary; we don't — point ACME/DDNS clients at
+     * the hidden master. Hidden-master plan Gap 7. */
+    if (g_zone_secondary) {
+        dns_log(LOG_NOTICE, "[UPDATE] refused on secondary (zone_role=secondary) — NOTAUTH\n");
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
+        return 12;
+    }
     /* TSIG verification */
     if (g_tsig_secret_len > 0 && !tsig_verify(pkt, plen)) {
         rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_BADSIG);
@@ -8052,6 +8087,8 @@ int main(int argc, char **argv) {
             g_dot_port, g_dot_ctx ? "TLS " : "----");
     dns_log(LOG_INFO, "║  DoT client-cert (mTLS) required            %-20s       ║\n",
             (g_dot_require_client_cert && g_mtls_ca_pem[0]) ? "yes" : "no");
+    dns_log(LOG_INFO, "║  Zone role                                  %-20s       ║\n",
+            g_zone_secondary ? "secondary (read-only)" : "primary");
     dns_log(LOG_INFO, "║  metrics/health (localhost, read-only)     :%d                   ║\n",
             g_metrics_port);
     dns_log(LOG_INFO, "║  DoH + management API now served by apid                          ║\n");
