@@ -22,6 +22,8 @@
  *   6303       Locally served DNS zones (RFC 6303)
  *   7344/8078  CDS/CDNSKEY – child signals for DNSSEC delegation
  *   7553       URI records
+ *   1035 PTR   Reverse DNS — serve in-addr.arpa / ip6.arpa zones (query/AXFR);
+ *              optional auto-PTR for DDNS A/AAAA (config:ddns_auto_ptr)
  *   9250 stub  NAPTR records (query/serve)
  *   5001       NSID – Name Server Identifier EDNS option
  *   5155       NSEC3 – hashed authenticated denial of existence
@@ -82,6 +84,10 @@
  *   config:ddns_allow_suffix   When set (e.g. ".dyn.corp.local"), RFC 2136
  *                              UPDATE may only touch names at/under this suffix;
  *                              everything else is REFUSED. Empty = unrestricted.
+ *   config:ddns_auto_ptr       When set, a forward A/AAAA DDNS registration also
+ *                              maintains the matching reverse PTR lease in the
+ *                              in-addr.arpa / ip6.arpa zone configured locally
+ *                              (ddns:<revzone>:PTR:*). Off = no auto-PTR.
  *   config:zone_role           "primary" (default) or "secondary". A secondary
  *                              is a read-only replica: UPDATE → NOTAUTH and it
  *                              never generates DNSSEC keys (load-only).
@@ -567,6 +573,10 @@ static char g_ddns_secret[256] = "changeme";
  * confines dynamic registrants to a sub-domain so static/infra names are immune
  * (CLAUDE-discovery.md Gap 3). Empty = no restriction (legacy behaviour). */
 static char g_ddns_allow_suffix[256] = "";
+/* config:ddns_auto_ptr — when set, a forward A/AAAA DDNS registration also
+ * maintains the matching reverse PTR lease in whichever in-addr.arpa / ip6.arpa
+ * zone is configured locally (CLAUDE-discovery.md Gap 4). Off = no auto-PTR. */
+static int g_ddns_auto_ptr = 0;
 /* config:zone_role — "primary" (default) or "secondary". A secondary is a
  * read-only replica: it pulls the zone from a master and must refuse all local
  * writes (UPDATE → NOTAUTH) and never mint its own DNSSEC keys (it would publish
@@ -2037,6 +2047,8 @@ static void config_load_from_valkey(void) {
     G("ddns_secret", g_ddns_secret);
     g_ddns_allow_suffix[0] = 0;
     G("ddns_allow_suffix", g_ddns_allow_suffix);
+    g_ddns_auto_ptr = 0;
+    GI("ddns_auto_ptr", g_ddns_auto_ptr);
     /* Role: a "secondary" is a read-only replica (hidden-master plan Gap 2). */
     g_zone_secondary = 0;
     {
@@ -4593,6 +4605,8 @@ static const char *type2str(uint16_t t) {
             return "NS";
         case DNS_TYPE_CNAME:
             return "CNAME";
+        case DNS_TYPE_PTR:
+            return "PTR";
         case DNS_TYPE_SOA:
             return "SOA";
         case DNS_TYPE_MX:
@@ -5144,6 +5158,7 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
     switch (type) {
         case DNS_TYPE_CNAME:
         case DNS_TYPE_NS:
+        case DNS_TYPE_PTR:
         case DNS_TYPE_DNAME: {
             int n = name_to_wire(pipe, rd, rdcap);
             if (n < 0)
@@ -6119,6 +6134,43 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                                   &answers);
         }
     }
+    /* PTR (reverse DNS). Served from both the dynamic lease (ddns:<zone>:PTR:*,
+     * TTL = remaining lease — auto-PTR registrations) and the static store
+     * (zone:<zone>:PTR:*, "ttl|<target>"). The owning in-addr.arpa / ip6.arpa
+     * zone is picked by the same longest-suffix match as any other zone. */
+    if (qtype == DNS_TYPE_PTR || qtype == DNS_TYPE_ANY) {
+        char val[512], k[768];
+        dkey(k, sizeof(k), "PTR", qname);
+        if (vk_get(k, val, sizeof(val)) && val[0]) {
+            found = 1;
+            uint8_t rd[300];
+            int rl = name_to_wire(val, rd, sizeof(rd));
+            if (rl > 0) {
+                long tl = vk_ttl(k);
+                if (tl < 1)
+                    tl = 1;
+                off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_PTR, (uint32_t) tl, rd,
+                              (uint16_t) rl, dnssec_ok, &answers);
+            }
+        }
+        zkey(k, sizeof(k), "PTR", qname);
+        if (vk_get(k, val, sizeof(val)) && val[0]) {
+            found = 1;
+            uint32_t ttl = DEFAULT_TTL;
+            char *pipe = strchr(val, '|');
+            if (pipe) {
+                ttl = (uint32_t) atoi(val);
+                pipe++;
+            } else {
+                pipe = val;
+            }
+            uint8_t rd[300];
+            int rl = name_to_wire(pipe, rd, sizeof(rd));
+            if (rl > 0)
+                off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_PTR, ttl, rd, (uint16_t) rl,
+                              dnssec_ok, &answers);
+        }
+    }
     /* Provisioned record types from Valkey */
     {
         uint16_t pts[] = {DNS_TYPE_CNAME,
@@ -6503,6 +6555,71 @@ static int ddns_name_allowed(const char *name) {
     return 0;
 }
 
+/* discovery Gap 4: build the reverse-DNS owner name for an IPv4/IPv6 address
+ * string. "10.0.0.42" -> "42.0.0.10.in-addr.arpa"; "2001:db8::1" -> its nibble-
+ * reversed ip6.arpa name. Returns the address family on success, -1 if `ipstr`
+ * is not a valid address or the name would not fit. */
+static int ddns_reverse_name(const char *ipstr, char *out, size_t cap) {
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (inet_pton(AF_INET, ipstr, &a4) == 1) {
+        const uint8_t *b = (const uint8_t *) &a4;
+        int n = snprintf(out, cap, "%u.%u.%u.%u.in-addr.arpa", b[3], b[2], b[1], b[0]);
+        return (n > 0 && (size_t) n < cap) ? AF_INET : -1;
+    }
+    if (inet_pton(AF_INET6, ipstr, &a6) == 1) {
+        char *p = out;
+        size_t left = cap;
+        /* Least-significant nibble first: low then high nibble of each byte,
+         * walking the address from its last byte to its first. */
+        for (int i = 15; i >= 0; i--) {
+            int n = snprintf(p, left, "%x.%x.", a6.s6_addr[i] & 0x0f, (a6.s6_addr[i] >> 4) & 0x0f);
+            if (n < 0 || (size_t) n >= left)
+                return -1;
+            p += n;
+            left -= (size_t) n;
+        }
+        int n = snprintf(p, left, "ip6.arpa");
+        return (n > 0 && (size_t) n < left) ? AF_INET6 : -1;
+    }
+    return -1;
+}
+
+/* discovery Gap 4: keep the reverse PTR lease in step with a forward A/AAAA
+ * DDNS registration. No-op unless config:ddns_auto_ptr is set and an
+ * in-addr.arpa / ip6.arpa zone covering `ipstr` is configured locally (picked by
+ * the same longest-suffix match as any query). `del` removes the PTR, otherwise
+ * it is written/renewed as ddns:<revzone>:PTR:<revname> -> <fqdn> with the
+ * forward lease's TTL. `bump` advances the reverse zone's serial + IXFR journal
+ * so the change replicates; an unchanged refresh passes bump=0 to renew the
+ * lease TTL without churning the serial. The reverse zone is a different zone
+ * than the forward one, so its key/serial/journal are addressed explicitly. */
+static void auto_ptr_apply(const char *fqdn, const char *ipstr, uint32_t ttl, int del, int bump) {
+    if (!g_ddns_auto_ptr)
+        return;
+    char rev[320];
+    if (ddns_reverse_name(ipstr, rev, sizeof(rev)) < 0)
+        return;
+    zone_entry_t *rz = zone_for_qname(rev);
+    if (!rz)
+        return; /* no reverse zone here — reverse DNS simply isn't served */
+    char key[800];
+    snprintf(key, sizeof(key), "ddns:%s:PTR:%s", rz->name, rev);
+    if (del) {
+        char had[256] = "";
+        if (!(vk_get(key, had, sizeof(had)) && had[0]))
+            return; /* nothing to retract → no replication event */
+        vk_del(key);
+    } else {
+        vk_set(key, fqdn, ttl ? ttl : DEFAULT_TTL);
+    }
+    if (!bump)
+        return;
+    uint32_t prev = rz->soa_serial;
+    uint32_t next = serial_bump(rz);
+    ixfr_journal_append(rz->name, prev, next, del ? 'D' : 'A', rev, fqdn);
+}
+
 /* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
@@ -6623,6 +6740,13 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                     uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A', un,
                                         ip);
+                    /* auto-PTR: retract the previous address's PTR (if the IP moved),
+                     * then publish the new one. Both bump the reverse zone. */
+                    if (old[0] && strcmp(old, ip) != 0)
+                        auto_ptr_apply(un, old, 0, 1, 1);
+                    auto_ptr_apply(un, ip, uttl, 0, 1);
+                } else {
+                    auto_ptr_apply(un, ip, uttl, 0, 0); /* renew PTR lease, no churn */
                 }
                 dns_log(LOG_NOTICE, "[DDNS] A %s->%s%s\n", un, ip, changed ? "" : " (refresh)");
                 STAT_INC(g_stat_ddns);
@@ -6638,6 +6762,11 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                     uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A', un,
                                         ip6);
+                    if (old[0] && strcmp(old, ip6) != 0)
+                        auto_ptr_apply(un, old, 0, 1, 1);
+                    auto_ptr_apply(un, ip6, uttl, 0, 1);
+                } else {
+                    auto_ptr_apply(un, ip6, uttl, 0, 0); /* renew PTR lease, no churn */
                 }
                 dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s%s\n", un, ip6, changed ? "" : " (refresh)");
             } else if (ut == DNS_TYPE_TXT && rdlen >= 1) {
@@ -6710,6 +6839,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
                     uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(zn, prev, next, 'D', un, old);
+                    auto_ptr_apply(un, old, 0, 1, 1); /* retract the reverse PTR too */
                 }
             }
             if (ut == DNS_TYPE_AAAA || ut == DNS_TYPE_ANY) {
@@ -6721,6 +6851,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
                     uint32_t next = serial_bump(t_zone);
                     ixfr_journal_append(zn, prev, next, 'D', un, old);
+                    auto_ptr_apply(un, old, 0, 1, 1);
                 }
             }
             if (ut == DNS_TYPE_TXT || ut == DNS_TYPE_ANY) {
@@ -6968,23 +7099,32 @@ static void axfr_emit_one(int fd, SSL *ssl, uint16_t qid, const char *name, uint
  * matches the live query path exactly. */
 static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname, uint8_t mac[64],
                               int *maclen) {
-    static const struct {
+    typedef struct {
         const char *ts;
         uint16_t t;
-    } ztypes[] = {
+    } xtype_t;
+    static const xtype_t ztypes[] = {
         {"A", DNS_TYPE_A},       {"AAAA", DNS_TYPE_AAAA},   {"CNAME", DNS_TYPE_CNAME},
         {"MX", DNS_TYPE_MX},     {"TXT", DNS_TYPE_TXT},     {"NS", DNS_TYPE_NS},
         {"SRV", DNS_TYPE_SRV},   {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
         {"TLSA", DNS_TYPE_TLSA}, {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
-        {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR},
+        {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
+    };
+    /* ddns:* leases that transfer: A/AAAA plus auto-PTR reverse records. */
+    static const xtype_t dtypes[] = {
+        {"A", DNS_TYPE_A},
+        {"AAAA", DNS_TYPE_AAAA},
+        {"PTR", DNS_TYPE_PTR},
     };
     const int nz = (int) (sizeof(ztypes) / sizeof(ztypes[0]));
+    const int nd = (int) (sizeof(dtypes) / sizeof(dtypes[0]));
     for (int pass = 0; pass < 2; pass++) {
         const char *ns = (pass == 0) ? "zone" : "ddns";
-        const int ntypes = (pass == 0) ? nz : 2; /* ddns: only A/AAAA */
+        const xtype_t *tt = (pass == 0) ? ztypes : dtypes;
+        const int ntypes = (pass == 0) ? nz : nd;
         for (int ti = 0; ti < ntypes; ti++) {
             char prefix[768], pat[800];
-            int pl = snprintf(prefix, sizeof(prefix), "%s:%s:%s:", ns, zname, ztypes[ti].ts);
+            int pl = snprintf(prefix, sizeof(prefix), "%s:%s:%s:", ns, zname, tt[ti].ts);
             snprintf(pat, sizeof(pat), "%s*", prefix);
             char **keys = NULL;
             int nk = vk_list_keys(pat, &keys);
@@ -6993,7 +7133,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                 char val[768];
                 if (!vk_get(keys[i], val, sizeof(val)) || !val[0])
                     continue;
-                uint16_t T = ztypes[ti].t;
+                uint16_t T = tt[ti].t;
                 if (T == DNS_TYPE_A || T == DNS_TYPE_AAAA) {
                     const int af = (T == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
                     const uint16_t alen = (T == DNS_TYPE_AAAA) ? 16 : 4;
@@ -7022,6 +7162,15 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                                 axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, alen, mac, maclen);
                         }
                     }
+                } else if (pass == 1) { /* ddns PTR lease: bare target, TTL = remaining lease */
+                    long tl = vk_ttl(keys[i]);
+                    if (tl < 1)
+                        tl = 1;
+                    uint8_t rd[300];
+                    int rl = name_to_wire(val, rd, sizeof(rd));
+                    if (rl > 0)
+                        axfr_emit_one(fd, ssl, qid, name, T, (uint32_t) tl, rd, (uint16_t) rl, mac,
+                                      maclen);
                 } else { /* rich provisioned types via the shared encoder */
                     uint32_t ttl = DEFAULT_TTL;
                     char *pipe = strchr(val, '|');

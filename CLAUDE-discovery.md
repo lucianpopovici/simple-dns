@@ -70,8 +70,10 @@ Name hygiene: put discovered names under a dedicated sub-domain
 > unchanged (lease TTL is still renewed) — a fleet refreshing every TTL/2 no
 > longer churns the serial. Guarded by `make check-ddns-acl`. NOTE: the REST
 > `/update` half of Gap 3 lives in `apid` now (not dnsd) and would need its own
-> suffix check. Remaining discovery gaps: 2 (sweeper + journal deletes), 4 (PTR,
-> needs reverse zones) and the IXFR id-echo.
+> suffix check. **Gap 4 (PTR / reverse zones) is now done** (branch
+> `ptr-reverse-zones`, `make check-ptr`) — multi-zone removed its blocker; see
+> the Gap 4 section. Remaining discovery gap: 2 (sweeper + journal deletes); the
+> IXFR id-echo is fixed (IXFR shipped, branch `ixfr-incremental`).
 
 ### Gap 1 — AXFR does not transfer runtime records **(blocker, also for CLAUDE.md)**
 
@@ -142,16 +144,31 @@ the suffix and are therefore immune.  ~20 lines.  Per-key TSIG ACLs
 (multiple named keys, each with a name-pattern) are the thorough version —
 phase 2, ~80 lines.
 
-### Gap 4 — PTR / reverse DNS (optional, deferred)
+### Gap 4 — PTR / reverse DNS **(done — branch `ptr-reverse-zones`)**
 
-Forward registrations don't create PTR records, and the server is
-**single-zone** (`g_zone_name`, 439; out-of-zone → REFUSED, 2638) so it
-cannot currently serve `in-addr.arpa` zones alongside the forward zone
-anyway (the `zone_t` struct at 289–349 looks like multi-zone groundwork,
-but nothing serves from it).  First pass: document that reverse DNS for
-discovered hosts is out of scope; the DHCP-backstop variant gets PTR for
-free if the DHCP server also manages the reverse zone elsewhere.  Revisit
-after multi-zone support exists.
+Multi-zone (migration Step 7) removed the single-zone blocker, so this is now
+implemented:
+
+- **Serve reverse zones.** PTR is a first-class served + transferred type:
+  `type2str`/`stored_rdata` know it, `build_query_resp` answers PTR from both
+  `zone:<rev>:PTR:*` (static, `ttl|target`) and `ddns:<rev>:PTR:*` (lease, TTL =
+  remaining), and `axfr_send_runtime` transfers both. A configured
+  `in-addr.arpa` / `ip6.arpa` `zone_table:<rev>` is selected by the same
+  longest-suffix match as any zone.
+- **Auto-PTR.** With `config:ddns_auto_ptr` set, a forward A/AAAA DDNS register
+  writes `ddns:<revzone>:PTR:<revname> -> <fqdn>` (lease TTL = forward TTL) into
+  whichever reverse zone is configured locally; an unchanged refresh renews the
+  PTR lease without churning the reverse serial, an IP change retracts the stale
+  PTR and publishes the new one, and a delete/expiry retracts it. The reverse
+  zone's serial + IXFR journal are bumped so the PTR replicates to secondaries.
+  `ddns_reverse_name()` builds the `.arpa` name (v4 octet-reverse, v6 nibble-
+  reverse); `auto_ptr_apply()` does the lease write/retract + bump/journal.
+
+Guarded by `make check-ptr` (static serve, auto-PTR v4+v6, AXFR of both, retract
+on delete). A reverse zone that isn't configured locally is a silent no-op, so
+the DHCP-backstop variant (reverse managed elsewhere) still works. Not wired to
+RFC 2136 *PTR* UPDATE from external clients — reverse records are either
+auto-maintained or provisioned via the control plane.
 
 ---
 
