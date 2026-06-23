@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-xfr-client check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -406,6 +406,50 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
+
+# Zone transfer CLIENT (hidden-master plan Gap 3). A secondary pulls each zone
+# from its master at startup. Drive a stub master (tests/axfr_master.py) that
+# serves one throwaway zone over plain TCP, run dnsd as a secondary pointed at
+# it, and assert the secondary now serves the transferred records (multi-IP A,
+# TXT, CNAME) with the master's serial — and that a zone the stub does NOT serve
+# (example.local) is left untouched (a failed pull must not wipe the store).
+# Needs Valkey + dig + python3; restores config afterward.
+check-xfr-client: $(BIN_DEBUG)
+	@echo "  CHECK  secondary AXFR pull from master (requires Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=xfrpull.test; P=5388;                                                           \
+	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
+	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
+	 python3 tests/axfr_master.py 127.0.0.1 $$P $$Z >/tmp/axfr_master.log 2>&1 & M=$$!;\
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 $$VC set config:zone_role secondary >/dev/null;                                   \
+	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
+	 $$VC set config:primary_port $$P >/dev/null;                                      \
+	 $$VC set config:primary_tls 0 >/dev/null;                                         \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_sec.log 2>&1 & DNS=$$!;     \
+	 sleep 2.5;                                                                        \
+	 A=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.$$Z A +time=2 +tries=1 | sort | tr '\n' ' '); \
+	 TX=$$(dig +short +nocookie @127.0.0.1 -p 5353 info.$$Z TXT +time=2 +tries=1);     \
+	 CN=$$(dig +short +nocookie @127.0.0.1 -p 5353 alias.$$Z CNAME +time=2 +tries=1);  \
+	 SOA=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 KEEP=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.example.local A +time=2 +tries=1); \
+	 kill $$DNS $$M 2>/dev/null || true;                                               \
+	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_ROLE" ]; then $$VC set config:zone_role "$$SAVE_ROLE" >/dev/null; else $$VC del config:zone_role >/dev/null; fi; \
+	 if [ -n "$$SAVE_PH" ]; then $$VC set config:primary_host "$$SAVE_PH" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
+	 echo "  pulled: wwwA=[$$A] TXT=[$$TX] CNAME=[$$CN] serial=$$SOA | untouched: www.example.local=[$$KEEP]"; \
+	 (echo "$$A" | grep -q "10.10.0.1") && (echo "$$A" | grep -q "10.10.0.2") || { echo "  FAIL  multi-IP A not transferred"; exit 1; }; \
+	 test "$$TX" = '"hello-xfr"' || { echo "  FAIL  TXT not transferred"; exit 1; }; \
+	 test "$$CN" = "www.$$Z." || { echo "  FAIL  CNAME not transferred"; exit 1; }; \
+	 test "$$SOA" = "424242" || { echo "  FAIL  master serial not adopted (got $$SOA)"; exit 1; }; \
+	 test "$$KEEP" = "192.168.1.10" || { echo "  FAIL  a failed pull clobbered example.local ($$KEEP)"; exit 1; }; \
+	 echo "  OK  secondary pulled the zone (records + serial); other zones left intact"
 
 # Secondary-role guards (hidden-master plan Gap 2/7/8). With
 # config:zone_role=secondary the instance is a read-only replica: an RFC 2136
@@ -796,6 +840,7 @@ help:
 	@echo "  make check-dot-mtls  mTLS on the DoT/transfer listener (needs Valkey + openssl)"
 	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
 	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"
+	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"

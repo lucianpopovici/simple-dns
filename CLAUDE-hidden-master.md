@@ -57,6 +57,18 @@ Everything below is missing and is required for the two-role deployment.
 > write 403 half of Gap 7 belongs to `apid` (not dnsd); `serial_bump` still runs
 > for DNSSEC rollover/TLSA on a secondary (a secondary shouldn't run rollover —
 > tie off with Gap 6).
+>
+> **Gap 3 done — AXFR client** (branch `xfr-client`): a secondary pulls every
+> zone from `config:primary_host:port` at startup (`xfr_pull` in a detached
+> thread). Plain TCP or TLS (`config:primary_tls` — server cert verified against
+> `config:xfr_ca_pem`, optional client cert `config:xfr_client_{cert,key}_pem`).
+> Parses the AXFR stream (A/AAAA/NS/CNAME/DNAME/MX/TXT/SRV → `xfr_rdata_to_store`)
+> and replaces `zone:<zone>:*` only on a COMPLETE transfer (closing SOA), adopting
+> the master's serial; a failed/partial pull leaves the store intact. Guarded by
+> `make check-xfr-client` (stub master + no-clobber check). **Still open: Gap 4
+> (request TSIG-sign + chained-response verify — until then run transfers over
+> TLS), IXFR (currently always AXFR), and Gap 5/6 (NOTIFY-triggered + periodic
+> refresh — currently a one-shot startup pull).**
 
 ## Gap 1 — mTLS on the DoT/transfer listener (master side)
 
