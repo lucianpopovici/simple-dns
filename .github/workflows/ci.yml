@@ -140,6 +140,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-xfr-refresh OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: Transfer TSIG (sign request + verify chained response)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-xfr-tsig OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
   warnings:
     name: Warnings as errors
     runs-on: ubuntu-latest

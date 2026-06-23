@@ -7161,6 +7161,132 @@ static SSL_CTX *xfr_client_ctx(void) {
     return ctx;
 }
 
+/* Build TSIG signing variables from a parsed TSIG RR (mirrors the block in
+ * tsig_verify): key name, class ANY, ttl 0, algorithm, time, fudge, error,
+ * other-len 0. Returns the byte count. Used to verify the chained AXFR MAC. */
+static int xfr_tsig_vars_from_rr(const tsig_rr_t *t, uint8_t vars[512]) {
+    int vp = 0;
+    char tmp2[256];
+    safe_strcpy(tmp2, t->key_name, sizeof(tmp2));
+    char *sp = NULL;
+    for (char *lbl = strtok_r(tmp2, ".", &sp); lbl; lbl = strtok_r(NULL, ".", &sp)) {
+        int ll = (int) strlen(lbl);
+        vars[vp++] = (uint8_t) ll;
+        memcpy(vars + vp, lbl, ll);
+        vp += ll;
+    }
+    vars[vp++] = 0; /* end of key name */
+    vars[vp++] = 0;
+    vars[vp++] = 255; /* class ANY */
+    vars[vp++] = 0;
+    vars[vp++] = 0;
+    vars[vp++] = 0;
+    vars[vp++] = 0; /* ttl 0 (4 bytes) */
+    memcpy(vars + vp, "\x0bhmac-sha256\x00", 13);
+    vp += 13;
+    vars[vp++] = (uint8_t) (t->time_high >> 8);
+    vars[vp++] = (uint8_t) (t->time_high & 0xFF);
+    vars[vp++] = (uint8_t) ((t->time_low >> 24) & 0xFF);
+    vars[vp++] = (uint8_t) ((t->time_low >> 16) & 0xFF);
+    vars[vp++] = (uint8_t) ((t->time_low >> 8) & 0xFF);
+    vars[vp++] = (uint8_t) (t->time_low & 0xFF);
+    vars[vp++] = t->fudge >> 8;
+    vars[vp++] = t->fudge & 0xFF;
+    vars[vp++] = t->error >> 8;
+    vars[vp++] = t->error & 0xFF;
+    vars[vp++] = 0;
+    vars[vp++] = 0; /* other len 0 */
+    return vp;
+}
+
+/* Sign an outgoing AXFR query with TSIG (RFC 8945): MAC = HMAC(query || vars).
+ * Returns the new length and stores the request MAC (which seeds the response
+ * chain). No-op (returns off) if TSIG is not configured. */
+static int xfr_tsig_sign_query(uint8_t *buf, int off, int blen, uint16_t qid, uint8_t *reqmac,
+                               int *reqmac_len) {
+    *reqmac_len = 0;
+    if (g_tsig_secret_len == 0)
+        return off;
+    time_t now = time(NULL);
+    uint8_t vars[512];
+    int vp = tsig_vars_build(vars, now, 0);
+    EVP_MAC *em;
+    EVP_MAC_CTX *ctx = tsig_hmac_new(&em);
+    if (!ctx)
+        return off;
+    EVP_MAC_update(ctx, buf, off);
+    EVP_MAC_update(ctx, vars, vp);
+    size_t ml = 64;
+    EVP_MAC_final(ctx, reqmac, &ml, 64);
+    *reqmac_len = (int) ml;
+    EVP_MAC_CTX_free(ctx);
+    EVP_MAC_free(em);
+    return tsig_rr_write(buf, off, blen, qid, 0, now, reqmac, *reqmac_len);
+}
+
+/* Verify one AXFR response message against the running MAC (RFC 8945 §5.3.1).
+ * A signed message (TSIG RR present): MAC = HMAC(prior || msg-minus-TSIG ||
+ * vars) must equal the RR's MAC; prior is reseeded to it. An unsigned
+ * intermediate: prior = HMAC(prior || msg). Returns 1 on success (sets
+ * *was_signed), 0 if a signed message fails verification. */
+static int xfr_tsig_verify_msg(const uint8_t *msg, int mlen, uint8_t *prior, int *prior_len,
+                               int *was_signed) {
+    tsig_rr_t t;
+    memset(&t, 0, sizeof(t));
+    const uint8_t *trr = tsig_find(msg, mlen, &t);
+    EVP_MAC *em;
+    EVP_MAC_CTX *ctx = tsig_hmac_new(&em);
+    if (!ctx)
+        return 0;
+    tsig_hmac_prepend(ctx, prior, *prior_len);
+    if (!trr) { /* unsigned intermediate — fold whole message into the chain */
+        EVP_MAC_update(ctx, msg, mlen);
+        uint8_t mac[64];
+        size_t ml = 64;
+        EVP_MAC_final(ctx, mac, &ml, 64);
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(em);
+        memcpy(prior, mac, ml);
+        *prior_len = (int) ml;
+        *was_signed = 0;
+        return 1;
+    }
+    int minus = (int) (trr - msg);
+    if (minus <= 0) {
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(em);
+        return 0;
+    }
+    uint8_t *tmp = malloc((size_t) minus);
+    if (!tmp) {
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(em);
+        return 0;
+    }
+    memcpy(tmp, msg, (size_t) minus);
+    uint16_t ar = ((uint16_t) tmp[10] << 8) | tmp[11];
+    ar--;
+    tmp[10] = ar >> 8;
+    tmp[11] = ar & 0xFF;
+    uint8_t vars[512];
+    int vp = xfr_tsig_vars_from_rr(&t, vars);
+    EVP_MAC_update(ctx, tmp, minus);
+    EVP_MAC_update(ctx, vars, vp);
+    free(tmp);
+    uint8_t mac[64];
+    size_t ml = 64;
+    EVP_MAC_final(ctx, mac, &ml, 64);
+    EVP_MAC_CTX_free(ctx);
+    EVP_MAC_free(em);
+    int ok = ((int) ml == t.mac_len) && memcmp(mac, t.mac, ml) == 0;
+    if (ok) {
+        memcpy(prior, t.mac, (size_t) t.mac_len);
+        *prior_len = t.mac_len;
+    }
+    *was_signed = 1;
+    return ok;
+}
+
 /* Pull `zone` from the configured master via AXFR and replace the local store.
  * Returns 0 on success, -1 on any failure (store left untouched on failure). */
 static int xfr_pull(const char *zone) {
@@ -7231,6 +7357,11 @@ static int xfr_pull(const char *zone) {
     qo += 2;
     put16(q, qo, DNS_CLASS_IN);
     qo += 2;
+    /* TSIG-sign the request (RFC 8945, Gap 4) if a key is configured; the
+     * request MAC seeds the response-chain verification below. */
+    uint8_t prior[64];
+    int prior_len = 0;
+    qo = xfr_tsig_sign_query(q, qo, sizeof(q), qid, prior, &prior_len);
     uint8_t lb[2] = {(uint8_t) (qo >> 8), (uint8_t) (qo & 0xFF)};
     int sok = ssl ? (SSL_write(ssl, lb, 2) == 2 && SSL_write(ssl, q, qo) == qo)
                   : (send(fd, lb, 2, 0) == 2 && send(fd, q, qo, 0) == qo);
@@ -7246,6 +7377,8 @@ static int xfr_pull(const char *zone) {
     xfr_rec_t *recs = malloc(sizeof(xfr_rec_t) * XFR_MAX_RECORDS);
     int nrec = 0, soa_seen = 0, ok = 0, overflow = 0;
     uint32_t serial = 0;
+    /* TSIG chain state (Gap 4): require verification when a key is configured. */
+    int tsig = (g_tsig_secret_len > 0), tsig_fail = 0, last_signed = 0, unsigned_run = 0;
     uint8_t *msg = malloc(65536);
     if (recs && msg) {
         while (soa_seen < 2) {
@@ -7255,6 +7388,21 @@ static int xfr_pull(const char *zone) {
             int mlen = (mlb[0] << 8) | mlb[1];
             if (mlen < 12 || mlen > 65535 || xfr_read_full(fd, ssl, msg, mlen) != 0)
                 break;
+            if (tsig) {
+                int was_signed = 0;
+                if (!xfr_tsig_verify_msg(msg, mlen, prior, &prior_len, &was_signed)) {
+                    dns_log(LOG_WARNING, "[XFR] %s: TSIG verification FAILED — rejecting\n", zone);
+                    tsig_fail = 1;
+                    break;
+                }
+                last_signed = was_signed;
+                unsigned_run = was_signed ? 0 : unsigned_run + 1;
+                if (unsigned_run > 99) { /* RFC 8945 §5.3.1 */
+                    dns_log(LOG_WARNING, "[XFR] %s: >99 unsigned messages — rejecting\n", zone);
+                    tsig_fail = 1;
+                    break;
+                }
+            }
             int qd = (int) ntohs(((dns_hdr_t *) msg)->qdcount);
             int an = (int) ntohs(((dns_hdr_t *) msg)->ancount);
             int off = 12;
@@ -7306,7 +7454,9 @@ static int xfr_pull(const char *zone) {
             }
         }
     stream_done:
-        ok = (soa_seen >= 2 && !overflow);
+        /* When TSIG is configured the transfer must verify and the final message
+         * must be signed (RFC 8945 §5.3.1); otherwise reject (no apply). */
+        ok = (soa_seen >= 2 && !overflow && (!tsig || (!tsig_fail && last_signed)));
     }
     if (ssl) {
         SSL_shutdown(ssl);

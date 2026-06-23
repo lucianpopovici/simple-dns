@@ -77,9 +77,21 @@ Everything below is missing and is required for the two-role deployment.
 > condvar (Gap 5). A zone that cannot refresh within its SOA expire stops
 > answering authoritatively (SERVFAIL, RFC 1035 §4.3.5); the expire clock seeds
 > at boot and resets on every successful contact. Guarded by
-> `make check-xfr-refresh`. Still open: **Gap 4 (transfer TSIG sign+verify)**,
-> IXFR (refresh does a full AXFR each time), and the master-side NOTIFY-sender
-> hardening (TSIG-signed NOTIFY + retry).
+> `make check-xfr-refresh`.
+>
+> **Gap 4 done — transfer TSIG** (branch `xfr-tsig`, RFC 8945): the client signs
+> its AXFR request (`xfr_tsig_sign_query`, the request MAC seeds the chain) and
+> verifies the master's chained response (`xfr_tsig_verify_msg`: per-message
+> MAC = HMAC(prior ‖ msg-minus-TSIG ‖ vars); unsigned intermediates fold into
+> the running MAC; >99 unsigned in a row rejected). When `config:tsig_secret_b64`
+> is set the transfer MUST verify and the final message MUST be signed, else the
+> pull is rejected and the store left intact — so transfers can now be
+> authenticated over plain TCP, not only TLS. `xfr_tsig_vars_from_rr` mirrors the
+> var layout in `tsig_verify`. Guarded by `make check-xfr-tsig` (valid applied;
+> wrong-key + unsigned rejected; the stub also verifies the client's request
+> signature). Still open: **IXFR** (refresh does a full AXFR each time) and the
+> master-side NOTIFY-sender hardening (TSIG-signed NOTIFY + retry). **With Gap 4
+> done, all hidden-master gaps (1–8) are complete.**
 
 ## Gap 1 — mTLS on the DoT/transfer listener (master side)
 
