@@ -110,6 +110,18 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-axfr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 1995 server IXFR (incremental diff framing + AXFR fallback)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-ixfr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: RFC 1995 secondary IXFR (incremental apply via NOTIFY re-pull)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-ixfr-client OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: mTLS on the DoT/transfer listener
         env:
           DNS_VALKEY_HOST: 127.0.0.1

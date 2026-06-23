@@ -712,6 +712,98 @@ check-axfr: $(BIN_DEBUG)
 	 test "$$SO" -ge 2 || { echo "  FAIL  transfer did not complete (need opening+closing SOA; ID echo?)"; exit 1; }; \
 	 echo "  OK  runtime zone:* and ddns:* records present; transfer bracketed by SOA"
 
+# RFC 1995 IXFR — *server-side* incremental transfer. Seed a throwaway zone at a
+# known serial plus a journal (ixfr:<zone>:journal) of A adds/deletes chaining
+# the client's serial up to current, then drive a small IXFR client
+# (tests/ixfr_client.py) and assert: (1) an in-range serial yields a correct
+# incremental diff with the right add/delete sections, (2) a serial not in the
+# journal falls back to AXFR, (3) the current serial replies "up to date".
+# Needs Valkey + python3.
+check-ixfr: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 1995 server IXFR: diff framing + AXFR fallback (Valkey + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=ixfr.test; CUR=103;                                                             \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|$$CUR|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set config:zone:$$Z:serial $$CUR >/dev/null;                                 \
+	 $$VC set zone:$$Z:A:www.$$Z "120|10.9.9.9" >/dev/null;                            \
+	 $$VC del ixfr:$$Z:journal >/dev/null;                                             \
+	 $$VC rpush ixfr:$$Z:journal "100|101|A|host1.$$Z|10.0.0.1" >/dev/null;            \
+	 $$VC rpush ixfr:$$Z:journal "101|102|A|host2.$$Z|10.0.0.2" >/dev/null;            \
+	 $$VC rpush ixfr:$$Z:journal "102|103|D|host1.$$Z|10.0.0.1" >/dev/null;            \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ixfr.log 2>&1 & DNS=$$!;    \
+	 sleep 1.5;                                                                        \
+	 INC=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z 100 2>/dev/null);          \
+	 FB=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z 50 2>/dev/null);            \
+	 UP=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z 103 2>/dev/null);           \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone_table:$$Z config:zone:$$Z:serial zone:$$Z:A:www.$$Z ixfr:$$Z:journal >/dev/null; \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 echo "  --- incremental (serial 100) ---"; echo "$$INC" | sed 's/^/    /';        \
+	 echo "  --- fallback (serial 50): $$(echo "$$FB" | grep '^MODE') | uptodate (103): $$(echo "$$UP" | grep '^MODE')"; \
+	 echo "$$INC" | grep -q "^MODE incremental" || { echo "  FAIL  in-range serial did not yield an incremental transfer"; exit 1; }; \
+	 echo "$$INC" | grep -q "^ADD host1.$$Z A 10.0.0.1" || { echo "  FAIL  missing ADD host1 10.0.0.1"; exit 1; }; \
+	 echo "$$INC" | grep -q "^ADD host2.$$Z A 10.0.0.2" || { echo "  FAIL  missing ADD host2 10.0.0.2"; exit 1; }; \
+	 echo "$$INC" | grep -q "^DEL host1.$$Z A 10.0.0.1" || { echo "  FAIL  missing DEL host1 10.0.0.1 (op field ignored?)"; exit 1; }; \
+	 echo "$$INC" | grep -q "^END 103" || { echo "  FAIL  incremental did not close at current serial 103"; exit 1; }; \
+	 echo "$$FB"  | grep -q "^MODE axfr" || { echo "  FAIL  out-of-journal serial did not fall back to AXFR"; exit 1; }; \
+	 echo "$$UP"  | grep -q "^MODE uptodate" || { echo "  FAIL  current-serial request was not answered up-to-date"; exit 1; }; \
+	 echo "  OK  incremental diff correct (adds+delete), AXFR fallback + up-to-date handled"
+
+# RFC 1995 IXFR — *client-side* incremental apply. Run dnsd as a secondary
+# pointed at an IXFR-capable stub master (tests/ixfr_master.py): the first pull
+# is a full AXFR (serial 0 → 100, records keep+old), then a NOTIFY drives a
+# re-pull which now carries the secondary's serial as an IXFR request; the stub
+# answers with a diff (delete old, add new, serial → 101). Assert the secondary
+# applied the diff incrementally: keep untouched, old removed, new present,
+# serial bumped. Needs Valkey + dig + python3; restores config afterward.
+check-ixfr-client: $(BIN_DEBUG)
+	@echo "  CHECK  secondary IXFR incremental apply (Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=ixfrpull.test; P=5392;                                                          \
+	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
+	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
+	 python3 tests/ixfr_master.py 127.0.0.1 $$P $$Z >/tmp/ixfr_master.log 2>&1 & M=$$!;\
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 $$VC del config:zone:$$Z:serial >/dev/null;                                       \
+	 $$VC set config:zone_role secondary >/dev/null;                                   \
+	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
+	 $$VC set config:primary_port $$P >/dev/null;                                      \
+	 $$VC set config:primary_tls 0 >/dev/null;                                         \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ixc.log 2>&1 & DNS=$$!;     \
+	 sleep 4;                                                                          \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 K1=$$(dig +short +nocookie @127.0.0.1 -p 5353 keep.$$Z A +time=2 +tries=1);       \
+	 O1=$$(dig +short +nocookie @127.0.0.1 -p 5353 old.$$Z A +time=2 +tries=1);        \
+	 dig +opcode=notify +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 >/dev/null 2>&1; \
+	 sleep 1.5;                                                                        \
+	 S2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 K2=$$(dig +short +nocookie @127.0.0.1 -p 5353 keep.$$Z A +time=2 +tries=1);       \
+	 O2=$$(dig +short +nocookie @127.0.0.1 -p 5353 old.$$Z A +time=2 +tries=1);        \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p 5353 new.$$Z A +time=2 +tries=1);        \
+	 kill $$DNS $$M 2>/dev/null || true;                                               \
+	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "ixfr:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_ROLE" ]; then $$VC set config:zone_role "$$SAVE_ROLE" >/dev/null; else $$VC del config:zone_role >/dev/null; fi; \
+	 if [ -n "$$SAVE_PH" ]; then $$VC set config:primary_host "$$SAVE_PH" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
+	 echo "  startup(AXFR): serial=$$S1 keep=[$$K1] old=[$$O1] | after NOTIFY(IXFR): serial=$$S2 keep=[$$K2] old=[$$O2] new=[$$N2]"; \
+	 test "$$S1" = "100" || { echo "  FAIL  initial AXFR serial ($$S1 != 100)"; exit 1; }; \
+	 test "$$O1" = "10.0.0.2" || { echo "  FAIL  initial AXFR did not load old.$$Z"; exit 1; }; \
+	 test "$$S2" = "101" || { echo "  FAIL  IXFR did not advance serial ($$S2 != 101)"; exit 1; }; \
+	 test "$$K2" = "10.0.0.1" || { echo "  FAIL  IXFR clobbered an untouched record (keep.$$Z)"; exit 1; }; \
+	 test -z "$$O2" || { echo "  FAIL  IXFR delete not applied (old.$$Z still [$$O2])"; exit 1; }; \
+	 test "$$N2" = "10.0.3.3" || { echo "  FAIL  IXFR add not applied (new.$$Z=[$$N2])"; exit 1; }; \
+	 echo "  OK  secondary applied the IXFR diff (add+delete) without a full re-transfer"
+
 # RFC 7344 regression: the CDS RRset must equal the DS the zone publishes, and
 # CDNSKEY must equal the zone's KSK DNSKEY(s). Guards against CDS/CDNSKEY drifting
 # back to the ZSK or to the wrong rdata format. Needs Valkey + dig.
