@@ -89,9 +89,11 @@ Everything below is missing and is required for the two-role deployment.
 > authenticated over plain TCP, not only TLS. `xfr_tsig_vars_from_rr` mirrors the
 > var layout in `tsig_verify`. Guarded by `make check-xfr-tsig` (valid applied;
 > wrong-key + unsigned rejected; the stub also verifies the client's request
-> signature). Still open: **IXFR** (refresh does a full AXFR each time) and the
-> master-side NOTIFY-sender hardening (TSIG-signed NOTIFY + retry). **With Gap 4
-> done, all hidden-master gaps (1–8) are complete.**
+> signature). **All hidden-master gaps (1–8) are complete.** Follow-ups since
+> shipped: **IXFR** (branch `ixfr-incremental`, refresh now does incremental
+> diffs) and **master-side NOTIFY-sender hardening** (branch
+> `notify-sender-hardening`: TSIG-signed NOTIFY + background retry until ACK —
+> see Gap 5 sender section).
 
 ## Gap 1 — mTLS on the DoT/transfer listener (master side)
 
@@ -251,9 +253,19 @@ When `zone_role=secondary`:
    instead of waiting for the refresh timer — `pthread_cond_signal` on a
    condition the refresh loop waits on with a timeout.
 
-Sender side (`notify_send` 3465) improvements for master→secondary auth:
-TSIG-sign the NOTIFY (append via `tsig_append`), and retry per RFC 1996 §3.6
-(currently fire-and-forget UDP, IPv4-only).  Estimated ~60 lines total.
+Sender side (`notify_send`) hardening for master→secondary auth — **done**
+(branch `notify-sender-hardening`): NOTIFY is no longer fire-and-forget. A zone
+change enqueues one job per (zone, target) onto a background `notify_thread`,
+which TSIG-signs the NOTIFY (`notify_build_packet` → `xfr_tsig_sign_query`, so a
+secondary configured with the key can authenticate the sender) and retransmits
+with exponential backoff (2→16 s, `NOTIFY_MAX_TRIES` 5) until the secondary's
+NOTIFY response is seen (`notify_got_ack`: matching id, QR set, opcode NOTIFY) or
+the cap is hit. Retrying off-thread means a slow/down secondary never blocks the
+request handler that triggered the change; re-arming an already-pending
+(zone,target) collapses rapid changes into one in-flight NOTIFY (§3.5).
+Guarded by `make check-notify` (TSIG verified, retransmit forced by a withheld
+ACK, retransmission stops on ACK). Still IPv4-only targets (matches the receiver
+and `notify_zone`'s parse).
 
 ---
 

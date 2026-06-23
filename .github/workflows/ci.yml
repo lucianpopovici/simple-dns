@@ -146,6 +146,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-ddns-sweeper OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: NOTIFY sender (TSIG-signed + retried until ACK)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-notify OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Secondary-role guards (UPDATE→NOTAUTH + no DNSSEC keygen)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

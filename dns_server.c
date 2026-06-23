@@ -8324,56 +8324,207 @@ done:
 }
 
 /* ==========================================================================
- * DNS NOTIFY sender (RFC 1996)
+ * DNS NOTIFY sender (RFC 1996) — TSIG-signed, retried in the background
+ *
+ * A zone change enqueues one job per (zone, target). A dedicated worker thread
+ * (re)transmits each NOTIFY — TSIG-signed when config:tsig_secret_b64 is set, so
+ * the secondary can authenticate the sender (RFC 1996 §3.6 + RFC 8945) — and
+ * retries with exponential backoff until the secondary's NOTIFY response is seen
+ * (matching id, QR set, opcode NOTIFY) or NOTIFY_MAX_TRIES is reached. Retrying
+ * in the background means a slow/down secondary never blocks the request handler
+ * that triggered the change. Re-arming an already-pending (zone,target) collapses
+ * rapid changes into one in-flight NOTIFY (RFC 1996 §3.5).
  * ======================================================================= */
-/* Send a NOTIFY for one zone to a comma-separated target list. */
+#define NOTIFY_MAX_TRIES 5
+#define NOTIFY_BASE_RETRY_S 2
+#define NOTIFY_MAX_RETRY_S 16
+#define NOTIFY_QUEUE_MAX 4096
+
+typedef struct notify_job {
+    char zone[256];
+    struct sockaddr_in dst;
+    uint16_t id;
+    int tries;
+    time_t next_at; /* earliest next (re)send; 0 = send on the next worker pass */
+    int fd;         /* UDP socket connect()ed to dst, polled for the ACK */
+    struct notify_job *next;
+} notify_job_t;
+
+static notify_job_t *g_notify_jobs = NULL;
+static pthread_mutex_t g_notify_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_notify_cond = PTHREAD_COND_INITIALIZER;
+
+/* Build a (optionally TSIG-signed) NOTIFY request for `zone`. Returns length or
+ * -1. The TSIG RR, when a key is configured, also bumps the header arcount. */
+static int notify_build_packet(const char *zone, uint16_t id, uint8_t *pkt, int cap) {
+    if (cap < 12)
+        return -1;
+    memset(pkt, 0, 12);
+    dns_hdr_t *h = (dns_hdr_t *) pkt;
+    h->id = htons(id);
+    h->flags = htons(DNS_OPCODE_NOTIFY | DNS_AA); /* request: QR=0, AA per §3.7 */
+    h->qdcount = htons(1);
+    int off = 12;
+    int n = name_to_wire(zone, pkt + off, cap - off);
+    if (n <= 0 || off + n + 4 > cap)
+        return -1;
+    off += n;
+    put16(pkt, off, DNS_TYPE_SOA);
+    off += 2;
+    put16(pkt, off, DNS_CLASS_IN);
+    off += 2;
+    uint8_t mac[64];
+    int maclen = 0;
+    off = xfr_tsig_sign_query(pkt, off, cap, id, mac, &maclen); /* no-op without a key */
+    return off;
+}
+
+/* Has `fd` received this job's NOTIFY response? Drains up to a few datagrams
+ * (the socket is connect()ed to the target, so only its replies arrive). */
+static int notify_got_ack(int fd, uint16_t id) {
+    uint8_t rsp[512];
+    for (int i = 0; i < 8; i++) {
+        ssize_t r = recv(fd, rsp, sizeof(rsp), MSG_DONTWAIT);
+        if (r < 12)
+            break;
+        const dns_hdr_t *rh = (const dns_hdr_t *) rsp;
+        uint16_t fl = ntohs(rh->flags);
+        if (ntohs(rh->id) == id && (fl & DNS_QR) && (fl & DNS_OPCODE_MASK) == DNS_OPCODE_NOTIFY)
+            return 1;
+    }
+    return 0;
+}
+
+static void *notify_thread(void *arg) {
+    (void) arg;
+    pthread_mutex_lock(&g_notify_mutex);
+    for (;;) {
+        while (!g_notify_jobs)
+            pthread_cond_wait(&g_notify_cond, &g_notify_mutex);
+        time_t now = time(NULL);
+        notify_job_t **pp = &g_notify_jobs;
+        while (*pp) {
+            notify_job_t *j = *pp;
+            if (notify_got_ack(j->fd, j->id)) {
+                dns_log(LOG_NOTICE, "[NOTIFY] %s: acknowledged by %s\n", j->zone,
+                        inet_ntoa(j->dst.sin_addr));
+                *pp = j->next;
+                close(j->fd);
+                free(j);
+                continue;
+            }
+            if (now >= j->next_at) {
+                if (j->tries >= NOTIFY_MAX_TRIES) {
+                    dns_log(LOG_WARNING,
+                            "[NOTIFY] %s: no response from %s after %d tries — giving up\n",
+                            j->zone, inet_ntoa(j->dst.sin_addr), j->tries);
+                    *pp = j->next;
+                    close(j->fd);
+                    free(j);
+                    continue;
+                }
+                uint8_t pkt[512];
+                int len = notify_build_packet(j->zone, j->id, pkt, sizeof(pkt));
+                if (len > 0 && send(j->fd, pkt, (size_t) len, 0) == len) {
+                    int backoff = NOTIFY_BASE_RETRY_S << j->tries;
+                    if (backoff > NOTIFY_MAX_RETRY_S)
+                        backoff = NOTIFY_MAX_RETRY_S;
+                    j->tries++;
+                    j->next_at = now + backoff;
+                    dns_log(LOG_NOTICE, "[NOTIFY] %s sent to %s (try %d, retry in %ds)\n", j->zone,
+                            inet_ntoa(j->dst.sin_addr), j->tries, backoff);
+                } else {
+                    j->next_at = now + NOTIFY_BASE_RETRY_S; /* transient send error — retry soon */
+                }
+            }
+            pp = &j->next;
+        }
+        if (!g_notify_jobs)
+            continue; /* all acked/exhausted → back to the idle wait */
+        /* Wake at the soonest retry, capped at 1s so acks are noticed promptly. */
+        time_t soonest = 0;
+        for (notify_job_t *j = g_notify_jobs; j; j = j->next)
+            if (soonest == 0 || j->next_at < soonest)
+                soonest = j->next_at;
+        now = time(NULL);
+        long wait_s = (long) (soonest - now);
+        if (wait_s < 1)
+            wait_s = 1;
+        if (wait_s > 1)
+            wait_s = 1;
+        struct timespec ts = {.tv_sec = now + wait_s, .tv_nsec = 0};
+        pthread_cond_timedwait(&g_notify_cond, &g_notify_mutex, &ts);
+    }
+    pthread_mutex_unlock(&g_notify_mutex); /* unreachable */
+    return NULL;
+}
+
+/* Enqueue (or re-arm) a NOTIFY for `zone` to one target. */
+static void notify_enqueue(const char *zone, const struct sockaddr_in *dst) {
+    pthread_mutex_lock(&g_notify_mutex);
+    int count = 0;
+    for (notify_job_t *j = g_notify_jobs; j; j = j->next) {
+        count++;
+        if (strcasecmp(j->zone, zone) == 0 && j->dst.sin_addr.s_addr == dst->sin_addr.s_addr &&
+            j->dst.sin_port == dst->sin_port) {
+            j->tries = 0; /* re-arm: the zone changed again — notify afresh (§3.5) */
+            j->next_at = 0;
+            pthread_cond_signal(&g_notify_cond);
+            pthread_mutex_unlock(&g_notify_mutex);
+            return;
+        }
+    }
+    if (count >= NOTIFY_QUEUE_MAX) {
+        pthread_mutex_unlock(&g_notify_mutex);
+        dns_log(LOG_WARNING, "[NOTIFY] queue full (%d) — dropping %s\n", count, zone);
+        return;
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd >= 0 && connect(fd, (const struct sockaddr *) dst, sizeof(*dst)) != 0) {
+        close(fd);
+        fd = -1;
+    }
+    notify_job_t *j = (fd >= 0) ? calloc(1, sizeof(*j)) : NULL;
+    if (!j) {
+        if (fd >= 0)
+            close(fd);
+        pthread_mutex_unlock(&g_notify_mutex);
+        return;
+    }
+    safe_strcpy(j->zone, zone, sizeof(j->zone));
+    j->dst = *dst;
+    j->id = (uint16_t) rand();
+    j->tries = 0;
+    j->next_at = 0; /* send on the next worker pass (immediately) */
+    j->fd = fd;
+    j->next = g_notify_jobs;
+    g_notify_jobs = j;
+    pthread_cond_signal(&g_notify_cond);
+    pthread_mutex_unlock(&g_notify_mutex);
+}
+
+/* Queue a NOTIFY for one zone to a comma-separated "ip[:port]" target list. */
 static void notify_zone(const char *zname, const char *targets_csv) {
     if (!zname[0] || !targets_csv[0])
         return;
     char targets[1024];
     safe_strcpy(targets, targets_csv, sizeof(targets));
     char *sp23 = NULL;
-    char *tok = strtok_r(targets, ",", &sp23);
-    while (tok) {
+    for (char *tok = strtok_r(targets, ",", &sp23); tok; tok = strtok_r(NULL, ",", &sp23)) {
         while (*tok == ' ')
             tok++;
-        char host[256] = "";
+        if (!*tok)
+            continue;
         int port = 53;
         char *col = strchr(tok, ':');
         if (col) {
             *col = 0;
             port = atoi(col + 1);
         }
-        safe_strcpy(host, tok, sizeof(host));
-        int fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (fd < 0) {
-            tok = strtok_r(NULL, ",", &sp23);
+        struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
+        if (inet_pton(AF_INET, tok, &dst.sin_addr) != 1)
             continue;
-        }
-        struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(port)};
-        if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-            close(fd);
-            tok = strtok_r(NULL, ",", &sp23);
-            continue;
-        }
-        uint8_t pkt[64] = {0};
-        dns_hdr_t *h = (dns_hdr_t *) pkt;
-        h->id = htons((uint16_t) rand());
-        h->flags = htons(DNS_QR & 0 ? 0 : 0 | DNS_OPCODE_NOTIFY | DNS_AA);
-        h->qdcount = htons(1);
-        int off = 12;
-        int n = name_to_wire(zname, pkt + off, sizeof(pkt) - off);
-        if (n > 0) {
-            off += n;
-            put16(pkt, off, DNS_TYPE_SOA);
-            off += 2;
-            put16(pkt, off, DNS_CLASS_IN);
-            off += 2;
-        }
-        sendto(fd, pkt, off, 0, (struct sockaddr *) &sa, sizeof(sa));
-        dns_log(LOG_NOTICE, "[NOTIFY] %s sent to %s:%d\n", zname, host, port);
-        close(fd);
-        tok = strtok_r(NULL, ",", &sp23);
+        notify_enqueue(zname, &dst);
     }
 }
 
@@ -9259,6 +9410,16 @@ int main(int argc, char **argv) {
             pthread_detach(rtid);
         else
             dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
+    }
+
+    /* NOTIFY sender: background worker that TSIG-signs + retries master→secondary
+     * NOTIFYs (RFC 1996 §3.6). Idle until a zone change enqueues a job. */
+    {
+        pthread_t ntid;
+        if (pthread_create(&ntid, NULL, notify_thread, NULL) == 0)
+            pthread_detach(ntid);
+        else
+            dns_log(LOG_ERR, "[NOTIFY] Failed to start NOTIFY sender thread\n");
     }
 
     /* Primary: DDNS lease-expiry sweeper — replays silent ddns:* expiries as
