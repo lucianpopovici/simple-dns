@@ -108,7 +108,10 @@ glance:
   retired only after old signatures expire from caches — so a validator always
   holds the key its RRSIG points at.
 - **Dynamic operation**: NOTIFY (1996), AXFR (5936), IXFR (1995, journal-based
-  diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007).
+  diffs), UPDATE (2136) with TSIG (8945) and the zone-authority check (3007). A
+  lease-expiry sweeper turns a silently-expiring `ddns:*` lease into a real
+  replicated deletion (serial bump + IXFR delete + NOTIFY) so secondaries don't
+  keep serving a dead workload's name.
 - **Reverse DNS**: `dnsd` serves `in-addr.arpa` / `ip6.arpa` zones (PTR queries
   + AXFR) like any other zone (longest-suffix selection). With
   `config:ddns_auto_ptr` set, a forward A/AAAA DDNS registration also creates and
@@ -149,6 +152,7 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
 | `config:notify_targets` | Comma-separated `IP:port` recipients for NOTIFY on zone change. |
 | `config:ddns_auto_ptr` | When set, a forward A/AAAA DDNS registration also maintains the matching reverse PTR lease in the locally-configured `in-addr.arpa` / `ip6.arpa` zone. |
+| `config:ddns_sweep_secs` | Interval (seconds) of the primary's DDNS lease-expiry sweeper (default 30, 0 = off): replays a silently-expired `ddns:*` lease as a serial bump + IXFR delete + NOTIFY so secondaries converge. |
 | `config:nsid` | NSID string reported via EDNS option 3. |
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
 | `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
