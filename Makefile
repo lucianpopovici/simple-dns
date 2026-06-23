@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-xfr-client check-xfr-refresh check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -406,6 +406,54 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
+
+# Transfer TSIG (hidden-master plan Gap 4, RFC 8945). A secondary signs its AXFR
+# request and verifies the master's chained-response MAC. Drive a TSIG-capable
+# stub master (tests/axfr_master_tsig.py) that verifies the client's request
+# signature (proving the client signs correctly) and signs the response. Assert:
+# a correctly-signed transfer is applied; a response signed with the WRONG key is
+# rejected; an UNSIGNED response (when a key is configured) is rejected — in both
+# rejection cases the store stays empty. Needs Valkey + dig + python3.
+check-xfr-tsig: $(BIN_DEBUG)
+	@echo "  CHECK  transfer TSIG sign+verify (RFC 8945) — requires Valkey + dig + python3"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=xfrtsig.test; P=5390; B64=$$(printf '0123456789abcdef0123456789abcdef' | base64); \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_KN=$$($$VC get config:tsig_key_name); \
+	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
+	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
+	 $$VC set config:tsig_secret_b64 "$$B64" >/dev/null;                               \
+	 $$VC set config:tsig_key_name tsig-key >/dev/null;                                \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set config:zone_role secondary >/dev/null;                                   \
+	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
+	 $$VC set config:primary_port $$P >/dev/null;                                      \
+	 $$VC set config:primary_tls 0 >/dev/null;                                         \
+	 RES="";                                                                           \
+	 for MODE in ok badresp unsigned; do                                              \
+	   for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	   python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" $$MODE >/tmp/xtsig_m.log 2>&1 & M=$$!; \
+	   ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/xtsig_s.log 2>&1 & DNS=$$!;    \
+	   sleep 2.2;                                                                       \
+	   W=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.$$Z A +time=2 +tries=1);        \
+	   kill $$DNS $$M 2>/dev/null || true; sleep 0.3;                                   \
+	   RES="$$RES $$MODE=[$$W]";                                                         \
+	   eval "R_$$MODE=\"$$W\"";                                                          \
+	 done;                                                                             \
+	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial config:tsig_key_name >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; else $$VC del config:tsig_secret_b64 >/dev/null; fi; \
+	 if [ -n "$$SAVE_KN" ]; then $$VC set config:tsig_key_name "$$SAVE_KN" >/dev/null; fi; \
+	 if [ -n "$$SAVE_ROLE" ]; then $$VC set config:zone_role "$$SAVE_ROLE" >/dev/null; else $$VC del config:zone_role >/dev/null; fi; \
+	 if [ -n "$$SAVE_PH" ]; then $$VC set config:primary_host "$$SAVE_PH" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
+	 echo "  results:$$RES"; \
+	 test "$$R_ok" = "10.20.0.1" || { echo "  FAIL  valid TSIG transfer not applied"; exit 1; }; \
+	 test -z "$$R_badresp" || { echo "  FAIL  response with wrong key was NOT rejected"; exit 1; }; \
+	 test -z "$$R_unsigned" || { echo "  FAIL  unsigned response was NOT rejected (TSIG required)"; exit 1; }; \
+	 echo "  OK  valid TSIG applied; wrong-key + unsigned responses rejected"
 
 # Secondary zone maintenance: NOTIFY-triggered refresh + SOA expire (hidden-
 # master plan Gap 6/5). A secondary re-pulls a zone immediately on a NOTIFY from
@@ -892,6 +940,7 @@ help:
 	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"
 	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
+	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
