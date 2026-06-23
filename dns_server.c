@@ -88,6 +88,10 @@
  *                              maintains the matching reverse PTR lease in the
  *                              in-addr.arpa / ip6.arpa zone configured locally
  *                              (ddns:<revzone>:PTR:*). Off = no auto-PTR.
+ *   config:ddns_sweep_secs     Interval (s) of the primary's DDNS lease-expiry
+ *                              sweeper (default 30, 0 = off): replays a silently
+ *                              expired ddns:* lease as a serial bump + IXFR 'D' +
+ *                              NOTIFY so secondaries converge.
  *   config:zone_role           "primary" (default) or "secondary". A secondary
  *                              is a read-only replica: UPDATE → NOTAUTH and it
  *                              never generates DNSSEC keys (load-only).
@@ -577,6 +581,13 @@ static char g_ddns_allow_suffix[256] = "";
  * maintains the matching reverse PTR lease in whichever in-addr.arpa / ip6.arpa
  * zone is configured locally (CLAUDE-discovery.md Gap 4). Off = no auto-PTR. */
 static int g_ddns_auto_ptr = 0;
+/* config:ddns_sweep_secs — interval of the DDNS lease-expiry sweeper (primary
+ * only). A ddns:* lease expiring in Valkey is otherwise a SILENT delete (no
+ * serial bump, no IXFR journal, no NOTIFY), so secondaries would keep serving a
+ * dead workload's name until some unrelated change advanced the serial. The
+ * sweeper detects vanished leases and emits the missing replication events
+ * (CLAUDE-discovery.md Gap 2). 0 disables it. */
+static int g_ddns_sweep_secs = 30;
 /* config:zone_role — "primary" (default) or "secondary". A secondary is a
  * read-only replica: it pulls the zone from a master and must refuse all local
  * writes (UPDATE → NOTAUTH) and never mint its own DNSSEC keys (it would publish
@@ -2049,6 +2060,7 @@ static void config_load_from_valkey(void) {
     G("ddns_allow_suffix", g_ddns_allow_suffix);
     g_ddns_auto_ptr = 0;
     GI("ddns_auto_ptr", g_ddns_auto_ptr);
+    GI("ddns_sweep_secs", g_ddns_sweep_secs);
     /* Role: a "secondary" is a read-only replica (hidden-master plan Gap 2). */
     g_zone_secondary = 0;
     {
@@ -7072,6 +7084,42 @@ static int vk_list_keys(const char *pattern, char ***out) {
     return n;
 }
 
+/* Like vk_list_keys but distinguishes a genuinely empty match (returns 0,
+ * *out=NULL) from a Valkey connection/protocol error (returns -1). The sweeper
+ * needs this: treating a transient KEYS failure as "every lease vanished" would
+ * falsely replay deletes for records that still exist, diverging secondaries. */
+static int vk_list_keys_strict(const char *pattern, char ***out) {
+    *out = NULL;
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return -1;
+    }
+    resp_reply_t r;
+    if (resp_cmd(&vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return -1;
+    }
+    if (r.count <= 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return 0; /* genuinely no matching keys */
+    }
+    char **arr = malloc((size_t) r.count * sizeof(char *));
+    int n = 0;
+    for (int i = 0; i < r.count; i++) {
+        resp_reply_t kr;
+        if (resp_parse(&vk, &kr) < 0)
+            break;
+        if (kr.type == 2 && arr)
+            arr[n++] = strdup(kr.str);
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!arr)
+        return -1;
+    *out = arr;
+    return n;
+}
+
 /* Send one AXFR record message (one RR, with TSIG MAC chaining). Each message
  * must echo the request ID (RFC 5936 §2.2). */
 static void axfr_emit_one(int fd, SSL *ssl, uint16_t qid, const char *name, uint16_t type,
@@ -8343,6 +8391,191 @@ static void notify_send(void) {
         notify_zone(g_zone_name, g_notify_targets);
 }
 
+/* NOTIFY a single zone's secondaries by name (look up its configured targets). */
+static void notify_one_zone(const char *zname) {
+    char targets[1024] = "";
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        if (strcasecmp(g_zones[i].name, zname) == 0) {
+            safe_strcpy(targets, g_zones[i].notify_targets, sizeof(targets));
+            break;
+        }
+    pthread_mutex_unlock(&g_zones_mutex);
+    if (!targets[0] && strcasecmp(zname, g_zone_name) == 0)
+        safe_strcpy(targets, g_notify_targets, sizeof(targets)); /* legacy single-zone */
+    if (targets[0])
+        notify_zone(zname, targets);
+}
+
+/* ==========================================================================
+ * DDNS lease-expiry sweeper (CLAUDE-discovery.md Gap 2)
+ *
+ * A ddns:<zone>:<TYPE>:<name> lease expiring in Valkey is a *silent* deletion:
+ * the add path bumped the serial + journalled when the lease was created, but
+ * the TTL-driven removal fires no event, so a secondary keeps serving the dead
+ * name until an unrelated change advances the serial. This thread (primary
+ * only) closes that hole. Each tick it lists the live ddns:* keys and diffs
+ * them against the previous tick's snapshot; every lease that vanished is
+ * replayed as a real deletion — serial_bump + ixfr_journal_append('D') on the
+ * owning zone — and each affected zone gets one batched NOTIFY.
+ *
+ * Self-contained: it works off the actual keyspace, so leases written by any
+ * front-end (RFC 2136 here, REST /update in apid, auto-PTR) are all covered
+ * without an explicit index. An explicitly-deleted lease (which already
+ * journalled its own 'D') may be replayed once more as an idempotent delete —
+ * harmless: a secondary deleting an already-absent record is a no-op, and the
+ * serial chain stays contiguous. Discovery leases expire rather than being
+ * deleted, so that path carries no redundancy.
+ * ======================================================================= */
+typedef struct {
+    char *key; /* full Valkey key, e.g. "ddns:dyn.example:A:host.dyn.example" */
+    char *val; /* last-seen value (the journal 'D' needs it) */
+} ddns_lease_t;
+
+#define DDNS_SWEEP_MAX 100000 /* defensive cap on tracked leases per tick */
+
+static int ddns_key_cmp(const void *a, const void *b) {
+    const ddns_lease_t *la = a;
+    const ddns_lease_t *lb = b;
+    return strcmp(la->key, lb->key);
+}
+
+/* Parse "ddns:<zone>:<type>:<name>" into its parts (zone/type/name copied out).
+ * Returns 0 on success, -1 if the key is malformed. <name> may contain dots but
+ * never a colon, so the split is unambiguous. */
+static int ddns_key_split(const char *key, char *zone, size_t zcap, char *type, size_t tcap,
+                          char *name, size_t ncap) {
+    if (strncmp(key, "ddns:", 5) != 0)
+        return -1;
+    const char *z = key + 5;
+    const char *c1 = strchr(z, ':');
+    if (!c1)
+        return -1;
+    const char *t = c1 + 1;
+    const char *c2 = strchr(t, ':');
+    if (!c2)
+        return -1;
+    const char *nm = c2 + 1;
+    if ((size_t) (c1 - z) >= zcap || (size_t) (c2 - t) >= tcap || strlen(nm) >= ncap)
+        return -1;
+    memcpy(zone, z, (size_t) (c1 - z));
+    zone[c1 - z] = 0;
+    memcpy(type, t, (size_t) (c2 - t));
+    type[c2 - t] = 0;
+    safe_strcpy(name, nm, ncap);
+    return 0;
+}
+
+/* Replay one vanished lease as a replicated deletion on its owning zone, and
+ * return the zone name (via zname_out) so the caller can batch a NOTIFY. */
+static void ddns_replay_expiry(const ddns_lease_t *l, char *zname_out, size_t zcap) {
+    zname_out[0] = 0;
+    char zone[256], type[16], name[256];
+    if (ddns_key_split(l->key, zone, sizeof(zone), type, sizeof(type), name, sizeof(name)) != 0)
+        return;
+    /* Find the owning zone; snapshot its current serial, then bump unlocked. */
+    zone_entry_t *z = NULL;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        if (g_zones[i].active && strcasecmp(g_zones[i].name, zone) == 0) {
+            z = &g_zones[i];
+            break;
+        }
+    pthread_mutex_unlock(&g_zones_mutex);
+    if (!z)
+        return; /* zone gone (deprovisioned) — nothing to replicate */
+    uint32_t prev = z->soa_serial;
+    uint32_t next = serial_bump(z);
+    ixfr_journal_append(z->name, prev, next, 'D', name, l->val ? l->val : "");
+    safe_strcpy(zname_out, z->name, zcap);
+    dns_log(LOG_NOTICE, "[DDNS] lease expired: %s %s %s — serial %u->%u\n", zone, type, name, prev,
+            next);
+}
+
+static void *ddns_sweeper_thread(void *arg) {
+    (void) arg;
+    ddns_lease_t *prev = NULL;
+    int nprev = 0;
+    for (;;) {
+        int interval = g_ddns_sweep_secs > 0 ? g_ddns_sweep_secs : 30;
+        sleep((unsigned) interval);
+        if (g_ddns_sweep_secs <= 0 || g_zone_secondary)
+            continue; /* disabled, or a secondary owns no leases to sweep */
+
+        /* Build this tick's snapshot: every live ddns:* key + its value. A
+         * Valkey error returns -1 (vs 0 for genuinely empty) — skip the tick and
+         * keep the previous baseline rather than mistaking the blip for a mass
+         * expiry that would replay bogus deletes. */
+        char **keys = NULL;
+        int nk = vk_list_keys_strict("ddns:*", &keys);
+        if (nk < 0)
+            continue;
+        if (nk > DDNS_SWEEP_MAX) { /* implausible; don't trust this snapshot */
+            for (int i = 0; i < nk; i++)
+                free(keys[i]);
+            free(keys);
+            continue;
+        }
+        ddns_lease_t *cur = NULL;
+        int ncur = 0;
+        if (nk > 0)
+            cur = calloc((size_t) nk, sizeof(ddns_lease_t));
+        if (nk > 0 && !cur) { /* OOM — skip the tick, keep the baseline */
+            for (int i = 0; i < nk; i++)
+                free(keys[i]);
+            free(keys);
+            continue;
+        }
+        for (int i = 0; i < nk; i++) {
+            char val[768] = "";
+            vk_get(keys[i], val, sizeof(val)); /* best-effort; existence is what matters */
+            cur[ncur].key = strdup(keys[i]);
+            cur[ncur].val = strdup(val);
+            if (cur[ncur].key && cur[ncur].val)
+                ncur++;
+        }
+        if (cur)
+            qsort(cur, (size_t) ncur, sizeof(ddns_lease_t), ddns_key_cmp);
+        for (int i = 0; i < nk; i++)
+            free(keys[i]);
+        free(keys);
+
+        /* A lease present last tick but absent now has expired. Batch one NOTIFY
+         * per affected zone (dedup by name). */
+        char notified[MAX_ZONES][256];
+        int nnotified = 0;
+        for (int i = 0; i < nprev; i++) {
+            ddns_lease_t want = {.key = prev[i].key, .val = NULL};
+            if (cur && bsearch(&want, cur, (size_t) ncur, sizeof(ddns_lease_t), ddns_key_cmp))
+                continue; /* still present */
+            char zn[256];
+            ddns_replay_expiry(&prev[i], zn, sizeof(zn));
+            if (!zn[0])
+                continue;
+            int seen = 0;
+            for (int j = 0; j < nnotified; j++)
+                if (strcasecmp(notified[j], zn) == 0) {
+                    seen = 1;
+                    break;
+                }
+            if (!seen && nnotified < MAX_ZONES)
+                safe_strcpy(notified[nnotified++], zn, sizeof(notified[0]));
+        }
+        for (int j = 0; j < nnotified; j++)
+            notify_one_zone(notified[j]);
+
+        /* Adopt this tick's snapshot as the baseline for the next. */
+        for (int i = 0; i < nprev; i++) {
+            free(prev[i].key);
+            free(prev[i].val);
+        }
+        free(prev);
+        prev = cur;
+        nprev = ncur;
+    }
+    return NULL;
+}
+
 /* ==========================================================================
  * DNS packet dispatch (shared by UDP / DoT / DoH)
  * ======================================================================= */
@@ -9026,6 +9259,16 @@ int main(int argc, char **argv) {
             pthread_detach(rtid);
         else
             dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
+    }
+
+    /* Primary: DDNS lease-expiry sweeper — replays silent ddns:* expiries as
+     * replicated deletions so secondaries converge (CLAUDE-discovery.md Gap 2). */
+    if (!g_zone_secondary) {
+        pthread_t stid;
+        if (pthread_create(&stid, NULL, ddns_sweeper_thread, NULL) == 0)
+            pthread_detach(stid);
+        else
+            dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
     }
 
     /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry

@@ -72,8 +72,11 @@ Name hygiene: put discovered names under a dedicated sub-domain
 > `/update` half of Gap 3 lives in `apid` now (not dnsd) and would need its own
 > suffix check. **Gap 4 (PTR / reverse zones) is now done** (branch
 > `ptr-reverse-zones`, `make check-ptr`) — multi-zone removed its blocker; see
-> the Gap 4 section. Remaining discovery gap: 2 (sweeper + journal deletes); the
-> IXFR id-echo is fixed (IXFR shipped, branch `ixfr-incremental`).
+> the Gap 4 section. **Gap 2 (lease-expiry replication) is also done** (branch
+> `ddns-expiry-sweeper`, `make check-ddns-sweeper`). The IXFR id-echo is fixed
+> (IXFR shipped, branch `ixfr-incremental`). **All discovery server-side gaps
+> (1–4) are now complete**; remaining discovery work is the `contrib/` registrars
+> (glue, no server code).
 
 ### Gap 1 — AXFR does not transfer runtime records **(blocker, also for CLAUDE.md)**
 
@@ -97,28 +100,33 @@ apply here too), TTL for `ddns:*` from `vk_ttl` (remaining lease).
 Estimated ~80–120 lines.  **Do this before CLAUDE.md Gap 3**, otherwise
 the transfer client has nothing real to test against.
 
-### Gap 2 — lease expiry is invisible to replication
+### Gap 2 — lease expiry is invisible to replication **(done — branch `ddns-expiry-sweeper`)**
 
-A `ddns:*` key expiring in Valkey is a *silent* deletion: no serial bump,
-no IXFR journal entry, no NOTIFY.  Secondaries would keep serving a dead
-workload's name until some unrelated change pushes a new serial.  Related
-holes in the same area:
+A `ddns:*` key expiring in Valkey was a *silent* deletion: no serial bump,
+no IXFR journal entry, no NOTIFY — secondaries would keep serving a dead
+workload's name until some unrelated change pushed a new serial.
 
-- explicit deletes don't journal either — the UPDATE delete path (3216)
-  and REST `/delete` (4705) call `vk_del`/`serial_bump` but never
-  `ixfr_journal_append` (its only callers are the two *add* paths,
-  3169/3176);
-- REST `/update` (4694) bumps the serial but doesn't journal the add.
+Implemented (`config:ddns_sweep_secs`, default 30 s, primary only):
 
-Fix, master-role only:
+- `ddns_sweeper_thread` keeps an in-memory snapshot of the live `ddns:*`
+  leases (key + value) and each tick diffs it against the keyspace. A lease
+  present last tick but gone now has expired → `serial_bump` +
+  `ixfr_journal_append(prev,next,'D',name,value)` on the owning zone
+  (`ddns_replay_expiry`), with one batched NOTIFY per affected zone
+  (`notify_one_zone`). It works off the actual keyspace, so leases from any
+  front-end (RFC 2136, apid REST, auto-PTR) are covered with no shared index.
+- Robustness: `vk_list_keys_strict` distinguishes a Valkey error (−1, skip the
+  tick) from a genuinely-empty match (0, replay everything) so a transient blip
+  can't be mistaken for a mass expiry that would replay bogus deletes.
+- The earlier "related holes" are already closed: explicit UPDATE A/AAAA deletes
+  now journal `'D'` (and the auto-PTR retract path journals too); the REST
+  `/update`/`/delete` halves live in `apid`. An explicitly-deleted lease may be
+  replayed once more by the sweeper as an idempotent (no-op) delete — harmless,
+  and discovery leases expire rather than being deleted, so that path is clean.
 
-1. `ddns_sweeper_thread` (start next to `pki_renewal_thread`, 4912):
-   maintain a `ddns:index` SET of registered names (add on every
-   registration); each sweep, `SCAN` the index, and for entries whose
-   `ddns:*` key has vanished → remove from index, `serial_bump`,
-   `ixfr_journal_append(prev,next,'D',name,...)`, batch one `notify_send`
-   per sweep.  Interval ≈ min lease / 2 (default 30 s).
-2. Journal deletes ('D') and REST adds at the three call sites above.
+Guarded by `make check-ddns-sweeper` (seed a short-TTL lease, let it expire,
+assert serial bump + the IXFR `'D'` from the pre-expiry serial via
+`tests/ixfr_client.py`).
 
 Estimated ~70 lines.
 
