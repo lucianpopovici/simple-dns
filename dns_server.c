@@ -366,6 +366,11 @@ typedef struct {
     char soa_rname[256];
     uint32_t soa_serial;
     uint32_t soa_refresh, soa_retry, soa_expire, soa_minimum;
+    /* Secondary zone-maintenance state (hidden-master plan Gap 6). xfr_last_ok =
+     * epoch of the last successful contact with the master (resets the expire
+     * timer); xfr_next_check = epoch the refresh thread should next pull. */
+    time_t xfr_last_ok;
+    time_t xfr_next_check;
     char axfr_allow[1024];
     char notify_targets[1024];
     /* Per-zone DNSSEC denial parameters (config:zone:<name>:*) */
@@ -656,6 +661,11 @@ static int g_primary_tls = 0;                    /* config:primary_tls (DoT) */
 static char g_xfr_ca_pem[MAX_PEM] = "";          /* config:xfr_ca_pem — verify master */
 static char g_xfr_client_cert_pem[MAX_PEM] = ""; /* config:xfr_client_cert_pem — our mTLS id */
 static char g_xfr_client_key_pem[MAX_PEM] = "";  /* config:xfr_client_key_pem */
+/* Refresh engine (Gap 6): a NOTIFY (Gap 5) sets g_xfr_wake + signals the cond so
+ * the refresh thread re-checks immediately instead of waiting for the timer. */
+static pthread_mutex_t g_xfr_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_xfr_cond = PTHREAD_COND_INITIALIZER;
+static int g_xfr_wake = 0;
 
 /* SOA parameters */
 static char g_soa_mname[256] = "ns1.example.local";
@@ -5723,6 +5733,21 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             return off;
         }
     }
+    /* Secondary: a zone past its SOA expire stops answering authoritatively
+     * (RFC 1035 §4.3.5 / RFC 1996) until the next successful transfer — Gap 6. */
+    if (t_zone && g_zone_secondary && t_zone->xfr_last_ok &&
+        time(NULL) - t_zone->xfr_last_ok > (time_t) t_zone->soa_expire) {
+        dns_log(LOG_WARNING, "[XFR] %s past SOA expire (%us) — SERVFAIL\n", t_zone->name,
+                t_zone->soa_expire);
+        rh->flags = htons(DNS_QR | DNS_RCODE_SERVFAIL);
+        rh->qdcount = htons(1);
+        int qsec3 = after - 12 + 4;
+        if (after > 0 && 12 + qsec3 <= resp_len) {
+            memcpy(resp + 12, query + 12, (size_t) qsec3);
+            return 12 + qsec3;
+        }
+        return 12;
+    }
     int answers = 0, auth_count = 0, found = 0;
     int any_minimal = 0; /* RFC 8482: limit ANY responses */
     if (qtype == DNS_TYPE_ANY)
@@ -7302,18 +7327,81 @@ static int xfr_pull(const char *zone) {
     return ok ? 0 : -1;
 }
 
-/* Startup pull: a secondary loads every configured zone from the master once.
- * Runs in a detached thread so a slow/unreachable master never blocks startup. */
-static void *xfr_startup_thread(void *arg) {
+/* Wake the refresh thread for an immediate re-check (Gap 5, NOTIFY path). */
+static void xfr_refresh_kick(void) {
+    pthread_mutex_lock(&g_xfr_mutex);
+    g_xfr_wake = 1;
+    pthread_cond_signal(&g_xfr_cond);
+    pthread_mutex_unlock(&g_xfr_mutex);
+}
+
+/* Zone-maintenance loop for a secondary (hidden-master plan Gap 6): pull each
+ * zone from the master on its SOA refresh timer (retry timer after a failure),
+ * immediately on a NOTIFY (Gap 5). The first pass loads every zone at startup.
+ * Records the last successful contact per zone (xfr_last_ok) so the query path
+ * can SERVFAIL a zone that has gone past its SOA expire (RFC 1035 §4.3.5). */
+static void *xfr_refresh_thread(void *arg) {
     (void) arg;
-    char names[MAX_ZONES][256];
-    int nz = 0;
-    pthread_mutex_lock(&g_zones_mutex);
-    for (int i = 0; i < g_zone_count && nz < MAX_ZONES; i++)
-        safe_strcpy(names[nz++], g_zones[i].name, sizeof(names[0]));
-    pthread_mutex_unlock(&g_zones_mutex);
-    for (int i = 0; i < nz; i++)
-        xfr_pull(names[i]);
+    /* Seed the expire clock at boot: a secondary that can never reach its master
+     * still expires the zone after soa_expire (rather than serving forever). */
+    {
+        time_t boot = time(NULL);
+        pthread_mutex_lock(&g_zones_mutex);
+        for (int i = 0; i < g_zone_count; i++)
+            if (g_zones[i].xfr_last_ok == 0)
+                g_zones[i].xfr_last_ok = boot;
+        pthread_mutex_unlock(&g_zones_mutex);
+    }
+    for (;;) {
+        /* Snapshot zone names + timers; do the (slow) network pulls unlocked. */
+        char names[MAX_ZONES][256];
+        uint32_t refresh[MAX_ZONES], retry[MAX_ZONES];
+        time_t due[MAX_ZONES];
+        int nz = 0;
+        time_t now = time(NULL);
+        pthread_mutex_lock(&g_zones_mutex);
+        for (int i = 0; i < g_zone_count && nz < MAX_ZONES; i++) {
+            safe_strcpy(names[nz], g_zones[i].name, sizeof(names[0]));
+            refresh[nz] = g_zones[i].soa_refresh ? g_zones[i].soa_refresh : 3600;
+            retry[nz] = g_zones[i].soa_retry ? g_zones[i].soa_retry : 900;
+            due[nz] = g_zones[i].xfr_next_check;
+            nz++;
+        }
+        pthread_mutex_unlock(&g_zones_mutex);
+        for (int i = 0; i < nz; i++) {
+            if (due[i] != 0 && now < due[i])
+                continue; /* not yet due (0 = never checked → pull now) */
+            int ok = (xfr_pull(names[i]) == 0);
+            time_t next = time(NULL) + (ok ? (time_t) refresh[i] : (time_t) retry[i]);
+            pthread_mutex_lock(&g_zones_mutex);
+            for (int j = 0; j < g_zone_count; j++)
+                if (strcasecmp(g_zones[j].name, names[i]) == 0) {
+                    g_zones[j].xfr_next_check = next;
+                    if (ok)
+                        g_zones[j].xfr_last_ok = time(NULL);
+                    break;
+                }
+            pthread_mutex_unlock(&g_zones_mutex);
+        }
+        /* Sleep until the soonest next_check (capped), or until a NOTIFY kick. */
+        now = time(NULL);
+        long sleep_s = 3600;
+        pthread_mutex_lock(&g_zones_mutex);
+        for (int i = 0; i < g_zone_count; i++) {
+            long d = (long) (g_zones[i].xfr_next_check - now);
+            if (g_zones[i].xfr_next_check != 0 && d < sleep_s)
+                sleep_s = d;
+        }
+        pthread_mutex_unlock(&g_zones_mutex);
+        if (sleep_s < 1)
+            sleep_s = 1;
+        struct timespec ts = {.tv_sec = now + sleep_s, .tv_nsec = 0};
+        pthread_mutex_lock(&g_xfr_mutex);
+        if (!g_xfr_wake)
+            pthread_cond_timedwait(&g_xfr_cond, &g_xfr_mutex, &ts);
+        g_xfr_wake = 0;
+        pthread_mutex_unlock(&g_xfr_mutex);
+    }
     return NULL;
 }
 
@@ -7705,12 +7793,37 @@ static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len
     if (op == DNS_OPCODE_UPDATE)
         return handle_update(pkt, plen, resp);
     if (op == DNS_OPCODE_NOTIFY) {
-        /* Accept and acknowledge NOTIFY */
+        /* Accept and acknowledge NOTIFY. On a secondary, a NOTIFY from the
+         * configured master triggers an immediate refresh (RFC 1996 §4.7,
+         * hidden-master plan Gap 5). Verify the source (RFC 1996 §3.10) so a
+         * stranger can't make us re-pull on demand; the pull itself is TLS-
+         * authenticated regardless. */
         dns_hdr_t *rh = (dns_hdr_t *) resp;
         rh->id = h->id;
         rh->flags = htons(DNS_QR | DNS_OPCODE_NOTIFY | DNS_RCODE_NOERROR);
         rh->qdcount = rh->ancount = rh->nscount = rh->arcount = 0;
-        dns_log(LOG_NOTICE, "[NOTIFY] Received NOTIFY\n");
+        if (g_zone_secondary && g_primary_host[0] && cip) {
+            int from_primary = 0;
+            struct addrinfo hints, *res = NULL;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_INET;
+            if (getaddrinfo(g_primary_host, NULL, &hints, &res) == 0) {
+                for (struct addrinfo *p = res; p; p = p->ai_next)
+                    if (((struct sockaddr_in *) p->ai_addr)->sin_addr.s_addr == cip->s_addr) {
+                        from_primary = 1;
+                        break;
+                    }
+                freeaddrinfo(res);
+            }
+            if (from_primary) {
+                dns_log(LOG_NOTICE, "[NOTIFY] from master — triggering refresh\n");
+                xfr_refresh_kick();
+            } else {
+                dns_log(LOG_NOTICE, "[NOTIFY] ignored (source is not the configured master)\n");
+            }
+        } else {
+            dns_log(LOG_NOTICE, "[NOTIFY] Received NOTIFY\n");
+        }
         return 12;
     }
     dns_hdr_t *rh = (dns_hdr_t *) resp;
@@ -8351,12 +8464,12 @@ int main(int argc, char **argv) {
             dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
     }
 
-    /* Secondary: pull every zone from the master once at startup (hidden-master
-     * plan Gap 3). Detached so an unreachable master never blocks the server;
-     * periodic refresh + NOTIFY-triggered re-pull are Gap 6/5. */
+    /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry
+     * timers + NOTIFY-triggered re-pull (hidden-master plan Gap 6/5). Detached so
+     * an unreachable master never blocks the server. */
     if (g_zone_secondary && g_primary_host[0]) {
         pthread_t xtid;
-        if (pthread_create(&xtid, NULL, xfr_startup_thread, NULL) == 0)
+        if (pthread_create(&xtid, NULL, xfr_refresh_thread, NULL) == 0)
             pthread_detach(xtid);
         else
             dns_log(LOG_ERR, "[XFR] Failed to start transfer-client thread\n");
