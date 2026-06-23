@@ -69,6 +69,17 @@ Everything below is missing and is required for the two-role deployment.
 > (request TSIG-sign + chained-response verify — until then run transfers over
 > TLS), IXFR (currently always AXFR), and Gap 5/6 (NOTIFY-triggered + periodic
 > refresh — currently a one-shot startup pull).**
+>
+> **Gap 6 + 5 done** (branch `xfr-refresh`): the startup pull became a
+> maintenance loop (`xfr_refresh_thread`) that re-pulls each zone on its SOA
+> refresh timer (retry timer after a failure). A NOTIFY from the configured
+> master (source-verified, RFC 1996 §3.10) kicks an immediate re-pull via a
+> condvar (Gap 5). A zone that cannot refresh within its SOA expire stops
+> answering authoritatively (SERVFAIL, RFC 1035 §4.3.5); the expire clock seeds
+> at boot and resets on every successful contact. Guarded by
+> `make check-xfr-refresh`. Still open: **Gap 4 (transfer TSIG sign+verify)**,
+> IXFR (refresh does a full AXFR each time), and the master-side NOTIFY-sender
+> hardening (TSIG-signed NOTIFY + retry).
 
 ## Gap 1 — mTLS on the DoT/transfer listener (master side)
 

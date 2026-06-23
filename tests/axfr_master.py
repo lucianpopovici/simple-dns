@@ -9,7 +9,11 @@ secondary's pull of that zone fails and its existing store is left untouched
 (important — the test shares one Valkey with everything else).
 
 It is NOT a real server and does no TSIG (the transfer-client's TSIG support is
-a separate step). Usage: axfr_master.py <bind_ip> <port> <zone>
+a separate step). Usage: axfr_master.py <bind_ip> <port> <zone> [control_file]
+
+If control_file is given it is read on every AXFR: line 1 = SOA serial, optional
+line 2 = an extra label to add as "<label>.<zone> A 10.10.0.9" — so a test can
+bump the serial / add a record between pulls to exercise refresh.
 """
 import socket
 import struct
@@ -17,6 +21,20 @@ import sys
 
 ZONE = "xfrpull.test"
 SERIAL = 424242
+CONTROL = None
+
+
+def current_serial_and_extra():
+    if not CONTROL:
+        return SERIAL, None
+    try:
+        with open(CONTROL) as f:
+            lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+        serial = int(lines[0]) if lines else SERIAL
+        extra = lines[1] if len(lines) > 1 else None
+        return serial, extra
+    except (OSError, ValueError):
+        return SERIAL, None
 
 
 def enc_name(name):
@@ -31,9 +49,9 @@ def rr(name, rrtype, rdata, ttl=120):
     return enc_name(name) + struct.pack(">HHIH", rrtype, 1, ttl, len(rdata)) + rdata
 
 
-def soa_rdata():
+def soa_rdata(serial):
     body = enc_name("ns1." + ZONE) + enc_name("hostmaster." + ZONE)
-    body += struct.pack(">IIIII", SERIAL, 3600, 900, 604800, 300)
+    body += struct.pack(">IIIII", serial, 3600, 900, 604800, 300)
     return body
 
 
@@ -50,15 +68,18 @@ def parse_qname(query):
 
 
 def build_axfr(qid):
-    """One message: SOA, www A x2, info TXT, alias CNAME, closing SOA."""
+    """One message: SOA, www A x2, info TXT, alias CNAME, [extra A], closing SOA."""
+    serial, extra = current_serial_and_extra()
     records = b""
     n = 0
-    records += rr(ZONE, 6, soa_rdata()); n += 1                       # SOA
+    records += rr(ZONE, 6, soa_rdata(serial)); n += 1                 # SOA
     records += rr("www." + ZONE, 1, socket.inet_aton("10.10.0.1")); n += 1
     records += rr("www." + ZONE, 1, socket.inet_aton("10.10.0.2")); n += 1
     records += rr("info." + ZONE, 16, b"\x09hello-xfr"); n += 1       # TXT "hello-xfr"
     records += rr("alias." + ZONE, 5, enc_name("www." + ZONE)); n += 1  # CNAME
-    records += rr(ZONE, 6, soa_rdata()); n += 1                       # closing SOA
+    if extra:
+        records += rr(extra + "." + ZONE, 1, socket.inet_aton("10.10.0.9")); n += 1
+    records += rr(ZONE, 6, soa_rdata(serial)); n += 1                 # closing SOA
     header = struct.pack(">HHHHHH", qid, 0x8400, 0, n, 0, 0)          # QR+AA
     return header + records
 
@@ -66,9 +87,11 @@ def build_axfr(qid):
 def main():
     bind_ip = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 5388
-    global ZONE
+    global ZONE, CONTROL
     if len(sys.argv) > 3:
         ZONE = sys.argv[3]
+    if len(sys.argv) > 4:
+        CONTROL = sys.argv[4]
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

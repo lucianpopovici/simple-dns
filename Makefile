@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-xfr-client check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-xfr-client check-xfr-refresh check-dot-mtls check-ddns-acl check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -406,6 +406,56 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
+
+# Secondary zone maintenance: NOTIFY-triggered refresh + SOA expire (hidden-
+# master plan Gap 6/5). A secondary re-pulls a zone immediately on a NOTIFY from
+# its master and, if it cannot refresh within the SOA expire, stops answering
+# authoritatively (SERVFAIL). Drive a stub master whose serial/records can be
+# changed mid-run via a control file; assert: (1) a NOTIFY makes the secondary
+# pick up the new serial + a new record; (2) after the master dies and expire
+# elapses, the zone SERVFAILs. Needs Valkey + dig + python3.
+check-xfr-refresh: $(BIN_DEBUG)
+	@echo "  CHECK  secondary refresh: NOTIFY re-pull + SOA expire (Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=xfrpull.test; P=5389; CTL=$$(mktemp);                                           \
+	 echo 100 > $$CTL;                                                                 \
+	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
+	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
+	 python3 tests/axfr_master.py 127.0.0.1 $$P $$Z $$CTL >/tmp/axfr_master_r.log 2>&1 & M=$$!; \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|2|1|4|300|127.0.0.1|" >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 $$VC set config:zone_role secondary >/dev/null;                                   \
+	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
+	 $$VC set config:primary_port $$P >/dev/null;                                      \
+	 $$VC set config:primary_tls 0 >/dev/null;                                         \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ref.log 2>&1 & DNS=$$!;     \
+	 sleep 2.5;                                                                        \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 N1=$$(dig +short +nocookie @127.0.0.1 -p 5353 new.$$Z A +time=2 +tries=1);        \
+	 printf '200\nnew\n' > $$CTL;                                                      \
+	 dig +opcode=notify +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 >/dev/null 2>&1; \
+	 sleep 1.5;                                                                        \
+	 S2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p 5353 new.$$Z A +time=2 +tries=1);        \
+	 kill $$M 2>/dev/null || true; sleep 6;                                            \
+	 EXP=$$(dig +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | grep -c 'status: SERVFAIL'); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_ROLE" ]; then $$VC set config:zone_role "$$SAVE_ROLE" >/dev/null; else $$VC del config:zone_role >/dev/null; fi; \
+	 if [ -n "$$SAVE_PH" ]; then $$VC set config:primary_host "$$SAVE_PH" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
+	 rm -f $$CTL;                                                                      \
+	 echo "  startup: serial=$$S1 new=[$$N1] | after NOTIFY: serial=$$S2 new=[$$N2] | post-expire SERVFAIL=$$EXP"; \
+	 test "$$S1" = "100" || { echo "  FAIL  startup pull serial ($$S1 != 100)"; exit 1; }; \
+	 test -z "$$N1" || { echo "  FAIL  new record present before it was added"; exit 1; }; \
+	 test "$$S2" = "200" || { echo "  FAIL  NOTIFY did not trigger refresh ($$S2 != 200)"; exit 1; }; \
+	 test "$$N2" = "10.10.0.9" || { echo "  FAIL  NOTIFY refresh did not pick up the new record"; exit 1; }; \
+	 test "$$EXP" -ge 1 || { echo "  FAIL  zone past SOA expire did not SERVFAIL"; exit 1; }; \
+	 echo "  OK  NOTIFY re-pulls (new serial+record); zone SERVFAILs past expire"
 
 # Zone transfer CLIENT (hidden-master plan Gap 3). A secondary pulls each zone
 # from its master at startup. Drive a stub master (tests/axfr_master.py) that
@@ -841,6 +891,7 @@ help:
 	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
 	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"
 	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
+	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
