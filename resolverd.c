@@ -2004,8 +2004,13 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
     safe_strcpy(saved_host, g_cfg.upstream_host[0], sizeof(saved_host));
     saved_port = g_cfg.upstream_port[0];
     saved_proto = g_cfg.proto;
-    safe_strcpy(g_cfg.upstream_host[0], g_cfg.upstream_host[upstream_idx],
-                sizeof(g_cfg.upstream_host[0]));
+    /* Point slot 0 at the chosen upstream. Skip the copy when it IS slot 0:
+     * safe_strcpy() is strncpy-based, and strncpy with src==dst is undefined
+     * behaviour (ASan: strncpy-param-overlap) — querying the primary upstream
+     * would otherwise abort. */
+    if (upstream_idx != 0)
+        safe_strcpy(g_cfg.upstream_host[0], g_cfg.upstream_host[upstream_idx],
+                    sizeof(g_cfg.upstream_host[0]));
     g_cfg.upstream_port[0] = g_cfg.upstream_port[upstream_idx];
     g_cfg.proto = g_cfg.upstream_proto[upstream_idx];
     int qlen = build_query(query, sizeof(query), qname, qtype, id, 1);

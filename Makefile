@@ -36,6 +36,10 @@ SANDBOX_SRC := sandbox.c
 SRC        := dns_server.c $(WIRE_SRC) $(SANDBOX_SRC)
 BIN        := dns_server
 BIN_DEBUG  := dns_server_debug
+# Port the test harness runs dnsd's DNS listener on. Default 5356 avoids the
+# mDNS port 5353, which collides with a desktop avahi-daemon (dig would hit
+# avahi instead of dnsd). Override with `make TPORT=5353 check-*` if needed.
+TPORT      ?= 5356
 SIG_GPG    := $(BIN).asc
 SIG_OSSL   := $(BIN).sig
 OSSL_PUBKEY := keys/codesign.pub.pem
@@ -378,10 +382,10 @@ fuzz-wire: fuzz/fuzz_name_from_wire.c $(WIRE_SRC) dns_wire.h
 # =============================================================================
 check: $(BIN_DEBUG)
 	@echo "  CHECK  Sending test query to localhost (requires Valkey on :6379)"
-	@./$(BIN_DEBUG) &                         \
+	@LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) &                         \
 	 DNS_PID=$$!;                              \
 	 sleep 1;                                  \
-	 dig @127.0.0.1 -p 5353 example.local A   \
+	 dig @127.0.0.1 -p $(TPORT) example.local A   \
 	     +time=2 +tries=1 +short;             \
 	 kill $$DNS_PID 2>/dev/null || true
 
@@ -392,15 +396,15 @@ check: $(BIN_DEBUG)
 # Needs Valkey + dig.
 check-dnssec-live: $(BIN_DEBUG)
 	@echo "  CHECK  live DNSSEC DO-bit honoured (requires Valkey + dig)"
-	@ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dolive.log 2>&1 & DNS=$$!;  \
+	@ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dolive.log 2>&1 & DNS=$$!;  \
 	 sleep 1.5;                                                                        \
 	 DO=0;                                                                             \
 	 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do                                           \
-	   DO=$$(dig +dnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
+	   DO=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
 	   if [ "$$DO" -ge 1 ]; then break; fi;                                            \
 	   sleep 1;                                                                        \
 	 done;                                                                             \
-	 NODO=$$(dig +nodnssec +nocookie @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 NODO=$$(dig +nodnssec +nocookie @127.0.0.1 -p $(TPORT) example.local SOA +time=2 +tries=1 | grep -c 'RRSIG'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 echo "  +dnssec RRSIGs=$$DO   +nodnssec RRSIGs=$$NODO";                           \
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
@@ -434,9 +438,9 @@ check-xfr-tsig: $(BIN_DEBUG)
 	 for MODE in ok badresp unsigned; do                                              \
 	   for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
 	   python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" $$MODE >/tmp/xtsig_m.log 2>&1 & M=$$!; \
-	   ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/xtsig_s.log 2>&1 & DNS=$$!;    \
+	   ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/xtsig_s.log 2>&1 & DNS=$$!;    \
 	   sleep 2.2;                                                                       \
-	   W=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.$$Z A +time=2 +tries=1);        \
+	   W=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=2 +tries=1);        \
 	   kill $$DNS $$M 2>/dev/null || true; sleep 0.3;                                   \
 	   RES="$$RES $$MODE=[$$W]";                                                         \
 	   eval "R_$$MODE=\"$$W\"";                                                          \
@@ -478,17 +482,17 @@ check-xfr-refresh: $(BIN_DEBUG)
 	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
 	 $$VC set config:primary_port $$P >/dev/null;                                      \
 	 $$VC set config:primary_tls 0 >/dev/null;                                         \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ref.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ref.log 2>&1 & DNS=$$!;     \
 	 sleep 2.5;                                                                        \
-	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 N1=$$(dig +short +nocookie @127.0.0.1 -p 5353 new.$$Z A +time=2 +tries=1);        \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 N1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) new.$$Z A +time=2 +tries=1);        \
 	 printf '200\nnew\n' > $$CTL;                                                      \
-	 dig +opcode=notify +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 >/dev/null 2>&1; \
+	 dig +opcode=notify +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 >/dev/null 2>&1; \
 	 sleep 1.5;                                                                        \
-	 S2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 N2=$$(dig +short +nocookie @127.0.0.1 -p 5353 new.$$Z A +time=2 +tries=1);        \
+	 S2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) new.$$Z A +time=2 +tries=1);        \
 	 kill $$M 2>/dev/null || true; sleep 6;                                            \
-	 EXP=$$(dig +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | grep -c 'status: SERVFAIL'); \
+	 EXP=$$(dig +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | grep -c 'status: SERVFAIL'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
 	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -527,13 +531,13 @@ check-xfr-client: $(BIN_DEBUG)
 	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
 	 $$VC set config:primary_port $$P >/dev/null;                                      \
 	 $$VC set config:primary_tls 0 >/dev/null;                                         \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_sec.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_sec.log 2>&1 & DNS=$$!;     \
 	 sleep 2.5;                                                                        \
-	 A=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.$$Z A +time=2 +tries=1 | sort | tr '\n' ' '); \
-	 TX=$$(dig +short +nocookie @127.0.0.1 -p 5353 info.$$Z TXT +time=2 +tries=1);     \
-	 CN=$$(dig +short +nocookie @127.0.0.1 -p 5353 alias.$$Z CNAME +time=2 +tries=1);  \
-	 SOA=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 KEEP=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.example.local A +time=2 +tries=1); \
+	 A=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=2 +tries=1 | sort | tr '\n' ' '); \
+	 TX=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) info.$$Z TXT +time=2 +tries=1);     \
+	 CN=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) alias.$$Z CNAME +time=2 +tries=1);  \
+	 SOA=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 KEEP=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.example.local A +time=2 +tries=1); \
 	 kill $$DNS $$M 2>/dev/null || true;                                               \
 	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
 	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -566,17 +570,17 @@ check-role: $(BIN_DEBUG)
 	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
 	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|3|3600|900|604800|300|127.0.0.1|" >/dev/null; \
 	 $$VC set config:zone_role secondary >/dev/null;                                   \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_role1.log 2>&1 & DNS=$$!;   \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_role1.log 2>&1 & DNS=$$!;   \
 	 sleep 1.5;                                                                        \
-	 NA=$$(printf 'server 127.0.0.1 5353\nzone example.local\nupdate add r1.example.local 60 A 10.0.0.5\nsend\n' | nsupdate 2>&1 | grep -c -i notauth); \
-	 R1=$$(dig +short +nocookie @127.0.0.1 -p 5353 r1.example.local A +time=2 +tries=1);\
-	 SEC_DK=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z DNSKEY +time=2 +tries=1 | grep -c '^25'); \
+	 NA=$$(printf 'server 127.0.0.1 $(TPORT)\nzone example.local\nupdate add r1.example.local 60 A 10.0.0.5\nsend\n' | nsupdate 2>&1 | grep -c -i notauth); \
+	 R1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) r1.example.local A +time=2 +tries=1);\
+	 SEC_DK=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z DNSKEY +time=2 +tries=1 | grep -c '^25'); \
 	 GUARD=$$(grep -c "ABSENT on a secondary" /tmp/dnsd_role1.log);                     \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:zone_role primary >/dev/null;                                     \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_role2.log 2>&1 & DNS=$$!;   \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_role2.log 2>&1 & DNS=$$!;   \
 	 sleep 2;                                                                          \
-	 PRI_DK=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z DNSKEY +time=2 +tries=1 | grep -c '^25'); \
+	 PRI_DK=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z DNSKEY +time=2 +tries=1 | grep -c '^25'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$Z >/dev/null;                                               \
 	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -606,17 +610,17 @@ check-ddns-acl: $(BIN_DEBUG)
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_SX=$$($$VC get config:ddns_allow_suffix); \
 	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
 	 $$VC set config:ddns_allow_suffix ".dyn.$$Z" >/dev/null;                          \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ddns.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ddns.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 printf 'server 127.0.0.1 5353\nzone %s\nupdate add %s 60 A 10.0.0.1\nsend\n' "$$Z" "$$FQDN" | nsupdate >/dev/null 2>&1; \
-	 IN=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$FQDN A +time=2 +tries=1);         \
-	 OUT=$$(printf 'server 127.0.0.1 5353\nzone %s\nupdate add www.%s 60 A 6.6.6.6\nsend\n' "$$Z" "$$Z" | nsupdate 2>&1 | grep -c -i refused); \
-	 WWW=$$(dig +short +nocookie @127.0.0.1 -p 5353 www.$$Z A +time=2 +tries=1 | head -1); \
-	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 printf 'server 127.0.0.1 5353\nupdate add %s 60 A 10.0.0.1\nsend\n' "$$FQDN" | nsupdate >/dev/null 2>&1; \
-	 S2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 printf 'server 127.0.0.1 5353\nupdate add %s 60 A 10.0.0.77\nsend\n' "$$FQDN" | nsupdate >/dev/null 2>&1; \
-	 S3=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 printf 'server 127.0.0.1 $(TPORT)\nzone %s\nupdate add %s 60 A 10.0.0.1\nsend\n' "$$Z" "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 IN=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$FQDN A +time=2 +tries=1);         \
+	 OUT=$$(printf 'server 127.0.0.1 $(TPORT)\nzone %s\nupdate add www.%s 60 A 6.6.6.6\nsend\n' "$$Z" "$$Z" | nsupdate 2>&1 | grep -c -i refused); \
+	 WWW=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=2 +tries=1 | head -1); \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 printf 'server 127.0.0.1 $(TPORT)\nupdate add %s 60 A 10.0.0.1\nsend\n' "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 S2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 printf 'server 127.0.0.1 $(TPORT)\nupdate add %s 60 A 10.0.0.77\nsend\n' "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 S3=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del config:ddns_allow_suffix ddns:$$Z:A:$$FQDN >/dev/null;                   \
 	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
@@ -650,12 +654,12 @@ check-ddns-sweeper: $(BIN_DEBUG)
 	 $$VC set config:zone:$$Z:serial $$S0 >/dev/null;                                  \
 	 $$VC del ixfr:$$Z:journal >/dev/null;                                             \
 	 $$VC set ddns:$$Z:A:$$HOST $$IP EX 4 >/dev/null;                                  \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_sweep.log 2>&1 & DNS=$$!;   \
-	 ALIVE=$$(sleep 1.5; dig +short +nocookie @127.0.0.1 -p 5353 $$HOST A +time=2 +tries=1); \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_sweep.log 2>&1 & DNS=$$!;   \
+	 ALIVE=$$(sleep 1.5; dig +short +nocookie @127.0.0.1 -p $(TPORT) $$HOST A +time=2 +tries=1); \
 	 sleep 6;                                                                          \
-	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 GONE=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$HOST A +time=2 +tries=1);       \
-	 INC=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z $$S0 2>/dev/null);         \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 GONE=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$HOST A +time=2 +tries=1);       \
+	 INC=$$(python3 tests/ixfr_client.py 127.0.0.1 $(TPORT) $$Z $$S0 2>/dev/null);         \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$Z config:zone:$$Z:serial ddns:$$Z:A:$$HOST ixfr:$$Z:journal >/dev/null; \
 	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -693,7 +697,7 @@ check-notify: $(BIN_DEBUG)
 	 $$VC set config:zone:$$Z:serial $$S0 >/dev/null;                                  \
 	 $$VC set ddns:$$Z:A:host.$$Z 10.1.2.3 EX 4 >/dev/null;                            \
 	 python3 tests/notify_secondary.py 127.0.0.1 $$SP $$Z "$$B64" 12 >/tmp/notify_sec.out 2>/tmp/notify_sec.err & STUB=$$!; \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_notify.log 2>&1 & DNS=$$!;  \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_notify.log 2>&1 & DNS=$$!;  \
 	 sleep 13;                                                                         \
 	 kill $$DNS 2>/dev/null || true; wait $$STUB 2>/dev/null || true;                  \
 	 OUT=$$(cat /tmp/notify_sec.out);                                                  \
@@ -734,18 +738,18 @@ check-ptr: $(BIN_DEBUG)
 	 $$VC set zone_table:$$REV "ns1.$$REV|hostmaster.$$REV|10|3600|900|604800|300|127.0.0.1|" >/dev/null; \
 	 $$VC set zone_table:$$REV6 "ns1.$$REV6|hostmaster.$$REV6|10|3600|900|604800|300|127.0.0.1|" >/dev/null; \
 	 $$VC set zone:$$REV:PTR:$$STATREV "120|$$STATTGT" >/dev/null;                     \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ptr.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ptr.log 2>&1 & DNS=$$!;     \
 	 sleep 1.5;                                                                        \
-	 STAT=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$STATREV PTR +time=2 +tries=1 | head -1); \
-	 printf 'server 127.0.0.1 5353\nzone %s\nupdate add %s 60 A %s\nsend\n' "$$FWD" "$$HOST" "$$IP" | nsupdate >/dev/null 2>&1; \
-	 printf 'server 127.0.0.1 5353\nzone %s\nupdate add %s 60 AAAA %s\nsend\n' "$$FWD" "$$HOST6" "$$IP6" | nsupdate >/dev/null 2>&1; \
+	 STAT=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$STATREV PTR +time=2 +tries=1 | head -1); \
+	 printf 'server 127.0.0.1 $(TPORT)\nzone %s\nupdate add %s 60 A %s\nsend\n' "$$FWD" "$$HOST" "$$IP" | nsupdate >/dev/null 2>&1; \
+	 printf 'server 127.0.0.1 $(TPORT)\nzone %s\nupdate add %s 60 AAAA %s\nsend\n' "$$FWD" "$$HOST6" "$$IP6" | nsupdate >/dev/null 2>&1; \
 	 sleep 0.3;                                                                        \
-	 AUTO=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$REVNAME PTR +time=2 +tries=1 | head -1); \
-	 AX=$$(dig +nocookie @127.0.0.1 -p 5353 $$REV AXFR +time=3 +tries=1 | awk '$$4=="PTR"{print $$1" "$$5}'); \
-	 AUTO6=$$(dig +nocookie @127.0.0.1 -p 5353 $$REV6 AXFR +time=3 +tries=1 | awk '$$4=="PTR"{print $$5}' | head -1); \
-	 printf 'server 127.0.0.1 5353\nzone %s\nupdate delete %s A\nsend\n' "$$FWD" "$$HOST" | nsupdate >/dev/null 2>&1; \
+	 AUTO=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$REVNAME PTR +time=2 +tries=1 | head -1); \
+	 AX=$$(dig +nocookie @127.0.0.1 -p $(TPORT) $$REV AXFR +time=3 +tries=1 | awk '$$4=="PTR"{print $$1" "$$5}'); \
+	 AUTO6=$$(dig +nocookie @127.0.0.1 -p $(TPORT) $$REV6 AXFR +time=3 +tries=1 | awk '$$4=="PTR"{print $$5}' | head -1); \
+	 printf 'server 127.0.0.1 $(TPORT)\nzone %s\nupdate delete %s A\nsend\n' "$$FWD" "$$HOST" | nsupdate >/dev/null 2>&1; \
 	 sleep 0.3;                                                                        \
-	 GONE=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$REVNAME PTR +time=2 +tries=1 | head -1); \
+	 GONE=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$REVNAME PTR +time=2 +tries=1 | head -1); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$REV zone_table:$$REV6 zone:$$REV:PTR:$$STATREV ddns:$$REV:PTR:$$REVNAME ddns:$$FWD:A:$$HOST ddns:$$FWD:AAAA:$$HOST6 config:zone:$$REV:serial config:zone:$$REV6:serial >/dev/null; \
 	 for k in $$($$VC --scan --pattern "dnssec:$$REV:*") $$($$VC --scan --pattern "dnssec:$$REV6:*") $$($$VC --scan --pattern "ddns:$$REV6:*") $$($$VC --scan --pattern "ixfr:$$REV:*") $$($$VC --scan --pattern "ixfr:$$REV6:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -786,14 +790,14 @@ check-dot-mtls: $(BIN_DEBUG)
 	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                      \
 	 $$VC set config:mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                       \
 	 $$VC set config:dot_require_client_cert 1 >/dev/null;                             \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dotm.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dotm.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
 	 NOCERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
 	 WITHCERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -cert $$D/cli.pem -key $$D/cli.key -CAfile $$D/ca.pem 2>&1 | grep -c "Verify return code: 0"); \
 	 WC_ALERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -cert $$D/cli.pem -key $$D/cli.key -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:dot_require_client_cert 0 >/dev/null;                             \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_dotm2.log 2>&1 & DNS=$$!;   \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dotm2.log 2>&1 & DNS=$$!;   \
 	 sleep 1.5;                                                                        \
 	 OPEN=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "Verify return code: 0"); \
 	 OPEN_ALERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
@@ -826,9 +830,9 @@ check-axfr: $(BIN_DEBUG)
 	 $$VC set zone:$$Z:A:web.$$Z "120|10.1.2.3|10.1.2.4" >/dev/null;                   \
 	 $$VC set zone:$$Z:TXT:info.$$Z "120|hello-axfr" >/dev/null;                       \
 	 $$VC set ddns:$$Z:A:dyn.$$Z 10.9.9.9 EX 300 >/dev/null;                           \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_axfr.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_axfr.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 OUT=$$(dig +noall +answer @127.0.0.1 -p 5353 $$Z AXFR +time=5 +tries=1);          \
+	 OUT=$$(dig +noall +answer @127.0.0.1 -p $(TPORT) $$Z AXFR +time=5 +tries=1);          \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z ddns:$$Z:A:dyn.$$Z >/dev/null;  \
 	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
@@ -866,11 +870,11 @@ check-ixfr: $(BIN_DEBUG)
 	 $$VC rpush ixfr:$$Z:journal "100|101|A|host1.$$Z|10.0.0.1" >/dev/null;            \
 	 $$VC rpush ixfr:$$Z:journal "101|102|A|host2.$$Z|10.0.0.2" >/dev/null;            \
 	 $$VC rpush ixfr:$$Z:journal "102|103|D|host1.$$Z|10.0.0.1" >/dev/null;            \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ixfr.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ixfr.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 INC=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z 100 2>/dev/null);          \
-	 FB=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z 50 2>/dev/null);            \
-	 UP=$$(python3 tests/ixfr_client.py 127.0.0.1 5353 $$Z 103 2>/dev/null);           \
+	 INC=$$(python3 tests/ixfr_client.py 127.0.0.1 $(TPORT) $$Z 100 2>/dev/null);          \
+	 FB=$$(python3 tests/ixfr_client.py 127.0.0.1 $(TPORT) $$Z 50 2>/dev/null);            \
+	 UP=$$(python3 tests/ixfr_client.py 127.0.0.1 $(TPORT) $$Z 103 2>/dev/null);           \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$Z config:zone:$$Z:serial zone:$$Z:A:www.$$Z ixfr:$$Z:journal >/dev/null; \
 	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -909,17 +913,17 @@ check-ixfr-client: $(BIN_DEBUG)
 	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
 	 $$VC set config:primary_port $$P >/dev/null;                                      \
 	 $$VC set config:primary_tls 0 >/dev/null;                                         \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_ixc.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ixc.log 2>&1 & DNS=$$!;     \
 	 sleep 4;                                                                          \
-	 S1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 K1=$$(dig +short +nocookie @127.0.0.1 -p 5353 keep.$$Z A +time=2 +tries=1);       \
-	 O1=$$(dig +short +nocookie @127.0.0.1 -p 5353 old.$$Z A +time=2 +tries=1);        \
-	 dig +opcode=notify +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 >/dev/null 2>&1; \
+	 S1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 K1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) keep.$$Z A +time=2 +tries=1);       \
+	 O1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) old.$$Z A +time=2 +tries=1);        \
+	 dig +opcode=notify +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 >/dev/null 2>&1; \
 	 sleep 1.5;                                                                        \
-	 S2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
-	 K2=$$(dig +short +nocookie @127.0.0.1 -p 5353 keep.$$Z A +time=2 +tries=1);       \
-	 O2=$$(dig +short +nocookie @127.0.0.1 -p 5353 old.$$Z A +time=2 +tries=1);        \
-	 N2=$$(dig +short +nocookie @127.0.0.1 -p 5353 new.$$Z A +time=2 +tries=1);        \
+	 S2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 K2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) keep.$$Z A +time=2 +tries=1);       \
+	 O2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) old.$$Z A +time=2 +tries=1);        \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) new.$$Z A +time=2 +tries=1);        \
 	 kill $$DNS $$M 2>/dev/null || true;                                               \
 	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
 	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "ixfr:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
@@ -941,14 +945,14 @@ check-ixfr-client: $(BIN_DEBUG)
 # back to the ZSK or to the wrong rdata format. Needs Valkey + dig.
 check-cds: $(BIN_DEBUG)
 	@echo "  CHECK  RFC 7344 CDS==DS and CDNSKEY==KSK (requires Valkey + dig)"
-	@./$(BIN_DEBUG) > /tmp/dnsd_cds.log 2>&1 &                                          \
+	@LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_cds.log 2>&1 &                                          \
 	 DNS_PID=$$!;                                                                       \
 	 sleep 1;                                                                           \
 	 Z=example.local;                                                                   \
-	 dig @127.0.0.1 -p 5353 $$Z DS      +short | sort > /tmp/cds_ds.txt;                \
-	 dig @127.0.0.1 -p 5353 $$Z CDS     +short | sort > /tmp/cds_cds.txt;               \
-	 dig @127.0.0.1 -p 5353 $$Z CDNSKEY +short | sort > /tmp/cds_cdk.txt;               \
-	 dig @127.0.0.1 -p 5353 $$Z DNSKEY  +short | grep '^257' | sort > /tmp/cds_ksk.txt; \
+	 dig @127.0.0.1 -p $(TPORT) $$Z DS      +short | sort > /tmp/cds_ds.txt;                \
+	 dig @127.0.0.1 -p $(TPORT) $$Z CDS     +short | sort > /tmp/cds_cds.txt;               \
+	 dig @127.0.0.1 -p $(TPORT) $$Z CDNSKEY +short | sort > /tmp/cds_cdk.txt;               \
+	 dig @127.0.0.1 -p $(TPORT) $$Z DNSKEY  +short | grep '^257' | sort > /tmp/cds_ksk.txt; \
 	 kill $$DNS_PID 2>/dev/null || true;                                                \
 	 test -s /tmp/cds_ds.txt || { echo "  FAIL  no DS/CDS emitted (zone unsigned?)"; exit 1; }; \
 	 diff /tmp/cds_ds.txt /tmp/cds_cds.txt || { echo "  FAIL  CDS != DS"; exit 1; };    \
@@ -969,16 +973,16 @@ check-catalog: $(BIN_DEBUG)
 	 $$VC set zone:$$CZ:TXT:version.$$CZ "300|2" >/dev/null;                           \
 	 $$VC set zone:$$CZ:PTR:m1.zones.$$CZ "300|$$MZ" >/dev/null;                       \
 	 $$VC set zone:$$MZ:A:www.$$MZ "300|10.9.8.7" >/dev/null;                          \
-	 ./$(BIN_DEBUG) > /tmp/dnsd_cat.log 2>&1 &                                         \
+	 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_cat.log 2>&1 &                                         \
 	 DNS_PID=$$!;                                                                      \
 	 sleep 1.5;                                                                        \
-	 A=$$(dig @127.0.0.1 -p 5353 www.$$MZ A   +short +time=2 +tries=1);                \
-	 S=$$(dig @127.0.0.1 -p 5353 $$MZ     SOA +short +time=2 +tries=1);                \
-	 D=$$(dig @127.0.0.1 -p 5353 $$MZ     DS  +short +time=2 +tries=1);                \
+	 A=$$(dig @127.0.0.1 -p $(TPORT) www.$$MZ A   +short +time=2 +tries=1);                \
+	 S=$$(dig @127.0.0.1 -p $(TPORT) $$MZ     SOA +short +time=2 +tries=1);                \
+	 D=$$(dig @127.0.0.1 -p $(TPORT) $$MZ     DS  +short +time=2 +tries=1);                \
 	 $$VC del zone:$$CZ:PTR:m1.zones.$$CZ >/dev/null;                                  \
 	 $$VC set config:catalog_test_poke 1 >/dev/null;                                   \
 	 sleep 1.5;                                                                        \
-	 A2=$$(dig @127.0.0.1 -p 5353 www.$$MZ A +short +time=2 +tries=1);                 \
+	 A2=$$(dig @127.0.0.1 -p $(TPORT) www.$$MZ A +short +time=2 +tries=1);                 \
 	 kill $$DNS_PID 2>/dev/null || true;                                               \
 	 $$VC del zone_table:$$CZ zone:$$CZ:TXT:version.$$CZ zone:$$MZ:A:www.$$MZ config:catalog_test_poke >/dev/null 2>&1; \
 	 for k in $$($$VC --scan --pattern "dnssec:$$CZ:*") $$($$VC --scan --pattern "dnssec:$$MZ:*") $$($$VC --scan --pattern "config:zone:$$MZ:*"); do $$VC del "$$k" >/dev/null 2>&1; done; \
@@ -1021,30 +1025,30 @@ check-forwarder: $(BIN_DEBUG)
 	 sleep 0.3;                                                                        \
 	 $$VC set config:forward_allow 127.0.0.0/8 >/dev/null;                             \
 	 $$VC set config:forwarders 127.0.0.1:$$DEAD,127.0.0.1:$$NORM >/dev/null;          \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd1.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_fwd1.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 FWD=$$(dig +nocookie @127.0.0.1 -p 5353 $$QN A +time=3 +tries=1);                 \
+	 FWD=$$(dig +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=3 +tries=1);                 \
 	 FWD_A=$$(echo "$$FWD" | awk '/^'$$QN'\./ && $$4=="A"{print $$5; exit}');          \
 	 FWD_RA=$$(echo "$$FWD" | grep -Ec 'flags:.* ra');                                 \
-	 NR=$$(dig @127.0.0.1 -p 5353 $$QN A +norecurse +time=2 +tries=1 | grep -c 'status: REFUSED'); \
-	 IN=$$(dig @127.0.0.1 -p 5353 example.local SOA +time=2 +tries=1 | grep -Ec 'flags:.* aa'); \
+	 NR=$$(dig @127.0.0.1 -p $(TPORT) $$QN A +norecurse +time=2 +tries=1 | grep -c 'status: REFUSED'); \
+	 IN=$$(dig @127.0.0.1 -p $(TPORT) example.local SOA +time=2 +tries=1 | grep -Ec 'flags:.* aa'); \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:forward_allow 192.0.2.0/24 >/dev/null;                            \
 	 $$VC set config:forwarders 127.0.0.1:$$NORM >/dev/null;                           \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd2.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_fwd2.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 CLOSED=$$(dig @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | grep -c 'status: REFUSED'); \
+	 CLOSED=$$(dig @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | grep -c 'status: REFUSED'); \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:forward_allow 127.0.0.0/8 >/dev/null;                             \
 	 $$VC set config:forwarders 127.0.0.1:$$TRUNC >/dev/null;                          \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd3.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_fwd3.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 TCPA=$$(dig +tcp +nocookie @127.0.0.1 -p 5353 $$QN A +time=3 +tries=1 | awk '/^'$$QN'\./ && $$4=="A"{print $$5; exit}'); \
+	 TCPA=$$(dig +tcp +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=3 +tries=1 | awk '/^'$$QN'\./ && $$4=="A"{print $$5; exit}'); \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:forwarders 127.0.0.1:$$SPOOF >/dev/null;                          \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_fwd4.log 2>&1 & DNS=$$!;    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_fwd4.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 SPOOFED=$$(dig +nocookie @127.0.0.1 -p 5353 $$QN A +time=3 +tries=1 | grep -c 'status: SERVFAIL'); \
+	 SPOOFED=$$(dig +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=3 +tries=1 | grep -c 'status: SERVFAIL'); \
 	 kill $$DNS $$P1 $$P2 $$P3 2>/dev/null || true;                                    \
 	 if [ -n "$$SAVE_EN" ]; then $$VC set config:forward_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:forward_enabled >/dev/null; fi; \
 	 if [ -n "$$SAVE_FW" ]; then $$VC set config:forwarders "$$SAVE_FW" >/dev/null; else $$VC del config:forwarders >/dev/null; fi; \
@@ -1075,24 +1079,24 @@ check-lb: $(BIN_DEBUG)
 	 SAVE_LB=$$($$VC get config:lb_mode);                                              \
 	 $$VC set $$REC "30|10.0.0.1|10.0.0.2|10.0.0.3" >/dev/null;                        \
 	 $$VC set config:lb_mode rr >/dev/null;                                            \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_lb1.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_lb1.log 2>&1 & DNS=$$!;     \
 	 sleep 1.5;                                                                        \
 	 FIRSTS=""; NLINES_MIN=9;                                                          \
 	 for i in 1 2 3 4 5 6; do                                                          \
-	   OUT=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1);        \
+	   OUT=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1);        \
 	   F=$$(echo "$$OUT" | head -1);                                                   \
 	   C=$$(echo "$$OUT" | grep -c '^10\.0\.0\.');                                     \
 	   FIRSTS="$$FIRSTS $$F";                                                          \
 	   if [ "$$C" -lt 3 ]; then NLINES_MIN=0; fi;                                      \
 	 done;                                                                             \
 	 DISTINCT=$$(echo $$FIRSTS | tr ' ' '\n' | sort -u | grep -c '^10\.0\.0\.');       \
-	 SIGS=$$(dig +dnssec +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 SIGS=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | grep -c 'RRSIG'); \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
 	 $$VC set config:lb_mode none >/dev/null;                                          \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_lb2.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_lb2.log 2>&1 & DNS=$$!;     \
 	 sleep 1.5;                                                                        \
-	 N1=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | head -1); \
-	 N2=$$(dig +short +nocookie @127.0.0.1 -p 5353 $$QN A +time=2 +tries=1 | head -1); \
+	 N1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | head -1); \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | head -1); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del $$REC >/dev/null;                                                        \
 	 if [ -n "$$SAVE_LB" ]; then $$VC set config:lb_mode "$$SAVE_LB" >/dev/null; else $$VC del config:lb_mode >/dev/null; fi; \
@@ -1125,7 +1129,7 @@ check-lb-health: $(BIN_DEBUG)
 	 $$VC set config:lb_health_interval 1 >/dev/null;                                  \
 	 $$VC set config:dns_port $$DP >/dev/null;                                         \
 	 python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',$$HP)); s.listen(16); time.sleep(60)" >/dev/null 2>&1 & LIS=$$!; \
-	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_lbh.log 2>&1 & DNS=$$!;     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_lbh.log 2>&1 & DNS=$$!;     \
 	 sleep 3;                                                                          \
 	 UP=$$(dig +short +nocookie @127.0.0.1 -p $$DP $$NAME A +time=2 +tries=1 | sort | tr '\n' ' '); \
 	 kill $$LIS 2>/dev/null || true;                                                   \
@@ -1144,8 +1148,18 @@ check-lb-health: $(BIN_DEBUG)
 	 echo "  OK  unhealthy address dropped; fail-open serves all when every backend is down"
 
 # resolverd smoke: bring up dnsd (authoritative upstream) and resolverd (caching
-# proxy, default LISTEN_PORT 5354 → upstream 127.0.0.1:5353/udp), then resolve
-# through the proxy and confirm it returns dnsd's answer. Needs Valkey + dig.
+# proxy on LISTEN_PORT 5354, default upstream 127.0.0.1:5353/udp), resolve through
+# the proxy and confirm it returns dnsd's answer. Needs Valkey + dig.
+#
+# NOTE: this is the ONE test deliberately kept on 5353 (it does not use $(TPORT)).
+# resolverd answers a `.local` query (example.local) via its RFC 6762 mDNS path —
+# a COOKIELESS multicast query to 224.0.0.251:5353 — which dnsd, bound to the mDNS
+# port 5353, receives and answers. Moving dnsd off 5353 breaks that path and falls
+# back to a unicast upstream query carrying a client-only DNS cookie, which dnsd
+# answers with BADCOOKIE; resolverd does not yet do the RFC 7873 cookie exchange
+# (separate follow-up), so it would get no answer. Keeping dnsd on 5353 here is
+# intentional. On a desktop running avahi (also on 5353) this test can be flaky;
+# the rest of the suite uses $(TPORT) to avoid that.
 check-resolverd: $(BIN_DEBUG) resolverd_debug
 	@echo "  CHECK  resolverd caching proxy → dnsd (requires Valkey + dig)"
 	@ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_rd.log 2>&1 &                \

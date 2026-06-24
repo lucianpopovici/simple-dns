@@ -2114,6 +2114,17 @@ static void config_load_from_valkey(void) {
     GI("http_port", g_http_port);
     GI("https_port", g_https_port);
     GI("metrics_port", g_metrics_port);
+    /* LISTEN_PORT env overrides config:dns_port (per-launch DNS port; documented
+     * in CLAUDE.md). Lets the test harness run dnsd off the mDNS port 5353 — which
+     * collides with a desktop avahi-daemon — without touching Valkey config. */
+    {
+        const char *lp = getenv("LISTEN_PORT");
+        if (lp && *lp) {
+            int p = atoi(lp);
+            if (p > 0 && p <= 65535)
+                g_dns_port = p;
+        }
+    }
     GI("udp_workers", g_udp_workers);
     {
         const char *uw = getenv("UDP_WORKERS");
