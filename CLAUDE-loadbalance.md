@@ -31,8 +31,18 @@ were emitted in stored order with no rotation.
   RRSIGs, alg 13 + 15, regardless of order). `config:lb_mode` is local serving
   policy, read via the live-reload config path; documented in the dns_server.c
   schema header and shown in the startup banner.
-- **Gap 2 (health checks): deferred** — explicitly phase-2 / optional ("only if
-  needed; rotation alone covers the common case"). Not built.
+- **Gap 2 (health checks): done** (branch `lb-health-checks`). `config:lb_health_enabled`
+  + `lb_health_targets` (`name[:port],...`, port default 80) + `lb_health_interval`
+  (default 10s) + `lb_health_timeout_ms` (default 1000). `lb_health_thread`
+  TCP-probes each target's `zone:<zone>:A|AAAA` addresses (non-blocking connect +
+  `poll`) and swaps an in-memory up/down table (`g_lb_health`, guarded by
+  `g_lb_health_mutex`); `emit_addr_rrset` drops down addresses — but emits
+  everything when ALL are down (fail-open). Zero query-path overhead when disabled
+  (no lock taken). Health state is local serving policy: it filters emission only,
+  never writes the zone, so it's safe on a secondary. Metrics:
+  `dns_lb_down_skips_total` + `dns_lb_health_enabled`. Guarded by
+  `make check-lb-health` (drops the down addr; fails open when all down; runs dnsd
+  on `config:dns_port 5356` to dodge a desktop avahi on 5353).
 
 Test: `make check-lb` (wired into CI) provisions a 3-address A RRset and asserts
 `rr` rotates the emission order (≥2 distinct first-addresses) while keeping all 3

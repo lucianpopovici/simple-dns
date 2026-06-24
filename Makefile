@@ -122,7 +122,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1103,6 +1103,45 @@ check-lb: $(BIN_DEBUG)
 	 test "$$SIGS" -ge 1         || { echo "  FAIL  +dnssec returned no RRSIG for the rotated RRset"; exit 1; }; \
 	 test -n "$$N1" -a "$$N1" = "$$N2" || { echo "  FAIL  lb_mode=none not stable ($$N1 vs $$N2)"; exit 1; }; \
 	 echo "  OK  rr rotates (all addrs kept, RRSIGs intact), none is stable"
+
+# A/AAAA load-balancing health checks (CLAUDE-loadbalance.md Gap 2). Provision a
+# name with two addresses: 127.0.0.1 (a python TCP listener answers → healthy)
+# and 127.0.0.2 (nothing listening → connection refused → down). With
+# config:lb_health_enabled the query must serve only the healthy 127.0.0.1; after
+# the listener is stopped (both down) it must fail open and serve both again.
+# Runs dnsd on config:dns_port 5356 to avoid colliding with a desktop mDNS
+# responder (avahi) on 5353. Needs Valkey + dig + python3.
+check-lb-health: $(BIN_DEBUG)
+	@echo "  CHECK  LB health checks: drop down addr, fail open when all down (Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=example.local; NAME=lbh.$$Z; HP=5394; DP=5356; REC=zone:$$Z:A:$$NAME;           \
+	 SAVE_HE=$$($$VC get config:lb_health_enabled); SAVE_HT=$$($$VC get config:lb_health_targets); \
+	 SAVE_HI=$$($$VC get config:lb_health_interval); SAVE_DP=$$($$VC get config:dns_port); \
+	 $$VC set $$REC "30|127.0.0.1|127.0.0.2" >/dev/null;                               \
+	 $$VC set config:lb_health_enabled 1 >/dev/null;                                   \
+	 $$VC set config:lb_health_targets "$$NAME:$$HP" >/dev/null;                       \
+	 $$VC set config:lb_health_interval 1 >/dev/null;                                  \
+	 $$VC set config:dns_port $$DP >/dev/null;                                         \
+	 python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',$$HP)); s.listen(16); time.sleep(60)" >/dev/null 2>&1 & LIS=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_lbh.log 2>&1 & DNS=$$!;     \
+	 sleep 3;                                                                          \
+	 UP=$$(dig +short +nocookie @127.0.0.1 -p $$DP $$NAME A +time=2 +tries=1 | sort | tr '\n' ' '); \
+	 kill $$LIS 2>/dev/null || true;                                                   \
+	 sleep 2.5;                                                                        \
+	 BOTH=$$(dig +short +nocookie @127.0.0.1 -p $$DP $$NAME A +time=2 +tries=1 | sort | tr '\n' ' '); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del $$REC config:lb_health_targets config:lb_health_interval >/dev/null;     \
+	 if [ -n "$$SAVE_HE" ]; then $$VC set config:lb_health_enabled "$$SAVE_HE" >/dev/null; else $$VC del config:lb_health_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_HT" ]; then $$VC set config:lb_health_targets "$$SAVE_HT" >/dev/null; fi; \
+	 if [ -n "$$SAVE_HI" ]; then $$VC set config:lb_health_interval "$$SAVE_HI" >/dev/null; fi; \
+	 if [ -n "$$SAVE_DP" ]; then $$VC set config:dns_port "$$SAVE_DP" >/dev/null; else $$VC del config:dns_port >/dev/null; fi; \
+	 echo "  healthy-only=[$$UP]  all-down(fail-open)=[$$BOTH]";                       \
+	 echo "$$UP"   | grep -q "127.0.0.1" || { echo "  FAIL  healthy address 127.0.0.1 was not served"; exit 1; }; \
+	 echo "$$UP"   | grep -q "127.0.0.2" && { echo "  FAIL  down address 127.0.0.2 was not filtered out"; exit 1; }; \
+	 echo "$$BOTH" | grep -q "127.0.0.1" && echo "$$BOTH" | grep -q "127.0.0.2" || { echo "  FAIL  fail-open did not serve all addresses when every target was down"; exit 1; }; \
+	 echo "  OK  unhealthy address dropped; fail-open serves all when every backend is down"
 
 # resolverd smoke: bring up dnsd (authoritative upstream) and resolverd (caching
 # proxy, default LISTEN_PORT 5354 → upstream 127.0.0.1:5353/udp), then resolve

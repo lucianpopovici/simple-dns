@@ -119,6 +119,10 @@ glance:
   `config:ddns_auto_ptr` set, a forward A/AAAA DDNS registration also creates and
   retracts the matching reverse PTR lease in whichever reverse zone is configured
   locally — so discovered hosts get reverse DNS automatically.
+- **Load balancing**: per-response A/AAAA rotation (`config:lb_mode` =
+  `rr`/`random`) plus optional TCP health checks (`config:lb_health_*`) that drop
+  down backends from answers and fail open when all are down. Local serving
+  policy — set it on the public secondaries; it never travels in AXFR/IXFR.
 - **Multi-zone / provisioning**: `dnsd` serves multiple zones (longest-suffix
   selection, per-zone SOA / DNSSEC keys / AXFR / UPDATE). Catalog zones
   (RFC 9432) bulk-provision member zones: a catalog is a `zone_table:<cat>` zone
@@ -157,6 +161,8 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:ddns_sweep_secs` | Interval (seconds) of the primary's DDNS lease-expiry sweeper (default 30, 0 = off): replays a silently-expired `ddns:*` lease as a serial bump + IXFR delete + NOTIFY so secondaries converge. |
 | `config:nsid` | NSID string reported via EDNS option 3. |
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
+| `config:lb_mode` | A/AAAA RRset rotation: `none` (default), `rr` (round-robin), `random`. Local serving policy — not zone data. |
+| `config:lb_health_enabled` / `_targets` / `_interval` / `_timeout_ms` | TCP health checks for load-balanced addresses: probe the addresses behind `_targets` (`name[:port],...`, port default 80) every `_interval`s (default 10) with a `_timeout_ms` connect timeout (default 1000); down addresses are dropped from answers, with fail-open when all are down. |
 | `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
 | `config:zsk_validity` (or `config:zone:<zone>:zsk_validity`) | ZSK lifetime in seconds; `dnsd` auto-starts a rollover when the active ZSK is older. `0`/unset = no automatic rollover. |
 | `config:zone:<zone>:zsk_rollover_request` | Manual trigger: set to a fresh value (e.g. an epoch) to start a ZSK rollover for that zone now. Edge-triggered. |

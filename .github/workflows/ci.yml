@@ -104,6 +104,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-lb OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: A/AAAA load-balancing health checks (drop down addr, fail-open)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-lb-health OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: AXFR completeness (runtime zone:* / ddns:* records)
         env:
           DNS_VALKEY_HOST: 127.0.0.1
