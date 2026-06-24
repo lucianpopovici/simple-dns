@@ -226,12 +226,21 @@ jobs:
     runs-on: ubuntu-latest
     # Blocking: the tree was reflowed with .clang-format and verified clean in
     # CI (run 27550875223). Keep new code formatted (`clang-format -i`).
+    #
+    # clang-format is PINNED to 20.1.8 via the PyPI wheel rather than installed
+    # from apt. The apt `clang-format` package floats with the runner image
+    # (it was v18 here) and v18's trailing-comment alignment differs from v20+,
+    # which silently broke this job from PR #17 on even though the tree was clean
+    # under the newer clang-format used locally. Pinning makes CI and local dev
+    # agree byte-for-byte — install the same version locally with
+    #   pipx install clang-format==20.1.8
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Install clang-format (pinned — see comment above)
+        run: pipx install "clang-format==20.1.8"
       - name: Check formatting
         run: |
+          clang-format --version
           files=$(git ls-files '*.c' '*.h')
           [ -z "$files" ] || clang-format --dry-run --Werror $files
 
