@@ -76,6 +76,13 @@
  *   config:lb_mode             A/AAAA RRset rotation: none (default) | rr
  *                              (round-robin) | random. Local serving policy
  *                              only — not zone data, never travels in AXFR/IXFR.
+ *   config:lb_health_enabled   "1" to TCP-probe load-balanced A/AAAA addresses
+ *                              and drop down ones from answers (fail-open when
+ *                              all are down). Local serving policy only.
+ *   config:lb_health_targets   "name[:port],..." — names whose A/AAAA addresses
+ *                              are probed (port default 80).
+ *   config:lb_health_interval  Seconds between probe rounds (default 10).
+ *   config:lb_health_timeout_ms  Per-probe TCP connect timeout (default 1000).
  *   config:dot_require_client_cert  "1" to require a verified client cert (mTLS)
  *                              on the DoT/transfer listener (needs
  *                              config:mtls_ca_pem). Default 0 — keep OFF on
@@ -624,6 +631,28 @@ static lb_mode_t g_lb_mode = LB_NONE; /* config:lb_mode: none|rr|random */
  * per-name distribution; atomic so concurrent workers stay race-free. */
 static _Atomic uint32_t g_lb_counter = 0;
 #define LB_MAX_ADDRS 32 /* cap addresses rotated per RRset (values are <=256 B) */
+
+/* Load-balancing health checks (CLAUDE-loadbalance.md Gap 2). When enabled, a
+ * background thread TCP-probes the addresses behind configured names and the
+ * query path drops addresses marked down — unless ALL are down, in which case it
+ * emits everything (a degraded answer beats an empty NOERROR resolvers would
+ * negative-cache). Health state is local serving policy, never written back to
+ * the zone, so it must never feed a secondary's store (CLAUDE.md Gap 7). */
+static int g_lb_health_enabled = 0;         /* config:lb_health_enabled */
+static char g_lb_health_targets[1024] = ""; /* config:lb_health_targets: name[:port],... */
+static int g_lb_health_interval = 10;       /* config:lb_health_interval (s) */
+static int g_lb_health_timeout_ms = 1000;   /* config:lb_health_timeout_ms */
+#define LB_HEALTH_DEFAULT_PORT 80
+#define LB_HEALTH_MAX 256 /* cap distinct probed addresses */
+typedef struct {
+    char ip[INET6_ADDRSTRLEN];
+    int up;
+} lb_health_entry_t;
+/* Current health table, rebuilt each probe round and swapped under the mutex.
+ * The query path reads it only when health checking is enabled. */
+static lb_health_entry_t *g_lb_health = NULL;
+static int g_lb_health_count = 0;
+static pthread_mutex_t g_lb_health_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Structured query log */
 static char g_query_log_path[512] = ""; /* "" = disabled */
@@ -1190,18 +1219,19 @@ static pthread_mutex_t g_zsk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_soa_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Query statistics (Prometheus) */
-static uint64_t g_stat_queries = 0;      /* total queries received */
-static uint64_t g_stat_noerror = 0;      /* NOERROR responses */
-static uint64_t g_stat_nxdomain = 0;     /* NXDOMAIN responses */
-static uint64_t g_stat_refused = 0;      /* REFUSED (out-of-zone) */
-static uint64_t g_stat_servfail = 0;     /* SERVFAIL responses */
-static uint64_t g_stat_rrl_drop = 0;     /* RRL: dropped */
-static uint64_t g_stat_rrl_tc = 0;       /* RRL: truncated */
-static uint64_t g_stat_axfr = 0;         /* AXFR transfers completed */
-static uint64_t g_stat_ddns = 0;         /* DDNS updates accepted */
-static uint64_t g_stat_signed = 0;       /* RRSIGs generated */
-static uint64_t g_stat_forwarded = 0;    /* queries answered via an upstream forwarder */
-static uint64_t g_stat_forward_fail = 0; /* forward attempts that failed (all upstreams) */
+static uint64_t g_stat_queries = 0;       /* total queries received */
+static uint64_t g_stat_noerror = 0;       /* NOERROR responses */
+static uint64_t g_stat_nxdomain = 0;      /* NXDOMAIN responses */
+static uint64_t g_stat_refused = 0;       /* REFUSED (out-of-zone) */
+static uint64_t g_stat_servfail = 0;      /* SERVFAIL responses */
+static uint64_t g_stat_rrl_drop = 0;      /* RRL: dropped */
+static uint64_t g_stat_rrl_tc = 0;        /* RRL: truncated */
+static uint64_t g_stat_axfr = 0;          /* AXFR transfers completed */
+static uint64_t g_stat_ddns = 0;          /* DDNS updates accepted */
+static uint64_t g_stat_signed = 0;        /* RRSIGs generated */
+static uint64_t g_stat_forwarded = 0;     /* queries answered via an upstream forwarder */
+static uint64_t g_stat_forward_fail = 0;  /* forward attempts that failed (all upstreams) */
+static uint64_t g_stat_lb_down_skips = 0; /* A/AAAA addresses suppressed as unhealthy (LB) */
 static pthread_mutex_t g_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define STAT_INC(c)                                                                                \
     do {                                                                                           \
@@ -2205,6 +2235,15 @@ static void config_load_from_valkey(void) {
                 dns_log(LOG_WARNING, "[LB] unknown lb_mode '%s' — rotation disabled\n", lb);
         }
     }
+    /* Load-balancing health checks (CLAUDE-loadbalance.md Gap 2). */
+    g_lb_health_enabled = 0;
+    GI("lb_health_enabled", g_lb_health_enabled);
+    g_lb_health_targets[0] = 0;
+    G("lb_health_targets", g_lb_health_targets);
+    g_lb_health_interval = 10;
+    GI("lb_health_interval", g_lb_health_interval);
+    g_lb_health_timeout_ms = 1000;
+    GI("lb_health_timeout_ms", g_lb_health_timeout_ms);
     /* TSIG secret (base64) */
     if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
         g_tsig_secret_len = b64std_dec(val, g_tsig_secret, sizeof(g_tsig_secret));
@@ -5361,9 +5400,22 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
     }
 }
 
+/* Health-table lookup (CLAUDE-loadbalance.md Gap 2). Returns 1 if `ip` is up
+ * OR not in the table (unknown = fail-open), 0 only if explicitly probed down.
+ * Caller must hold g_lb_health_mutex. */
+static int lb_ip_is_up(const char *ip) {
+    for (int i = 0; i < g_lb_health_count; i++)
+        if (strcmp(g_lb_health[i].ip, ip) == 0)
+            return g_lb_health[i].up;
+    return 1;
+}
+
 /* Emit a multi-address A/AAAA RRset from a stored "ttl|ip|ip|..." value,
  * applying load-balancing rotation (config:lb_mode) to the emission order
- * (CLAUDE-loadbalance.md Gap 1). `val` is mutated (tokenised) in place.
+ * (CLAUDE-loadbalance.md Gap 1) and, when health checking is enabled (Gap 2),
+ * dropping addresses currently marked down — unless every address is down, in
+ * which case all are emitted (fail-open: a degraded answer beats an empty
+ * NOERROR resolvers negative-cache). `val` is mutated (tokenised) in place.
  * Rotation is signature-neutral: emit_rr signs each address RR on its own. */
 static int emit_addr_rrset(uint8_t *resp, int off, int resp_len, const char *name, uint16_t type,
                            char *val, int dnssec_ok, int *answers) {
@@ -5385,15 +5437,37 @@ static int emit_addr_rrset(uint8_t *resp, int off, int resp_len, const char *nam
         ips[n++] = ip;
     if (n == 0)
         return off;
-    /* 2. pick rotation start */
+    /* 1b. health filter (opt-in). Keep only up addresses; if that leaves none,
+     * fall back to all of them (fail-open). No lock/scan when disabled. */
+    char *healthy[LB_MAX_ADDRS];
+    int hn = 0;
+    if (g_lb_health_enabled) {
+        pthread_mutex_lock(&g_lb_health_mutex);
+        for (int i = 0; i < n; i++)
+            if (lb_ip_is_up(ips[i]))
+                healthy[hn++] = ips[i];
+        pthread_mutex_unlock(&g_lb_health_mutex);
+    }
+    char **set = ips;
+    int sn = n;
+    if (g_lb_health_enabled && hn > 0) {
+        set = healthy;
+        sn = hn;
+        if (hn < n) {
+            pthread_mutex_lock(&g_stat_mutex);
+            g_stat_lb_down_skips += (uint64_t) (n - hn);
+            pthread_mutex_unlock(&g_stat_mutex);
+        }
+    }
+    /* 2. pick rotation start (over the emitted set) */
     int start = 0;
     if (g_lb_mode == LB_RR)
-        start = (int) (atomic_fetch_add(&g_lb_counter, 1u) % (uint32_t) n);
+        start = (int) (atomic_fetch_add(&g_lb_counter, 1u) % (uint32_t) sn);
     else if (g_lb_mode == LB_RANDOM)
-        start = rand() % n;
+        start = rand() % sn;
     /* 3. emit rotated */
-    for (int i = 0; i < n; i++) {
-        const char *ip = ips[(start + i) % n];
+    for (int i = 0; i < sn; i++) {
+        const char *ip = set[(start + i) % sn];
         uint8_t rd[16];
         if (inet_pton(af, ip, rd) == 1)
             off = emit_rr(resp, off, resp_len, name, type, ttl, rd, addrlen, dnssec_ok, answers);
@@ -8643,6 +8717,151 @@ static void ddns_replay_expiry(const ddns_lease_t *l, char *zname_out, size_t zc
             next);
 }
 
+/* ==========================================================================
+ * Load-balancing health checks (CLAUDE-loadbalance.md Gap 2)
+ *
+ * Background thread that TCP-probes the A/AAAA addresses behind the names in
+ * config:lb_health_targets and publishes an up/down table the query path
+ * consults (emit_addr_rrset). Local serving policy only — it filters emission
+ * and never writes the zone, so it is safe on a public secondary (CLAUDE.md
+ * Gap 7) and may differ per instance.
+ * ======================================================================= */
+
+/* Non-blocking TCP connect probe. 1 = connected within timeout, 0 = not. */
+static int lb_tcp_probe(const char *ip, int port, int timeout_ms) {
+    int af = strchr(ip, ':') ? AF_INET6 : AF_INET;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    socklen_t slen;
+    if (af == AF_INET) {
+        struct sockaddr_in *s = (struct sockaddr_in *) &ss;
+        s->sin_family = AF_INET;
+        s->sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, ip, &s->sin_addr) != 1)
+            return 0;
+        slen = sizeof(*s);
+    } else {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *) &ss;
+        s->sin6_family = AF_INET6;
+        s->sin6_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET6, ip, &s->sin6_addr) != 1)
+            return 0;
+        slen = sizeof(*s);
+    }
+    int fd = socket(af, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return 0;
+    int up = 0;
+    int r = connect(fd, (struct sockaddr *) &ss, slen);
+    if (r == 0) {
+        up = 1; /* connected immediately (loopback) */
+    } else if (errno == EINPROGRESS) {
+        struct pollfd p = {.fd = fd, .events = POLLOUT};
+        if (poll(&p, 1, timeout_ms > 0 ? timeout_ms : 1000) > 0 && (p.revents & POLLOUT)) {
+            int err = 0;
+            socklen_t el = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+                up = 1;
+        }
+    }
+    close(fd);
+    return up;
+}
+
+/* Read `name`'s stored A+AAAA addresses (from its owning zone) into out[],
+ * returning the count. Skips ddns:* leases — only zone:* RRsets are balanced. */
+static int lb_addrs_for_name(const char *name, char out[][INET6_ADDRSTRLEN], int cap) {
+    int n = 0;
+    zone_entry_t *z = zone_for_qname(name);
+    const char *zn = z ? z->name : g_zone_name;
+    const char *types[2] = {"A", "AAAA"};
+    for (int t = 0; t < 2 && n < cap; t++) {
+        char key[800];
+        snprintf(key, sizeof(key), "zone:%.255s:%s:%.255s", zn, types[t], name);
+        char val[512];
+        if (!vk_get(key, val, sizeof(val)) || !val[0])
+            continue;
+        char *pipe = strchr(val, '|');
+        char *p = pipe ? pipe + 1 : val; /* skip the ttl| prefix */
+        char *sp = NULL;
+        for (char *ip = strtok_r(p, "|", &sp); ip && n < cap; ip = strtok_r(NULL, "|", &sp))
+            safe_strcpy(out[n++], ip, INET6_ADDRSTRLEN);
+    }
+    return n;
+}
+
+/* One probe round: gather every address behind every configured target, probe
+ * it, and swap in the fresh up/down table. Transitions are logged. */
+static void lb_health_probe_round(void) {
+    char targets[1024];
+    safe_strcpy(targets, g_lb_health_targets, sizeof(targets));
+    lb_health_entry_t *next = calloc(LB_HEALTH_MAX, sizeof(lb_health_entry_t));
+    if (!next)
+        return;
+    int nn = 0;
+    char *sp = NULL;
+    for (char *tok = strtok_r(targets, ",", &sp); tok && nn < LB_HEALTH_MAX;
+         tok = strtok_r(NULL, ",", &sp)) {
+        while (*tok == ' ')
+            tok++;
+        if (!*tok)
+            continue;
+        int port = LB_HEALTH_DEFAULT_PORT;
+        /* "name:port" — a colon is unambiguous here (DNS names carry none). */
+        char *colon = strrchr(tok, ':');
+        if (colon) {
+            *colon = 0;
+            port = atoi(colon + 1);
+            if (port <= 0 || port > 65535)
+                port = LB_HEALTH_DEFAULT_PORT;
+        }
+        char addrs[LB_MAX_ADDRS][INET6_ADDRSTRLEN];
+        int na = lb_addrs_for_name(tok, addrs, LB_MAX_ADDRS);
+        for (int a = 0; a < na && nn < LB_HEALTH_MAX; a++) {
+            int dup = 0;
+            for (int j = 0; j < nn; j++)
+                if (strcmp(next[j].ip, addrs[a]) == 0) {
+                    dup = 1;
+                    break;
+                }
+            if (dup)
+                continue;
+            int up = lb_tcp_probe(addrs[a], port, g_lb_health_timeout_ms);
+            safe_strcpy(next[nn].ip, addrs[a], sizeof(next[nn].ip));
+            next[nn].up = up;
+            nn++;
+        }
+    }
+    /* Swap the table in, logging only the addresses whose state changed. */
+    pthread_mutex_lock(&g_lb_health_mutex);
+    for (int i = 0; i < nn; i++) {
+        int prev = -1;
+        for (int j = 0; j < g_lb_health_count; j++)
+            if (strcmp(g_lb_health[j].ip, next[i].ip) == 0) {
+                prev = g_lb_health[j].up;
+                break;
+            }
+        if (prev != next[i].up)
+            dns_log(LOG_NOTICE, "[LB] %s is %s\n", next[i].ip, next[i].up ? "UP" : "DOWN");
+    }
+    lb_health_entry_t *old = g_lb_health;
+    g_lb_health = next;
+    g_lb_health_count = nn;
+    pthread_mutex_unlock(&g_lb_health_mutex);
+    free(old);
+}
+
+static void *lb_health_thread(void *arg) {
+    (void) arg;
+    for (;;) {
+        if (g_lb_health_enabled && g_lb_health_targets[0])
+            lb_health_probe_round();
+        int interval = g_lb_health_interval > 0 ? g_lb_health_interval : 10;
+        sleep((unsigned) interval);
+    }
+    return NULL;
+}
+
 static void *ddns_sweeper_thread(void *arg) {
     (void) arg;
     ddns_lease_t *prev = NULL;
@@ -9006,7 +9225,8 @@ static void handle_metrics(int fd) {
     pthread_mutex_lock(&g_stat_mutex);
     uint64_t sq = g_stat_queries, sn = g_stat_noerror, snx = g_stat_nxdomain, sr = g_stat_refused,
              ss = g_stat_servfail, rd = g_stat_rrl_drop, rt = g_stat_rrl_tc, ax = g_stat_axfr,
-             dd = g_stat_ddns, si = g_stat_signed, fw = g_stat_forwarded, ff = g_stat_forward_fail;
+             dd = g_stat_ddns, si = g_stat_signed, fw = g_stat_forwarded, ff = g_stat_forward_fail,
+             lbd = g_stat_lb_down_skips;
     pthread_mutex_unlock(&g_stat_mutex);
     snprintf(body, sizeof(body),
              "# HELP dns_queries_total Total DNS queries received\n"
@@ -9043,12 +9263,19 @@ static void handle_metrics(int fd) {
              "dns_rrl_enabled %d\n"
              "# HELP dns_forward_enabled Whether out-of-zone forwarding is active\n"
              "# TYPE dns_forward_enabled gauge\n"
-             "dns_forward_enabled %d\n",
+             "dns_forward_enabled %d\n"
+             "# HELP dns_lb_down_skips_total A/AAAA addresses suppressed as unhealthy\n"
+             "# TYPE dns_lb_down_skips_total counter\n"
+             "dns_lb_down_skips_total %llu\n"
+             "# HELP dns_lb_health_enabled Whether load-balancing health checks are active\n"
+             "# TYPE dns_lb_health_enabled gauge\n"
+             "dns_lb_health_enabled %d\n",
              (unsigned long long) sq, (unsigned long long) sn, (unsigned long long) snx,
              (unsigned long long) sr, (unsigned long long) ss, (unsigned long long) rd,
              (unsigned long long) rt, (unsigned long long) ax, (unsigned long long) dd,
              (unsigned long long) si, (unsigned long long) fw, (unsigned long long) ff,
-             g_soa_serial, g_rrl_enabled, (g_forward_enabled && g_forward_allow[0]) ? 1 : 0);
+             g_soa_serial, g_rrl_enabled, (g_forward_enabled && g_forward_allow[0]) ? 1 : 0,
+             (unsigned long long) lbd, g_lb_health_enabled ? 1 : 0);
     metrics_send(fd, 200, "text/plain; version=0.0.4", body);
 }
 
@@ -9432,6 +9659,16 @@ int main(int argc, char **argv) {
             dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
     }
 
+    /* Load-balancing health-check probe thread (CLAUDE-loadbalance.md Gap 2).
+     * Idle (just sleeps) until config:lb_health_enabled is set. */
+    {
+        pthread_t htid;
+        if (pthread_create(&htid, NULL, lb_health_thread, NULL) == 0)
+            pthread_detach(htid);
+        else
+            dns_log(LOG_ERR, "[LB] Failed to start health-check thread\n");
+    }
+
     /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry
      * timers + NOTIFY-triggered re-pull (hidden-master plan Gap 6/5). Detached so
      * an unreachable master never blocks the server. */
@@ -9609,6 +9846,8 @@ int main(int argc, char **argv) {
             (g_forward_enabled && g_forward_allow[0]) ? "ENABLED " : "disabled");
     dns_log(LOG_INFO, "║  A/AAAA load-balancing                      %-20s       ║\n",
             g_lb_mode == LB_RR ? "round-robin" : (g_lb_mode == LB_RANDOM ? "random" : "none"));
+    dns_log(LOG_INFO, "║  LB health checks                           %-20s       ║\n",
+            g_lb_health_enabled ? "enabled" : "disabled");
     dns_log(LOG_INFO, "║  DNS Cookies                                enabled               ║\n");
     dns_log(LOG_INFO, "║  NSID                                       %-20s       ║\n", g_nsid);
     dns_log(LOG_INFO, "║  Authenticated denial                       %s                ║\n",
