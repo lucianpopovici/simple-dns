@@ -43,7 +43,7 @@
  *   config:resolverd_isolation_mode  (RESOLVERD_ISOLATION) chroot (default) | mountns
  *   config:resolverd_privdrop_user   (RESOLVERD_USER)      drop target (default nobody)
  *   config:resolverd_privdrop_group  (RESOLVERD_GROUP)     drop target group
- *   config:resolverd_seccomp_mode    (RESOLVERD_SECCOMP)   audit (default) | enforce | off
+ *   config:resolverd_seccomp_mode    (RESOLVERD_SECCOMP)   enforce (default) | audit | off
  *
  * Build (see the Makefile for the hardened production target):
  *   make resolverd        # optimised, hardened
@@ -3805,8 +3805,12 @@ static void usage(const char *prog) {
  * outbound connections and resolves upstream hostnames, so its chroot must carry
  * resolver files + a CA bundle. All config is read HERE, before sandbox_apply()
  * chroots, so a chroot that hides the config source cannot silently weaken the
- * filter. seccomp defaults to audit (log-only) until the whitelist is
- * strace-harvested across every upstream transport; then switch to enforce. */
+ * filter. seccomp defaults to enforce: the whitelist was strace-harvested across
+ * every upstream transport (UDP/TCP/DoT-TLS/DoH, IP + hostname/getaddrinfo
+ * upstreams, cache miss/hit, DNSSEC validation) on glibc/Fedora and confirmed to
+ * issue no syscall outside sandbox.c's base[]+getaddrinfo group (zero gaps, no
+ * EPERM under enforce). Override to "audit" per-deployment to re-harvest on a
+ * different libc/kernel before trusting enforce there. */
 static void resolverd_log(int level, const char *fmt, ...) {
     (void) level;
     va_list ap;
@@ -3828,7 +3832,8 @@ static void apply_sandbox(void) {
     sandbox_env_override(sb.privdrop_group, sizeof(sb.privdrop_group), "RESOLVERD_GROUP");
     vk_get("config:resolverd_seccomp_mode", sb.seccomp_mode, sizeof(sb.seccomp_mode));
     sandbox_env_override(sb.seccomp_mode, sizeof(sb.seccomp_mode), "RESOLVERD_SECCOMP");
-    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    /* enforce by default — whitelist harvest-validated across all transports (see above) */
+    sb.seccomp_default = SANDBOX_SECCOMP_ENFORCE;
     sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* glibc resolver for upstream hostnames */
     sb.log = resolverd_log;
     sb.tag = "resolverd";
