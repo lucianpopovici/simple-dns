@@ -271,10 +271,13 @@ chroot must carry resolver files + a CA bundle):
 `config:resolverd_{chroot_dir,isolation_mode,privdrop_user,privdrop_group,
 seccomp_mode}` (env `RESOLVERD_{CHROOT,ISOLATION,USER,GROUP,SECCOMP}`). All config
 is read **before** the chroot, so a chroot that hides Valkey cannot silently
-downgrade the seccomp mode. The seccomp layer defaults to **audit** (log-only)
-until the whitelist is strace-harvested across every upstream transport on the
-target libc/kernel — run audit, confirm the audit log is clean, then switch
-`seccomp_mode` to `enforce`. To survive the chroot, `resolverd` eagerly loads the
+downgrade the seccomp mode. The seccomp layer defaults to **enforce**: the
+whitelist was strace-harvested across every upstream transport (UDP/TCP/DoT-TLS/
+DoH, IP + hostname/getaddrinfo upstreams, cache miss/hit, DNSSEC validation) on
+glibc/Fedora and confirmed to issue no syscall outside `sandbox.c`'s base[] +
+getaddrinfo group (zero gaps; no EPERM observed under enforce). On a different
+libc/kernel, set `seccomp_mode=audit` first, confirm the audit log is clean, then
+return to `enforce`. To survive the chroot, `resolverd` eagerly loads the
 TLS trust store (the system default CA *file*, or `DOT_CA_PEM`) at startup before
 confinement — `SSL_CTX_set_default_verify_paths` alone is lazy and would fail
 upstream cert verification once `/etc/ssl` is gone. (Its build carries
@@ -475,9 +478,10 @@ stale-shadow throttle, recvmmsg/sendmmsg batching) is done and archived at
 The `dnsd`-style privilege-drop / seccomp / mount-isolation sandbox has been
 extended to `resolverd` and **factored into the shared `libsandbox`**
 (`sandbox.{c,h}`), so `dnsd` and `resolverd` now share one implementation
-(no duplicated copy to diverge). `resolverd`'s only remaining hardening task is
-to flip its seccomp default from `audit` to `enforce` after a per-deployment
-whitelist harvest.
+(no duplicated copy to diverge). Both `dnsd` and `resolverd` now default seccomp
+to `enforce` (resolverd's whitelist was harvest-validated across all upstream
+transports on glibc/Fedora); re-harvest with `seccomp_mode=audit` only when
+porting to a different libc/kernel.
 
 ---
 

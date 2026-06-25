@@ -43,7 +43,7 @@
  *   config:resolverd_isolation_mode  (RESOLVERD_ISOLATION) chroot (default) | mountns
  *   config:resolverd_privdrop_user   (RESOLVERD_USER)      drop target (default nobody)
  *   config:resolverd_privdrop_group  (RESOLVERD_GROUP)     drop target group
- *   config:resolverd_seccomp_mode    (RESOLVERD_SECCOMP)   audit (default) | enforce | off
+ *   config:resolverd_seccomp_mode    (RESOLVERD_SECCOMP)   enforce (default) | audit | off
  *
  * Build (see the Makefile for the hardened production target):
  *   make resolverd        # optimised, hardened
@@ -2163,8 +2163,8 @@ static uint32_t entry_remaining_ttl(const cache_entry_t *e) {
         uint32_t elapsed = (uint32_t) (time(NULL) - e->inserted_at);
         return elapsed < e->neg_ttl ? e->neg_ttl - elapsed : 0;
     }
-    if (e->nrr == 0)
-        return 0;
+    if (e->nrr == 0 || !e->rrs)
+        return 0; /* no RRs (or not yet/partly built) — treat as expired */
     uint32_t min_remain = UINT32_MAX;
     for (int i = 0; i < e->nrr; i++) {
         uint32_t elapsed = (uint32_t) (time(NULL) - e->rrs[i].inserted_at);
@@ -2210,8 +2210,9 @@ static void lru_insert(cache_entry_t *e) {
 }
 
 static void cache_entry_free(cache_entry_t *e) {
-    for (int i = 0; i < e->nrr; i++)
-        free(e->rrs[i].rdata);
+    if (e->rrs)
+        for (int i = 0; i < e->nrr; i++)
+            free(e->rrs[i].rdata);
     free(e->rrs);
     free(e);
 }
@@ -2543,11 +2544,6 @@ static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype) {
     tok = strtok_r(NULL, "|", &sp4);
     if (tok)
         e->inserted_at = (time_t) atol(tok);
-    /* Rebuild TTL against current time */
-    if (entry_remaining_ttl(e) == 0) {
-        free(e);
-        return NULL;
-    }
     if (e->nrr > 0) {
         e->rrs = calloc(e->nrr, sizeof(cache_rr_t));
         if (!e->rrs) {
@@ -2572,6 +2568,15 @@ static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype) {
                     hex_dec(hexdata, e->rrs[i].rdata, rdl);
             }
         }
+    }
+    /* Rebuild TTL against current time. Must run AFTER e->rrs is populated: the
+     * positive-entry path of entry_remaining_ttl() reads each RR's
+     * ttl_original/inserted_at, so calling it earlier (with nrr>0 but rrs not yet
+     * allocated) dereferenced a NULL e->rrs and crashed on the first Valkey cache
+     * hit after an in-memory miss (e.g. a freshly (re)started resolverd). */
+    if (entry_remaining_ttl(e) == 0) {
+        cache_entry_free(e);
+        return NULL;
     }
     return e;
 }
@@ -3800,8 +3805,12 @@ static void usage(const char *prog) {
  * outbound connections and resolves upstream hostnames, so its chroot must carry
  * resolver files + a CA bundle. All config is read HERE, before sandbox_apply()
  * chroots, so a chroot that hides the config source cannot silently weaken the
- * filter. seccomp defaults to audit (log-only) until the whitelist is
- * strace-harvested across every upstream transport; then switch to enforce. */
+ * filter. seccomp defaults to enforce: the whitelist was strace-harvested across
+ * every upstream transport (UDP/TCP/DoT-TLS/DoH, IP + hostname/getaddrinfo
+ * upstreams, cache miss/hit, DNSSEC validation) on glibc/Fedora and confirmed to
+ * issue no syscall outside sandbox.c's base[]+getaddrinfo group (zero gaps, no
+ * EPERM under enforce). Override to "audit" per-deployment to re-harvest on a
+ * different libc/kernel before trusting enforce there. */
 static void resolverd_log(int level, const char *fmt, ...) {
     (void) level;
     va_list ap;
@@ -3823,7 +3832,8 @@ static void apply_sandbox(void) {
     sandbox_env_override(sb.privdrop_group, sizeof(sb.privdrop_group), "RESOLVERD_GROUP");
     vk_get("config:resolverd_seccomp_mode", sb.seccomp_mode, sizeof(sb.seccomp_mode));
     sandbox_env_override(sb.seccomp_mode, sizeof(sb.seccomp_mode), "RESOLVERD_SECCOMP");
-    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    /* enforce by default — whitelist harvest-validated across all transports (see above) */
+    sb.seccomp_default = SANDBOX_SECCOMP_ENFORCE;
     sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* glibc resolver for upstream hostnames */
     sb.log = resolverd_log;
     sb.tag = "resolverd";
@@ -3878,6 +3888,11 @@ int main(int argc, char **argv) {
                 g_cfg.proto = PROTO_DOH;
             else
                 g_cfg.proto = PROTO_UDP;
+            /* The query path dispatches on the per-upstream transport
+             * (upstream_proto[0]), not g_cfg.proto. Keep them in sync — as the
+             * env UPSTREAM_PROTO path does — so --proto dot/tcp/doh is honoured
+             * instead of silently falling back to plaintext UDP. */
+            g_cfg.upstream_proto[0] = g_cfg.proto;
         } else if (!strcmp(argv[i], "--listen") && i + 1 < argc) {
             g_cfg.listen_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--tsig-key") && i + 1 < argc) {
