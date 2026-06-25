@@ -92,7 +92,7 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-resolverd OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
-      - name: resolverd Valkey cache-load path (regression: NULL e->rrs crash)
+      - name: "resolverd Valkey cache-load path (regression: NULL e->rrs crash)"
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
