@@ -3883,6 +3883,11 @@ int main(int argc, char **argv) {
                 g_cfg.proto = PROTO_DOH;
             else
                 g_cfg.proto = PROTO_UDP;
+            /* The query path dispatches on the per-upstream transport
+             * (upstream_proto[0]), not g_cfg.proto. Keep them in sync — as the
+             * env UPSTREAM_PROTO path does — so --proto dot/tcp/doh is honoured
+             * instead of silently falling back to plaintext UDP. */
+            g_cfg.upstream_proto[0] = g_cfg.proto;
         } else if (!strcmp(argv[i], "--listen") && i + 1 < argc) {
             g_cfg.listen_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--tsig-key") && i + 1 < argc) {
