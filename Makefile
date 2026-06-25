@@ -1160,16 +1160,22 @@ check-lb-health: $(BIN_DEBUG)
 # (separate follow-up), so it would get no answer. Keeping dnsd on 5353 here is
 # intentional. On a desktop running avahi (also on 5353) this test can be flaky;
 # the rest of the suite uses $(TPORT) to avoid that.
+# dnsd runs on $(TPORT) (avahi-immune, like the rest of the suite) and resolverd
+# forwards to it explicitly. --no-mdns keeps the .local query on the unicast
+# upstream path instead of resolverd's mDNS multicast (port 5353), which is what
+# used to pin this test to 5353 and let a stray avahi answer it.
 check-resolverd: $(BIN_DEBUG) resolverd_debug
 	@echo "  CHECK  resolverd caching proxy → dnsd (requires Valkey + dig)"
-	@ASAN_OPTIONS=detect_leaks=0 ./$(BIN_DEBUG) > /tmp/dnsd_rd.log 2>&1 &                \
+	@ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_rd.log 2>&1 & \
 	 DNS_PID=$$!;                                                                       \
-	 ASAN_OPTIONS=detect_leaks=0 ./resolverd_debug > /tmp/resolverd_rd.log 2>&1 &       \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5354                                       \
+	     ./resolverd_debug --upstream 127.0.0.1:$(TPORT) --no-mdns                      \
+	     > /tmp/resolverd_rd.log 2>&1 &                                                 \
 	 RD_PID=$$!;                                                                        \
 	 sleep 2;                                                                           \
 	 A=$$(dig @127.0.0.1 -p 5354 example.local A +short +time=2 +tries=1);             \
 	 kill $$DNS_PID $$RD_PID 2>/dev/null || true;                                       \
-	 echo "  resolved via resolverd (:5354): A=[$$A]";                                 \
+	 echo "  resolved via resolverd (:5354 → dnsd :$(TPORT)): A=[$$A]";                \
 	 test "$$A" = "192.168.1.10" || { echo "  FAIL  resolverd did not return dnsd's answer"; exit 1; }; \
 	 echo "  OK  resolverd proxied dnsd's answer"
 
