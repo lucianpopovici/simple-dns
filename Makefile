@@ -438,6 +438,7 @@ check-xfr-tsig: $(BIN_DEBUG)
 	 for MODE in ok badresp unsigned; do                                              \
 	   for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
 	   python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" $$MODE >/tmp/xtsig_m.log 2>&1 & M=$$!; \
+	   for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
 	   ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/xtsig_s.log 2>&1 & DNS=$$!;    \
 	   sleep 2.2;                                                                       \
 	   W=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=2 +tries=1);        \
@@ -1148,18 +1149,9 @@ check-lb-health: $(BIN_DEBUG)
 	 echo "  OK  unhealthy address dropped; fail-open serves all when every backend is down"
 
 # resolverd smoke: bring up dnsd (authoritative upstream) and resolverd (caching
-# proxy on LISTEN_PORT 5354, default upstream 127.0.0.1:5353/udp), resolve through
-# the proxy and confirm it returns dnsd's answer. Needs Valkey + dig.
+# proxy on LISTEN_PORT 5354), resolve example.local through the proxy and confirm
+# it returns dnsd's answer. Needs Valkey + dig.
 #
-# NOTE: this is the ONE test deliberately kept on 5353 (it does not use $(TPORT)).
-# resolverd answers a `.local` query (example.local) via its RFC 6762 mDNS path —
-# a COOKIELESS multicast query to 224.0.0.251:5353 — which dnsd, bound to the mDNS
-# port 5353, receives and answers. Moving dnsd off 5353 breaks that path and falls
-# back to a unicast upstream query carrying a client-only DNS cookie, which dnsd
-# answers with BADCOOKIE; resolverd does not yet do the RFC 7873 cookie exchange
-# (separate follow-up), so it would get no answer. Keeping dnsd on 5353 here is
-# intentional. On a desktop running avahi (also on 5353) this test can be flaky;
-# the rest of the suite uses $(TPORT) to avoid that.
 # dnsd runs on $(TPORT) (avahi-immune, like the rest of the suite) and resolverd
 # forwards to it explicitly. --no-mdns keeps the .local query on the unicast
 # upstream path instead of resolverd's mDNS multicast (port 5353), which is what
