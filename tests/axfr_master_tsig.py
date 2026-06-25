@@ -65,6 +65,23 @@ def tsig_vars(keyname, time_signed, fudge, error=0):
     return v
 
 
+def parse_qname(query):
+    """Return the lowercased question name (no trailing dot), or '' if unparseable."""
+    if len(query) < 12:
+        return ""
+    off = 12
+    labels = []
+    while off < len(query):
+        n = query[off]
+        if n == 0:
+            break
+        if n & 0xC0:  # compression not expected in a question
+            return ""
+        labels.append(query[off + 1:off + 1 + n].decode("latin-1"))
+        off += 1 + n
+    return ".".join(labels).lower()
+
+
 def parse_tsig(query):
     """Return (ok, minus_len, keyname, time_signed, fudge, mac). minus_len is the
     offset where the TSIG RR begins (message without TSIG)."""
@@ -162,6 +179,12 @@ def main():
                     break
                 query += c
             qid = struct.unpack(">H", query[0:2])[0]
+            # Only serve our own throwaway zone. A dnsd secondary pulls EVERY zone
+            # it holds (the zone_role flag is global), so it also asks this stub for
+            # the default example.local — refuse that so we never transfer foreign
+            # records into another zone (which would pollute the shared Valkey).
+            if parse_qname(query) != ZONE.rstrip(".").lower():
+                conn.close(); continue
             parsed = parse_tsig(query)
             if not parsed:
                 conn.close(); continue
