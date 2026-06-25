@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1173,6 +1173,31 @@ check-resolverd: $(BIN_DEBUG) resolverd_debug
 	 test "$$A" = "192.168.1.10" || { echo "  FAIL  resolverd did not return dnsd's answer"; exit 1; }; \
 	 echo "  OK  resolverd proxied dnsd's answer"
 
+# Regression: the Valkey persistent-cache load path. Seeds a positive entry and
+# queries it with an unreachable upstream, so the answer can only come from
+# cache_load_valkey(). Guards the bug where entry_remaining_ttl() ran before
+# e->rrs was allocated (nrr>0, rrs==NULL) and crashed (SEGV @ 0x8) on the first
+# Valkey cache hit after an in-memory miss (e.g. a freshly restarted resolverd).
+check-resolverd-cache: resolverd_debug
+	@echo "  CHECK  resolverd Valkey cache-load path (regression: NULL e->rrs)"
+	@command -v valkey-cli >/dev/null 2>&1 || { echo "  SKIP  valkey-cli not found"; exit 0; }; \
+	 KEY=dnscache:cacheregress.test:A; NOW=$$(date +%s);                               \
+	 valkey-cli del $$KEY >/dev/null 2>&1 || true;                                     \
+	 valkey-cli set $$KEY "1|0|0|0|$$NOW|1:300:4:5db8d822|" >/dev/null;                \
+	 valkey-cli expire $$KEY 300 >/dev/null;                                           \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5358                                      \
+	     ./resolverd_debug --upstream 127.0.0.1:1 > /tmp/resolverd_cache.log 2>&1 &    \
+	 RD_PID=$$!;                                                                       \
+	 sleep 2;                                                                          \
+	 A=$$(dig @127.0.0.1 -p 5358 cacheregress.test A +short +time=2 +tries=1);         \
+	 ALIVE=0; kill -0 $$RD_PID 2>/dev/null && ALIVE=1;                                 \
+	 kill $$RD_PID 2>/dev/null || true;                                               \
+	 valkey-cli del $$KEY >/dev/null 2>&1 || true;                                     \
+	 echo "  cache-hit A=[$$A] daemon_alive=$$ALIVE";                                  \
+	 test "$$ALIVE" = 1 || { echo "  FAIL  resolverd crashed serving a Valkey cache hit"; cat /tmp/resolverd_cache.log; exit 1; }; \
+	 test "$$A" = "93.184.216.34" || { echo "  FAIL  cache-load path returned wrong/empty answer"; exit 1; }; \
+	 echo "  OK  served cached A from Valkey without crashing"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -1219,6 +1244,7 @@ help:
 	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
+	@echo "  make check-resolverd-cache resolverd Valkey cache-load regression (needs Valkey + dig)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

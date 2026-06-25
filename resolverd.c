@@ -2163,8 +2163,8 @@ static uint32_t entry_remaining_ttl(const cache_entry_t *e) {
         uint32_t elapsed = (uint32_t) (time(NULL) - e->inserted_at);
         return elapsed < e->neg_ttl ? e->neg_ttl - elapsed : 0;
     }
-    if (e->nrr == 0)
-        return 0;
+    if (e->nrr == 0 || !e->rrs)
+        return 0; /* no RRs (or not yet/partly built) — treat as expired */
     uint32_t min_remain = UINT32_MAX;
     for (int i = 0; i < e->nrr; i++) {
         uint32_t elapsed = (uint32_t) (time(NULL) - e->rrs[i].inserted_at);
@@ -2210,8 +2210,9 @@ static void lru_insert(cache_entry_t *e) {
 }
 
 static void cache_entry_free(cache_entry_t *e) {
-    for (int i = 0; i < e->nrr; i++)
-        free(e->rrs[i].rdata);
+    if (e->rrs)
+        for (int i = 0; i < e->nrr; i++)
+            free(e->rrs[i].rdata);
     free(e->rrs);
     free(e);
 }
@@ -2543,11 +2544,6 @@ static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype) {
     tok = strtok_r(NULL, "|", &sp4);
     if (tok)
         e->inserted_at = (time_t) atol(tok);
-    /* Rebuild TTL against current time */
-    if (entry_remaining_ttl(e) == 0) {
-        free(e);
-        return NULL;
-    }
     if (e->nrr > 0) {
         e->rrs = calloc(e->nrr, sizeof(cache_rr_t));
         if (!e->rrs) {
@@ -2572,6 +2568,15 @@ static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype) {
                     hex_dec(hexdata, e->rrs[i].rdata, rdl);
             }
         }
+    }
+    /* Rebuild TTL against current time. Must run AFTER e->rrs is populated: the
+     * positive-entry path of entry_remaining_ttl() reads each RR's
+     * ttl_original/inserted_at, so calling it earlier (with nrr>0 but rrs not yet
+     * allocated) dereferenced a NULL e->rrs and crashed on the first Valkey cache
+     * hit after an in-memory miss (e.g. a freshly (re)started resolverd). */
+    if (entry_remaining_ttl(e) == 0) {
+        cache_entry_free(e);
+        return NULL;
     }
     return e;
 }
