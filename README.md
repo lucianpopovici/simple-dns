@@ -131,7 +131,10 @@ glance:
   timers/ACL/NOTIFY, generated DNSSEC keys), deactivating members the catalog
   drops — all in-memory, without writing `zone_table:*`.
 - **EDNS / transport**: 6891 OPT, 5001 NSID, 7828 TCP-keepalive, 7830/8467
-  padding, 8914 EDE, 9018 DNS Cookies (real SipHash-2-4, BADCOOKIE handshake).
+  padding, 8914 EDE, DNS Cookies (RFC 7873) — `dnsd` is the server side (real
+  SipHash-2-4, 9018 server cookies, BADCOOKIE), and `resolverd` is the client
+  side: a stable per-upstream Client Cookie, learns and reuses the Server Cookie,
+  and retries once on BADCOOKIE (RCODE 23).
 - **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
 - **PKI bootstrap** (`certd`): ACME (8555, DNS-01) and EST (7030) over mTLS.
 
@@ -175,7 +178,7 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:seccomp_mode` | `dnsd` syscall sandbox (env `DNS_SECCOMP` overrides): `enforce` (default — non-whitelisted syscalls return `EPERM`), `audit` (they are logged but permitted — use to re-validate the whitelist after a toolchain/libc/kernel change or unusual config), or `off`. Requires a build with libseccomp (`-DHAVE_SECCOMP`). Implemented by the shared `libsandbox` (`sandbox.{c,h}`); `resolverd` uses the same filter via `config:resolverd_seccomp_mode`. |
 | `config:chroot_dir` | If set (env `DNS_CHROOT` overrides), `dnsd` confines its filesystem to this directory after binding sockets, before dropping privileges. Only acts when started as root; fail-closed if confinement fails. With the default `127.0.0.1` Valkey it needs nothing inside the dir; a Valkey *hostname* needs resolver files (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `libnss_*.so`) for reconnects. |
 | `config:isolation_mode` | How `config:chroot_dir` is applied (env `DNS_ISOLATION` overrides): `chroot` (default, `chroot(2)` — confines every thread) or `mountns` (a private mount namespace + `pivot_root(2)`, unmounting the old root). `mountns` confines the request-handling threads (UDP loop + TCP/DoT workers spawned after the pivot); the trusted keyspace/rollover threads, started earlier, stay in the parent mount namespace. Linux only. |
-| `config:resolverd_privdrop_user` / `config:resolverd_privdrop_group` / `config:resolverd_chroot_dir` / `config:resolverd_isolation_mode` / `config:resolverd_seccomp_mode` | `resolverd`'s own sandbox, mirroring the `dnsd` keys above (env `RESOLVERD_USER` / `RESOLVERD_GROUP` / `RESOLVERD_CHROOT` / `RESOLVERD_ISOLATION` / `RESOLVERD_SECCOMP`). Applied after the listeners bind, before the proxy loop. Scoped separately from `dnsd` because `resolverd` makes outbound connections and resolves upstream hostnames, so its chroot must carry resolver files + a CA bundle. `resolverd_seccomp_mode` defaults to `audit` (log-only) — harvest the whitelist against your upstream transports, then switch to `enforce`. |
+| `config:resolverd_privdrop_user` / `config:resolverd_privdrop_group` / `config:resolverd_chroot_dir` / `config:resolverd_isolation_mode` / `config:resolverd_seccomp_mode` | `resolverd`'s own sandbox, mirroring the `dnsd` keys above (env `RESOLVERD_USER` / `RESOLVERD_GROUP` / `RESOLVERD_CHROOT` / `RESOLVERD_ISOLATION` / `RESOLVERD_SECCOMP`). Applied after the listeners bind, before the proxy loop. Scoped separately from `dnsd` because `resolverd` makes outbound connections and resolves upstream hostnames, so its chroot must carry resolver files + a CA bundle. `resolverd_seccomp_mode` defaults to `enforce` (the whitelist was harvest-validated across every upstream transport on glibc/Fedora); set it to `audit` to re-harvest before trusting `enforce` on a different libc/kernel. |
 | `config:mdns_enabled` / `config:mdns_interfaces` | Enable `mdnsd` and its interface allowlist (`"all"` or a comma-separated list; it refuses to start unset). |
 | `config:acme_*`, `config:est_*` | ACME/EST endpoints + identity for `certd`. |
 | `config:dashboard_password_hash` | Dashboard admin password hash (see [Dashboard](#dashboard)). |
@@ -279,6 +282,8 @@ make certd mdnsd apid resolverd   # the sidecars + recursive resolver (unsigned)
 make debug           # dnsd under ASan/UBSan, full symbols
 make check           # smoke test (needs Valkey + dig)
 make check-resolverd # resolverd caching proxy → dnsd (needs Valkey + dig)
+make check-resolverd-cache  # resolverd Valkey cache-load regression (needs Valkey + dig)
+make check-resolverd-cookie # resolverd RFC 7873 cookie exchange (needs dig + python3)
 make check-catalog   # RFC 9432 catalog provision/deprovision (needs Valkey + dig)
 make check-dnssec    # DNSSEC known-answer + negative (flipped-byte) tests
 make check-wire      # name_from_wire compression/edge-case unit tests

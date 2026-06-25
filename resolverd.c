@@ -11,7 +11,8 @@
  *   - Listens on a configurable local port (default 5354)
  *   - Forwards queries to the dns_server (UDP, TCP, or DoT)
  *   - Authenticates with TSIG (HMAC-SHA256) using the shared key
- *   - Sends EDNS(0) with SipHash-2-4 DNS Cookies (RFC 9018)
+ *   - Sends EDNS(0) DNS Cookies (RFC 7873): stable per-upstream Client Cookie,
+ *     learns + reuses the Server Cookie, retries once on BADCOOKIE (RCODE 23)
  *   - Caches all responses (positive + negative) with TTL accuracy
  *   - Stores cache in Valkey under  cache:<qname>:<qtype>  for persistence
  *   - In-memory fallback cache (LRU, configurable size) when Valkey is down
@@ -124,9 +125,14 @@
 #define DNS_RD 0x0100
 #define DNS_RA 0x0080
 #define DNS_RCODE_MASK 0x000F
+/* RFC 7873 §5.3 BADCOOKIE: an extended RCODE — low nibble in the header, high
+ * bits in the OPT TTL, so it must be reassembled from both. */
+#define DNS_RCODE_BADCOOKIE 23
 #define DNS_OPCODE_QUERY 0x0000
 #define EDNS_OPT_COOKIE 10
+/* DNS Cookie sizes (RFC 7873 §4): 8-byte client cookie, 8..32-byte server cookie. */
 #define DNS_COOKIE_LEN 8
+#define DNS_COOKIE_SERVER_MAX 32
 #define SOA_MINIMUM_OFF 16 /* offset to minimum within SOA rdata (past serials) */
 
 #define CACHE_BUCKETS 4096 /* must be power of 2 */
@@ -1526,9 +1532,126 @@ static int tsig_sign_query(uint8_t *buf, int off, int blen, uint16_t orig_id) {
 }
 
 /* =========================================================================
+ * DNS Cookies — client side (RFC 7873)
+ *
+ * Per upstream we keep a stable Client Cookie (so a cookie-enforcing server can
+ * recognise us across queries) and the most recent Server Cookie it handed back.
+ * On the first query to a server we have no Server Cookie, so it answers
+ * BADCOOKIE (RCODE 23) and includes a fresh Server Cookie; we learn it and retry.
+ * Subsequent queries carry the learned Server Cookie and are answered directly.
+ * ======================================================================= */
+static uint8_t g_client_cookie[MAX_UPSTREAMS][DNS_COOKIE_LEN];
+static int g_client_cookie_set[MAX_UPSTREAMS];
+static uint8_t g_server_cookie[MAX_UPSTREAMS][DNS_COOKIE_SERVER_MAX];
+static int g_server_cookie_len[MAX_UPSTREAMS]; /* 0 = none learned yet */
+static pthread_mutex_t g_cookie_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Stable Client Cookie for an upstream: SipHash(host, secret). RFC 7873 §4
+ * recommends a Client Cookie that is constant per server but differs between
+ * servers (avoids cross-server linkability). */
+static void cookie_get_client(int idx, uint8_t out[DNS_COOKIE_LEN]) {
+    pthread_mutex_lock(&g_cookie_mutex);
+    if (!g_client_cookie_set[idx]) {
+        const char *host = g_cfg.upstream_host[idx];
+        uint64_t h = siphash24((const uint8_t *) host, strlen(host), g_cfg.cookie_secret);
+        memcpy(g_client_cookie[idx], &h, DNS_COOKIE_LEN);
+        g_client_cookie_set[idx] = 1;
+    }
+    memcpy(out, g_client_cookie[idx], DNS_COOKIE_LEN);
+    pthread_mutex_unlock(&g_cookie_mutex);
+}
+
+/* Copy the learned Server Cookie for an upstream into out (max
+ * DNS_COOKIE_SERVER_MAX). Returns its length, or 0 if none learned. */
+static int cookie_get_server(int idx, uint8_t *out) {
+    pthread_mutex_lock(&g_cookie_mutex);
+    int len = g_server_cookie_len[idx];
+    if (len > 0)
+        memcpy(out, g_server_cookie[idx], (size_t) len);
+    pthread_mutex_unlock(&g_cookie_mutex);
+    return len;
+}
+
+static void cookie_store_server(int idx, const uint8_t *scookie, int slen) {
+    if (slen <= 0 || slen > DNS_COOKIE_SERVER_MAX)
+        return;
+    pthread_mutex_lock(&g_cookie_mutex);
+    memcpy(g_server_cookie[idx], scookie, (size_t) slen);
+    g_server_cookie_len[idx] = slen;
+    pthread_mutex_unlock(&g_cookie_mutex);
+}
+
+/* Walk a response's OPT RR. Returns the 12-bit extended RCODE (combining the
+ * header's low nibble with the OPT TTL's high byte — needed because BADCOOKIE=23
+ * does not fit the 4-bit header field), or the basic header RCODE if there is no
+ * OPT. If a COOKIE option is present, the Server Cookie portion (the bytes after
+ * the 8-byte Client Cookie, 8..32 bytes) is copied into the scookie/slen outs.
+ * Bounds-checked throughout; fails toward "no cookie" on any malformed input. */
+static int response_opt_parse(const uint8_t *pkt, int plen, uint8_t *scookie, int *slen) {
+    *slen = 0;
+    if (plen < 12)
+        return -1;
+    const dns_hdr_t *h = (const dns_hdr_t *) pkt;
+    int rcode = ntohs(h->flags) & DNS_RCODE_MASK;
+    int off = 12;
+    char nm[256];
+    /* Question section */
+    for (int i = 0; i < ntohs(h->qdcount); i++) {
+        off = name_from_wire(pkt, plen, off, nm, sizeof(nm));
+        if (off < 0 || off + 4 > plen)
+            return rcode;
+        off += 4;
+    }
+    /* Answer + authority RRs — skip over rdata */
+    int skip = ntohs(h->ancount) + ntohs(h->nscount);
+    for (int i = 0; i < skip; i++) {
+        off = name_from_wire(pkt, plen, off, nm, sizeof(nm));
+        if (off < 0 || off + 10 > plen)
+            return rcode;
+        int rdl = get16(pkt, off + 8);
+        off += 10 + rdl;
+        if (off > plen)
+            return rcode;
+    }
+    /* Additional RRs — look for OPT */
+    for (int i = 0; i < ntohs(h->arcount); i++) {
+        off = name_from_wire(pkt, plen, off, nm, sizeof(nm));
+        if (off < 0 || off + 10 > plen)
+            return rcode;
+        uint16_t rtype = get16(pkt, off);
+        int rdl = get16(pkt, off + 8);
+        if (rtype == DNS_TYPE_OPT) {
+            int ext_rcode = pkt[off + 4]; /* OPT TTL high byte = extended RCODE */
+            rcode = (ext_rcode << 4) | (rcode & 0x0F);
+            int rp = off + 10;
+            int end = rp + rdl;
+            while (rp + 4 <= end && rp + 4 <= plen) {
+                uint16_t oc = get16(pkt, rp);
+                uint16_t ol = get16(pkt, rp + 2);
+                rp += 4;
+                if (rp + ol > plen)
+                    break;
+                if (oc == EDNS_OPT_COOKIE && ol > DNS_COOKIE_LEN) {
+                    int sl = ol - DNS_COOKIE_LEN;
+                    if (sl > DNS_COOKIE_SERVER_MAX)
+                        sl = DNS_COOKIE_SERVER_MAX;
+                    memcpy(scookie, pkt + rp + DNS_COOKIE_LEN, (size_t) sl);
+                    *slen = sl;
+                }
+                rp += ol;
+            }
+        }
+        off += 10 + rdl;
+        if (off > plen)
+            return rcode;
+    }
+    return rcode;
+}
+
+/* =========================================================================
  * EDNS(0) + DNS Cookie
  * ======================================================================= */
-static int edns_append(uint8_t *buf, int off, int blen, int do_bit) {
+static int edns_append(uint8_t *buf, int off, int blen, int do_bit, int upstream_idx) {
     if (off + 11 > blen)
         return off;
     buf[off++] = 0; /* root name */
@@ -1541,21 +1664,24 @@ static int edns_append(uint8_t *buf, int off, int blen, int do_bit) {
     buf[off++] = 0; /* extended rcode+version */
     buf[off++] = do_bit ? 0x80 : 0x00;
     buf[off++] = 0; /* DO bit */
-    /* RDATA: DNS Cookie option */
+    /* RDATA: DNS Cookie option (RFC 7873) — stable Client Cookie for this
+     * upstream, plus the learned Server Cookie (if any) so a cookie-enforcing
+     * server answers directly instead of with BADCOOKIE. */
     int rdata_off = off + 2;
     int rdata_len = 0;
-    /* Generate client cookie via SipHash-2-4 */
-    uint8_t cookie_in[8];
-    RAND_bytes(cookie_in, 8);
-    uint64_t ch = siphash24(cookie_in, 8, g_cfg.cookie_secret);
-    uint8_t ccookie[8];
-    memcpy(ccookie, &ch, 8);
-    if (rdata_off + 12 < blen) {
+    uint8_t ccookie[DNS_COOKIE_LEN];
+    cookie_get_client(upstream_idx, ccookie);
+    uint8_t scookie[DNS_COOKIE_SERVER_MAX];
+    int slen = cookie_get_server(upstream_idx, scookie);
+    int cookie_opt_len = DNS_COOKIE_LEN + slen; /* 8 + 0..32 */
+    if (rdata_off + 4 + cookie_opt_len < blen) {
         put16(buf, rdata_off, EDNS_OPT_COOKIE);
-        put16(buf, rdata_off + 2, DNS_COOKIE_LEN);
+        put16(buf, rdata_off + 2, (uint16_t) cookie_opt_len);
         memcpy(buf + rdata_off + 4, ccookie, DNS_COOKIE_LEN);
-        rdata_off += 4 + DNS_COOKIE_LEN;
-        rdata_len += 4 + DNS_COOKIE_LEN;
+        if (slen > 0)
+            memcpy(buf + rdata_off + 4 + DNS_COOKIE_LEN, scookie, (size_t) slen);
+        rdata_off += 4 + cookie_opt_len;
+        rdata_len += 4 + cookie_opt_len;
     }
     put16(buf, off, (uint16_t) rdata_len);
     off = rdata_off;
@@ -1568,7 +1694,7 @@ static int edns_append(uint8_t *buf, int off, int blen, int do_bit) {
  * Transport: build query, send, receive response
  * ======================================================================= */
 static int build_query(uint8_t *buf, int blen, const char *qname, uint16_t qtype, uint16_t id,
-                       int do_bit) {
+                       int do_bit, int upstream_idx) {
     if (blen < 12)
         return -1;
     memset(buf, 0, 12);
@@ -1587,7 +1713,7 @@ static int build_query(uint8_t *buf, int blen, const char *qname, uint16_t qtype
     off += 2;
     put16(buf, off, DNS_CLASS_IN);
     off += 2;
-    off = edns_append(buf, off, blen, do_bit);
+    off = edns_append(buf, off, blen, do_bit, upstream_idx);
     off = tsig_sign_query(buf, off, blen, id);
     return off;
 }
@@ -1991,32 +2117,12 @@ static int parse_server_arg(const char *arg) {
     return route_add(suffix, host, port, proto) >= 0 ? 1 : 0;
 }
 
-/* Send a query to one specific upstream (by index). Returns rlen or -1. */
-static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, int resp_sz,
-                              int upstream_idx, long *rtt_us_out) {
-    uint16_t id = (uint16_t) (rand() & 0xFFFF);
-    uint8_t query[DNS_BUF];
-    /* Temporarily point g_cfg to this upstream for build_query/tcp_query */
-    /* (they read g_cfg.upstream_host/port/proto) */
-    char saved_host[256];
-    int saved_port;
-    upstream_proto_t saved_proto;
-    safe_strcpy(saved_host, g_cfg.upstream_host[0], sizeof(saved_host));
-    saved_port = g_cfg.upstream_port[0];
-    saved_proto = g_cfg.proto;
-    /* Point slot 0 at the chosen upstream. Skip the copy when it IS slot 0:
-     * safe_strcpy() is strncpy-based, and strncpy with src==dst is undefined
-     * behaviour (ASan: strncpy-param-overlap) — querying the primary upstream
-     * would otherwise abort. */
-    if (upstream_idx != 0)
-        safe_strcpy(g_cfg.upstream_host[0], g_cfg.upstream_host[upstream_idx],
-                    sizeof(g_cfg.upstream_host[0]));
-    g_cfg.upstream_port[0] = g_cfg.upstream_port[upstream_idx];
-    g_cfg.proto = g_cfg.upstream_proto[upstream_idx];
-    int qlen = build_query(query, sizeof(query), qname, qtype, id, 1);
+/* Send one already-built query over the current upstream's transport (g_cfg.proto
+ * + slot 0, set by the caller). Returns response length or -1. Factored out so
+ * the RFC 7873 BADCOOKIE retry can resend without duplicating the transport
+ * fan-out. */
+static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int resp_sz) {
     int rlen = -1;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     if (g_cfg.proto == PROTO_DOT)
         rlen = tcp_query(query, qlen, resp, resp_sz, 1);
     else if (g_cfg.proto == PROTO_TCP)
@@ -2061,6 +2167,58 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
                     rlen = tcp_query(query, qlen, resp, resp_sz, 0);
             }
             freeaddrinfo(res);
+        }
+    }
+    return rlen;
+}
+
+/* Send a query to one specific upstream (by index). Returns rlen or -1. */
+static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, int resp_sz,
+                              int upstream_idx, long *rtt_us_out) {
+    uint16_t id = (uint16_t) (rand() & 0xFFFF);
+    uint8_t query[DNS_BUF];
+    /* Temporarily point g_cfg to this upstream for build_query/tcp_query */
+    /* (they read g_cfg.upstream_host/port/proto) */
+    char saved_host[256];
+    int saved_port;
+    upstream_proto_t saved_proto;
+    safe_strcpy(saved_host, g_cfg.upstream_host[0], sizeof(saved_host));
+    saved_port = g_cfg.upstream_port[0];
+    saved_proto = g_cfg.proto;
+    /* Point slot 0 at the chosen upstream. Skip the copy when it IS slot 0:
+     * safe_strcpy() is strncpy-based, and strncpy with src==dst is undefined
+     * behaviour (ASan: strncpy-param-overlap) — querying the primary upstream
+     * would otherwise abort. */
+    if (upstream_idx != 0)
+        safe_strcpy(g_cfg.upstream_host[0], g_cfg.upstream_host[upstream_idx],
+                    sizeof(g_cfg.upstream_host[0]));
+    g_cfg.upstream_port[0] = g_cfg.upstream_port[upstream_idx];
+    g_cfg.proto = g_cfg.upstream_proto[upstream_idx];
+    int qlen = build_query(query, sizeof(query), qname, qtype, id, 1, upstream_idx);
+    int rlen = -1;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rlen = upstream_dispatch(query, qlen, resp, resp_sz);
+    /* RFC 7873: learn the Server Cookie the upstream returned; if it rejected us
+     * with BADCOOKIE (no/stale Server Cookie), retry once carrying the fresh one
+     * (new ID for anti-spoofing). Subsequent queries reuse the stored cookie via
+     * edns_append, so this round trip happens at most once per upstream. */
+    if (rlen >= 12) {
+        uint8_t scookie[DNS_COOKIE_SERVER_MAX];
+        int slen = 0;
+        int full_rcode = response_opt_parse(resp, rlen, scookie, &slen);
+        if (slen > 0)
+            cookie_store_server(upstream_idx, scookie, slen);
+        if (full_rcode == DNS_RCODE_BADCOOKIE && slen > 0) {
+            id = (uint16_t) (rand() & 0xFFFF);
+            qlen = build_query(query, sizeof(query), qname, qtype, id, 1, upstream_idx);
+            rlen = upstream_dispatch(query, qlen, resp, resp_sz);
+            if (rlen >= 12) {
+                int slen2 = 0;
+                response_opt_parse(resp, rlen, scookie, &slen2);
+                if (slen2 > 0)
+                    cookie_store_server(upstream_idx, scookie, slen2);
+            }
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
