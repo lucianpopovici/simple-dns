@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1198,6 +1198,29 @@ check-resolverd-cache: resolverd_debug
 	 test "$$A" = "93.184.216.34" || { echo "  FAIL  cache-load path returned wrong/empty answer"; exit 1; }; \
 	 echo "  OK  served cached A from Valkey without crashing"
 
+# RFC 7873 client-side DNS Cookies. A stub upstream refuses to answer until the
+# client proves it holds a valid Server Cookie (first query → BADCOOKIE carrying
+# a fresh Server Cookie; resolverd must learn it and retry). Asserts the upstream
+# both sent a BADCOOKIE and later answered a cookie-validated query, and that the
+# cookie-gated answer reached the client.
+check-resolverd-cookie: resolverd_debug
+	@echo "  CHECK  resolverd RFC 7873 DNS cookie exchange (BADCOOKIE retry)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 python3 tests/cookie_upstream.py 127.0.0.1 5409 203.0.113.77 > /tmp/cookie_stub.log 2>&1 & \
+	 STUB_PID=$$!;                                                                     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5360                                      \
+	     ./resolverd_debug --upstream 127.0.0.1:5409 --no-dnssec --no-valkey          \
+	     > /tmp/resolverd_cookie.log 2>&1 &                                            \
+	 RD_PID=$$!;                                                                       \
+	 sleep 2;                                                                          \
+	 A=$$(dig @127.0.0.1 -p 5360 cookie.test A +short +time=3 +tries=1);              \
+	 kill $$RD_PID $$STUB_PID 2>/dev/null || true;                                     \
+	 echo "  resolved A=[$$A]";                                                        \
+	 grep -q BADCOOKIE /tmp/cookie_stub.log || { echo "  FAIL  upstream never sent BADCOOKIE"; cat /tmp/cookie_stub.log; exit 1; }; \
+	 grep -q "ANSWER cookie-validated" /tmp/cookie_stub.log || { echo "  FAIL  resolverd never retried with a valid Server Cookie"; cat /tmp/cookie_stub.log; exit 1; }; \
+	 test "$$A" = "203.0.113.77" || { echo "  FAIL  resolverd did not return the cookie-gated answer"; cat /tmp/resolverd_cookie.log; exit 1; }; \
+	 echo "  OK  resolverd completed the RFC 7873 cookie handshake and resolved"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -1245,6 +1268,7 @@ help:
 	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make check-resolverd-cache resolverd Valkey cache-load regression (needs Valkey + dig)"
+	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"
