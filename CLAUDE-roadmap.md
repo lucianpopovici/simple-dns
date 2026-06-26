@@ -133,8 +133,9 @@ record formats here use the Phase-1 schema decision.
    verbatim but canonicalizes through the shared codec (fixed a latent
    mixed-case name-bearing-rdata BOGUS bug across the dnsd↔resolverd boundary).
    Interop KAT + negative added to `make check-dnssec` (`run_canon_mx`, alg
-   13 + 15). Remaining libdnswire tails: move the `name_from_wire` fuzz harness
-   into the lib test tree; add 9267/8906 conformance tests to CI.
+   13 + 15). 9267/8906 conformance now gated in CI (`make check-conformance` in
+   the unit-tests step). Remaining libdnswire tail (low value, deferred): move
+   the `name_from_wire` fuzz harness into the lib test tree.
 2. **dnsd — correctness first, then features**
    (`CLAUDE-rfc-additions*.md`, `CLAUDE-ENUM.md`):
    - Correctness of existing behavior: 9077 (NSEC/NSEC3 negative-TTL), 1982

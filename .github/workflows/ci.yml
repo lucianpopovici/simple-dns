@@ -59,10 +59,11 @@ jobs:
           make apid       OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make resolverd  OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
-      - name: Unit tests (DNSSEC known-answer/negative + name parser)
+      - name: Unit tests (DNSSEC known-answer/negative + name parser + wire conformance)
         run: |
-          make check-dnssec OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
-          make check-wire   OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make check-dnssec      OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make check-wire        OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make check-conformance OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Smoke test against Valkey
         env:
