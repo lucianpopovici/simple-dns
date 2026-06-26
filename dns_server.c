@@ -2914,10 +2914,25 @@ static int make_rrsig(const char *owner, uint16_t rrtype, uint32_t ttl, const ui
     rr[rp++] = (ttl >> 16) & 0xFF;
     rr[rp++] = (ttl >> 8) & 0xFF;
     rr[rp++] = ttl & 0xFF;
-    rr[rp++] = rrdata_len >> 8;
-    rr[rp++] = rrdata_len & 0xFF;
-    memcpy(rr + rp, rrdata, rrdata_len);
-    rp += rrdata_len;
+    /* Canonicalize the rdata via the shared libdnswire codec (RFC 4034 §6.2)
+     * so the signer's bytes match what a validator (resolverd) reconstructs:
+     * name-bearing rdata (NS/MX/SOA/SRV/CNAME/PTR/DNAME) must be lowercased and
+     * decompressed identically on both sides or the signature fails to verify
+     * across the daemon boundary. canon_rdata copies all other rdata verbatim,
+     * so A/AAAA/TXT/DNSKEY/NSEC output is unchanged. rrdata is a standalone,
+     * already-uncompressed buffer, so it is its own "packet" (off 0, plen =
+     * rrdata_len); the canonical length never exceeds rrdata_len here, so the
+     * rr buffer (sized ow+10+rrdata_len) always has room. */
+    int rdlen_pos = rp; /* RDLENGTH (2 bytes), back-patched after canon */
+    rp += 2;
+    int clen = canon_rdata(rrdata, rrdata_len, 0, rrdata_len, rrtype, rr + rp, rr_need - rp);
+    if (clen < 0) {
+        free(rr);
+        return -1;
+    }
+    rr[rdlen_pos] = (uint8_t) (clen >> 8);
+    rr[rdlen_pos + 1] = (uint8_t) (clen & 0xFF);
+    rp += clen;
     /* Sign. All OpenSSL return values are checked — fail closed on any error
      * rather than emit a bogus signature. */
     EVP_MD_CTX *mc = EVP_MD_CTX_new();

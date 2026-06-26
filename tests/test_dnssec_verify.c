@@ -44,6 +44,13 @@ static const uint8_t WIRE_QNAME[] = {3,   'w', 'w', 'w', 7,   'e', 'x', 'a', 'm'
                                      'p', 'l', 'e', 3,   'c', 'o', 'm', 0};
 /* example.com in wire format (RRSIG signer name) */
 static const uint8_t WIRE_SIGNER[] = {7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0};
+/* mail.example.com — MX RRset owner, all lowercase */
+static const uint8_t WIRE_MX_OWNER[] = {4,   'm', 'a', 'i', 'l', 7,   'e', 'x', 'a',
+                                        'm', 'p', 'l', 'e', 3,   'c', 'o', 'm', 0};
+/* Mail.Example.COM — MX exchange spelled with deliberate mixed case (the bytes
+ * that appear in the packet; a correct signer must canonicalize them). */
+static const uint8_t WIRE_MX_MIXED[] = {4,   'M', 'a', 'i', 'l', 7,   'E', 'x', 'a',
+                                        'm', 'p', 'l', 'e', 3,   'C', 'O', 'M', 0};
 
 #define ORIG_TTL 3600u /* original TTL carried in the RRSIG */
 #define PKT_TTL 1234u  /* TTL in the packet — must NOT be what gets signed */
@@ -229,6 +236,223 @@ static int sign_data(EVP_PKEY *pkey, int is_ed, const uint8_t *data, size_t dlen
     return ok;
 }
 
+/* Generate a key for the algorithm and extract its DNSKEY public bytes
+ * (32 for Ed25519, 64 for ECDSA P-256). Returns the EVP_PKEY or NULL. */
+static EVP_PKEY *gen_key(int is_ed, uint8_t *pub, int *publen) {
+    EVP_PKEY *k = is_ed ? EVP_PKEY_Q_keygen(NULL, NULL, "ED25519")
+                        : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    if (!k)
+        return NULL;
+    if (is_ed) {
+        size_t l = 32;
+        if (EVP_PKEY_get_raw_public_key(k, pub, &l) <= 0 || l != 32) {
+            EVP_PKEY_free(k);
+            return NULL;
+        }
+        *publen = 32;
+    } else {
+        uint8_t enc[80];
+        size_t l = 0;
+        if (EVP_PKEY_get_octet_string_param(k, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, enc, sizeof(enc),
+                                            &l) <= 0 ||
+            l != 65 || enc[0] != 0x04) {
+            EVP_PKEY_free(k);
+            return NULL;
+        }
+        memcpy(pub, enc + 1, 64); /* strip the 0x04 uncompressed-point tag */
+        *publen = 64;
+    }
+    return k;
+}
+
+/* Lay the RRSIG rdata header (covered .. signer name) for a single-RR set. */
+static int build_rrsig_hdr(uint8_t *hdr, uint16_t covered, uint8_t alg, uint8_t labels) {
+    put16(hdr, 0, covered);
+    hdr[2] = alg;
+    hdr[3] = labels;
+    put32(hdr, 4, ORIG_TTL);
+    put32(hdr, 8, 0xFFFFFFFFu);
+    put32(hdr, 12, 0);
+    put16(hdr, 16, 0);
+    memcpy(hdr + 18, WIRE_SIGNER, sizeof(WIRE_SIGNER));
+    return 18 + (int) sizeof(WIRE_SIGNER);
+}
+
+/* RFC 4034 §6.2 interop gate. An MX RRset whose exchange name is spelled with
+ * mixed case in the packet. A correct signer (dnsd make_rrsig, post-fix)
+ * canonicalizes the rdata — lowercasing the embedded name — through the SAME
+ * libdnswire canon_rdata the validator uses, so the signature verifies. A
+ * signer that signs the rdata verbatim (pre-fix make_rrsig) signs bytes the
+ * verifier never reconstructs and must be rejected. Guards the dnsd↔resolverd
+ * canonical-form contract (CLAUDE-libdnswire.md acceptance #3). */
+static void run_canon_mx(uint8_t alg) {
+    const int is_ed = (alg == 15);
+    printf("== canonical-form MX interop, algorithm %u (%s) ==\n", alg,
+           is_ed ? "Ed25519" : "ECDSA P-256");
+    uint8_t pub[80];
+    int publen = 0;
+    EVP_PKEY *pkey = gen_key(is_ed, pub, &publen);
+    if (!pkey) {
+        printf("  FAIL  keygen\n");
+        g_failures++;
+        return;
+    }
+
+    /* MX rdata as it appears on the wire: preference(2) + mixed-case exchange. */
+    uint8_t mx_rd[64];
+    put16(mx_rd, 0, 10);
+    memcpy(mx_rd + 2, WIRE_MX_MIXED, sizeof(WIRE_MX_MIXED));
+    int mx_rdlen = 2 + (int) sizeof(WIRE_MX_MIXED);
+
+    /* Build packet: question (mail.example.com MX) + MX + RRSIG + DNSKEY. */
+    uint8_t pkt[1024];
+    int o = 0;
+    put16(pkt, 0, 0x1234);
+    put16(pkt, 2, 0x8180);
+    put16(pkt, 4, 1);
+    put16(pkt, 6, 3);
+    put16(pkt, 8, 0);
+    put16(pkt, 10, 0);
+    o = 12;
+    memcpy(pkt + o, WIRE_MX_OWNER, sizeof(WIRE_MX_OWNER));
+    o += (int) sizeof(WIRE_MX_OWNER);
+    put16(pkt, o, DNS_TYPE_MX);
+    o += 2;
+    put16(pkt, o, 1);
+    o += 2;
+    /* answer 1: MX (owner via compression pointer to the qname at offset 12) */
+    int mx_off = o;
+    pkt[o++] = 0xC0;
+    pkt[o++] = 0x0C;
+    put16(pkt, o, DNS_TYPE_MX);
+    o += 2;
+    put16(pkt, o, 1);
+    o += 2;
+    put32(pkt, o, PKT_TTL);
+    o += 4;
+    put16(pkt, o, (uint16_t) mx_rdlen);
+    o += 2;
+    int mx_rd_off = o;
+    memcpy(pkt + o, mx_rd, (size_t) mx_rdlen);
+    o += mx_rdlen;
+
+    /* Canonical rdata via the shared codec (lowercases the exchange name). */
+    uint8_t canon[64];
+    int clen = canon_rdata(pkt, o, mx_rd_off, mx_rdlen, DNS_TYPE_MX, canon, sizeof(canon));
+    if (clen < 0) {
+        printf("  FAIL  canon_rdata\n");
+        g_failures++;
+        EVP_PKEY_free(pkey);
+        return;
+    }
+    CHECK(memcmp(canon + 2, WIRE_MX_OWNER, sizeof(WIRE_MX_OWNER)) == 0,
+          "canon_rdata lowercases the MX exchange name");
+
+    /* RRSIG header (labels: mail.example.com = 3). */
+    uint8_t hdr[18 + sizeof(WIRE_SIGNER)];
+    int hdr_len = build_rrsig_hdr(hdr, DNS_TYPE_MX, alg, 3);
+
+    /* Correct signing input: hdr || owner|type|class|origTTL|canonRDLEN|canonRDATA. */
+    uint8_t signing[512];
+    int s = 0;
+    memcpy(signing + s, hdr, (size_t) hdr_len);
+    s += hdr_len;
+    memcpy(signing + s, WIRE_MX_OWNER, sizeof(WIRE_MX_OWNER));
+    s += (int) sizeof(WIRE_MX_OWNER);
+    put16(signing, s, DNS_TYPE_MX);
+    s += 2;
+    put16(signing, s, 1);
+    s += 2;
+    put32(signing, s, ORIG_TTL);
+    s += 4;
+    put16(signing, s, (uint16_t) clen);
+    s += 2;
+    memcpy(signing + s, canon, (size_t) clen);
+    s += clen;
+
+    uint8_t sig[64];
+    if (!sign_data(pkey, is_ed, signing, (size_t) s, sig)) {
+        printf("  FAIL  signing (canonical)\n");
+        g_failures++;
+        EVP_PKEY_free(pkey);
+        return;
+    }
+
+    /* answer 2: RRSIG (owner via pointer to qname). */
+    int rrsig_rdlen = hdr_len + 64;
+    pkt[o++] = 0xC0;
+    pkt[o++] = 0x0C;
+    put16(pkt, o, DNS_TYPE_RRSIG);
+    o += 2;
+    put16(pkt, o, 1);
+    o += 2;
+    put32(pkt, o, PKT_TTL);
+    o += 4;
+    put16(pkt, o, (uint16_t) rrsig_rdlen);
+    o += 2;
+    int rrsig_rd_off = o;
+    memcpy(pkt + o, hdr, (size_t) hdr_len);
+    o += hdr_len;
+    int sig_off = o;
+    memcpy(pkt + o, sig, 64);
+    o += 64;
+
+    /* answer 3: DNSKEY (owner example.com — pointer to "example" at offset 17). */
+    pkt[o++] = 0xC0;
+    pkt[o++] = 0x11;
+    put16(pkt, o, DNS_TYPE_DNSKEY);
+    o += 2;
+    put16(pkt, o, 1);
+    o += 2;
+    put32(pkt, o, PKT_TTL);
+    o += 4;
+    put16(pkt, o, (uint16_t) (4 + publen));
+    o += 2;
+    int dk_off = o;
+    put16(pkt, o, 0x0101);
+    o += 2;
+    pkt[o++] = 3;
+    pkt[o++] = alg;
+    memcpy(pkt + o, pub, (size_t) publen);
+    o += publen;
+    int plen = o;
+
+    int r = dnssec_verify_rrset(pkt, plen, &mx_off, 1, pkt + rrsig_rd_off, rrsig_rdlen, pkt + dk_off,
+                                4 + publen);
+    CHECK(r == 1, "canonical signer: mixed-case MX verifies");
+
+    /* Negative: re-sign the rdata VERBATIM (pre-fix behavior) and swap the
+     * signature into the packet — the verifier canonicalizes and must reject. */
+    int s2 = 0;
+    memcpy(signing + s2, hdr, (size_t) hdr_len);
+    s2 += hdr_len;
+    memcpy(signing + s2, WIRE_MX_OWNER, sizeof(WIRE_MX_OWNER));
+    s2 += (int) sizeof(WIRE_MX_OWNER);
+    put16(signing, s2, DNS_TYPE_MX);
+    s2 += 2;
+    put16(signing, s2, 1);
+    s2 += 2;
+    put32(signing, s2, ORIG_TTL);
+    s2 += 4;
+    put16(signing, s2, (uint16_t) mx_rdlen);
+    s2 += 2;
+    memcpy(signing + s2, mx_rd, (size_t) mx_rdlen); /* verbatim mixed-case */
+    s2 += mx_rdlen;
+    uint8_t sig2[64];
+    if (!sign_data(pkey, is_ed, signing, (size_t) s2, sig2)) {
+        printf("  FAIL  signing (verbatim)\n");
+        g_failures++;
+        EVP_PKEY_free(pkey);
+        return;
+    }
+    memcpy(pkt + sig_off, sig2, 64);
+    r = dnssec_verify_rrset(pkt, plen, &mx_off, 1, pkt + rrsig_rd_off, rrsig_rdlen, pkt + dk_off,
+                            4 + publen);
+    CHECK(r == 0, "verbatim (non-canonical) MX signature rejected");
+
+    EVP_PKEY_free(pkey);
+}
+
 static void run_alg(uint8_t alg) {
     const int is_ed = (alg == 15);
     printf("== algorithm %u (%s) ==\n", alg, is_ed ? "Ed25519" : "ECDSA P-256");
@@ -343,6 +567,8 @@ static void run_alg(uint8_t alg) {
 int main(void) {
     run_alg(15); /* Ed25519 */
     run_alg(13); /* ECDSA P-256 */
+    run_canon_mx(15);
+    run_canon_mx(13);
     if (g_failures) {
         printf("\n%d FAILURE(S)\n", g_failures);
         return 1;
