@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -396,6 +396,39 @@ check-frag: $(BIN_DEBUG)
 	 test "$$OPT" = "1232" || { echo "  FAIL  response OPT advertises [$$OPT], expected 1232"; exit 1; }; \
 	 test "$$TCPAAAA" -eq 8 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 8)"; exit 1; }; \
 	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 8 AAAA)"
+
+# RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
+# min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
+# own TTL. Drives both arms of the min(): soa_ttl above MINIMUM (negative capped
+# down to MINIMUM, positive larger) and below it (negative reduced below MINIMUM).
+check-negttl: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 9077 negative-response TTL = min(SOA.MINIMUM, SOA-TTL)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
+	 Z=example.local;                                                                  \
+	 SAVE_MIN=$$($$VC get config:soa_minimum); SAVE_TTL=$$($$VC get config:soa_ttl);   \
+	 rc=0;                                                                             \
+	 for CASE in "7200 300 7200 300" "60 3600 60 60"; do                              \
+	   set -- $$CASE; STTL=$$1; MIN=$$2; XPOS=$$3; XNEG=$$4;                           \
+	   $$VC set config:soa_minimum $$MIN >/dev/null;                                   \
+	   $$VC set config:soa_ttl $$STTL >/dev/null;                                      \
+	   ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_negttl.log 2>&1 & DNS=$$!; \
+	   sleep 1.5;                                                                      \
+	   POS=$$(dig +noall +answer @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '$$4=="SOA"{print $$2; exit}'); \
+	   AUTH=$$(dig +dnssec +noall +authority @127.0.0.1 -p $(TPORT) nope.$$Z A +time=2 +tries=1); \
+	   NSOA=$$(echo "$$AUTH" | awk '$$4=="SOA"{print $$2; exit}');                     \
+	   NN3=$$(echo "$$AUTH"  | awk '$$4=="NSEC3"{print $$2; exit}');                   \
+	   kill $$DNS 2>/dev/null || true;                                                 \
+	   echo "  soa_ttl=$$STTL minimum=$$MIN -> pos_soa=[$$POS] neg_soa=[$$NSOA] neg_nsec3=[$$NN3] (want pos=$$XPOS neg=$$XNEG)"; \
+	   test "$$POS"  = "$$XPOS" || { echo "  FAIL  positive SOA TTL $$POS != $$XPOS (soa_ttl)"; rc=1; }; \
+	   test "$$NSOA" = "$$XNEG" || { echo "  FAIL  negative SOA TTL $$NSOA != $$XNEG = min(min,soa_ttl)"; rc=1; }; \
+	   test "$$NN3"  = "$$XNEG" || { echo "  FAIL  NSEC3 TTL $$NN3 != $$XNEG = min(min,soa_ttl)"; rc=1; }; \
+	 done;                                                                             \
+	 if [ -n "$$SAVE_MIN" ]; then $$VC set config:soa_minimum "$$SAVE_MIN" >/dev/null; else $$VC del config:soa_minimum >/dev/null; fi; \
+	 if [ -n "$$SAVE_TTL" ]; then $$VC set config:soa_ttl "$$SAVE_TTL" >/dev/null; else $$VC del config:soa_ttl >/dev/null; fi; \
+	 test $$rc -eq 0 || exit 1;                                                        \
+	 echo "  OK  RFC 9077 negative TTLs capped to min(MINIMUM, SOA-TTL); positive SOA at SOA-TTL"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
