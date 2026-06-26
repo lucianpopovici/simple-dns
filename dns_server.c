@@ -246,108 +246,8 @@
 #define BUF_SIZE 4096 /* enlarged for EDNS/AXFR */
 #define HTTP_BUF 16384
 #define RESP_BUF 65536
-#define EDNS_MAX_UDP 1232 /* current BCP 2020 recommendation */
 #define MAX_AXFR_THREADS 8
 #define TSIG_ALG_HMAC_SHA256 "hmac-sha256."
-/* TSIG time window in seconds (RFC 8945 §5.2.3 recommends 300). Emitted as
- * two big-endian bytes in BOTH the digest input and the TSIG RDATA — keep
- * every emit site on this constant so the two cannot drift apart. */
-#define TSIG_FUDGE 300
-#define DNS_COOKIE_CLIENT_LEN 8
-#define DNS_COOKIE_SERVER_LEN 16 /* RFC 9018 §4.2: version|reserved|timestamp|hash */
-#define DNS_COOKIE_VALIDITY 3600 /* seconds */
-
-/* ==========================================================================
- * DNS type / class / opcode constants
- * ======================================================================= */
-#define DNS_TYPE_A 1
-#define DNS_TYPE_NS 2
-#define DNS_TYPE_CNAME 5
-#define DNS_TYPE_PTR 12 /* RFC 1035 — pointer for reverse DNS */
-#define DNS_TYPE_SOA 6
-#define DNS_TYPE_MX 15
-#define DNS_TYPE_TXT 16
-#define DNS_TYPE_AAAA 28
-#define DNS_TYPE_LOC 29
-#define DNS_TYPE_SRV 33
-#define DNS_TYPE_NAPTR 35
-#define DNS_TYPE_DNAME 39
-#define DNS_TYPE_OPT 41
-#define DNS_TYPE_SSHFP 44
-#define DNS_TYPE_RRSIG 46
-#define DNS_TYPE_NSEC 47
-#define DNS_TYPE_DNSKEY 48
-#define DNS_TYPE_NSEC3 50
-#define DNS_TYPE_NSEC3PARAM 51
-#define DNS_TYPE_TLSA 52
-#define DNS_TYPE_DS 43      /* RFC 4034 §5 — delegation signer */
-#define DNS_TYPE_CDS 59     /* RFC 7344 — child DS */
-#define DNS_TYPE_CDNSKEY 60 /* RFC 7344 — child DNSKEY */
-#define DNS_TYPE_URI 256    /* RFC 7553 */
-#define DNS_TYPE_CAA 257
-#define DNS_TYPE_IXFR 251 /* RFC 1995 — incremental zone transfer */
-#define DNS_TYPE_AXFR 252 /* RFC 5936 — full zone transfer */
-#define DNS_TYPE_ANY 255
-#define DNS_TTL_MAX 2147483647u /* RFC 2181 §8 — 2^31-1 */
-
-#define DNS_CLASS_IN 1
-#define DNS_CLASS_ANY 255
-#define DNS_CLASS_NONE 254
-
-#define DNS_QR 0x8000
-#define DNS_AA 0x0400
-#define DNS_TC 0x0200
-#define DNS_RD 0x0100
-#define DNS_RA 0x0080 /* Recursion Available — set on relayed forwarder responses */
-#define DNS_AD 0x0020 /* RFC 4035 §3.1.6 — Authenticated Data */
-#define DNS_OPCODE_QUERY 0x0000
-#define DNS_OPCODE_NOTIFY 0x2000
-#define DNS_OPCODE_UPDATE 0x2800
-#define DNS_OPCODE_MASK 0x7800
-
-#define DNS_RCODE_NOERROR 0
-#define DNS_RCODE_FORMERR 1
-#define DNS_RCODE_SERVFAIL 2
-#define DNS_RCODE_NXDOMAIN 3
-#define DNS_RCODE_NOTIMP 4
-#define DNS_RCODE_REFUSED 5
-#define DNS_RCODE_YXDOMAIN 6
-#define DNS_RCODE_YXRRSET 7 /* RFC 2136: RRset should not exist but does */
-#define DNS_RCODE_NXRRSET 8 /* RFC 2136: RRset should exist but does not */
-#define DNS_RCODE_NOTAUTH 9 /* RFC 2136 §2.2: server not authoritative / not authorized */
-#define DNS_RCODE_NOTZONE 10
-#define DNS_RCODE_BADVERS 16
-#define DNS_RCODE_BADSIG 17
-#define DNS_RCODE_BADCOOKIE 23
-
-/* EDNS option codes */
-#define EDNS_OPT_NSID 3
-#define EDNS_OPT_COOKIE 10
-#define EDNS_OPT_KEEPALIVE 11
-#define EDNS_OPT_PADDING 12
-#define EDNS_OPT_EDE 15
-
-/* Extended DNS Error info codes (RFC 8914) */
-#define EDE_OTHER 0
-#define EDE_DNSKEY_MISSING 1
-#define EDE_RRSIG_MISSING 3
-#define EDE_SIG_EXPIRED 5
-#define EDE_SIG_NOT_YET 6
-#define EDE_DNSKEY_MISSING2 7
-#define EDE_SIG_INVALID 8
-#define EDE_NXDOMAIN_NXZONE 12
-#define EDE_BLOCKED 15
-#define EDE_FILTERED 17
-#define EDE_NOT_AUTH 18
-#define EDE_NOT_SUPPORTED 19
-#define EDE_NXDOMAIN 20
-#define EDE_NO_REACHABLE 22
-
-/* DNSSEC algorithm numbers */
-#define DNS_ALG_ECDSAP256SHA256 13
-#define DNS_ALG_ED25519 15
-#define DNS_DNSKEY_FLAG_ZSK 256
-#define DNS_DNSKEY_FLAG_KSK 257 /* Secure Entry Point — RFC 3757 */
 
 /* DNSSEC signing keys are now per-zone (see zone_entry_t): ZSK signs RRsets,
  * KSK signs the DNSKEY RRset.  Loaded from dnssec:<zone>:* at startup. */
@@ -360,13 +260,6 @@ static int vk_set(const char *, const char *, uint32_t);
 static int vk_get(const char *, char *, int);
 static int emit_rr(uint8_t *, int, int, const char *, uint16_t, uint32_t, const uint8_t *, uint16_t,
                    int, int *);
-
-/* NSEC3 hash algorithm */
-#define NSEC3_ALG_SHA1 1
-
-typedef struct {
-    uint16_t id, flags, qdcount, ancount, nscount, arcount;
-} __attribute__((packed)) dns_hdr_t;
 
 typedef struct {
     char name[256];
@@ -671,7 +564,6 @@ static pthread_mutex_t g_qlog_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Format: {"ts":<unix>,"client":"<ip>","qname":"<n>","qtype":"<t>",
  *           "rcode":<r>,"answers":<n>,"rtt_us":<t>,"transport":"<udp|tcp|dot|doh>"}
  */
-static const char *type2str(uint16_t t); /* forward decl for qlog_write */
 static void qlog_write(const char *client_ip, const char *qname, uint16_t qtype, uint8_t rcode,
                        int answers, long rtt_us, const char *transport) {
     if (!g_query_log_fp && !g_query_log_path[0])
@@ -4693,63 +4585,6 @@ static int tsig_axfr_last(uint8_t *buf, int off, int blen, uint16_t qid, const u
  * DNS wire helpers
  * ======================================================================= */
 
-static const char *type2str(uint16_t t) {
-    switch (t) {
-        case DNS_TYPE_A:
-            return "A";
-        case DNS_TYPE_NS:
-            return "NS";
-        case DNS_TYPE_CNAME:
-            return "CNAME";
-        case DNS_TYPE_PTR:
-            return "PTR";
-        case DNS_TYPE_SOA:
-            return "SOA";
-        case DNS_TYPE_MX:
-            return "MX";
-        case DNS_TYPE_TXT:
-            return "TXT";
-        case DNS_TYPE_AAAA:
-            return "AAAA";
-        case DNS_TYPE_LOC:
-            return "LOC";
-        case DNS_TYPE_SRV:
-            return "SRV";
-        case DNS_TYPE_DNAME:
-            return "DNAME";
-        case DNS_TYPE_SSHFP:
-            return "SSHFP";
-        case DNS_TYPE_RRSIG:
-            return "RRSIG";
-        case DNS_TYPE_NSEC:
-            return "NSEC";
-        case DNS_TYPE_DNSKEY:
-            return "DNSKEY";
-        case DNS_TYPE_NSEC3:
-            return "NSEC3";
-        case DNS_TYPE_TLSA:
-            return "TLSA";
-        case DNS_TYPE_DS:
-            return "DS";
-        case DNS_TYPE_CAA:
-            return "CAA";
-        case DNS_TYPE_CDS:
-            return "CDS";
-        case DNS_TYPE_CDNSKEY:
-            return "CDNSKEY";
-        case DNS_TYPE_URI:
-            return "URI";
-        case DNS_TYPE_IXFR:
-            return "IXFR";
-        case DNS_TYPE_AXFR:
-            return "AXFR";
-        case DNS_TYPE_ANY:
-            return "ANY";
-        default:
-            return "?";
-    }
-}
-
 /* ==========================================================================
  * Response Rate Limiting (RRL)
  *
@@ -4876,232 +4711,21 @@ static uint32_t zone_soa_minimum(void) {
 }
 
 /* ==========================================================================
- * EDNS(0) parsing and response building
+ * EDNS(0) — edns_info_t, edns_parse, edns_append_opt live in libdnswire.
+ * dnsd_edns_opt wraps edns_append_opt with daemon-specific NSID and
+ * IP-bound server-cookie computation (RFC 9018 §4.2).
  * ======================================================================= */
-typedef struct {
-    int present;
-    uint16_t max_udp;
-    uint8_t version;
-    int do_bit;
-    uint8_t client_cookie[8];
-    int has_client_cookie;
-    uint8_t server_cookie[16]; /* RFC 9018: up to 16 bytes */
-    int server_cookie_len;
-    int has_server_cookie;
-    char nsid_req; /* 1 if client requested NSID */
-    int has_padding;
-    uint16_t padding_req;
-    int keepalive_req;
-} edns_info_t;
-
-static void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
-    memset(ei, 0, sizeof(*ei));
-    ei->max_udp = 512;
-    const dns_hdr_t *h = (const dns_hdr_t *) pkt;
-    if (ntohs(h->arcount) == 0)
-        return;
-    /* Scan additional section for OPT */
-    int off = 12;
-    int skip = ntohs(h->qdcount) + ntohs(h->ancount) + ntohs(h->nscount) + ntohs(h->arcount);
-    (void) skip;
-    /* Quick scan: skip q/an/ns sections */
-    for (int s = 0; s < 3; s++) {
-        int cnt = s == 0 ? ntohs(h->qdcount) : (s == 1 ? ntohs(h->ancount) : ntohs(h->nscount));
-        for (int i = 0; i < cnt; i++) {
-            for (;;) {
-                if (off >= plen)
-                    return;
-                uint8_t c = pkt[off];
-                if ((c & 0xC0) == 0xC0) {
-                    off += 2;
-                    break;
-                }
-                if (c == 0) {
-                    off++;
-                    break;
-                }
-                off += c + 1;
-            }
-            if (s == 0) {
-                off += 4;
-            } else {
-                if (off + 10 > plen)
-                    return;
-                uint16_t rdl = get16(pkt, off + 8);
-                off += 10 + rdl;
-            }
-        }
+static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit,
+                         uint16_t rcode_ext, const edns_info_t *ei, const struct in_addr *cip,
+                         int ede_code, const char *ede_text) {
+    uint8_t sc[DNS_COOKIE_SERVER_LEN];
+    if (ei && ei->has_client_cookie) {
+        const struct in_addr zero = {0};
+        compute_server_cookie(ei->client_cookie, cip ? cip : &zero, (uint32_t) time(NULL), sc);
     }
-    for (int i = 0; i < ntohs(h->arcount); i++) {
-        if (off >= plen)
-            break;
-        int name_start = off;
-        (void) name_start;
-        for (;;) {
-            if (off >= plen)
-                return;
-            uint8_t c = pkt[off];
-            if ((c & 0xC0) == 0xC0) {
-                off += 2;
-                break;
-            }
-            if (c == 0) {
-                off++;
-                break;
-            }
-            off += c + 1;
-        }
-        if (off + 10 > plen)
-            break;
-        uint16_t rtype = get16(pkt, off);
-        if (rtype == DNS_TYPE_OPT) {
-            ei->present = 1;
-            ei->max_udp = get16(pkt, off + 2);
-            /* OPT RR TTL field (RFC 6891 §6.1.3): ext-RCODE(off+4) | VERSION
-             * (off+5) | flags(off+6,off+7). DO is the top bit of the 2-octet
-             * flags, i.e. off+6 — NOT off+4 (that is the extended RCODE, always
-             * 0 here, which silently disabled DNSSEC for every live query). */
-            ei->version = pkt[off + 5];
-            ei->do_bit = (pkt[off + 6] & 0x80) ? 1 : 0;
-            uint16_t rdlen = get16(pkt, off + 8);
-            int rp = off + 10;
-            while (rp + 4 <= off + 10 + rdlen && rp + 4 <= plen) {
-                uint16_t oc = get16(pkt, rp), ol = get16(pkt, rp + 2);
-                rp += 4;
-                if (oc == EDNS_OPT_NSID) {
-                    ei->nsid_req = 1;
-                } else if (oc == EDNS_OPT_COOKIE && ol >= 8) {
-                    if (rp + ol <= plen) {
-                        memcpy(ei->client_cookie, pkt + rp, 8);
-                        ei->has_client_cookie = 1;
-                        /* RFC 9018: server cookie is the bytes after the 8-byte
-                         * client cookie, length 8..32.  Capture for verification. */
-                        if (ol > 8 && ol <= 8 + (int) sizeof(ei->server_cookie)) {
-                            int slen = ol - 8;
-                            memcpy(ei->server_cookie, pkt + rp + 8, slen);
-                            ei->server_cookie_len = slen;
-                            ei->has_server_cookie = 1;
-                        }
-                    }
-                } else if (oc == EDNS_OPT_KEEPALIVE) {
-                    ei->keepalive_req = 1;
-                } else if (oc == EDNS_OPT_PADDING) {
-                    ei->has_padding = 1;
-                    ei->padding_req = ol;
-                }
-                rp += ol;
-            }
-            break;
-        }
-        uint16_t rdlen = get16(pkt, off + 8);
-        off += 10 + rdlen;
-    }
-}
-
-/* Append an EDNS OPT RR to the response */
-static int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit,
-                           uint16_t rcode_ext, const edns_info_t *req_ei, const struct in_addr *cip,
-                           int ede_code, const char *ede_text) {
-    if (off + 11 > blen)
-        return off;
-    /* Name = root (1 byte 0) */
-    buf[off++] = 0;
-    /* type = OPT */
-    buf[off++] = 0;
-    buf[off++] = 41;
-    /* class = max UDP payload */
-    uint16_t maxudp = is_tcp ? 65535 : EDNS_MAX_UDP;
-    buf[off++] = maxudp >> 8;
-    buf[off++] = maxudp & 0xFF;
-    /* Extended RCODE (top 8 bits) | version=0 | DO bit | Z */
-    buf[off++] = rcode_ext & 0xFF;
-    buf[off++] = 0;
-    buf[off++] = do_bit ? 0x80 : 0x00;
-    buf[off++] = 0;
-    /* RDATA: options */
-    int rdata_off = off + 2;
-    int rdata_len = 0;
-    if (off + 2 > blen)
-        return off;
-    /* NSID option */
-    if (req_ei && req_ei->nsid_req && g_nsid[0]) {
-        int nsid_len = (int) strlen(g_nsid);
-        if (rdata_off + 4 + nsid_len < blen) {
-            put16(buf, rdata_off, EDNS_OPT_NSID);
-            put16(buf, rdata_off + 2, (uint16_t) nsid_len);
-            memcpy(buf + rdata_off + 4, g_nsid, nsid_len);
-            rdata_off += 4 + nsid_len;
-            rdata_len += 4 + nsid_len;
-        }
-    }
-    /* Cookie option */
-    if (req_ei && req_ei->has_client_cookie) {
-        if (rdata_off + 4 + DNS_COOKIE_CLIENT_LEN + DNS_COOKIE_SERVER_LEN < blen) {
-            uint8_t scookie[DNS_COOKIE_SERVER_LEN];
-            struct in_addr zero = {0};
-            const struct in_addr *use_ip = cip ? cip : &zero;
-            compute_server_cookie(req_ei->client_cookie, use_ip, (uint32_t) time(NULL), scookie);
-            put16(buf, rdata_off, EDNS_OPT_COOKIE);
-            put16(buf, rdata_off + 2, DNS_COOKIE_CLIENT_LEN + DNS_COOKIE_SERVER_LEN);
-            memcpy(buf + rdata_off + 4, req_ei->client_cookie, DNS_COOKIE_CLIENT_LEN);
-            memcpy(buf + rdata_off + 4 + DNS_COOKIE_CLIENT_LEN, scookie, DNS_COOKIE_SERVER_LEN);
-            int total = 4 + DNS_COOKIE_CLIENT_LEN + DNS_COOKIE_SERVER_LEN;
-            rdata_off += total;
-            rdata_len += total;
-        }
-    }
-    /* TCP keepalive: suggest 30s */
-    if (is_tcp && req_ei && req_ei->keepalive_req) {
-        if (rdata_off + 6 < blen) {
-            put16(buf, rdata_off, EDNS_OPT_KEEPALIVE);
-            put16(buf, rdata_off + 2, 2);
-            put16(buf, rdata_off + 4, 300); /* 30s in units of 100ms */
-            rdata_off += 6;
-            rdata_len += 6;
-        }
-    }
-    /* EDE option */
-    if (ede_code >= 0) {
-        int tlen = ede_text ? (int) strlen(ede_text) : 0;
-        if (rdata_off + 4 + 2 + tlen < blen) {
-            put16(buf, rdata_off, EDNS_OPT_EDE);
-            put16(buf, rdata_off + 2, (uint16_t) (2 + tlen));
-            put16(buf, rdata_off + 4, (uint16_t) ede_code);
-            if (tlen)
-                memcpy(buf + rdata_off + 6, ede_text, tlen);
-            rdata_off += 4 + 2 + tlen;
-            rdata_len += 4 + 2 + tlen;
-        }
-    }
-    /* RFC 7830 / RFC 8467: pad encrypted-transport (DoT/DoH) responses.
-     *   - If client requested padding (has_padding): honour with 128-byte blocks
-     *     (common DNS-over-TLS client convention).
-     *   - Always pad on is_tcp to a multiple of 468 bytes (RFC 8467 §4
-     *     recommended block size), which hides response size from observers
-     *     even when the client did not explicitly request padding. */
-    if (is_tcp) {
-        /* Choose block size: honour client request (128) or use RFC 8467 default (468) */
-        int block = (req_ei && req_ei->has_padding) ? 128 : 468;
-        /* Current total wire size of the response if we wrote the OPT RR now */
-        int cur = off + 2 + rdata_len + 4; /* +4 = OPT RR owner+type+class+ttl prefix */
-        int pad = block - ((cur) % block);
-        if (pad == block)
-            pad = 0; /* already on a block boundary */
-        if (pad > 0 && rdata_off + 4 + pad < blen) {
-            put16(buf, rdata_off, EDNS_OPT_PADDING);
-            put16(buf, rdata_off + 2, (uint16_t) pad);
-            memset(buf + rdata_off + 4, 0, pad);
-            rdata_off += 4 + pad;
-            rdata_len += 4 + pad;
-        }
-    }
-    /* Write RDLEN */
-    put16(buf, off, (uint16_t) rdata_len);
-    off = rdata_off;
-    /* Increment arcount */
-    dns_hdr_t *rh = (dns_hdr_t *) buf;
-    rh->arcount = htons(ntohs(rh->arcount) + 1);
-    return off;
+    return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei,
+                           g_nsid[0] ? g_nsid : NULL,
+                           (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text);
 }
 
 /* ==========================================================================
@@ -5835,7 +5459,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     if (ei.present && ei.version != 0) {
         rh->flags = htons(DNS_QR | DNS_AA | (DNS_RCODE_BADVERS & 0xF));
         rh->ancount = rh->nscount = htons(0);
-        off = edns_append_opt(resp, off, resp_len, is_tcp, 0,
+        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0,
                               (uint16_t) ((DNS_RCODE_BADVERS >> 4) & 0xFF), &ei, cip, -1, NULL);
         return off;
     }
@@ -5845,7 +5469,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
          * high 8 bits per RFC 6891 §6.1.3. */
         rh->flags = htons(DNS_QR | DNS_AA | (DNS_RCODE_BADCOOKIE & 0xF));
         rh->ancount = rh->nscount = htons(0);
-        off = edns_append_opt(resp, off, resp_len, is_tcp, 0,
+        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0,
                               (uint16_t) ((DNS_RCODE_BADCOOKIE >> 4) & 0xFF), &ei, cip, -1, NULL);
         dns_log(LOG_DEBUG, "[COOKIE] BADCOOKIE %s %s\n", type2str(qtype), qname);
         return off;
@@ -5884,7 +5508,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 off = 12 + qsec2;
             } else
                 off = 12;
-            off = edns_append_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, EDE_NOT_AUTH,
+            off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, EDE_NOT_AUTH,
                                   "Not authoritative for this zone");
             dns_log(LOG_DEBUG, "[REFUSED] %s %s\n", type2str(qtype), qname);
             STAT_INC(g_stat_refused);
@@ -5924,7 +5548,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 off = add_nsec_denial(resp, off, resp_len, qname, dnssec_ok, &ac2);
             rh->nscount = htons(ntohs(rh->nscount) + (uint16_t) ac2);
         }
-        off = edns_append_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, EDE_NXDOMAIN,
+        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, EDE_NXDOMAIN,
                               "Locally served zone");
         return off;
     }
@@ -6621,7 +6245,7 @@ finish_answer:
         }
     }
     /* EDNS OPT in response */
-    off = edns_append_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, ede_code, ede_text);
+    off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, ede_code, ede_text);
     return off;
 }
 

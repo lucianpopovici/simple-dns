@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -360,6 +360,14 @@ check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c resolverd.c $(WIR
 # name_from_wire compression-handling tests.
 # -Wno-unused-function: -DUNIT_TEST compiles out resolverd.c's main(), which
 # is the only caller of some helpers.
+check-conformance: tests/test_conformance.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_conformance"
+	$(CC) $(CSTD) $(WARN) \
+	      $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_conformance \
+	      tests/test_conformance.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_conformance
+
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \

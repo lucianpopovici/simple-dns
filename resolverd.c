@@ -98,41 +98,10 @@
  * Constants
  * ======================================================================= */
 #define DNS_BUF 8192
-#define DNS_TYPE_A 1
-#define DNS_TYPE_NS 2
-#define DNS_TYPE_CNAME 5
-#define DNS_TYPE_SOA 6
-#define DNS_TYPE_PTR 12
-#define DNS_TYPE_MX 15
-#define DNS_TYPE_TXT 16
-#define DNS_TYPE_AAAA 28
-#define DNS_TYPE_SRV 33
-#define DNS_TYPE_DNAME 39
-#define DNS_TYPE_OPT 41
-#define DNS_TYPE_RRSIG 46
-#define DNS_TYPE_DNSKEY 48
-#define DNS_TYPE_SSHFP 44
-#define DNS_TYPE_TLSA 52
-#define DNS_TYPE_CAA 257
-#define DNS_TYPE_ANY 255
-/* TSIG time window in seconds (RFC 8945 §5.2.3 recommends 300). Emitted as
- * two big-endian bytes in BOTH the digest input and the TSIG RDATA — keep
- * every emit site on this constant so the two cannot drift apart. */
-#define TSIG_FUDGE 300
-#define DNS_CLASS_IN 1
-#define DNS_QR 0x8000
-#define DNS_AA 0x0400
-#define DNS_TC 0x0200
-#define DNS_RD 0x0100
-#define DNS_RA 0x0080
-#define DNS_RCODE_MASK 0x000F
-/* RFC 7873 §5.3 BADCOOKIE: an extended RCODE — low nibble in the header, high
- * bits in the OPT TTL, so it must be reassembled from both. */
-#define DNS_RCODE_BADCOOKIE 23
-#define DNS_OPCODE_QUERY 0x0000
-#define EDNS_OPT_COOKIE 10
-/* DNS Cookie sizes (RFC 7873 §4): 8-byte client cookie, 8..32-byte server cookie. */
-#define DNS_COOKIE_LEN 8
+/* Constants moved to dns_wire.h: DNS_TYPE_*, DNS_CLASS_IN, DNS_QR, DNS_RA,
+ * DNS_RCODE_MASK, DNS_RCODE_BADCOOKIE, DNS_OPCODE_QUERY, TSIG_FUDGE,
+ * EDNS_OPT_COOKIE (as EDNS_OPT_COOKIE), DNS_COOKIE_CLIENT_LEN. */
+#define DNS_COOKIE_LEN DNS_COOKIE_CLIENT_LEN /* resolverd local alias */
 #define DNS_COOKIE_SERVER_MAX 32
 #define SOA_MINIMUM_OFF 16 /* offset to minimum within SOA rdata (past serials) */
 
@@ -154,10 +123,6 @@
 /* =========================================================================
  * Types
  * ======================================================================= */
-typedef struct {
-    uint16_t id, flags, qdcount, ancount, nscount, arcount;
-} __attribute__((packed)) dns_hdr_t;
-
 typedef enum { PROTO_UDP = 0, PROTO_TCP, PROTO_DOT, PROTO_DOH } upstream_proto_t;
 
 /* A single cached RR */
@@ -626,81 +591,6 @@ static int vk_keys_scan(const char *pattern, char keys[][512], int maxkeys) {
     return n;
 }
 
-/* =========================================================================
- * DNS wire helpers
- * ======================================================================= */
-
-static const char *type2str(uint16_t t) {
-    switch (t) {
-        case DNS_TYPE_A:
-            return "A";
-        case DNS_TYPE_NS:
-            return "NS";
-        case DNS_TYPE_CNAME:
-            return "CNAME";
-        case DNS_TYPE_SOA:
-            return "SOA";
-        case DNS_TYPE_PTR:
-            return "PTR";
-        case DNS_TYPE_MX:
-            return "MX";
-        case DNS_TYPE_TXT:
-            return "TXT";
-        case DNS_TYPE_AAAA:
-            return "AAAA";
-        case DNS_TYPE_SRV:
-            return "SRV";
-        case DNS_TYPE_SSHFP:
-            return "SSHFP";
-        case DNS_TYPE_TLSA:
-            return "TLSA";
-        case DNS_TYPE_CAA:
-            return "CAA";
-        case DNS_TYPE_ANY:
-            return "ANY";
-        default: {
-            static char buf[12];
-            snprintf(buf, sizeof(buf), "TYPE%u", t);
-            return buf;
-        }
-    }
-}
-
-static uint16_t str2type(const char *s) {
-    if (!strcasecmp(s, "A"))
-        return DNS_TYPE_A;
-    if (!strcasecmp(s, "AAAA"))
-        return DNS_TYPE_AAAA;
-    if (!strcasecmp(s, "CNAME"))
-        return DNS_TYPE_CNAME;
-    if (!strcasecmp(s, "MX"))
-        return DNS_TYPE_MX;
-    if (!strcasecmp(s, "NS"))
-        return DNS_TYPE_NS;
-    if (!strcasecmp(s, "PTR"))
-        return DNS_TYPE_PTR;
-    if (!strcasecmp(s, "TXT"))
-        return DNS_TYPE_TXT;
-    if (!strcasecmp(s, "SRV"))
-        return DNS_TYPE_SRV;
-    if (!strcasecmp(s, "SOA"))
-        return DNS_TYPE_SOA;
-    if (!strcasecmp(s, "SSHFP"))
-        return DNS_TYPE_SSHFP;
-    if (!strcasecmp(s, "TLSA"))
-        return DNS_TYPE_TLSA;
-    if (!strcasecmp(s, "CAA"))
-        return DNS_TYPE_CAA;
-    if (!strcasecmp(s, "ANY"))
-        return DNS_TYPE_ANY;
-    /* Numeric TYPE */
-    if (!strncasecmp(s, "TYPE", 4))
-        return (uint16_t) atoi(s + 4);
-    if (s[0] >= '0' && s[0] <= '9')
-        return (uint16_t) atoi(s);
-    return 0;
-}
-
 /* Format one rdata value as a human-readable string */
 static void rdata_to_str(const uint8_t *pkt, int plen, int rdoff, uint16_t rdlen, uint16_t type,
                          char *out, int olen) {
@@ -932,15 +822,6 @@ static int verify_ed25519(const uint8_t *sig_raw, const uint8_t *data, int dlen,
  * ======================================================================= */
 
 #define DNSSEC_MAX_RRS 16 /* max RRs in one verified RRset */
-/* Worst-case canonical RR: owner (255) + fixed (10) + SOA rdata
- * (255 + 255 + 20). Round up. */
-#define CANON_RR_MAX 800
-
-typedef struct {
-    uint8_t buf[CANON_RR_MAX];
-    int len;
-} canon_rr_t;
-
 /* Number of labels in a dotted name ("" = root = 0). The leftmost "*" of an
  * already-wildcard owner does not count (RFC 4034 §3.1.3). */
 static int name_label_count(const char *name) {
@@ -954,85 +835,6 @@ static int name_label_count(const char *name) {
     if (name[0] == '*' && name[1] == '.')
         n--;
     return n;
-}
-
-/* Write the canonical form of an RR's rdata (RFC 4034 §6.2): embedded domain
- * names are decompressed and lowercased for the name-bearing types this
- * resolver handles; all other rdata is copied verbatim.
- * Returns the canonical length, or -1 on malformed input. */
-static int canon_rdata(const uint8_t *pkt, int plen, int rdoff, int rdlen, uint16_t rtype,
-                       uint8_t *out, int outsz) {
-    if (rdoff < 0 || rdlen < 0 || rdoff + rdlen > plen)
-        return -1;
-    char nm[256];
-    switch (rtype) {
-        case DNS_TYPE_NS:
-        case DNS_TYPE_CNAME:
-        case DNS_TYPE_PTR:
-        case DNS_TYPE_DNAME: {
-            if (name_from_wire(pkt, plen, rdoff, nm, sizeof(nm)) < 0)
-                return -1;
-            return name_to_wire(nm, out, outsz);
-        }
-        case DNS_TYPE_MX: {
-            if (rdlen < 3 || outsz < 2)
-                return -1;
-            out[0] = pkt[rdoff];
-            out[1] = pkt[rdoff + 1];
-            if (name_from_wire(pkt, plen, rdoff + 2, nm, sizeof(nm)) < 0)
-                return -1;
-            int n = name_to_wire(nm, out + 2, outsz - 2);
-            if (n < 0)
-                return -1;
-            return 2 + n;
-        }
-        case DNS_TYPE_SRV: {
-            if (rdlen < 7 || outsz < 6)
-                return -1;
-            memcpy(out, pkt + rdoff, 6);
-            if (name_from_wire(pkt, plen, rdoff + 6, nm, sizeof(nm)) < 0)
-                return -1;
-            int n = name_to_wire(nm, out + 6, outsz - 6);
-            if (n < 0)
-                return -1;
-            return 6 + n;
-        }
-        case DNS_TYPE_SOA: {
-            int a = name_from_wire(pkt, plen, rdoff, nm, sizeof(nm));
-            if (a < 0)
-                return -1;
-            int pos = name_to_wire(nm, out, outsz);
-            if (pos < 0)
-                return -1;
-            int b = name_from_wire(pkt, plen, a, nm, sizeof(nm));
-            if (b < 0)
-                return -1;
-            int n = name_to_wire(nm, out + pos, outsz - pos);
-            if (n < 0)
-                return -1;
-            pos += n;
-            if (b + 20 > plen || pos + 20 > outsz)
-                return -1;
-            memcpy(out + pos, pkt + b, 20); /* serial..minimum: 5×u32 */
-            return pos + 20;
-        }
-        default:
-            if (rdlen > outsz)
-                return -1;
-            memcpy(out, pkt + rdoff, rdlen);
-            return rdlen;
-    }
-}
-
-/* Canonical RRset order (RFC 4034 §6.3): compare rdata as left-justified
- * octet sequences; a missing octet sorts before a zero. Owner/type/class/TTL
- * are identical across the set, so whole-record comparison is equivalent. */
-static int canon_rr_cmp(const canon_rr_t *a, const canon_rr_t *b) {
-    int min = a->len < b->len ? a->len : b->len;
-    int c = memcmp(a->buf, b->buf, min);
-    if (c)
-        return c;
-    return a->len - b->len;
 }
 
 /*

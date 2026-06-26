@@ -17,6 +17,139 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* ── DNS type constants (RFC 1035 and later) ─────────────────────────────── */
+
+#define DNS_TYPE_A 1
+#define DNS_TYPE_NS 2
+#define DNS_TYPE_CNAME 5
+#define DNS_TYPE_SOA 6
+#define DNS_TYPE_PTR 12
+#define DNS_TYPE_MX 15
+#define DNS_TYPE_TXT 16
+#define DNS_TYPE_AAAA 28
+#define DNS_TYPE_LOC 29
+#define DNS_TYPE_SRV 33
+#define DNS_TYPE_NAPTR 35
+#define DNS_TYPE_DNAME 39
+#define DNS_TYPE_OPT 41
+#define DNS_TYPE_SSHFP 44
+#define DNS_TYPE_DS 43      /* RFC 4034 §5 — delegation signer */
+#define DNS_TYPE_RRSIG 46
+#define DNS_TYPE_NSEC 47
+#define DNS_TYPE_DNSKEY 48
+#define DNS_TYPE_NSEC3 50
+#define DNS_TYPE_NSEC3PARAM 51
+#define DNS_TYPE_TLSA 52
+#define DNS_TYPE_CDS 59     /* RFC 7344 — child DS */
+#define DNS_TYPE_CDNSKEY 60 /* RFC 7344 — child DNSKEY */
+#define DNS_TYPE_URI 256    /* RFC 7553 */
+#define DNS_TYPE_CAA 257
+#define DNS_TYPE_IXFR 251 /* RFC 1995 — incremental zone transfer */
+#define DNS_TYPE_AXFR 252 /* RFC 5936 — full zone transfer */
+#define DNS_TYPE_ANY 255
+#define DNS_TTL_MAX 2147483647u /* RFC 2181 §8 — 2^31-1 */
+
+/* ── DNS class constants ─────────────────────────────────────────────────── */
+
+#define DNS_CLASS_IN 1
+#define DNS_CLASS_ANY 255
+#define DNS_CLASS_NONE 254
+
+/* ── DNS header flags / opcode / rcode ───────────────────────────────────── */
+
+#define DNS_QR 0x8000
+#define DNS_AA 0x0400
+#define DNS_TC 0x0200
+#define DNS_RD 0x0100
+#define DNS_RA 0x0080 /* Recursion Available */
+#define DNS_AD 0x0020 /* RFC 4035 §3.1.6 — Authenticated Data */
+#define DNS_RCODE_MASK 0x000F
+#define DNS_OPCODE_QUERY 0x0000
+#define DNS_OPCODE_NOTIFY 0x2000
+#define DNS_OPCODE_UPDATE 0x2800
+#define DNS_OPCODE_MASK 0x7800
+
+#define DNS_RCODE_NOERROR 0
+#define DNS_RCODE_FORMERR 1
+#define DNS_RCODE_SERVFAIL 2
+#define DNS_RCODE_NXDOMAIN 3
+#define DNS_RCODE_NOTIMP 4
+#define DNS_RCODE_REFUSED 5
+#define DNS_RCODE_YXDOMAIN 6
+#define DNS_RCODE_YXRRSET 7   /* RFC 2136: RRset should not exist but does */
+#define DNS_RCODE_NXRRSET 8   /* RFC 2136: RRset should exist but does not */
+#define DNS_RCODE_NOTAUTH 9   /* RFC 2136 §2.2: not authoritative / not authorized */
+#define DNS_RCODE_NOTZONE 10
+#define DNS_RCODE_BADVERS 16
+#define DNS_RCODE_BADSIG 17
+#define DNS_RCODE_BADCOOKIE 23
+
+/* ── EDNS(0) constants (RFC 6891) ────────────────────────────────────────── */
+
+#define EDNS_MAX_UDP 1232 /* current BCP 2020 recommendation */
+#define EDNS_OPT_NSID 3
+#define EDNS_OPT_COOKIE 10
+#define EDNS_OPT_KEEPALIVE 11
+#define EDNS_OPT_PADDING 12
+#define EDNS_OPT_EDE 15
+
+/* Extended DNS Error info codes (RFC 8914) */
+#define EDE_OTHER 0
+#define EDE_DNSKEY_MISSING 1
+#define EDE_RRSIG_MISSING 3
+#define EDE_SIG_EXPIRED 5
+#define EDE_SIG_NOT_YET 6
+#define EDE_DNSKEY_MISSING2 7
+#define EDE_SIG_INVALID 8
+#define EDE_NXDOMAIN_NXZONE 12
+#define EDE_BLOCKED 15
+#define EDE_FILTERED 17
+#define EDE_NOT_AUTH 18
+#define EDE_NOT_SUPPORTED 19
+#define EDE_NXDOMAIN 20
+#define EDE_NO_REACHABLE 22
+
+/* ── DNS Cookie constants (RFC 9018) ─────────────────────────────────────── */
+
+#define DNS_COOKIE_CLIENT_LEN 8
+#define DNS_COOKIE_SERVER_LEN 16 /* RFC 9018 §4.2: version|reserved|timestamp|hash */
+#define DNS_COOKIE_VALIDITY 3600 /* seconds */
+
+/* ── DNSSEC / TSIG constants ─────────────────────────────────────────────── */
+
+#define DNS_ALG_ECDSAP256SHA256 13
+#define DNS_ALG_ED25519 15
+#define DNS_DNSKEY_FLAG_ZSK 256
+#define DNS_DNSKEY_FLAG_KSK 257 /* Secure Entry Point — RFC 3757 */
+#define NSEC3_ALG_SHA1 1
+/* TSIG time window (RFC 8945 §5.2.3); emitted in both digest input and RDATA
+ * — keep every emit site on this constant so they cannot drift. */
+#define TSIG_FUDGE 300
+
+/* ── DNS header ──────────────────────────────────────────────────────────── */
+
+typedef struct {
+    uint16_t id, flags, qdcount, ancount, nscount, arcount;
+} __attribute__((packed)) dns_hdr_t;
+
+/* ── EDNS parsed OPT fields ──────────────────────────────────────────────── */
+
+typedef struct {
+    int present;
+    uint16_t max_udp;
+    uint8_t version;
+    int do_bit;
+    uint8_t client_cookie[DNS_COOKIE_CLIENT_LEN];
+    int has_client_cookie;
+    uint8_t server_cookie[DNS_COOKIE_SERVER_LEN];
+    int server_cookie_len;
+    int has_server_cookie;
+    int nsid_req;
+    int has_padding;
+    uint16_t padding_req;
+    int keepalive_req;
+} edns_info_t;
+
 /* ── Small string helpers ────────────────────────────────────────────────── */
 
 /* In-place ASCII lowercase. */
@@ -91,6 +224,68 @@ int append_rr(uint8_t *buf, int off, int blen, const char *name, uint16_t type, 
               uint32_t ttl, const uint8_t *rdata, uint16_t rdlen);
 int append_rr_plain(uint8_t *buf, int off, int blen, const char *name, uint16_t type, uint16_t cls,
                     uint32_t ttl, const uint8_t *rdata, uint16_t rdlen);
+
+/* ── DNS type name utilities ─────────────────────────────────────────────── */
+
+/* Return the mnemonic string for a DNS type (e.g. 1 → "A", 28 → "AAAA").
+ * Unknown types are returned as "TYPE<n>" in a static buffer (not re-entrant
+ * for back-to-back unknown types; callers that need two simultaneous results
+ * must copy one first). */
+const char *type2str(uint16_t t);
+
+/* Parse a type mnemonic or "TYPE<n>" string into its numeric value.
+ * Returns 0 for unrecognised input. */
+uint16_t str2type(const char *s);
+
+/* ── RFC 1982 serial-number arithmetic ───────────────────────────────────── */
+
+/* Returns 1 if a < b in serial-number space (RFC 1982 §3.2). */
+int serial_lt(uint32_t a, uint32_t b);
+
+/* Returns 1 if a >= b in serial-number space. */
+int serial_ge(uint32_t a, uint32_t b);
+
+/* ── EDNS(0) parsing and response building ───────────────────────────────── */
+
+/* Parse the OPT RR from a DNS packet into *ei. If no OPT RR is present,
+ * ei->present is left 0 and ei->max_udp is set to 512. */
+void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei);
+
+/* Append an EDNS OPT RR to buf[off..blen) and return the new offset.
+ * Returns the unchanged off on overflow (caller can still send a bare response).
+ *
+ *   nsid    - NSID option value (ASCII); NULL omits the option.
+ *   scookie - pre-computed server cookie (DNS_COOKIE_SERVER_LEN bytes);
+ *             NULL omits the cookie option. The client cookie is taken from
+ *             req_ei->client_cookie when req_ei != NULL and scookie != NULL.
+ *   ede_code - RFC 8914 info code; -1 omits the EDE option.
+ *
+ * The correct server cookie is IP-bound (RFC 9018 §4.2): callers must compute
+ * it before calling this function and pass the result as scookie. */
+int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
+                    const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
+                    int ede_code, const char *ede_text);
+
+/* ── RFC 4034 §6 canonical-form helpers ──────────────────────────────────── */
+
+/* Write the canonical rdata for an RR of the given type (RFC 4034 §6.2):
+ * embedded domain names in name-bearing types are decompressed and lowercased;
+ * all other rdata is copied verbatim. Returns the canonical length or -1. */
+int canon_rdata(const uint8_t *pkt, int plen, int rdoff, int rdlen, uint16_t rtype, uint8_t *out,
+                int outsz);
+
+/* Maximum byte size of one canonicalized RR:
+ * owner (255) + type/class/ttl/rdlen (10) + SOA rdata (255+255+20) = 795 → 800 */
+#define CANON_RR_MAX 800
+
+typedef struct {
+    uint8_t buf[CANON_RR_MAX];
+    int len;
+} canon_rr_t;
+
+/* Canonical RRset order (RFC 4034 §6.3): compare canonical rdata as
+ * left-justified octet sequences; shorter is less when a prefix matches. */
+int canon_rr_cmp(const canon_rr_t *a, const canon_rr_t *b);
 
 /* ── Versioned length-prefixed TLV codec (ADR-003 structured values) ──────────
  * The on-Valkey encoding for complex/extensible record values (SVCB SvcParams,

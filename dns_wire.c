@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <stdio.h>
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
 
@@ -460,6 +461,364 @@ int tlv_next(const uint8_t *buf, int buflen, int *off, uint8_t *tag, const uint8
         *vlen = l;
     *off += TLV_HDR_LEN + (int) l;
     return 1;
+}
+
+/* ── DNS type name utilities ─────────────────────────────────────────────── */
+
+const char *type2str(uint16_t t) {
+    switch (t) {
+        case DNS_TYPE_A:       return "A";
+        case DNS_TYPE_NS:      return "NS";
+        case DNS_TYPE_CNAME:   return "CNAME";
+        case DNS_TYPE_SOA:     return "SOA";
+        case DNS_TYPE_PTR:     return "PTR";
+        case DNS_TYPE_MX:      return "MX";
+        case DNS_TYPE_TXT:     return "TXT";
+        case DNS_TYPE_AAAA:    return "AAAA";
+        case DNS_TYPE_LOC:     return "LOC";
+        case DNS_TYPE_SRV:     return "SRV";
+        case DNS_TYPE_NAPTR:   return "NAPTR";
+        case DNS_TYPE_DNAME:   return "DNAME";
+        case DNS_TYPE_SSHFP:   return "SSHFP";
+        case DNS_TYPE_DS:      return "DS";
+        case DNS_TYPE_RRSIG:   return "RRSIG";
+        case DNS_TYPE_NSEC:    return "NSEC";
+        case DNS_TYPE_DNSKEY:  return "DNSKEY";
+        case DNS_TYPE_NSEC3:   return "NSEC3";
+        case DNS_TYPE_NSEC3PARAM: return "NSEC3PARAM";
+        case DNS_TYPE_TLSA:    return "TLSA";
+        case DNS_TYPE_CDS:     return "CDS";
+        case DNS_TYPE_CDNSKEY: return "CDNSKEY";
+        case DNS_TYPE_URI:     return "URI";
+        case DNS_TYPE_CAA:     return "CAA";
+        case DNS_TYPE_IXFR:    return "IXFR";
+        case DNS_TYPE_AXFR:    return "AXFR";
+        case DNS_TYPE_ANY:     return "ANY";
+        default: {
+            static char buf[12];
+            snprintf(buf, sizeof(buf), "TYPE%u", (unsigned) t);
+            return buf;
+        }
+    }
+}
+
+uint16_t str2type(const char *s) {
+    if (!strcasecmp(s, "A"))         return DNS_TYPE_A;
+    if (!strcasecmp(s, "NS"))        return DNS_TYPE_NS;
+    if (!strcasecmp(s, "CNAME"))     return DNS_TYPE_CNAME;
+    if (!strcasecmp(s, "SOA"))       return DNS_TYPE_SOA;
+    if (!strcasecmp(s, "PTR"))       return DNS_TYPE_PTR;
+    if (!strcasecmp(s, "MX"))        return DNS_TYPE_MX;
+    if (!strcasecmp(s, "TXT"))       return DNS_TYPE_TXT;
+    if (!strcasecmp(s, "AAAA"))      return DNS_TYPE_AAAA;
+    if (!strcasecmp(s, "LOC"))       return DNS_TYPE_LOC;
+    if (!strcasecmp(s, "SRV"))       return DNS_TYPE_SRV;
+    if (!strcasecmp(s, "NAPTR"))     return DNS_TYPE_NAPTR;
+    if (!strcasecmp(s, "DNAME"))     return DNS_TYPE_DNAME;
+    if (!strcasecmp(s, "SSHFP"))     return DNS_TYPE_SSHFP;
+    if (!strcasecmp(s, "DS"))        return DNS_TYPE_DS;
+    if (!strcasecmp(s, "RRSIG"))     return DNS_TYPE_RRSIG;
+    if (!strcasecmp(s, "NSEC"))      return DNS_TYPE_NSEC;
+    if (!strcasecmp(s, "DNSKEY"))    return DNS_TYPE_DNSKEY;
+    if (!strcasecmp(s, "NSEC3"))     return DNS_TYPE_NSEC3;
+    if (!strcasecmp(s, "NSEC3PARAM")) return DNS_TYPE_NSEC3PARAM;
+    if (!strcasecmp(s, "TLSA"))      return DNS_TYPE_TLSA;
+    if (!strcasecmp(s, "CDS"))       return DNS_TYPE_CDS;
+    if (!strcasecmp(s, "CDNSKEY"))   return DNS_TYPE_CDNSKEY;
+    if (!strcasecmp(s, "URI"))       return DNS_TYPE_URI;
+    if (!strcasecmp(s, "CAA"))       return DNS_TYPE_CAA;
+    if (!strcasecmp(s, "IXFR"))      return DNS_TYPE_IXFR;
+    if (!strcasecmp(s, "AXFR"))      return DNS_TYPE_AXFR;
+    if (!strcasecmp(s, "ANY"))       return DNS_TYPE_ANY;
+    /* Numeric TYPE<n> notation (RFC 3597) */
+    if (!strncasecmp(s, "TYPE", 4) && s[4] >= '0' && s[4] <= '9')
+        return (uint16_t) atoi(s + 4);
+    if (s[0] >= '0' && s[0] <= '9')
+        return (uint16_t) atoi(s);
+    return 0;
+}
+
+/* ── RFC 1982 serial-number arithmetic ───────────────────────────────────── */
+
+int serial_lt(uint32_t a, uint32_t b) {
+    return (a != b) &&
+           (((b - a) & 0x80000000u) == 0);
+}
+
+int serial_ge(uint32_t a, uint32_t b) {
+    return !serial_lt(a, b);
+}
+
+/* ── EDNS(0) parsing ─────────────────────────────────────────────────────── */
+
+/* Skip a wire-format name starting at pkt[off]; return new offset or -1. */
+static int skip_name(const uint8_t *pkt, int plen, int off) {
+    int steps = 0;
+    while (steps++ < 128) {
+        if (off >= plen)
+            return -1;
+        uint8_t c = pkt[off];
+        if ((c & 0xC0) == 0xC0) {
+            off += 2;
+            return (off <= plen) ? off : -1;
+        }
+        if (c == 0)
+            return off + 1;
+        off += c + 1;
+    }
+    return -1;
+}
+
+void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
+    memset(ei, 0, sizeof(*ei));
+    ei->max_udp = 512;
+    if (plen < 12)
+        return;
+    int arcount = (int) get16(pkt, 10);
+    if (arcount == 0)
+        return;
+    int off = 12;
+    /* Skip question section */
+    int qdcount = (int) get16(pkt, 4);
+    for (int i = 0; i < qdcount; i++) {
+        off = skip_name(pkt, plen, off);
+        if (off < 0 || off + 4 > plen)
+            return;
+        off += 4; /* qtype + qclass */
+    }
+    /* Skip answer and authority sections */
+    int ancount = (int) get16(pkt, 6);
+    int nscount = (int) get16(pkt, 8);
+    int skip_rrs = ancount + nscount;
+    for (int i = 0; i < skip_rrs; i++) {
+        off = skip_name(pkt, plen, off);
+        if (off < 0 || off + 10 > plen)
+            return;
+        uint16_t rdlen = get16(pkt, off + 8);
+        off += 10 + (int) rdlen;
+    }
+    /* Scan additional section for OPT */
+    for (int i = 0; i < arcount; i++) {
+        if (off >= plen)
+            break;
+        off = skip_name(pkt, plen, off);
+        if (off < 0 || off + 10 > plen)
+            break;
+        uint16_t rtype = get16(pkt, off);
+        if (rtype == DNS_TYPE_OPT) {
+            ei->present = 1;
+            ei->max_udp = get16(pkt, off + 2);
+            /* OPT TTL field (RFC 6891 §6.1.3): ext-RCODE(off+4) | VERSION
+             * (off+5) | flags(off+6, off+7). DO is the top bit of the 2-octet
+             * flags field at off+6 — NOT off+4 (that is the extended RCODE). */
+            ei->version = pkt[off + 5];
+            ei->do_bit = (pkt[off + 6] & 0x80) ? 1 : 0;
+            uint16_t rdlen = get16(pkt, off + 8);
+            int rp = off + 10;
+            int rend = off + 10 + (int) rdlen;
+            while (rp + 4 <= rend && rp + 4 <= plen) {
+                uint16_t oc = get16(pkt, rp);
+                uint16_t ol = get16(pkt, rp + 2);
+                rp += 4;
+                if (oc == EDNS_OPT_NSID) {
+                    ei->nsid_req = 1;
+                } else if (oc == EDNS_OPT_COOKIE && ol >= DNS_COOKIE_CLIENT_LEN) {
+                    if (rp + ol <= plen) {
+                        memcpy(ei->client_cookie, pkt + rp, DNS_COOKIE_CLIENT_LEN);
+                        ei->has_client_cookie = 1;
+                        /* Server cookie: bytes after the 8-byte client cookie,
+                         * length 8..DNS_COOKIE_SERVER_LEN (RFC 9018). */
+                        if (ol > DNS_COOKIE_CLIENT_LEN &&
+                            ol <= DNS_COOKIE_CLIENT_LEN + DNS_COOKIE_SERVER_LEN) {
+                            int slen = ol - DNS_COOKIE_CLIENT_LEN;
+                            memcpy(ei->server_cookie, pkt + rp + DNS_COOKIE_CLIENT_LEN, slen);
+                            ei->server_cookie_len = slen;
+                            ei->has_server_cookie = 1;
+                        }
+                    }
+                } else if (oc == EDNS_OPT_KEEPALIVE) {
+                    ei->keepalive_req = 1;
+                } else if (oc == EDNS_OPT_PADDING) {
+                    ei->has_padding = 1;
+                    ei->padding_req = ol;
+                }
+                if (rp + (int) ol > plen)
+                    break;
+                rp += (int) ol;
+            }
+            break;
+        }
+        uint16_t rdlen = get16(pkt, off + 8);
+        off += 10 + (int) rdlen;
+    }
+}
+
+/* ── EDNS(0) response building ───────────────────────────────────────────── */
+
+int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
+                    const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
+                    int ede_code, const char *ede_text) {
+    if (off + 11 > blen)
+        return off;
+    buf[off++] = 0; /* root name */
+    buf[off++] = 0;
+    buf[off++] = 41; /* OPT type */
+    /* class = max UDP payload */
+    uint16_t maxudp = is_tcp ? 65535 : EDNS_MAX_UDP;
+    buf[off++] = maxudp >> 8;
+    buf[off++] = maxudp & 0xFF;
+    /* TTL = ext-RCODE | version=0 | DO | Z */
+    buf[off++] = rcode_ext & 0xFF;
+    buf[off++] = 0;
+    buf[off++] = do_bit ? 0x80 : 0x00;
+    buf[off++] = 0;
+    /* RDATA: options */
+    int rdata_off = off + 2;
+    int rdata_len = 0;
+    if (off + 2 > blen)
+        return off;
+    /* NSID option */
+    if (nsid && nsid[0]) {
+        int nsid_len = (int) strlen(nsid);
+        if (rdata_off + 4 + nsid_len < blen) {
+            put16(buf, rdata_off, EDNS_OPT_NSID);
+            put16(buf, rdata_off + 2, (uint16_t) nsid_len);
+            memcpy(buf + rdata_off + 4, nsid, nsid_len);
+            rdata_off += 4 + nsid_len;
+            rdata_len += 4 + nsid_len;
+        }
+    }
+    /* Cookie option: emit client cookie + pre-computed server cookie */
+    if (req_ei && req_ei->has_client_cookie && scookie) {
+        int total = 4 + DNS_COOKIE_CLIENT_LEN + DNS_COOKIE_SERVER_LEN;
+        if (rdata_off + total < blen) {
+            put16(buf, rdata_off, EDNS_OPT_COOKIE);
+            put16(buf, rdata_off + 2, DNS_COOKIE_CLIENT_LEN + DNS_COOKIE_SERVER_LEN);
+            memcpy(buf + rdata_off + 4, req_ei->client_cookie, DNS_COOKIE_CLIENT_LEN);
+            memcpy(buf + rdata_off + 4 + DNS_COOKIE_CLIENT_LEN, scookie, DNS_COOKIE_SERVER_LEN);
+            rdata_off += total;
+            rdata_len += total;
+        }
+    }
+    /* TCP keepalive: suggest 30s (300 units of 100ms, RFC 7828) */
+    if (is_tcp && req_ei && req_ei->keepalive_req) {
+        if (rdata_off + 6 < blen) {
+            put16(buf, rdata_off, EDNS_OPT_KEEPALIVE);
+            put16(buf, rdata_off + 2, 2);
+            put16(buf, rdata_off + 4, 300);
+            rdata_off += 6;
+            rdata_len += 6;
+        }
+    }
+    /* EDE option (RFC 8914) */
+    if (ede_code >= 0) {
+        int tlen = ede_text ? (int) strlen(ede_text) : 0;
+        if (rdata_off + 4 + 2 + tlen < blen) {
+            put16(buf, rdata_off, EDNS_OPT_EDE);
+            put16(buf, rdata_off + 2, (uint16_t) (2 + tlen));
+            put16(buf, rdata_off + 4, (uint16_t) ede_code);
+            if (tlen)
+                memcpy(buf + rdata_off + 6, ede_text, tlen);
+            rdata_off += 4 + 2 + tlen;
+            rdata_len += 4 + 2 + tlen;
+        }
+    }
+    /* Padding (RFC 7830 / RFC 8467):
+     *   - Encrypted transports (is_tcp): always pad to RFC 8467 §4 block size (468).
+     *   - If client requested padding: use 128-byte blocks instead. */
+    if (is_tcp) {
+        int block = (req_ei && req_ei->has_padding) ? 128 : 468;
+        int cur = off + 2 + rdata_len + 4;
+        int pad = block - (cur % block);
+        if (pad == block)
+            pad = 0;
+        if (pad > 0 && rdata_off + 4 + pad < blen) {
+            put16(buf, rdata_off, EDNS_OPT_PADDING);
+            put16(buf, rdata_off + 2, (uint16_t) pad);
+            memset(buf + rdata_off + 4, 0, pad);
+            rdata_off += 4 + pad;
+            rdata_len += 4 + pad;
+        }
+    }
+    put16(buf, off, (uint16_t) rdata_len);
+    off = rdata_off;
+    /* Increment arcount (offset 10 in DNS header) */
+    put16(buf, 10, (uint16_t) (get16(buf, 10) + 1));
+    return off;
+}
+
+/* ── RFC 4034 §6 canonical-form helpers ──────────────────────────────────── */
+
+int canon_rdata(const uint8_t *pkt, int plen, int rdoff, int rdlen, uint16_t rtype, uint8_t *out,
+                int outsz) {
+    if (rdoff < 0 || rdlen < 0 || rdoff + rdlen > plen)
+        return -1;
+    char nm[256];
+    switch (rtype) {
+        case DNS_TYPE_NS:
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_PTR:
+        case DNS_TYPE_DNAME: {
+            if (name_from_wire(pkt, plen, rdoff, nm, sizeof(nm)) < 0)
+                return -1;
+            return name_to_wire(nm, out, outsz);
+        }
+        case DNS_TYPE_MX: {
+            if (rdlen < 3 || outsz < 2)
+                return -1;
+            out[0] = pkt[rdoff];
+            out[1] = pkt[rdoff + 1];
+            if (name_from_wire(pkt, plen, rdoff + 2, nm, sizeof(nm)) < 0)
+                return -1;
+            int n = name_to_wire(nm, out + 2, outsz - 2);
+            if (n < 0)
+                return -1;
+            return 2 + n;
+        }
+        case DNS_TYPE_SRV: {
+            if (rdlen < 7 || outsz < 6)
+                return -1;
+            memcpy(out, pkt + rdoff, 6);
+            if (name_from_wire(pkt, plen, rdoff + 6, nm, sizeof(nm)) < 0)
+                return -1;
+            int n = name_to_wire(nm, out + 6, outsz - 6);
+            if (n < 0)
+                return -1;
+            return 6 + n;
+        }
+        case DNS_TYPE_SOA: {
+            int a = name_from_wire(pkt, plen, rdoff, nm, sizeof(nm));
+            if (a < 0)
+                return -1;
+            int pos = name_to_wire(nm, out, outsz);
+            if (pos < 0)
+                return -1;
+            int b = name_from_wire(pkt, plen, a, nm, sizeof(nm));
+            if (b < 0)
+                return -1;
+            int n = name_to_wire(nm, out + pos, outsz - pos);
+            if (n < 0)
+                return -1;
+            pos += n;
+            if (b + 20 > plen || pos + 20 > outsz)
+                return -1;
+            memcpy(out + pos, pkt + b, 20); /* serial..minimum: 5×u32 */
+            return pos + 20;
+        }
+        default:
+            if (rdlen > outsz)
+                return -1;
+            memcpy(out, pkt + rdoff, rdlen);
+            return rdlen;
+    }
+}
+
+int canon_rr_cmp(const canon_rr_t *a, const canon_rr_t *b) {
+    int min = a->len < b->len ? a->len : b->len;
+    int c = memcmp(a->buf, b->buf, min);
+    if (c)
+        return c;
+    return a->len - b->len;
 }
 
 /* ── Schema version contract (ADR-003) ───────────────────────────────────────

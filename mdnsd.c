@@ -53,24 +53,8 @@
 #define MDNS_MAX_MSG 8192       /* max mDNS message size */
 #define DNSSD_SERVICES "_services._dns-sd._udp.local"
 
-#define DNS_TYPE_A 1
-#define DNS_TYPE_CNAME 5
-#define DNS_TYPE_PTR 12
-#define DNS_TYPE_TXT 16
-#define DNS_TYPE_AAAA 28
-#define DNS_TYPE_SRV 33
-#define DNS_TYPE_ANY 255
-#define DNS_CLASS_IN 1
-#define DNS_CLASS_ANY 255
-#define DNS_QR 0x8000
-#define DNS_AA 0x0400
-
 #define RESP_BUF 65536
 #define MAX_IFACES 16
-
-typedef struct {
-    uint16_t id, flags, qdcount, ancount, nscount, arcount;
-} __attribute__((packed)) dns_hdr_t;
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 static void dns_log(int level, const char *fmt, ...) {
@@ -369,41 +353,6 @@ static int zone_glob_get(const char *tname, const char *qname, char *out, int ol
     if (!key[0])
         return 0;
     return vk_get(key, out, olen);
-}
-
-/* ── Type name mapping (the record types mDNS serves) ────────────────────── */
-static const char *type2str(uint16_t t) {
-    switch (t) {
-        case DNS_TYPE_A:
-            return "A";
-        case DNS_TYPE_AAAA:
-            return "AAAA";
-        case DNS_TYPE_PTR:
-            return "PTR";
-        case DNS_TYPE_SRV:
-            return "SRV";
-        case DNS_TYPE_TXT:
-            return "TXT";
-        case DNS_TYPE_CNAME:
-            return "CNAME";
-        default:
-            return "?";
-    }
-}
-static uint16_t str2type(const char *s) {
-    if (!strcasecmp(s, "A"))
-        return DNS_TYPE_A;
-    if (!strcasecmp(s, "AAAA"))
-        return DNS_TYPE_AAAA;
-    if (!strcasecmp(s, "PTR"))
-        return DNS_TYPE_PTR;
-    if (!strcasecmp(s, "SRV"))
-        return DNS_TYPE_SRV;
-    if (!strcasecmp(s, "TXT"))
-        return DNS_TYPE_TXT;
-    if (!strcasecmp(s, "CNAME"))
-        return DNS_TYPE_CNAME;
-    return 0;
 }
 
 /* ── Wire-format helpers specific to mDNS ────────────────────────────────── */
