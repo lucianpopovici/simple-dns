@@ -139,7 +139,11 @@ record formats here use the Phase-1 schema decision.
 2. **dnsd — correctness first, then features**
    (`CLAUDE-rfc-additions*.md`, `CLAUDE-ENUM.md`):
    - Correctness of existing behavior: 9077 (NSEC/NSEC3 negative-TTL), 1982
-     (serial arithmetic, via libdnswire), 9715 (UDP fragmentation avoidance).
+     (serial arithmetic, via libdnswire), ~~9715 (UDP fragmentation
+     avoidance)~~ **DONE 2026-06-26** — effective UDP size capped at 1232 +
+     TC fallback (`make check-frag`, in CI). Next correctness item: 9077, then
+     audit the IXFR serial comparison (`dns_server.c:7813` uses raw `<`, should
+     use `serial_lt`) for 1982.
    - Then new record types/features: 9460 (SVCB/HTTPS), 8976 (ZONEMD), 7477
      (CSYNC), 5782 (DNSxL), 1794 (RR rotation), 6116/6117/6118 (ENUM over
      NAPTR), 2317 (classless reverse delegation), and the batch-3 complementary

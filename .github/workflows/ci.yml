@@ -160,6 +160,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-ptr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 9715 UDP fragmentation avoidance (1232 cap + TC fallback)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-frag OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: DDNS lease-expiry sweeper (silent expiry → serial bump + IXFR delete)
         env:
           DNS_VALKEY_HOST: 127.0.0.1
