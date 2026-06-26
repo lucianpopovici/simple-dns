@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire fuzz-wire fuzz-response gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -376,6 +376,20 @@ fuzz-wire: fuzz/fuzz_name_from_wire.c $(WIRE_SRC) dns_wire.h
 	      fuzz/fuzz_name_from_wire.c $(WIRE_SRC)
 	mkdir -p fuzz/corpus
 	./fuzz/fuzz_name_from_wire -max_total_time=60 fuzz/corpus
+
+# libFuzzer over resolverd's UNTRUSTED upstream-response parsers
+# (response_opt_parse / response_matches_query / parse_response_to_entry). The
+# harness #includes resolverd.c (its main() is gated by UNIT_TEST) so it can
+# reach those statics and the g_cfg state they read; libFuzzer supplies main.
+fuzz-response: fuzz/fuzz_response.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [FUZZ]  fuzz_response (resolverd response parser; clang, ASan+UBSan+libFuzzer)"
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -DUNIT_TEST -I. -I$(OSSL_INC) \
+	      -Wno-unused-function \
+	      -o fuzz/fuzz_response \
+	      fuzz/fuzz_response.c $(WIRE_SRC) $(SANDBOX_SRC) \
+	      -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)
+	mkdir -p fuzz/corpus_response
+	ASAN_OPTIONS=detect_leaks=1 ./fuzz/fuzz_response -max_total_time=60 fuzz/corpus_response
 
 # =============================================================================
 # Smoke test

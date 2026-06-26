@@ -4,7 +4,8 @@
 #
 # All jobs are blocking: build + sanitizer + smoke test, warnings-as-errors
 # (curated set + -Werror), static analysis (scan-build + cppcheck), clang-format,
-# and a 60s name_from_wire fuzz smoke. The tree is clean against all of them;
+# and two 60s fuzz smokes (name_from_wire + resolverd response parser). The tree
+# is clean against all of them;
 # keep it that way (format new code with clang-format, fix warnings, add
 # cppcheck inline-suppr only with justification).
 #
@@ -281,3 +282,25 @@ jobs:
         run: |
           mkdir -p fuzz/corpus
           ./fuzz_name_from_wire -max_total_time=60 fuzz/corpus
+
+  fuzz-response-smoke:
+    name: Fuzz smoke (resolverd response parser)
+    runs-on: ubuntu-latest
+    # libFuzzer over resolverd's untrusted upstream-response parsers
+    # (response_opt_parse / response_matches_query / parse_response_to_entry).
+    # The harness #includes resolverd.c (main gated by UNIT_TEST), so it links
+    # OpenSSL + pthread like resolverd itself.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
+      - name: Build fuzzer
+        run: |
+          clang -g -O1 -fsanitize=fuzzer,address,undefined -DUNIT_TEST -I. \
+                -Wno-unused-function \
+                fuzz/fuzz_response.c dns_wire.c sandbox.c -o fuzz_response \
+                -lssl -lcrypto -lpthread
+      - name: Run 60s smoke + replay regression corpus
+        run: |
+          mkdir -p fuzz/corpus_response
+          ASAN_OPTIONS=detect_leaks=1 ./fuzz_response -max_total_time=60 fuzz/corpus_response
