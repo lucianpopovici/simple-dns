@@ -45,6 +45,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include <openssl/crypto.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -940,15 +941,47 @@ static void handle_metrics(int fd, SSL *ssl) {
     }
 }
 
+/* Read an HTTP request: loop until the CRLFCRLF header terminator, then until the
+ * Content-Length body bytes are present — all bounded by `bufsz` and the socket's
+ * SO_RCVTIMEO. A single recv() (the old behaviour) truncated any DoH POST body
+ * split across TCP segments and had no body-size handling (CSA-DOS-001). Returns
+ * total bytes read (NUL-terminated) or -1. */
+static int http_read_request(int fd, SSL *ssl, char *buf, int bufsz) {
+    int total = 0;
+    int hdr_end = -1;
+    long content_len = -1;
+    while (total < bufsz - 1) {
+        int n = ssl ? SSL_read(ssl, buf + total, bufsz - 1 - total)
+                    : (int) recv(fd, buf + total, bufsz - 1 - total, 0);
+        if (n <= 0)
+            break; /* EOF / timeout / error */
+        total += n;
+        buf[total] = 0;
+        if (hdr_end < 0) {
+            char *e = strstr(buf, "\r\n\r\n");
+            if (e) {
+                hdr_end = (int) (e - buf) + 4;
+                char *cl = strcasestr(buf, "content-length:");
+                if (cl && cl < buf + hdr_end) {
+                    content_len = strtol(cl + 15, NULL, 10);
+                    if (content_len < 0)
+                        content_len = 0;
+                    if (content_len > bufsz - 1)
+                        content_len = bufsz - 1; /* capped by the buffer */
+                }
+            }
+        }
+        if (hdr_end >= 0 && (content_len < 0 || total - hdr_end >= content_len))
+            break; /* headers complete and full body (or no body) received */
+    }
+    return total > 0 ? total : -1;
+}
+
 /* ── Request handler (ported from the monolith's handle_api; every side
  *    effect is a Valkey write — nothing reaches into dnsd's memory) ──────── */
 static void handle_api(int fd, SSL *ssl, int is_mgmt) {
     char buf[HTTP_BUF];
-    int n;
-    if (ssl)
-        n = SSL_read(ssl, buf, sizeof(buf) - 1);
-    else
-        n = (int) recv(fd, buf, sizeof(buf) - 1, 0);
+    int n = http_read_request(fd, ssl, buf, sizeof(buf));
     if (n <= 0)
         return;
     buf[n] = 0;
@@ -1038,7 +1071,11 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
     if (!is_mgmt) {
         char secret[256] = "";
         vk_get("config:ddns_secret", secret, sizeof(secret));
-        if (!secret[0] || strcmp(akey, secret) != 0) {
+        /* Constant-time compare (CSA-TIME-001): strcmp short-circuits on the
+         * first differing byte, leaking a timing oracle on the DDNS secret. */
+        size_t la = strlen(akey);
+        size_t ls = strlen(secret);
+        if (!secret[0] || la != ls || CRYPTO_memcmp(akey, secret, ls) != 0) {
             api_send(fd, ssl, 403, "forbidden\n");
             return;
         }

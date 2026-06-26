@@ -499,6 +499,19 @@ static void cert_post_issue(const char *domain, const char *cert_pem, const char
 }
 
 /* ── HTTPS client (optionally mTLS) ──────────────────────────────────────── */
+/* Bind the expected peer identity so the handshake fails on a cert that does not
+ * match `host` (CSA-TLS-002). SSL_set_tlsext_host_name() only sets SNI; identity
+ * is checked via set1_host (DNS) or set1_ip (IP literal). */
+static void tls_verify_peer_name(SSL *ssl, const char *host) {
+    X509_VERIFY_PARAM *vp = SSL_get0_param(ssl);
+    X509_VERIFY_PARAM_set_hostflags(vp, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    unsigned char addr[16];
+    if (inet_pton(AF_INET, host, addr) == 1 || inet_pton(AF_INET6, host, addr) == 1)
+        X509_VERIFY_PARAM_set1_ip_asc(vp, host);
+    else
+        X509_VERIFY_PARAM_set1_host(vp, host, 0);
+}
+
 static char *https_req_mtls(const char *host, int port, const char *method, const char *path,
                             const char *body, const char *client_cert_pem,
                             const char *client_key_pem, const char *server_ca_pem,
@@ -538,10 +551,13 @@ static char *https_req_mtls(const char *host, int port, const char *method, cons
             X509_free(cx);
         }
         BIO_free(bca);
-        SSL_CTX_set_verify(cctx, SSL_VERIFY_PEER, NULL);
     } else {
         SSL_CTX_set_default_verify_paths(cctx);
     }
+    /* Verify the CA chain on BOTH paths (CSA-TLS-001): previously SSL_VERIFY_PEER
+     * was set only when an explicit CA PEM was configured, so the normal
+     * system-trust path (public ACME CA) accepted ANY certificate. */
+    SSL_CTX_set_verify(cctx, SSL_VERIFY_PEER, NULL);
     if (client_cert_pem && client_cert_pem[0] && client_key_pem && client_key_pem[0]) {
         BIO *bc = BIO_new_mem_buf(client_cert_pem, -1);
         X509 *cc = PEM_read_bio_X509_AUX(bc, NULL, NULL, NULL);
@@ -570,8 +586,9 @@ static char *https_req_mtls(const char *host, int port, const char *method, cons
     SSL *ssl = SSL_new(cctx);
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, host);
+    tls_verify_peer_name(ssl, host);
     if (SSL_connect(ssl) <= 0) {
-        dns_log(LOG_ERR, "[PKI] TLS handshake to %s:%d failed\n", host, port);
+        dns_log(LOG_ERR, "[PKI] TLS handshake/verify to %s:%d failed\n", host, port);
         SSL_free(ssl);
         SSL_CTX_free(cctx);
         close(fd);

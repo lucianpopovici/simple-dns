@@ -121,6 +121,22 @@ int main(void) {
               "monotonically backward pointer chain parses");
     }
 
+    /* name_to_wire must reject a label > 63 octets (RFC 1035 §3.1) — a longer
+       length octet collides with the 0xC0 compression-pointer marker on re-parse
+       (CSA-WIRE-001). */
+    {
+        char longlabel[80];
+        memset(longlabel, 'a', 64);
+        longlabel[64] = '.';
+        memcpy(longlabel + 65, "com", 3);
+        longlabel[68] = 0; /* 64-octet label — over the limit */
+        uint8_t wbuf[256];
+        int r = name_to_wire(longlabel, wbuf, sizeof(wbuf));
+        check(r == -1, "name_to_wire rejects label > 63 octets");
+        int r2 = name_to_wire("www.example.com", wbuf, sizeof(wbuf));
+        check(r2 > 0, "name_to_wire accepts a valid name");
+    }
+
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;
 }
