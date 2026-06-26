@@ -351,6 +351,7 @@ HTTP front-ends. Define and enforce this.
 | `acme:*` | certd | certd | ACME account key, order state |
 | `cache:*` | resolverd | resolverd | Persisted resolver cache |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
+| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid | ADR-003 schema-version contract (`major.minor`) |
 
 **Live reload (done — migration Step 6):** each daemon runs a subscriber on a
 dedicated Valkey connection, enables keyspace notifications
@@ -364,6 +365,35 @@ and re-announces. zone/ddns records are already read live per query.
 Subscribers re-run a full catch-up after every reconnect and use capped
 backoff, so a Valkey restart causes neither missed updates nor a reconnect
 storm.
+
+### Schema versioning + format registry (ADR-003, done — Phase 1)
+
+The Valkey bus is a **versioned contract**, not an ad-hoc set of strings
+(`CLAUDE-architecture.md` ADR-003, Accepted option C):
+
+- **Version key.** `schema:version` holds `major.minor` (current **1.0**). Every
+  daemon compares it against its compiled `SCHEMA_VERSION` at startup via
+  `schema_version_check()` (in `libdnswire`): a **major** mismatch is fatal —
+  the daemon refuses to start; a **minor** mismatch warns and continues
+  (minor = additive). `dnsd` is the **seeder** (writes the key when absent); the
+  others only read it. Valkey-down/absent is treated as "assume current" and
+  never blocks boot.
+- **Compatibility rule.** Within a major: additive only — new **optional
+  trailing** fields; readers must tolerate unknown trailing fields (and, for
+  TLV, unknown tags). Any breaking change bumps the major **and** ships a
+  migration under `tools/`.
+- **Encoding policy (the registry).** Two encodings, chosen per value:
+
+  | Value kind | Encoding | Examples |
+  |---|---|---|
+  | Simple, stable scalars | **pipe** `a\|b\|c` (unchanged) | `config:*`, `ddns:A`/`AAAA` (`ttl\|ip`), SOA timers, `zone_table:*` scalars |
+  | Complex / extensible | **versioned TLV** (`tlv_*`, see `dns_wire.h`) | SVCB/HTTPS SvcParams, NAPTR, ZONEMD, ENUM rules, EPP objects — everything ADR-003 keeps off the fragile `\|` delimiter |
+
+  TLV layout: `version(1) { tag(1) len(2,BE) value(len) }*` — bounds-checked,
+  fail-closed, readers skip unknown tags. **New complex record types (Phase 2)
+  land on TLV, not pipe.** Pipe stays only where a field can never contain `|`
+  and the field set is fixed. The codec is unit-tested (`make check-wire`) and
+  fuzzed (`make fuzz-tlv`).
 
 ---
 

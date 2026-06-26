@@ -125,6 +125,13 @@
  *   zone_table:<zone>          Zone SOA + transfer settings
  *                              (mname|rname|serial|refresh|retry|expire|minimum
  *                               |axfr_allow|notify_targets)
+ *   schema:version             ADR-003 inter-daemon schema contract "major.minor"
+ *                              (current 1.0; dnsd seeds it, every daemon checks it
+ *                              at startup — major mismatch is fatal, minor warns).
+ *                              Simple values stay pipe-delimited; complex/extensible
+ *                              values (SVCB, NAPTR, ZONEMD, ENUM, EPP) use the
+ *                              versioned TLV codec (tlv_* in libdnswire). See the
+ *                              format registry in CLAUDE.md.
  *   zone:<zone>:<TYPE>:<name>  Authoritative record, e.g. zone:example.com:A:www.example.com
  *                              (SRV ttl|prio|weight|port|target; CAA ttl|flags|tag|value;
  *                               SSHFP ttl|alg|fptype|fp_hex; TLSA ttl|usage|sel|mtype|hex;
@@ -9609,6 +9616,36 @@ static void *udp_worker_thread(void *arg) {
     return NULL;
 }
 
+/* ADR-003 schema-version gate. dnsd is the SEEDER: on an absent key it writes the
+ * compiled version so the rest of the fleet has a contract to check against. A
+ * major mismatch (or unparseable value) is fatal — the inter-daemon bus format is
+ * incompatible; a minor mismatch only warns (additive change). By the time this
+ * runs dnsd has already hard-required Valkey at boot, so ABSENT means "not seeded
+ * yet", not "Valkey down". Returns 0 to proceed, -1 to refuse. */
+static int schema_gate(void) {
+    char sv[32] = "";
+    vk_get("schema:version", sv, sizeof(sv));
+    switch (schema_version_check(sv)) {
+        case SCHEMA_OK:
+            return 0;
+        case SCHEMA_MINOR_DIFF:
+            dns_log(LOG_WARNING,
+                    "[Schema] schema:version %s differs in minor from compiled %s — continuing\n",
+                    sv, SCHEMA_VERSION_STR);
+            return 0;
+        case SCHEMA_ABSENT:
+            vk_set("schema:version", SCHEMA_VERSION_STR, 0);
+            dns_log(LOG_INFO, "[Schema] seeded schema:version=%s\n", SCHEMA_VERSION_STR);
+            return 0;
+        default: /* SCHEMA_MAJOR_DIFF or SCHEMA_MALFORMED */
+            dns_log(
+                LOG_ERR,
+                "[Schema] schema:version %s incompatible with compiled %s — refusing to start\n",
+                sv[0] ? sv : "(unparseable)", SCHEMA_VERSION_STR);
+            return -1;
+    }
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -9639,6 +9676,11 @@ int main(int argc, char **argv) {
 
     /* Phase 2: Load config */
     config_load_from_valkey();
+
+    /* Phase 2a: schema-version contract (ADR-003) — seed it (dnsd is the seeder)
+     * or refuse to start on an incompatible major. */
+    if (schema_gate() != 0)
+        return 1;
 
     /* In-process record cache: allocate once here if enabled at boot. */
     if (g_rcache_ttl > 0)

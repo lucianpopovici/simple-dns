@@ -1408,6 +1408,34 @@ static int renewal_check(void) {
     return ok;
 }
 
+/* ADR-003 schema-version gate. certd is NOT the seeder (dnsd writes
+ * schema:version); it only checks. Absent/Valkey-down is "assume current" and
+ * never blocks; an incompatible major (or unparseable value) refuses. Returns 0
+ * to proceed, -1 to refuse. */
+static int schema_gate(void) {
+    char sv[32] = "";
+    vk_get("schema:version", sv, sizeof(sv));
+    switch (schema_version_check(sv)) {
+        case SCHEMA_OK:
+            return 0;
+        case SCHEMA_MINOR_DIFF:
+            dns_log(LOG_WARNING,
+                    "[Schema] schema:version %s differs in minor from compiled %s — continuing\n",
+                    sv, SCHEMA_VERSION_STR);
+            return 0;
+        case SCHEMA_ABSENT:
+            dns_log(LOG_INFO, "[Schema] schema:version absent — assuming compiled %s\n",
+                    SCHEMA_VERSION_STR);
+            return 0;
+        default: /* SCHEMA_MAJOR_DIFF or SCHEMA_MALFORMED */
+            dns_log(
+                LOG_ERR,
+                "[Schema] schema:version %s incompatible with compiled %s — refusing to start\n",
+                sv[0] ? sv : "(unparseable)", SCHEMA_VERSION_STR);
+            return -1;
+    }
+}
+
 int main(int argc, char **argv) {
     int once = 0;
     for (int i = 1; i < argc; i++) {
@@ -1426,6 +1454,8 @@ int main(int argc, char **argv) {
     /* est_cacerts is exercised on demand only; reference it so a build with
      * the function unused still compiles clean under -Wall. */
     (void) est_cacerts;
+    if (schema_gate() != 0)
+        return 1;
     if (once)
         return renewal_check() < 0 ? 1 : 0;
     for (;;) {

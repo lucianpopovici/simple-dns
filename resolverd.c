@@ -4070,6 +4070,35 @@ static void apply_sandbox(void) {
 }
 
 #ifndef UNIT_TEST
+/* ADR-003 schema-version gate (serving/proxy path only — one-shot CLI queries do
+ * not participate in the long-running bus contract). resolverd is NOT the seeder;
+ * dnsd writes schema:version. Absent or Valkey-down is treated as "assume current"
+ * and never blocks; only an explicit incompatible major (or unparseable value)
+ * refuses. Returns 0 to proceed, -1 to refuse. */
+static int schema_gate(void) {
+    char sv[32] = "";
+    vk_get("schema:version", sv, sizeof(sv));
+    switch (schema_version_check(sv)) {
+        case SCHEMA_OK:
+            return 0;
+        case SCHEMA_MINOR_DIFF:
+            fprintf(stderr,
+                    "[Schema] schema:version %s differs in minor from compiled %s — continuing\n",
+                    sv, SCHEMA_VERSION_STR);
+            return 0;
+        case SCHEMA_ABSENT:
+            fprintf(stderr, "[Schema] schema:version absent — assuming compiled %s\n",
+                    SCHEMA_VERSION_STR);
+            return 0;
+        default: /* SCHEMA_MAJOR_DIFF or SCHEMA_MALFORMED */
+            fprintf(
+                stderr,
+                "[Schema] schema:version %s incompatible with compiled %s — refusing to start\n",
+                sv[0] ? sv : "(unparseable)", SCHEMA_VERSION_STR);
+            return -1;
+    }
+}
+
 int main(int argc, char **argv) {
     SSL_library_init();
     OpenSSL_add_all_algorithms();
@@ -4247,6 +4276,8 @@ int main(int argc, char **argv) {
         return result.rcode;
     }
     /* Default: proxy mode */
+    if (schema_gate() != 0)
+        return 1;
     mode_proxy = 1;
     if (mode_proxy) {
         /* Start proxy in main thread (blocking) */

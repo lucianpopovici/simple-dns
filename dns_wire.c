@@ -392,3 +392,99 @@ int append_rr_plain(uint8_t *buf, int off, int blen, const char *name, uint16_t 
         memcpy(buf + off, rdata, rdlen);
     return off + rdlen;
 }
+
+/* ── Versioned length-prefixed TLV codec (ADR-003 structured values) ───────────
+ * See dns_wire.h for the format and rationale. Every function is bounds-checked
+ * and fails closed (-1) on overflow or malformed framing. */
+
+int tlv_begin(uint8_t *buf, int buflen, uint8_t version) {
+    if (!buf || buflen < 1)
+        return -1;
+    buf[0] = version;
+    return 1;
+}
+
+int tlv_put(uint8_t *buf, int buflen, int off, uint8_t tag, const uint8_t *val, int vlen) {
+    if (!buf || off < 0 || vlen < 0 || vlen > 0xFFFF)
+        return -1;
+    if (vlen > 0 && !val)
+        return -1;
+    if (off + TLV_HDR_LEN + vlen > buflen)
+        return -1;
+    buf[off] = tag;
+    put16(buf, off + 1, (uint16_t) vlen);
+    if (vlen > 0)
+        memcpy(buf + off + TLV_HDR_LEN, val, (size_t) vlen);
+    return off + TLV_HDR_LEN + vlen;
+}
+
+int tlv_put_u8(uint8_t *buf, int buflen, int off, uint8_t tag, uint8_t v) {
+    return tlv_put(buf, buflen, off, tag, &v, 1);
+}
+
+int tlv_put_u16(uint8_t *buf, int buflen, int off, uint8_t tag, uint16_t v) {
+    uint8_t b[2];
+    put16(b, 0, v);
+    return tlv_put(buf, buflen, off, tag, b, 2);
+}
+
+int tlv_put_u32(uint8_t *buf, int buflen, int off, uint8_t tag, uint32_t v) {
+    uint8_t b[4];
+    put32(b, 0, v);
+    return tlv_put(buf, buflen, off, tag, b, 4);
+}
+
+int tlv_version(const uint8_t *buf, int buflen) {
+    if (!buf || buflen < 1)
+        return -1;
+    return buf[0];
+}
+
+int tlv_next(const uint8_t *buf, int buflen, int *off, uint8_t *tag, const uint8_t **val,
+             uint16_t *vlen) {
+    if (!buf || !off || *off < 0)
+        return -1;
+    if (*off == buflen)
+        return 0; /* clean end of blob */
+    if (*off + TLV_HDR_LEN > buflen)
+        return -1; /* truncated item header */
+    uint8_t t = buf[*off];
+    uint16_t l = get16(buf, *off + 1);
+    if (*off + TLV_HDR_LEN + (int) l > buflen)
+        return -1; /* value runs past the buffer */
+    if (tag)
+        *tag = t;
+    if (val)
+        *val = buf + *off + TLV_HDR_LEN;
+    if (vlen)
+        *vlen = l;
+    *off += TLV_HDR_LEN + (int) l;
+    return 1;
+}
+
+/* ── Schema version contract (ADR-003) ───────────────────────────────────────
+ * Pure comparator: no I/O. The daemon reads `schema:version` from Valkey and
+ * passes it here; the SCHEMA_* return code drives its startup policy. */
+
+int schema_version_check(const char *stored) {
+    if (!stored || !stored[0])
+        return SCHEMA_ABSENT;
+    char *end = NULL;
+    long major = strtol(stored, &end, 10);
+    if (end == stored || *end != '.')
+        return SCHEMA_MALFORMED;
+    const char *minor_str = end + 1;
+    if (!*minor_str)
+        return SCHEMA_MALFORMED;
+    char *end2 = NULL;
+    long minor = strtol(minor_str, &end2, 10);
+    if (end2 == minor_str || *end2 != '\0')
+        return SCHEMA_MALFORMED;
+    if (major < 0 || minor < 0)
+        return SCHEMA_MALFORMED;
+    if (major != SCHEMA_VERSION_MAJOR)
+        return SCHEMA_MAJOR_DIFF;
+    if (minor != SCHEMA_VERSION_MINOR)
+        return SCHEMA_MINOR_DIFF;
+    return SCHEMA_OK;
+}
