@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -951,6 +951,39 @@ check-ixfr: $(BIN_DEBUG)
 	 echo "$$FB"  | grep -q "^MODE axfr" || { echo "  FAIL  out-of-journal serial did not fall back to AXFR"; exit 1; }; \
 	 echo "$$UP"  | grep -q "^MODE uptodate" || { echo "  FAIL  current-serial request was not answered up-to-date"; exit 1; }; \
 	 echo "  OK  incremental diff correct (adds+delete), AXFR fallback + up-to-date handled"
+
+# RFC 1982: the IXFR "is the client behind us?" decision must use serial
+# arithmetic, not a raw `<`. Here the zone serial has wrapped past 2^32 to a
+# small value (16) while the client still holds a large pre-wrap serial
+# (0xFFFFFF00). Numerically client > current, so a raw `<` would force a full
+# AXFR; serial_lt orders them correctly and serves the journaled diff. The
+# journal chain spans the wrap (…|0xFFFFFFFF|0|16) and is matched by exact link.
+check-ixfr-wrap: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 1982 serial-wrap IXFR decision (serial_lt, not raw <)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=ixfrwrap.test; CUR=16; OLD=4294967040; M1=4294967295;                           \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|$$CUR|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set config:zone:$$Z:serial $$CUR >/dev/null;                                 \
+	 $$VC set zone:$$Z:A:www.$$Z "120|10.9.9.9" >/dev/null;                            \
+	 $$VC del ixfr:$$Z:journal >/dev/null;                                             \
+	 $$VC rpush ixfr:$$Z:journal "$$OLD|$$M1|A|h1.$$Z|10.0.0.1" >/dev/null;            \
+	 $$VC rpush ixfr:$$Z:journal "$$M1|0|A|h2.$$Z|10.0.0.2" >/dev/null;                \
+	 $$VC rpush ixfr:$$Z:journal "0|$$CUR|D|h1.$$Z|10.0.0.1" >/dev/null;               \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ixfrwrap.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 OUT=$$(python3 tests/ixfr_client.py 127.0.0.1 $(TPORT) $$Z $$OLD 2>/dev/null);        \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone_table:$$Z config:zone:$$Z:serial zone:$$Z:A:www.$$Z ixfr:$$Z:journal >/dev/null; \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 echo "  --- wrap IXFR (client serial $$OLD, current $$CUR) ---"; echo "$$OUT" | sed 's/^/    /'; \
+	 echo "$$OUT" | grep -q "^MODE incremental" || { echo "  FAIL  serial-wrap request fell back to AXFR (raw < instead of serial_lt)"; exit 1; }; \
+	 echo "$$OUT" | grep -q "^END $$CUR" || { echo "  FAIL  wrap incremental did not close at current serial $$CUR"; exit 1; }; \
+	 echo "  OK  serial-wrap IXFR served incrementally (RFC 1982 ordering)"
 
 # RFC 1995 IXFR — *client-side* incremental apply. Run dnsd as a secondary
 # pointed at an IXFR-capable stub master (tests/ixfr_master.py): the first pull
