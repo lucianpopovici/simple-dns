@@ -7815,7 +7815,10 @@ static void *axfr_thread(void *arg) {
      * The op field selects the deletion vs addition section so a 'D' entry is a
      * real delete and an 'A' a real add (the previous code emitted every change
      * as an addition inside the deletion section). */
-    if (c.ixfr && c.ixfr_serial > 0 && c.ixfr_serial < t_zone->soa_serial) {
+    /* RFC 1982 serial arithmetic: a raw `<` mis-decides across the 2^32 wrap
+     * (e.g. our serial wrapped to a small value while the client still holds a
+     * large older one), needlessly forcing AXFR. serial_lt orders correctly. */
+    if (c.ixfr && c.ixfr_serial > 0 && serial_lt(c.ixfr_serial, t_zone->soa_serial)) {
         char *entries[IXFR_JOURNAL_MAX];
         int ne =
             ixfr_journal_fetch(zname, c.ixfr_serial, t_zone->soa_serial, entries, IXFR_JOURNAL_MAX);
