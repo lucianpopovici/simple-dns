@@ -134,7 +134,10 @@ glance:
   padding, 8914 EDE, DNS Cookies (RFC 7873) — `dnsd` is the server side (real
   SipHash-2-4, 9018 server cookies, BADCOOKIE), and `resolverd` is the client
   side: a stable per-upstream Client Cookie, learns and reuses the Server Cookie,
-  and retries once on BADCOOKIE (RCODE 23).
+  and retries once on BADCOOKIE (RCODE 23). 9715 / Flag Day 2020 fragmentation
+  avoidance: `dnsd` advertises a 1232-byte EDNS buffer and caps the *effective*
+  UDP response at 1232 even when a client advertises more, setting TC so the
+  client retries over TCP rather than emitting a fragmentable datagram.
 - **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
 - **PKI bootstrap** (`certd`): ACME (8555, DNS-01) and EST (7030) over mTLS.
 

@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -367,6 +367,35 @@ check-conformance: tests/test_conformance.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	      $(INCLUDES) -I. -o tests/test_conformance \
 	      tests/test_conformance.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
 	./tests/test_conformance
+
+# RFC 9715 / Flag Day 2020: UDP responses must not exceed the fragmentation-safe
+# size even when the client advertises a larger EDNS buffer — cap to 1232 and set
+# TC so the client retries over TCP, where the full answer is returned. The probe
+# is a DNSSEC-signed AAAA RRset (the canonical fragmentation case): the full
+# response (~2.3 KB) sits between 1232 and the client's advertised 4096, so a TC
+# bit proves the 1232 cap fired rather than the 4096 buffer.
+check-frag: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 9715 UDP fragmentation avoidance (1232 cap + TC fallback)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
+	 Z=example.local; BIGN=big.$$Z;                                                    \
+	 VAL=30; for i in 1 2 3 4 5 6 7 8; do VAL="$$VAL|2001:db8:$$i::$$i"; done;          \
+	 $$VC set zone:$$Z:AAAA:$$BIGN "$$VAL" >/dev/null;                                 \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_frag.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 UDPFLAGS=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +bufsize=4096 +ignore +notcp +dnssec $$BIGN AAAA +time=2 +tries=1 | awk -F'flags: ' '/;; flags:/{split($$2,a,";"); print a[1]; exit}'); \
+	 OPT=$$(dig +nocookie @127.0.0.1 -p $(TPORT) $$Z A +time=2 +tries=1 | awk '/; EDNS/{for(i=1;i<=NF;i++) if($$i=="udp:") print $$(i+1)}'); \
+	 TCPSIZE=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +tcp +dnssec $$BIGN AAAA +time=3 +tries=1 | awk '/MSG SIZE/{print $$NF}'); \
+	 TCPAAAA=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +tcp +dnssec $$BIGN AAAA +time=3 +tries=1 +short | grep -c '^2001:db8:'); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone:$$Z:AAAA:$$BIGN >/dev/null;                                         \
+	 echo "  udp_flags=[$$UDPFLAGS] opt_udp=[$$OPT] tcp_size=[$$TCPSIZE] tcp_aaaa=[$$TCPAAAA]"; \
+	 test -n "$$TCPSIZE" && test "$$TCPSIZE" -gt 1232 || { echo "  FAIL  probe response not >1232 over TCP (size=$$TCPSIZE) — cannot exercise the UDP cap"; exit 1; }; \
+	 echo "$$UDPFLAGS" | grep -qw tc || { echo "  FAIL  UDP answer >1232 not truncated (TC unset) despite bufsize=4096"; exit 1; }; \
+	 test "$$OPT" = "1232" || { echo "  FAIL  response OPT advertises [$$OPT], expected 1232"; exit 1; }; \
+	 test "$$TCPAAAA" -eq 8 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 8)"; exit 1; }; \
+	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 8 AAAA)"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"

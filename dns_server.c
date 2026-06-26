@@ -6251,6 +6251,11 @@ finish_answer:
         uint16_t max_udp = ei.present ? ei.max_udp : 512;
         if (max_udp < 512)
             max_udp = 512;
+        /* RFC 9715 / DNS Flag Day 2020: never emit a UDP datagram larger than
+         * the fragmentation-safe size, even if the client advertised a bigger
+         * EDNS buffer — cap and fall back to TC/TCP instead of fragmenting. */
+        if (max_udp > EDNS_MAX_UDP)
+            max_udp = EDNS_MAX_UDP;
         if ((uint16_t) off > max_udp) {
             /* Truncate: keep header + question, set TC, drop answers */
             int qend = 12 + (after - 12) + 4; /* header + question section */
