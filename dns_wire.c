@@ -190,6 +190,10 @@ int name_to_wire(const char *name, uint8_t *buf, int blen) {
     char *lbl = strtok_r(tmp, ".", &saveptr);
     while (lbl) {
         int ll = (int) strlen(lbl);
+        /* RFC 1035 §3.1: a label length octet must be <= 63 — a longer one
+         * collides with the 0xC0 compression-pointer marker on re-parse. */
+        if (ll > 63)
+            return -1;
         if (pos + ll + 1 >= blen)
             return -1;
         buf[pos++] = (uint8_t) ll;
@@ -335,6 +339,8 @@ int name_to_wire_c(const char *name, uint8_t *buf, int pos, int blen, int abs_of
         }
         /* Emit this label */
         int ll = (int) strlen(labels[i]);
+        if (ll > 63) /* RFC 1035 §3.1: label length octet must be <= 63 */
+            return -1;
         if (pos + ll + 1 >= blen)
             return -1;
         buf[pos++] = (uint8_t) ll;

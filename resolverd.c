@@ -91,6 +91,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include "sandbox.h"
 
 /* =========================================================================
@@ -1648,6 +1649,53 @@ static int response_opt_parse(const uint8_t *pkt, int plen, uint8_t *scookie, in
     return rcode;
 }
 
+/* CSPRNG 16-bit value for transaction IDs and source ports — the resolver's
+ * primary anti-spoofing entropy (RFC 5452). rand()/srand(time()) is predictable;
+ * fall back to it only if OpenSSL's RNG ever fails (it should not). */
+static uint16_t csprng_u16(void) {
+    uint16_t v;
+    if (RAND_bytes((unsigned char *) &v, sizeof(v)) == 1)
+        return v;
+    return (uint16_t) rand();
+}
+
+/* Two DNS names equal ignoring case and a single trailing dot. */
+static int names_equal_nocase(const char *a, const char *b) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    if (la && a[la - 1] == '.')
+        la--;
+    if (lb && b[lb - 1] == '.')
+        lb--;
+    return la == lb && strncasecmp(a, b, la) == 0;
+}
+
+/* RFC 5452 response acceptance: a reply is trusted only if its transaction ID
+ * matches the query, the QR bit is set, and the question section echoes the asked
+ * QNAME (case-insensitive), QTYPE, and QCLASS. Without this an off-path spoofer
+ * only has to guess the 16-bit source port; with it they must also guess the
+ * 16-bit ID. */
+static int response_matches_query(const uint8_t *resp, int rlen, uint16_t id, const char *qname,
+                                  uint16_t qtype) {
+    if (rlen < 12)
+        return 0;
+    if (get16(resp, 0) != id)
+        return 0;
+    if (!(get16(resp, 2) & DNS_QR))
+        return 0;
+    if (get16(resp, 4) < 1)
+        return 0; /* qdcount */
+    char rqname[256];
+    int off = name_from_wire(resp, rlen, 12, rqname, sizeof(rqname));
+    if (off < 0 || off + 4 > rlen)
+        return 0;
+    if (get16(resp, off) != qtype)
+        return 0;
+    if (get16(resp, off + 2) != DNS_CLASS_IN) /* we only ever ask IN */
+        return 0;
+    return names_equal_nocase(rqname, qname);
+}
+
 /* =========================================================================
  * EDNS(0) + DNS Cookie
  * ======================================================================= */
@@ -1718,6 +1766,21 @@ static int build_query(uint8_t *buf, int blen, const char *qname, uint16_t qtype
     return off;
 }
 
+/* Bind the expected peer identity to a client SSL so the handshake fails on a
+ * certificate that does not match `host`. SSL_set_tlsext_host_name() only sets the
+ * SNI extension — it does NOT verify the cert, which left DoT/DoH open to MITM by
+ * any CA-valid cert (CSA-TLS-002). SSL_set1_host checks DNS names only, so an IP
+ * literal upstream is verified via set1_ip against the cert's IP SANs instead. */
+static void tls_verify_peer_name(SSL *ssl, const char *host) {
+    X509_VERIFY_PARAM *vp = SSL_get0_param(ssl);
+    X509_VERIFY_PARAM_set_hostflags(vp, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    unsigned char addr[16];
+    if (inet_pton(AF_INET, host, addr) == 1 || inet_pton(AF_INET6, host, addr) == 1)
+        X509_VERIFY_PARAM_set1_ip_asc(vp, host);
+    else
+        X509_VERIFY_PARAM_set1_host(vp, host, 0);
+}
+
 /* Open a DoT connection to the upstream server */
 static SSL *dot_connect(int *fd_out) {
     struct addrinfo hints = {0}, *res;
@@ -1744,6 +1807,7 @@ static SSL *dot_connect(int *fd_out) {
     SSL *ssl = SSL_new(g_dot_ctx);
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, g_cfg.upstream_host[0]);
+    tls_verify_peer_name(ssl, g_cfg.upstream_host[0]);
     if (SSL_connect(ssl) <= 0) {
         SSL_free(ssl);
         close(fd);
@@ -1879,6 +1943,7 @@ static int doh_query_on(const char *host, int port, const char *path, const uint
     SSL *ssl = SSL_new(g_dot_ctx);
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, host);
+    tls_verify_peer_name(ssl, host);
     if (SSL_connect(ssl) <= 0) {
         SSL_free(ssl);
         close(fd);
@@ -2144,7 +2209,7 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
                 struct sockaddr_storage local = {0};
                 local.ss_family = (sa_family_t) res->ai_family;
                 for (int a = 0; a < 16; a++) {
-                    uint16_t sp = (uint16_t) (1024 + (rand() % 64511));
+                    uint16_t sp = (uint16_t) (1024 + (csprng_u16() % 64511));
                     if (local.ss_family == AF_INET)
                         ((struct sockaddr_in *) &local)->sin_port = htons(sp);
                     else
@@ -2175,7 +2240,7 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
 /* Send a query to one specific upstream (by index). Returns rlen or -1. */
 static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, int resp_sz,
                               int upstream_idx, long *rtt_us_out) {
-    uint16_t id = (uint16_t) (rand() & 0xFFFF);
+    uint16_t id = csprng_u16();
     uint8_t query[DNS_BUF];
     /* Temporarily point g_cfg to this upstream for build_query/tcp_query */
     /* (they read g_cfg.upstream_host/port/proto) */
@@ -2199,10 +2264,14 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     rlen = upstream_dispatch(query, qlen, resp, resp_sz);
-    /* RFC 7873: learn the Server Cookie the upstream returned; if it rejected us
-     * with BADCOOKIE (no/stale Server Cookie), retry once carrying the fresh one
-     * (new ID for anti-spoofing). Subsequent queries reuse the stored cookie via
-     * edns_append, so this round trip happens at most once per upstream. */
+    /* RFC 5452: drop any reply whose ID/question does not match what we asked —
+     * fail closed so a spoofed or stray packet is never cached or trusted. */
+    if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname, qtype))
+        rlen = -1;
+    /* RFC 7873: learn the Server Cookie from the (now validated) response; if the
+     * upstream rejected us with BADCOOKIE (no/stale Server Cookie), retry once
+     * carrying the fresh one (new ID). Subsequent queries reuse the stored cookie
+     * via edns_append, so this round trip happens at most once per upstream. */
     if (rlen >= 12) {
         uint8_t scookie[DNS_COOKIE_SERVER_MAX];
         int slen = 0;
@@ -2210,9 +2279,11 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
         if (slen > 0)
             cookie_store_server(upstream_idx, scookie, slen);
         if (full_rcode == DNS_RCODE_BADCOOKIE && slen > 0) {
-            id = (uint16_t) (rand() & 0xFFFF);
+            id = csprng_u16();
             qlen = build_query(query, sizeof(query), qname, qtype, id, 1, upstream_idx);
             rlen = upstream_dispatch(query, qlen, resp, resp_sz);
+            if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname, qtype))
+                rlen = -1;
             if (rlen >= 12) {
                 int slen2 = 0;
                 response_opt_parse(resp, rlen, scookie, &slen2);

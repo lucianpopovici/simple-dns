@@ -207,6 +207,7 @@
 #include <net/if.h>
 #include <ifaddrs.h>
 #include "sandbox.h" /* shared privilege-drop / chroot / seccomp sandbox */
+#include <openssl/crypto.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -927,6 +928,30 @@ static void rsyslog_disconnect(void) {
  * Called with g_log_mutex HELD.
  * Returns 0 on success, -1 on failure.
  */
+/* CSPRNG 16-bit value for outbound transaction IDs (CSA-RAND-002). rand() is
+ * predictable; the recipient authenticates NOTIFY via TSIG/SOA so this is mostly
+ * for consistency, but a CSPRNG is the right default. */
+static uint16_t csprng_u16(void) {
+    uint16_t v;
+    if (RAND_bytes((unsigned char *) &v, sizeof(v)) == 1)
+        return v;
+    return (uint16_t) rand();
+}
+
+/* Bind the expected peer identity so the TLS handshake fails on a cert that does
+ * not match `host` (CSA-TLS-002/003). SSL_set_tlsext_host_name() only sets SNI;
+ * identity is checked via set1_host (DNS) or set1_ip (IP literal). Only meaningful
+ * when peer verification is enabled on the SSL/CTX. */
+static void tls_verify_peer_name(SSL *ssl, const char *host) {
+    X509_VERIFY_PARAM *vp = SSL_get0_param(ssl);
+    X509_VERIFY_PARAM_set_hostflags(vp, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    unsigned char addr[16];
+    if (inet_pton(AF_INET, host, addr) == 1 || inet_pton(AF_INET6, host, addr) == 1)
+        X509_VERIFY_PARAM_set1_ip_asc(vp, host);
+    else
+        X509_VERIFY_PARAM_set1_host(vp, host, 0);
+}
+
 static int rsyslog_connect(void) {
     rsyslog_disconnect();
     if (!g_rsyslog_host[0] || g_rsyslog_port <= 0)
@@ -1000,6 +1025,8 @@ static int rsyslog_connect(void) {
     }
     SSL_set_fd(g_rsyslog_ssl, fd);
     SSL_set_tlsext_host_name(g_rsyslog_ssl, g_rsyslog_host);
+    if (g_rsyslog_tls_verify)
+        tls_verify_peer_name(g_rsyslog_ssl, g_rsyslog_host);
 
     if (SSL_connect(g_rsyslog_ssl) <= 0) {
         SSL_free(g_rsyslog_ssl);
@@ -4309,7 +4336,7 @@ static int tsig_verify(const uint8_t *pkt, int plen) {
     mlen = (unsigned) ml2;
     EVP_MAC_CTX_free(mctx);
     EVP_MAC_free(evp_mac);
-    int ok = (mlen == (unsigned) t.mac_len) && (memcmp(mac, t.mac, mlen) == 0);
+    int ok = (mlen == (unsigned) t.mac_len) && (CRYPTO_memcmp(mac, t.mac, mlen) == 0);
     if (ok && t.mac_len > 0 && t.mac_len <= (int) sizeof(g_tsig_req_mac)) {
         memcpy(g_tsig_req_mac, t.mac, t.mac_len);
         g_tsig_req_mac_len = t.mac_len;
@@ -5097,7 +5124,7 @@ static int cookie_verify(const edns_info_t *ei, const struct in_addr *cip) {
         return 0; /* stale or future-dated */
     uint8_t expected[DNS_COOKIE_SERVER_LEN];
     compute_server_cookie(ei->client_cookie, cip, ts, expected);
-    return memcmp(expected, ei->server_cookie, DNS_COOKIE_SERVER_LEN) == 0;
+    return CRYPTO_memcmp(expected, ei->server_cookie, DNS_COOKIE_SERVER_LEN) == 0;
 }
 
 /* Forward declaration needed by NSEC functions */
@@ -7724,7 +7751,7 @@ static int xfr_tsig_verify_msg(const uint8_t *msg, int mlen, uint8_t *prior, int
     EVP_MAC_final(ctx, mac, &ml, 64);
     EVP_MAC_CTX_free(ctx);
     EVP_MAC_free(em);
-    int ok = ((int) ml == t.mac_len) && memcmp(mac, t.mac, ml) == 0;
+    int ok = ((int) ml == t.mac_len) && CRYPTO_memcmp(mac, t.mac, ml) == 0;
     if (ok) {
         memcpy(prior, t.mac, (size_t) t.mac_len);
         *prior_len = t.mac_len;
@@ -7770,6 +7797,11 @@ static int xfr_pull(const char *zone) {
         ssl = SSL_new(cctx);
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, g_primary_host);
+        /* When a CA is pinned (so SSL_VERIFY_PEER is on) also bind the hostname,
+         * so a pinned-CA transfer authenticates the primary's identity, not just
+         * its chain. No-CA transfers stay integrity-protected by TSIG. */
+        if (g_xfr_ca_pem[0])
+            tls_verify_peer_name(ssl, g_primary_host);
         static const uint8_t alpn[] = {3, 'd', 'o', 't'};
         SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
         if (SSL_connect(ssl) <= 0 || (g_xfr_ca_pem[0] && SSL_get_verify_result(ssl) != X509_V_OK)) {
@@ -8578,7 +8610,7 @@ static void notify_enqueue(const char *zone, const struct sockaddr_in *dst) {
     }
     safe_strcpy(j->zone, zone, sizeof(j->zone));
     j->dst = *dst;
-    j->id = (uint16_t) rand();
+    j->id = csprng_u16();
     j->tries = 0;
     j->next_at = 0; /* send on the next worker pass (immediately) */
     j->fd = fd;
