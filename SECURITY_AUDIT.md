@@ -347,6 +347,15 @@ This was a focused, high-yield pass over the parsers, crypto, TLS, privilege,
 and authentication surfaces plus a pattern sweep across all ~23K lines — not a
 line-by-line audit of every function. Areas worth a dedicated follow-up:
 resolverd cache concurrency (rwlock/UAF under reload), dnsd dynamic-UPDATE and
-AXFR/IXFR memory handling, and the mdnsd multicast parser. The highest-value
-next step is a libFuzzer harness over the resolver's *response* parser (not just
-`name_from_wire`) under ASan+UBSan, seeded from real upstream replies.
+AXFR/IXFR memory handling, and the mdnsd multicast parser.
+
+**Done (2026-06-26):** the audit's stated highest-value next step — a libFuzzer
+harness over the resolver's *response* parser (not just `name_from_wire`) under
+ASan+UBSan, seeded from real upstream replies — is shipped:
+`fuzz/fuzz_response.c` (`make fuzz-response`, CI job *Fuzz smoke (resolverd
+response parser)*) drives `response_opt_parse`, `response_matches_query`, and
+`parse_response_to_entry` by #including resolverd.c. Seed corpus in
+`fuzz/corpus_response/` (5 hand-built replies: A, AAAA, NXDOMAIN+SOA, NODATA+SOA,
+A+EDNS-cookie); first 60s run (≈7M execs) found no crash/leak. This closes the
+Definition-of-Done fuzz requirement for the CSA-NET-001 response-validation
+change. Remaining follow-ups above are still open.
