@@ -144,9 +144,13 @@ record formats here use the Phase-1 schema decision.
      TC fallback (`make check-frag`, in CI). **1982 DONE 2026-06-26** — the IXFR
      ordering compare now uses `serial_lt` (was a raw `<` that mis-decides across
      the 2^32 wrap → needless AXFR); `make check-ixfr-wrap` guards it (in CI).
-     Next correctness item: **9077** (NSEC/NSEC3 negative-TTL — note dnsd already
-     caps denial RRs at `soa_minimum`; mostly a verifying-test + confirming the
-     min(MINIMUM, SOA-TTL) rule).
+     **9077 DONE 2026-06-26** — added a real per-zone SOA-record TTL
+     (`config:soa_ttl`, `config:zone:<z>:soa_ttl`, optional `zone_table` trailing
+     field); the SOA RR is served at that TTL while negative-response NSEC/NSEC3
+     + authority SOA are capped at `min(soa_ttl, soa_minimum)` per RFC 9077.
+     `make check-negttl` (both min() arms) in CI. **Phase 2.2 correctness done
+     (9715 + 1982 + 9077).** Next: feature record types — **9460 (SVCB/HTTPS)**
+     on TLV per ADR-003, then 8976 (ZONEMD), 7477 (CSYNC), ENUM/NAPTR, etc.
    - Then new record types/features: 9460 (SVCB/HTTPS), 8976 (ZONEMD), 7477
      (CSYNC), 5782 (DNSxL), 1794 (RR rotation), 6116/6117/6118 (ENUM over
      NAPTR), 2317 (classless reverse delegation), and the batch-3 complementary

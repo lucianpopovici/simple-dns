@@ -58,6 +58,11 @@
  *   config:soa_retry           SOA retry interval      (default: 900)
  *   config:soa_expire          SOA expire interval     (default: 604800)
  *   config:soa_minimum         SOA minimum/negative TTL(default: 300)
+ *   config:soa_ttl             TTL the SOA RR is served with; negative-response
+ *                              NSEC/NSEC3 + authority SOA are capped at
+ *                              min(soa_ttl, soa_minimum) per RFC 9077.
+ *                              (default: unset → soa_minimum)
+ *   config:zone:<z>:soa_ttl    Per-zone override of the above.
  *   config:zone_serial         SOA serial (auto-incremented on changes)
  *   config:tsig_key_name       TSIG key name           (default: tsig-key)
  *   config:tsig_secret_b64     TSIG HMAC-SHA256 secret (base64)
@@ -124,7 +129,9 @@
  * Multi-zone key schema (migration Step 7) — records carry the owning zone:
  *   zone_table:<zone>          Zone SOA + transfer settings
  *                              (mname|rname|serial|refresh|retry|expire|minimum
- *                               |axfr_allow|notify_targets)
+ *                               |axfr_allow|notify_targets[|soa_ttl])
+ *                              soa_ttl is an optional additive trailing field
+ *                              (ADR-003); absent → soa_minimum (RFC 9077).
  *   schema:version             ADR-003 inter-daemon schema contract "major.minor"
  *                              (current 1.0; dnsd seeds it, every daemon checks it
  *                              at startup — major mismatch is fatal, minor warns).
@@ -277,7 +284,7 @@ typedef struct {
  * longest-suffix match on qname against the zone table.
  *
  * Valkey key: zone_table:<zone_name>
- * Value:      mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify_targets
+ * Value:      mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify_targets[|soa_ttl]
  * ======================================================================= */
 #define MAX_ZONES 16
 
@@ -287,6 +294,10 @@ typedef struct {
     char soa_rname[256];
     uint32_t soa_serial;
     uint32_t soa_refresh, soa_retry, soa_expire, soa_minimum;
+    /* TTL the SOA RR is served with (RFC 9077 "the SOA's TTL"). 0 = unset →
+     * falls back to soa_minimum (the legacy behavior). The negative-response
+     * NSEC/NSEC3 + authority SOA are capped at min(this, soa_minimum). */
+    uint32_t soa_ttl;
     /* Secondary zone-maintenance state (hidden-master plan Gap 6). xfr_last_ok =
      * epoch of the last successful contact with the master (resets the expire
      * timer); xfr_next_check = epoch the refresh thread should next pull. */
@@ -406,7 +417,7 @@ static int dkey(char *buf, size_t sz, const char *type, const char *name) {
 /* Add or update a zone. Returns its index or -1 on error. */
 static int zone_upsert(const char *name, const char *mname, const char *rname, uint32_t serial,
                        uint32_t refresh, uint32_t retry, uint32_t expire, uint32_t minimum,
-                       const char *axfr_allow, const char *notify_targets) {
+                       uint32_t soa_ttl, const char *axfr_allow, const char *notify_targets) {
     pthread_mutex_lock(&g_zones_mutex);
     int idx = -1;
     for (int i = 0; i < g_zone_count; i++)
@@ -430,6 +441,7 @@ static int zone_upsert(const char *name, const char *mname, const char *rname, u
     z->soa_retry = retry;
     z->soa_expire = expire;
     z->soa_minimum = minimum;
+    z->soa_ttl = soa_ttl;
     safe_strcpy(z->axfr_allow, axfr_allow ? axfr_allow : "127.0.0.1", sizeof(z->axfr_allow));
     safe_strcpy(z->notify_targets, notify_targets ? notify_targets : "", sizeof(z->notify_targets));
     z->active = 1; /* (re)affirm the slot; catalog_origin is preserved across upserts */
@@ -627,6 +639,7 @@ static uint32_t g_soa_refresh = 3600;
 static uint32_t g_soa_retry = 900;
 static uint32_t g_soa_expire = 604800;
 static uint32_t g_soa_minimum = 300;
+static uint32_t g_soa_ttl = 0; /* 0 = unset → use g_soa_minimum (RFC 9077) */
 static uint32_t g_soa_serial = 1;
 static char g_zone_name[256] = "example.local";
 
@@ -1928,10 +1941,13 @@ static void zones_load_from_valkey(void) {
             continue;
         char buf[2048];
         safe_strcpy(buf, val, sizeof(buf));
-        char *f[9] = {0};
+        /* mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify_targets
+         * |soa_ttl(optional, RFC 9077). soa_ttl is an additive trailing field
+         * (ADR-003): absent → 0 → falls back to minimum. */
+        char *f[10] = {0};
         char *p = buf;
         int fi = 0;
-        while (fi < 9) {
+        while (fi < 10) {
             f[fi++] = p;
             char *n = strchr(p, '|');
             if (!n)
@@ -1942,7 +1958,7 @@ static void zones_load_from_valkey(void) {
         zone_upsert(zname, f[0] ? f[0] : "", f[1] ? f[1] : "", f[2] ? (uint32_t) atoi(f[2]) : 1,
                     f[3] ? (uint32_t) atoi(f[3]) : 3600, f[4] ? (uint32_t) atoi(f[4]) : 900,
                     f[5] ? (uint32_t) atoi(f[5]) : 604800, f[6] ? (uint32_t) atoi(f[6]) : 300,
-                    f[7] ? f[7] : NULL, f[8] ? f[8] : NULL);
+                    f[9] ? (uint32_t) atoi(f[9]) : 0, f[7] ? f[7] : NULL, f[8] ? f[8] : NULL);
     }
 }
 /* Atomically increment and return new integer value */
@@ -2103,6 +2119,7 @@ static void config_load_from_valkey(void) {
     GU("soa_retry", g_soa_retry);
     GU("soa_expire", g_soa_expire);
     GU("soa_minimum", g_soa_minimum);
+    GU("soa_ttl", g_soa_ttl);
     GU("zone_serial", g_soa_serial);
     G("tsig_key_name", g_tsig_key_name);
     G("nsid", g_nsid);
@@ -3591,6 +3608,9 @@ static void zone_apply_config(zone_entry_t *z) {
     snprintf(k, sizeof(k), "config:zone:%s:dnssec_nsec_mode", z->name);
     if (vk_get(k, v, sizeof(v)) && v[0])
         z->dnssec_use_nsec3 = (strcasecmp(v, "nsec") == 0) ? 0 : 1;
+    snprintf(k, sizeof(k), "config:zone:%s:soa_ttl", z->name);
+    if (vk_get(k, v, sizeof(v)) && v[0])
+        z->soa_ttl = (uint32_t) strtoul(v, NULL, 10);
 }
 /* Seed/refresh the primary zone (config:zone_name) from the legacy global
  * config:* values, so a single-zone deployment with no zone_table:* entry still
@@ -3603,7 +3623,7 @@ static void seed_primary_zone(void) {
     snprintf(rname, sizeof(rname), "hostmaster.%s", g_zone_name);
     zone_upsert(g_zone_name, g_soa_mname[0] ? g_soa_mname : mname,
                 g_soa_rname[0] ? g_soa_rname : rname, g_soa_serial, g_soa_refresh, g_soa_retry,
-                g_soa_expire, g_soa_minimum, g_axfr_allow, g_notify_targets);
+                g_soa_expire, g_soa_minimum, g_soa_ttl, g_axfr_allow, g_notify_targets);
 }
 static void zones_post_load(void) {
     pthread_mutex_lock(&g_zones_mutex);
@@ -3725,7 +3745,7 @@ static int catalog_find_zone_idx(const char *name) {
  * zone_entry_t so we never read its key pointers as if they were template data. */
 typedef struct {
     char name[256];
-    uint32_t refresh, retry, expire, minimum;
+    uint32_t refresh, retry, expire, minimum, soa_ttl;
     char axfr_allow[1024];
     char notify_targets[1024];
 } catalog_tmpl_t;
@@ -3768,7 +3788,7 @@ static int catalog_provision_member(const char *cat, const char *member,
     if (vk_get(sk, sv, sizeof(sv)) && sv[0])
         serial = (uint32_t) strtoul(sv, NULL, 10);
     idx = zone_upsert(member, mname, rname, serial, tmpl->refresh, tmpl->retry, tmpl->expire,
-                      tmpl->minimum, tmpl->axfr_allow, tmpl->notify_targets);
+                      tmpl->minimum, tmpl->soa_ttl, tmpl->axfr_allow, tmpl->notify_targets);
     if (idx < 0) {
         dns_log(LOG_WARNING, "[Catalog] %s: cannot provision %s — zone table full (MAX_ZONES=%d)\n",
                 cat, member, MAX_ZONES);
@@ -3806,6 +3826,7 @@ static void catalog_scan_all(void) {
         t->retry = z->soa_retry;
         t->expire = z->soa_expire;
         t->minimum = z->soa_minimum;
+        t->soa_ttl = z->soa_ttl;
         safe_strcpy(t->axfr_allow, z->axfr_allow, sizeof(t->axfr_allow));
         safe_strcpy(t->notify_targets, z->notify_targets, sizeof(t->notify_targets));
     }
@@ -4720,9 +4741,26 @@ static int build_soa_rdata(uint8_t *rd, int rdlen) {
     return build_soa_rdata_serial(rd, rdlen, serial);
 }
 
-/* SOA minimum TTL for the current zone (used for negative-cache TTLs). */
+/* SOA MINIMUM field for the current zone (the RDATA value; also the legacy
+ * negative-cache TTL). */
 static uint32_t zone_soa_minimum(void) {
     return t_zone ? t_zone->soa_minimum : g_soa_minimum;
+}
+
+/* TTL the SOA RR is served with for the current zone. Configured soa_ttl, or
+ * soa_minimum when unset (0) — preserving the legacy single-TTL behavior. */
+static uint32_t zone_soa_ttl(void) {
+    uint32_t t = t_zone ? t_zone->soa_ttl : g_soa_ttl;
+    return t ? t : zone_soa_minimum();
+}
+
+/* RFC 9077: the TTL for NSEC/NSEC3 (and their RRSIGs) and the authority-section
+ * SOA in a negative response is min(SOA.MINIMUM, the SOA's TTL), so a validator
+ * doing aggressive-NSEC use cannot cache a denial past the negative window. */
+static uint32_t zone_negative_ttl(void) {
+    uint32_t mn = zone_soa_minimum();
+    uint32_t st = zone_soa_ttl();
+    return st < mn ? st : mn;
 }
 
 /* ==========================================================================
@@ -4818,7 +4856,7 @@ static int add_nsec_denial(uint8_t *resp, int off, int resp_len, const char *qna
     int rdlen = nsec_rdata(qname, rd, sizeof(rd));
     if (rdlen < 0)
         return off;
-    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_NSEC, zone_soa_minimum(), rd,
+    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_NSEC, zone_negative_ttl(), rd,
                   (uint16_t) rdlen, dnssec_ok, auth_count);
     return off;
 }
@@ -5166,7 +5204,7 @@ static int add_soa_authority(uint8_t *resp, int off, int resp_len, int dnssec_ok
     if (soa_len < 0)
         return off;
     off = emit_rr(resp, off, resp_len, t_zone ? t_zone->name : g_zone_name, DNS_TYPE_SOA,
-                  zone_soa_minimum(), soa_rd, (uint16_t) soa_len, dnssec_ok, auth_count);
+                  zone_negative_ttl(), soa_rd, (uint16_t) soa_len, dnssec_ok, auth_count);
     return off;
 }
 
@@ -5189,7 +5227,7 @@ static int add_nsec3_denial(uint8_t *resp, int off, int resp_len, const char *qn
         snprintf(nsec3_owner, sizeof(nsec3_owner), "%s.%s", hash,
                  t_zone ? t_zone->name : g_zone_name);
         strlower(nsec3_owner);
-        off = emit_rr(resp, off, resp_len, nsec3_owner, DNS_TYPE_NSEC3, zone_soa_minimum(), n3rd,
+        off = emit_rr(resp, off, resp_len, nsec3_owner, DNS_TYPE_NSEC3, zone_negative_ttl(), n3rd,
                       (uint16_t) n3len, dnssec_ok, auth_count);
     }
     return off;
@@ -5795,7 +5833,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         int soa_len = build_soa_rdata(soa_rd, sizeof(soa_rd));
         if (soa_len > 0) {
             found = 1;
-            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_SOA, zone_soa_minimum(), soa_rd,
+            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_SOA, zone_soa_ttl(), soa_rd,
                           (uint16_t) soa_len, dnssec_ok, &answers);
             if (any_minimal && answers > 0)
                 goto finish_answer;

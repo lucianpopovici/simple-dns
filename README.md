@@ -94,7 +94,8 @@ OpenSSL ≥ 3.0 is required. The `Makefile` derives `OSSL_INC`/`OSSL_LIB` via
 `dnsd`'s header comment (`dns_server.c:1`) keeps the authoritative list. At a
 glance:
 
-- **Core / queries**: RFC 1034/1035, 2181, 2308, 4592 wildcards, 6303
+- **Core / queries**: RFC 1034/1035, 2181, 2308, 9077 (negative-response
+  NSEC/NSEC3 + SOA TTL = min(SOA.MINIMUM, SOA-TTL)), 4592 wildcards, 6303
   locally-served zones, 8482 minimal-ANY, 9619 QDCOUNT enforcement.
 - **Record types**: A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV (2782),
   CAA (8659), SSHFP (4255), TLSA/DANE (6698/7671), LOC (1876), URI (7553),
@@ -158,6 +159,7 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 |---|---|
 | `config:zone_name` | Primary authoritative zone (default `example.local`). Additional zones are added via `zone_table:<zone>`. |
 | `config:soa_*` | Default SOA `mname`, `rname`, `refresh`, `retry`, `expire`, `minimum` for the primary zone. |
+| `config:soa_ttl` | TTL the SOA RR is served with (default: unset → `soa_minimum`). Negative-response NSEC/NSEC3 + authority SOA are capped at `min(soa_ttl, soa_minimum)` per RFC 9077. Per-zone override: `config:zone:<zone>:soa_ttl`. |
 | `config:zone_serial` | Primary zone SOA serial; other zones use `config:zone:<zone>:serial`. |
 | `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. |
 | `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
@@ -195,7 +197,7 @@ owning zone in the key:
 * Records: `zone:<zone>:<TYPE>:<fqdn>` (pipe-delimited values)
 * Dynamic-update records: `ddns:<zone>:<TYPE>:<fqdn>`
 * Per-zone config: `config:zone:<zone>:serial`, `:nsec3_iters`, `:nsec3_salt`,
-  `:dnssec_nsec_mode` (each defaults to the global `config:*` value)
+  `:dnssec_nsec_mode`, `:soa_ttl` (each defaults to the global `config:*` value)
 * Per-zone DNSSEC keys: `dnssec:<zone>:{zsk,zsk_ed25519,ksk,ksk_ed25519}`
 * Per-zone ZSK-rollover state (written by `dnsd`): `dnssec:<zone>:zsk_created`
   (epoch the active ZSK set was created), `:zsk_rollover` (`publish|<epoch>` or
@@ -209,7 +211,8 @@ still use `mdns:<TYPE>:<fqdn>`; the active TLS cert+key blob from `certd` is
 `cert:current`. Examples:
 
 ```
-zone_table:example.com                                 →  ns1.example.com|hostmaster.example.com|10|3600|900|604800|300|127.0.0.1|
+zone_table:example.com                                 →  ns1.example.com|hostmaster.example.com|10|3600|900|604800|300|127.0.0.1||7200
+                                                          (fields: mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify_targets[|soa_ttl])
 zone:example.local:TXT:_acme-challenge.host.example.local → 60|abc...123
 zone:example.local:MX:example.local                    →  300|10|mail.example.local
 zone:example.com:SRV:_xmpp._tcp.example.com            →  60|10|20|5222|xmpp.example.com
