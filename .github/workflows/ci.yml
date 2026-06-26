@@ -304,3 +304,22 @@ jobs:
         run: |
           mkdir -p fuzz/corpus_response
           ASAN_OPTIONS=detect_leaks=1 ./fuzz_response -max_total_time=60 fuzz/corpus_response
+
+  fuzz-tlv-smoke:
+    name: Fuzz smoke (TLV codec)
+    runs-on: ubuntu-latest
+    # libFuzzer over the ADR-003 length-prefixed TLV codec (dns_wire.c) — the
+    # structured encoding for complex Valkey values. Reader parses untrusted
+    # inter-daemon-bus bytes; this proves it stays in bounds.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build fuzzer
+        run: |
+          clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
+                fuzz/fuzz_tlv.c dns_wire.c -o fuzz_tlv
+      - name: Run 60s smoke + replay regression corpus
+        run: |
+          mkdir -p fuzz/corpus_tlv
+          ASAN_OPTIONS=detect_leaks=1 ./fuzz_tlv -max_total_time=60 fuzz/corpus_tlv

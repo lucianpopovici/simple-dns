@@ -1467,6 +1467,34 @@ static void load_config(void) {
     tls_material_load();
 }
 
+/* ADR-003 schema-version gate. apid is part of the control plane but NOT the
+ * schema seeder (dnsd writes schema:version); it only checks. Absent/Valkey-down
+ * is "assume current" and never blocks; an incompatible major (or unparseable
+ * value) refuses. Returns 0 to proceed, -1 to refuse. */
+static int schema_gate(void) {
+    char sv[32] = "";
+    vk_get("schema:version", sv, sizeof(sv));
+    switch (schema_version_check(sv)) {
+        case SCHEMA_OK:
+            return 0;
+        case SCHEMA_MINOR_DIFF:
+            dns_log(LOG_WARNING,
+                    "[Schema] schema:version %s differs in minor from compiled %s — continuing\n",
+                    sv, SCHEMA_VERSION_STR);
+            return 0;
+        case SCHEMA_ABSENT:
+            dns_log(LOG_INFO, "[Schema] schema:version absent — assuming compiled %s\n",
+                    SCHEMA_VERSION_STR);
+            return 0;
+        default: /* SCHEMA_MAJOR_DIFF or SCHEMA_MALFORMED */
+            dns_log(
+                LOG_ERR,
+                "[Schema] schema:version %s incompatible with compiled %s — refusing to start\n",
+                sv[0] ? sv : "(unparseable)", SCHEMA_VERSION_STR);
+            return -1;
+    }
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -1475,6 +1503,8 @@ int main(int argc, char **argv) {
     SSL_load_error_strings();
     signal(SIGPIPE, SIG_IGN);
     load_config();
+    if (schema_gate() != 0)
+        return 1;
     tls_reload();
     dns_log(LOG_NOTICE, "[apid] Starting: HTTP :%d, HTTPS :%d, dnsd at 127.0.0.1:%d\n", g_http_port,
             g_https_port, g_dns_port);

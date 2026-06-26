@@ -92,4 +92,63 @@ int append_rr(uint8_t *buf, int off, int blen, const char *name, uint16_t type, 
 int append_rr_plain(uint8_t *buf, int off, int blen, const char *name, uint16_t type, uint16_t cls,
                     uint32_t ttl, const uint8_t *rdata, uint16_t rdlen);
 
+/* ── Versioned length-prefixed TLV codec (ADR-003 structured values) ──────────
+ * The on-Valkey encoding for complex/extensible record values (SVCB SvcParams,
+ * NAPTR, ZONEMD, ENUM rules, EPP objects) — everything ADR-003 keeps OUT of the
+ * fragile pipe-delimited format. Layout:
+ *
+ *     blob := version(1) { tag(1) length(2, big-endian) value(length) }*
+ *
+ * Writers append items left-to-right; readers iterate and SKIP unknown tags, so
+ * a new optional field is an additive, backward-compatible change within a major
+ * version (a breaking change bumps the blob version and ships a migration). Every
+ * call is bounds-checked and returns -1 on overflow / malformed framing — fail
+ * closed, never emit or trust a truncated item (same convention as the rest of
+ * libdnswire). See the format registry in CLAUDE.md. */
+
+#define TLV_HDR_LEN 3 /* tag(1) + length(2) per item */
+
+/* Begin a blob: write the 1-byte version. Returns the new offset (1) or -1. */
+int tlv_begin(uint8_t *buf, int buflen, uint8_t version);
+
+/* Append one item (tag + length-prefixed value). vlen must be 0..65535 and, when
+ * > 0, val must be non-NULL. Returns the new offset or -1 on overflow/bad args. */
+int tlv_put(uint8_t *buf, int buflen, int off, uint8_t tag, const uint8_t *val, int vlen);
+
+/* Scalar convenience writers (value stored big-endian). Return new offset or -1. */
+int tlv_put_u8(uint8_t *buf, int buflen, int off, uint8_t tag, uint8_t v);
+int tlv_put_u16(uint8_t *buf, int buflen, int off, uint8_t tag, uint16_t v);
+int tlv_put_u32(uint8_t *buf, int buflen, int off, uint8_t tag, uint32_t v);
+
+/* Read the blob version byte. Returns the version (0..255) or -1 if empty. */
+int tlv_version(const uint8_t *buf, int buflen);
+
+/* Iterate items. Initialise *off = 1 (just past the version) before the first
+ * call. On return 1, the out-params tag/val/vlen describe the next item (val
+ * points INTO buf — no copy) and *off advances past it. Returns 0 at a clean end
+ * and -1 on malformed framing (truncated header or value running past buflen). */
+int tlv_next(const uint8_t *buf, int buflen, int *off, uint8_t *tag, const uint8_t **val,
+             uint16_t *vlen);
+
+/* ── Schema version contract (ADR-003) ────────────────────────────────────────
+ * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the
+ * version they speak and compare it against the `schema:version` key at startup.
+ * major.minor: a major bump is a breaking change (incompatible — fail closed); a
+ * minor bump is additive (compatible — warn). */
+#define SCHEMA_VERSION_MAJOR 1
+#define SCHEMA_VERSION_MINOR 0
+#define SCHEMA_VERSION_STR "1.0"
+
+enum {
+    SCHEMA_OK = 0,          /* stored == compiled */
+    SCHEMA_MINOR_DIFF = 1,  /* same major, different minor — caller should warn */
+    SCHEMA_MAJOR_DIFF = -1, /* incompatible major — caller must fail closed */
+    SCHEMA_ABSENT = -2,     /* key empty/missing — caller should seed or assume current */
+    SCHEMA_MALFORMED = -3   /* not "major.minor" — caller must fail closed */
+};
+
+/* Compare a stored "major.minor" string against the compiled SCHEMA_VERSION.
+ * Returns one of the SCHEMA_* codes above (pure function — no I/O). */
+int schema_version_check(const char *stored);
+
 #endif /* DNS_WIRE_H */

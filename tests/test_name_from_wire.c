@@ -137,6 +137,64 @@ int main(void) {
         check(r2 > 0, "name_to_wire accepts a valid name");
     }
 
+    /* ── ADR-003 TLV codec: round-trip, skip-unknown, fail-closed framing ───── */
+    {
+        uint8_t blob[64];
+        int off = tlv_begin(blob, sizeof(blob), 1);
+        check(off == 1, "tlv_begin writes version byte");
+        off = tlv_put_u16(blob, sizeof(blob), off, 1 /*tag*/, 0x1234);
+        off = tlv_put_u8(blob, sizeof(blob), off, 2 /*tag*/, 0x7F);
+        const uint8_t hint[4] = {1, 2, 3, 4};
+        off = tlv_put(blob, sizeof(blob), off, 3 /*tag*/, hint, 4);
+        check(off > 0, "tlv_put items succeed within buffer");
+        int total = off;
+
+        /* Read it back; also prove an unknown tag in the middle is skipped. */
+        check(tlv_version(blob, total) == 1, "tlv_version reads version");
+        int roff = 1;
+        uint8_t tag = 0;
+        const uint8_t *val = NULL;
+        uint16_t vlen = 0;
+        int seen_u16 = 0, seen_u8 = 0, seen_blob = 0;
+        int r;
+        while ((r = tlv_next(blob, total, &roff, &tag, &val, &vlen)) == 1) {
+            if (tag == 1 && vlen == 2 && get16(val, 0) == 0x1234)
+                seen_u16 = 1;
+            else if (tag == 2 && vlen == 1 && val[0] == 0x7F)
+                seen_u8 = 1;
+            else if (tag == 3 && vlen == 4 && memcmp(val, hint, 4) == 0)
+                seen_blob = 1;
+        }
+        check(r == 0, "tlv_next reaches a clean end (returns 0)");
+        check(seen_u16 && seen_u8 && seen_blob, "tlv round-trips every item");
+
+        /* Overflow: a value that does not fit must fail closed, not truncate. */
+        uint8_t small[4];
+        int o2 = tlv_begin(small, sizeof(small), 1);
+        check(tlv_put(small, sizeof(small), o2, 9, hint, 4) == -1,
+              "tlv_put rejects an item that overflows the buffer");
+
+        /* Malformed framing: a length that runs past the blob must be rejected. */
+        uint8_t bad[] = {1 /*ver*/, 5 /*tag*/, 0x00, 0x10 /*len=16*/, 0xAA};
+        int boff = 1;
+        check(tlv_next(bad, sizeof(bad), &boff, &tag, &val, &vlen) == -1,
+              "tlv_next rejects a length running past the buffer");
+    }
+
+    /* ── ADR-003 schema version comparator ──────────────────────────────────── */
+    {
+        check(schema_version_check(SCHEMA_VERSION_STR) == SCHEMA_OK,
+              "schema_version_check accepts the compiled version");
+        check(schema_version_check("") == SCHEMA_ABSENT, "empty schema version is ABSENT");
+        check(schema_version_check(NULL) == SCHEMA_ABSENT, "NULL schema version is ABSENT");
+        check(schema_version_check("1.7") == SCHEMA_MINOR_DIFF, "newer minor warns (MINOR_DIFF)");
+        check(schema_version_check("2.0") == SCHEMA_MAJOR_DIFF,
+              "major bump fails closed (MAJOR_DIFF)");
+        check(schema_version_check("9") == SCHEMA_MALFORMED, "missing minor is MALFORMED");
+        check(schema_version_check("1.x") == SCHEMA_MALFORMED, "non-numeric minor is MALFORMED");
+        check(schema_version_check("1.0.3") == SCHEMA_MALFORMED, "trailing junk is MALFORMED");
+    }
+
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;
 }
