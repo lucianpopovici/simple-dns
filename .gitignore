@@ -29,6 +29,7 @@ last-claude
 tests/test_dnssec_verify
 tests/test_rollover
 tests/test_name_from_wire
+tests/test_conformance
 fuzz/fuzz_name_from_wire
 fuzz/fuzz_response
 fuzz/fuzz_tlv

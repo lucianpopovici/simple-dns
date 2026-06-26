@@ -128,6 +128,13 @@ record formats here use the Phase-1 schema decision.
 1. **libdnswire conformance** (`CLAUDE-libdnswire.md`) — lock the shared
    sign/validate canonical-form gate; move RFC 1982 serial arithmetic here
    (dnsd Add 9). Unblocks everything downstream.
+   **Canonical-form gate CLOSED (2026-06-26):** `canon_rdata`/`canon_rr_cmp`
+   are single-source in `dns_wire.c`; dnsd's `make_rrsig` no longer copies rdata
+   verbatim but canonicalizes through the shared codec (fixed a latent
+   mixed-case name-bearing-rdata BOGUS bug across the dnsd↔resolverd boundary).
+   Interop KAT + negative added to `make check-dnssec` (`run_canon_mx`, alg
+   13 + 15). Remaining libdnswire tails: move the `name_from_wire` fuzz harness
+   into the lib test tree; add 9267/8906 conformance tests to CI.
 2. **dnsd — correctness first, then features**
    (`CLAUDE-rfc-additions*.md`, `CLAUDE-ENUM.md`):
    - Correctness of existing behavior: 9077 (NSEC/NSEC3 negative-TTL), 1982
