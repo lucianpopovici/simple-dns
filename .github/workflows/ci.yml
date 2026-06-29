@@ -64,6 +64,7 @@ jobs:
           make check-dnssec      OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make check-wire        OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make check-conformance OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+          make check-svcb        OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Smoke test against Valkey
         env:

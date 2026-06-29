@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <stdio.h>
+#include <arpa/inet.h> /* inet_pton — RFC 9460 ipv4hint/ipv6hint */
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
 
@@ -463,37 +464,287 @@ int tlv_next(const uint8_t *buf, int buflen, int *off, uint8_t *tag, const uint8
     return 1;
 }
 
+/* ── RFC 9460 SVCB/HTTPS codec (TLV schema documented in dns_wire.h) ───────── */
+
+/* Map a SvcParamKey presentation name to its number (known keys only). Returns
+ * -1 for unknown / generic keyNNNNN (unsupported in this version). */
+static int svcb_keyname(const char *s) {
+    if (!strcasecmp(s, "mandatory"))
+        return SVCB_KEY_MANDATORY;
+    if (!strcasecmp(s, "alpn"))
+        return SVCB_KEY_ALPN;
+    if (!strcasecmp(s, "no-default-alpn"))
+        return SVCB_KEY_NO_DEFAULT_ALPN;
+    if (!strcasecmp(s, "port"))
+        return SVCB_KEY_PORT;
+    if (!strcasecmp(s, "ipv4hint"))
+        return SVCB_KEY_IPV4HINT;
+    if (!strcasecmp(s, "ech"))
+        return SVCB_KEY_ECH;
+    if (!strcasecmp(s, "ipv6hint"))
+        return SVCB_KEY_IPV6HINT;
+    return -1;
+}
+
+/* Build the RFC 9460 wire value for one SvcParam and store it as a TLV item.
+ * `value` is the presentation value (NULL for a valueless key). */
+static int svcb_param_to_tlv(uint8_t *tlv, int cap, int off, int key, const char *value) {
+    uint8_t v[512];
+    int vl = 0;
+    char tmp[512];
+    char *sp = NULL, *t;
+    switch (key) {
+        case SVCB_KEY_NO_DEFAULT_ALPN:
+            vl = 0; /* valueless */
+            break;
+        case SVCB_KEY_ALPN:
+            if (!value)
+                return -1;
+            safe_strcpy(tmp, value, sizeof(tmp));
+            for (t = strtok_r(tmp, ",", &sp); t; t = strtok_r(NULL, ",", &sp)) {
+                int l = (int) strlen(t);
+                if (l < 1 || l > 255 || vl + 1 + l > (int) sizeof(v))
+                    return -1;
+                v[vl++] = (uint8_t) l;
+                memcpy(v + vl, t, (size_t) l);
+                vl += l;
+            }
+            if (vl == 0)
+                return -1;
+            break;
+        case SVCB_KEY_PORT: {
+            if (!value)
+                return -1;
+            char *end = NULL;
+            long p = strtol(value, &end, 10);
+            if (end == value || *end || p < 0 || p > 65535)
+                return -1;
+            v[0] = (uint8_t) (p >> 8);
+            v[1] = (uint8_t) (p & 0xFF);
+            vl = 2;
+            break;
+        }
+        case SVCB_KEY_IPV4HINT:
+            if (!value)
+                return -1;
+            safe_strcpy(tmp, value, sizeof(tmp));
+            for (t = strtok_r(tmp, ",", &sp); t; t = strtok_r(NULL, ",", &sp)) {
+                if (vl + 4 > (int) sizeof(v) || inet_pton(AF_INET, t, v + vl) != 1)
+                    return -1;
+                vl += 4;
+            }
+            if (vl == 0)
+                return -1;
+            break;
+        case SVCB_KEY_IPV6HINT:
+            if (!value)
+                return -1;
+            safe_strcpy(tmp, value, sizeof(tmp));
+            for (t = strtok_r(tmp, ",", &sp); t; t = strtok_r(NULL, ",", &sp)) {
+                if (vl + 16 > (int) sizeof(v) || inet_pton(AF_INET6, t, v + vl) != 1)
+                    return -1;
+                vl += 16;
+            }
+            if (vl == 0)
+                return -1;
+            break;
+        case SVCB_KEY_ECH: {
+            if (!value)
+                return -1;
+            int dl = b64std_dec(value, v, sizeof(v));
+            if (dl < 0)
+                return -1;
+            vl = dl;
+            break;
+        }
+        case SVCB_KEY_MANDATORY:
+            if (!value)
+                return -1;
+            safe_strcpy(tmp, value, sizeof(tmp));
+            for (t = strtok_r(tmp, ",", &sp); t; t = strtok_r(NULL, ",", &sp)) {
+                int mk = svcb_keyname(t);
+                if (mk < 0 || vl + 2 > (int) sizeof(v))
+                    return -1;
+                v[vl++] = (uint8_t) (mk >> 8);
+                v[vl++] = (uint8_t) (mk & 0xFF);
+            }
+            if (vl == 0)
+                return -1;
+            break;
+        default:
+            return -1;
+    }
+    return tlv_put(tlv, cap, off, (uint8_t) (SVCB_TLV_PARAM_BASE + key), vl ? v : NULL, vl);
+}
+
+int svcb_present_to_tlv(const char *present, uint8_t *tlv, int cap) {
+    char work[1024];
+    safe_strcpy(work, present, sizeof(work));
+    char *sp = NULL;
+    char *tok = strtok_r(work, " \t", &sp);
+    if (!tok)
+        return -1;
+    char *end = NULL;
+    long prio = strtol(tok, &end, 10);
+    if (end == tok || *end || prio < 0 || prio > 65535)
+        return -1;
+    char *target = strtok_r(NULL, " \t", &sp);
+    if (!target)
+        return -1;
+    int off = tlv_begin(tlv, cap, SVCB_TLV_VERSION);
+    if (off < 0)
+        return -1;
+    off = tlv_put_u16(tlv, cap, off, SVCB_TLV_PRIORITY, (uint16_t) prio);
+    if (off < 0)
+        return -1;
+    off = tlv_put(tlv, cap, off, SVCB_TLV_TARGET, (const uint8_t *) target, (int) strlen(target));
+    if (off < 0)
+        return -1;
+    int seen[SVCB_KEY_MAX + 1] = {0};
+    for (char *kv = strtok_r(NULL, " \t", &sp); kv; kv = strtok_r(NULL, " \t", &sp)) {
+        char *eq = strchr(kv, '=');
+        const char *value = NULL;
+        if (eq) {
+            *eq = 0;
+            value = eq + 1;
+        }
+        int key = svcb_keyname(kv);
+        if (key < 0 || seen[key]) /* unknown or duplicate SvcParamKey */
+            return -1;
+        if (prio == 0) /* AliasMode carries no SvcParams (RFC 9460 §2.4.2) */
+            return -1;
+        seen[key] = 1;
+        off = svcb_param_to_tlv(tlv, cap, off, key, value);
+        if (off < 0)
+            return -1;
+    }
+    return off;
+}
+
+int svcb_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap) {
+    if (tlv_version(tlv, tlvlen) != SVCB_TLV_VERSION)
+        return -1;
+    int prio = -1;
+    char target[256] = "";
+    const uint8_t *pval[SVCB_KEY_MAX + 1] = {0};
+    int plen[SVCB_KEY_MAX + 1] = {0};
+    int has[SVCB_KEY_MAX + 1] = {0};
+    int off = 1;
+    uint8_t tag;
+    const uint8_t *val;
+    uint16_t vlen;
+    int rc;
+    while ((rc = tlv_next(tlv, tlvlen, &off, &tag, &val, &vlen)) == 1) {
+        if (tag == SVCB_TLV_PRIORITY) {
+            if (vlen != 2)
+                return -1;
+            prio = (val[0] << 8) | val[1];
+        } else if (tag == SVCB_TLV_TARGET) {
+            if (vlen >= (uint16_t) sizeof(target))
+                return -1;
+            memcpy(target, val, vlen);
+            target[vlen] = 0;
+        } else if (tag >= SVCB_TLV_PARAM_BASE && tag <= SVCB_TLV_PARAM_BASE + SVCB_KEY_MAX) {
+            int key = tag - SVCB_TLV_PARAM_BASE;
+            pval[key] = val;
+            plen[key] = vlen;
+            has[key] = 1;
+        }
+        /* unknown tag → skip (additive forward-compat) */
+    }
+    if (rc < 0 || prio < 0)
+        return -1;
+    int o = 0;
+    if (o + 2 > outcap)
+        return -1;
+    out[o++] = (uint8_t) (prio >> 8);
+    out[o++] = (uint8_t) (prio & 0xFF);
+    /* TargetName is uncompressed (RFC 9460 §2.2); "." (root) is valid. */
+    int n = name_to_wire(target[0] ? target : ".", out + o, outcap - o);
+    if (n < 0)
+        return -1;
+    o += n;
+    /* SvcParams MUST appear in ascending key order with no duplicates
+     * (RFC 9460 §2.2); iterating keys 0..MAX yields exactly that. */
+    for (int key = 0; key <= SVCB_KEY_MAX; key++) {
+        if (!has[key])
+            continue;
+        if (o + 4 + plen[key] > outcap)
+            return -1;
+        out[o++] = (uint8_t) (key >> 8);
+        out[o++] = (uint8_t) (key & 0xFF);
+        out[o++] = (uint8_t) (plen[key] >> 8);
+        out[o++] = (uint8_t) (plen[key] & 0xFF);
+        if (plen[key] > 0) {
+            memcpy(out + o, pval[key], (size_t) plen[key]);
+            o += plen[key];
+        }
+    }
+    return o;
+}
+
 /* ── DNS type name utilities ─────────────────────────────────────────────── */
 
 const char *type2str(uint16_t t) {
     switch (t) {
-        case DNS_TYPE_A:       return "A";
-        case DNS_TYPE_NS:      return "NS";
-        case DNS_TYPE_CNAME:   return "CNAME";
-        case DNS_TYPE_SOA:     return "SOA";
-        case DNS_TYPE_PTR:     return "PTR";
-        case DNS_TYPE_MX:      return "MX";
-        case DNS_TYPE_TXT:     return "TXT";
-        case DNS_TYPE_AAAA:    return "AAAA";
-        case DNS_TYPE_LOC:     return "LOC";
-        case DNS_TYPE_SRV:     return "SRV";
-        case DNS_TYPE_NAPTR:   return "NAPTR";
-        case DNS_TYPE_DNAME:   return "DNAME";
-        case DNS_TYPE_SSHFP:   return "SSHFP";
-        case DNS_TYPE_DS:      return "DS";
-        case DNS_TYPE_RRSIG:   return "RRSIG";
-        case DNS_TYPE_NSEC:    return "NSEC";
-        case DNS_TYPE_DNSKEY:  return "DNSKEY";
-        case DNS_TYPE_NSEC3:   return "NSEC3";
-        case DNS_TYPE_NSEC3PARAM: return "NSEC3PARAM";
-        case DNS_TYPE_TLSA:    return "TLSA";
-        case DNS_TYPE_CDS:     return "CDS";
-        case DNS_TYPE_CDNSKEY: return "CDNSKEY";
-        case DNS_TYPE_URI:     return "URI";
-        case DNS_TYPE_CAA:     return "CAA";
-        case DNS_TYPE_IXFR:    return "IXFR";
-        case DNS_TYPE_AXFR:    return "AXFR";
-        case DNS_TYPE_ANY:     return "ANY";
+        case DNS_TYPE_A:
+            return "A";
+        case DNS_TYPE_NS:
+            return "NS";
+        case DNS_TYPE_CNAME:
+            return "CNAME";
+        case DNS_TYPE_SOA:
+            return "SOA";
+        case DNS_TYPE_PTR:
+            return "PTR";
+        case DNS_TYPE_MX:
+            return "MX";
+        case DNS_TYPE_TXT:
+            return "TXT";
+        case DNS_TYPE_AAAA:
+            return "AAAA";
+        case DNS_TYPE_LOC:
+            return "LOC";
+        case DNS_TYPE_SRV:
+            return "SRV";
+        case DNS_TYPE_NAPTR:
+            return "NAPTR";
+        case DNS_TYPE_DNAME:
+            return "DNAME";
+        case DNS_TYPE_SSHFP:
+            return "SSHFP";
+        case DNS_TYPE_DS:
+            return "DS";
+        case DNS_TYPE_RRSIG:
+            return "RRSIG";
+        case DNS_TYPE_NSEC:
+            return "NSEC";
+        case DNS_TYPE_DNSKEY:
+            return "DNSKEY";
+        case DNS_TYPE_NSEC3:
+            return "NSEC3";
+        case DNS_TYPE_NSEC3PARAM:
+            return "NSEC3PARAM";
+        case DNS_TYPE_TLSA:
+            return "TLSA";
+        case DNS_TYPE_CDS:
+            return "CDS";
+        case DNS_TYPE_CDNSKEY:
+            return "CDNSKEY";
+        case DNS_TYPE_SVCB:
+            return "SVCB";
+        case DNS_TYPE_HTTPS:
+            return "HTTPS";
+        case DNS_TYPE_URI:
+            return "URI";
+        case DNS_TYPE_CAA:
+            return "CAA";
+        case DNS_TYPE_IXFR:
+            return "IXFR";
+        case DNS_TYPE_AXFR:
+            return "AXFR";
+        case DNS_TYPE_ANY:
+            return "ANY";
         default: {
             static char buf[12];
             snprintf(buf, sizeof(buf), "TYPE%u", (unsigned) t);
@@ -503,33 +754,64 @@ const char *type2str(uint16_t t) {
 }
 
 uint16_t str2type(const char *s) {
-    if (!strcasecmp(s, "A"))         return DNS_TYPE_A;
-    if (!strcasecmp(s, "NS"))        return DNS_TYPE_NS;
-    if (!strcasecmp(s, "CNAME"))     return DNS_TYPE_CNAME;
-    if (!strcasecmp(s, "SOA"))       return DNS_TYPE_SOA;
-    if (!strcasecmp(s, "PTR"))       return DNS_TYPE_PTR;
-    if (!strcasecmp(s, "MX"))        return DNS_TYPE_MX;
-    if (!strcasecmp(s, "TXT"))       return DNS_TYPE_TXT;
-    if (!strcasecmp(s, "AAAA"))      return DNS_TYPE_AAAA;
-    if (!strcasecmp(s, "LOC"))       return DNS_TYPE_LOC;
-    if (!strcasecmp(s, "SRV"))       return DNS_TYPE_SRV;
-    if (!strcasecmp(s, "NAPTR"))     return DNS_TYPE_NAPTR;
-    if (!strcasecmp(s, "DNAME"))     return DNS_TYPE_DNAME;
-    if (!strcasecmp(s, "SSHFP"))     return DNS_TYPE_SSHFP;
-    if (!strcasecmp(s, "DS"))        return DNS_TYPE_DS;
-    if (!strcasecmp(s, "RRSIG"))     return DNS_TYPE_RRSIG;
-    if (!strcasecmp(s, "NSEC"))      return DNS_TYPE_NSEC;
-    if (!strcasecmp(s, "DNSKEY"))    return DNS_TYPE_DNSKEY;
-    if (!strcasecmp(s, "NSEC3"))     return DNS_TYPE_NSEC3;
-    if (!strcasecmp(s, "NSEC3PARAM")) return DNS_TYPE_NSEC3PARAM;
-    if (!strcasecmp(s, "TLSA"))      return DNS_TYPE_TLSA;
-    if (!strcasecmp(s, "CDS"))       return DNS_TYPE_CDS;
-    if (!strcasecmp(s, "CDNSKEY"))   return DNS_TYPE_CDNSKEY;
-    if (!strcasecmp(s, "URI"))       return DNS_TYPE_URI;
-    if (!strcasecmp(s, "CAA"))       return DNS_TYPE_CAA;
-    if (!strcasecmp(s, "IXFR"))      return DNS_TYPE_IXFR;
-    if (!strcasecmp(s, "AXFR"))      return DNS_TYPE_AXFR;
-    if (!strcasecmp(s, "ANY"))       return DNS_TYPE_ANY;
+    if (!strcasecmp(s, "A"))
+        return DNS_TYPE_A;
+    if (!strcasecmp(s, "NS"))
+        return DNS_TYPE_NS;
+    if (!strcasecmp(s, "CNAME"))
+        return DNS_TYPE_CNAME;
+    if (!strcasecmp(s, "SOA"))
+        return DNS_TYPE_SOA;
+    if (!strcasecmp(s, "PTR"))
+        return DNS_TYPE_PTR;
+    if (!strcasecmp(s, "MX"))
+        return DNS_TYPE_MX;
+    if (!strcasecmp(s, "TXT"))
+        return DNS_TYPE_TXT;
+    if (!strcasecmp(s, "AAAA"))
+        return DNS_TYPE_AAAA;
+    if (!strcasecmp(s, "LOC"))
+        return DNS_TYPE_LOC;
+    if (!strcasecmp(s, "SRV"))
+        return DNS_TYPE_SRV;
+    if (!strcasecmp(s, "NAPTR"))
+        return DNS_TYPE_NAPTR;
+    if (!strcasecmp(s, "DNAME"))
+        return DNS_TYPE_DNAME;
+    if (!strcasecmp(s, "SSHFP"))
+        return DNS_TYPE_SSHFP;
+    if (!strcasecmp(s, "DS"))
+        return DNS_TYPE_DS;
+    if (!strcasecmp(s, "RRSIG"))
+        return DNS_TYPE_RRSIG;
+    if (!strcasecmp(s, "NSEC"))
+        return DNS_TYPE_NSEC;
+    if (!strcasecmp(s, "DNSKEY"))
+        return DNS_TYPE_DNSKEY;
+    if (!strcasecmp(s, "NSEC3"))
+        return DNS_TYPE_NSEC3;
+    if (!strcasecmp(s, "NSEC3PARAM"))
+        return DNS_TYPE_NSEC3PARAM;
+    if (!strcasecmp(s, "TLSA"))
+        return DNS_TYPE_TLSA;
+    if (!strcasecmp(s, "CDS"))
+        return DNS_TYPE_CDS;
+    if (!strcasecmp(s, "CDNSKEY"))
+        return DNS_TYPE_CDNSKEY;
+    if (!strcasecmp(s, "SVCB"))
+        return DNS_TYPE_SVCB;
+    if (!strcasecmp(s, "HTTPS"))
+        return DNS_TYPE_HTTPS;
+    if (!strcasecmp(s, "URI"))
+        return DNS_TYPE_URI;
+    if (!strcasecmp(s, "CAA"))
+        return DNS_TYPE_CAA;
+    if (!strcasecmp(s, "IXFR"))
+        return DNS_TYPE_IXFR;
+    if (!strcasecmp(s, "AXFR"))
+        return DNS_TYPE_AXFR;
+    if (!strcasecmp(s, "ANY"))
+        return DNS_TYPE_ANY;
     /* Numeric TYPE<n> notation (RFC 3597) */
     if (!strncasecmp(s, "TYPE", 4) && s[4] >= '0' && s[4] <= '9')
         return (uint16_t) atoi(s + 4);
@@ -541,8 +823,7 @@ uint16_t str2type(const char *s) {
 /* ── RFC 1982 serial-number arithmetic ───────────────────────────────────── */
 
 int serial_lt(uint32_t a, uint32_t b) {
-    return (a != b) &&
-           (((b - a) & 0x80000000u) == 0);
+    return (a != b) && (((b - a) & 0x80000000u) == 0);
 }
 
 int serial_ge(uint32_t a, uint32_t b) {

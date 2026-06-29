@@ -22,6 +22,8 @@
  *   6303       Locally served DNS zones (RFC 6303)
  *   7344/8078  CDS/CDNSKEY – child signals for DNSSEC delegation
  *   7553       URI records
+ *   9460       SVCB / HTTPS service-binding records (SvcParams stored as TLV;
+ *              query + AXFR serve, DNSSEC-signed)
  *   1035 PTR   Reverse DNS — serve in-addr.arpa / ip6.arpa zones (query/AXFR);
  *              optional auto-PTR for DDNS A/AAAA (config:ddns_auto_ptr)
  *   9250 stub  NAPTR records (query/serve)
@@ -4776,8 +4778,7 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
         const struct in_addr zero = {0};
         compute_server_cookie(ei->client_cookie, cip ? cip : &zero, (uint32_t) time(NULL), sc);
     }
-    return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei,
-                           g_nsid[0] ? g_nsid : NULL,
+    return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei, g_nsid[0] ? g_nsid : NULL,
                            (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text);
 }
 
@@ -5116,6 +5117,16 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
             if (nn2 > 0)
                 rp2 += nn2;
             return rp2;
+        }
+        case DNS_TYPE_SVCB:
+        case DNS_TYPE_HTTPS: {
+            /* Stored value is hex(TLV) — the ADR-003 structured SvcParams
+             * encoding. Decode to the TLV blob, then emit RFC 9460 wire. */
+            uint8_t tlv[512];
+            int tl = hex_dec(pipe, tlv, sizeof(tlv));
+            if (tl < 0)
+                return -1;
+            return svcb_tlv_to_wire(tlv, tl, rd, rdcap);
         }
         default:
             return -1;
@@ -5513,7 +5524,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         rh->flags = htons(DNS_QR | DNS_AA | (DNS_RCODE_BADVERS & 0xF));
         rh->ancount = rh->nscount = htons(0);
         off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0,
-                              (uint16_t) ((DNS_RCODE_BADVERS >> 4) & 0xFF), &ei, cip, -1, NULL);
+                            (uint16_t) ((DNS_RCODE_BADVERS >> 4) & 0xFF), &ei, cip, -1, NULL);
         return off;
     }
     if (!cookie_verify(&ei, cip)) {
@@ -5523,7 +5534,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         rh->flags = htons(DNS_QR | DNS_AA | (DNS_RCODE_BADCOOKIE & 0xF));
         rh->ancount = rh->nscount = htons(0);
         off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0,
-                              (uint16_t) ((DNS_RCODE_BADCOOKIE >> 4) & 0xFF), &ei, cip, -1, NULL);
+                            (uint16_t) ((DNS_RCODE_BADCOOKIE >> 4) & 0xFF), &ei, cip, -1, NULL);
         dns_log(LOG_DEBUG, "[COOKIE] BADCOOKIE %s %s\n", type2str(qtype), qname);
         return off;
     }
@@ -5562,7 +5573,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             } else
                 off = 12;
             off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, EDE_NOT_AUTH,
-                                  "Not authoritative for this zone");
+                                "Not authoritative for this zone");
             dns_log(LOG_DEBUG, "[REFUSED] %s %s\n", type2str(qtype), qname);
             STAT_INC(g_stat_refused);
             return off;
@@ -5602,7 +5613,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             rh->nscount = htons(ntohs(rh->nscount) + (uint16_t) ac2);
         }
         off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, EDE_NXDOMAIN,
-                              "Locally served zone");
+                            "Locally served zone");
         return off;
     }
     /* DNSSEC signing keys for the matched zone (NULL for locally-served zones). */
@@ -5981,19 +5992,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Provisioned record types from Valkey */
     {
-        uint16_t pts[] = {DNS_TYPE_CNAME,
-                          DNS_TYPE_MX,
-                          DNS_TYPE_TXT,
-                          DNS_TYPE_NS,
-                          DNS_TYPE_SRV,
-                          DNS_TYPE_CAA,
-                          DNS_TYPE_SSHFP,
-                          DNS_TYPE_TLSA,
-                          DNS_TYPE_DNAME,
-                          DNS_TYPE_LOC,
-                          DNS_TYPE_URI,
-                          DNS_TYPE_NAPTR,
-                          0};
+        uint16_t pts[] = {
+            DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,  DNS_TYPE_NS,    DNS_TYPE_SRV,
+            DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA, DNS_TYPE_DNAME, DNS_TYPE_LOC,
+            DNS_TYPE_URI,   DNS_TYPE_NAPTR, DNS_TYPE_SVCB, DNS_TYPE_HTTPS, 0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)
@@ -6958,6 +6960,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
         {"SRV", DNS_TYPE_SRV},   {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
         {"TLSA", DNS_TYPE_TLSA}, {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
         {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
+        {"SVCB", DNS_TYPE_SVCB}, {"HTTPS", DNS_TYPE_HTTPS},
     };
     /* ddns:* leases that transfer: A/AAAA plus auto-PTR reverse records. */
     static const xtype_t dtypes[] = {

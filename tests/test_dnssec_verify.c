@@ -417,8 +417,8 @@ static void run_canon_mx(uint8_t alg) {
     o += publen;
     int plen = o;
 
-    int r = dnssec_verify_rrset(pkt, plen, &mx_off, 1, pkt + rrsig_rd_off, rrsig_rdlen, pkt + dk_off,
-                                4 + publen);
+    int r = dnssec_verify_rrset(pkt, plen, &mx_off, 1, pkt + rrsig_rd_off, rrsig_rdlen,
+                                pkt + dk_off, 4 + publen);
     CHECK(r == 1, "canonical signer: mixed-case MX verifies");
 
     /* Negative: re-sign the rdata VERBATIM (pre-fix behavior) and swap the

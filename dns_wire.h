@@ -33,7 +33,7 @@
 #define DNS_TYPE_DNAME 39
 #define DNS_TYPE_OPT 41
 #define DNS_TYPE_SSHFP 44
-#define DNS_TYPE_DS 43      /* RFC 4034 §5 — delegation signer */
+#define DNS_TYPE_DS 43 /* RFC 4034 §5 — delegation signer */
 #define DNS_TYPE_RRSIG 46
 #define DNS_TYPE_NSEC 47
 #define DNS_TYPE_DNSKEY 48
@@ -42,6 +42,8 @@
 #define DNS_TYPE_TLSA 52
 #define DNS_TYPE_CDS 59     /* RFC 7344 — child DS */
 #define DNS_TYPE_CDNSKEY 60 /* RFC 7344 — child DNSKEY */
+#define DNS_TYPE_SVCB 64    /* RFC 9460 — service binding */
+#define DNS_TYPE_HTTPS 65   /* RFC 9460 — HTTPS-specific service binding */
 #define DNS_TYPE_URI 256    /* RFC 7553 */
 #define DNS_TYPE_CAA 257
 #define DNS_TYPE_IXFR 251 /* RFC 1995 — incremental zone transfer */
@@ -76,9 +78,9 @@
 #define DNS_RCODE_NOTIMP 4
 #define DNS_RCODE_REFUSED 5
 #define DNS_RCODE_YXDOMAIN 6
-#define DNS_RCODE_YXRRSET 7   /* RFC 2136: RRset should not exist but does */
-#define DNS_RCODE_NXRRSET 8   /* RFC 2136: RRset should exist but does not */
-#define DNS_RCODE_NOTAUTH 9   /* RFC 2136 §2.2: not authoritative / not authorized */
+#define DNS_RCODE_YXRRSET 7 /* RFC 2136: RRset should not exist but does */
+#define DNS_RCODE_NXRRSET 8 /* RFC 2136: RRset should exist but does not */
+#define DNS_RCODE_NOTAUTH 9 /* RFC 2136 §2.2: not authoritative / not authorized */
 #define DNS_RCODE_NOTZONE 10
 #define DNS_RCODE_BADVERS 16
 #define DNS_RCODE_BADSIG 17
@@ -324,6 +326,36 @@ int tlv_version(const uint8_t *buf, int buflen);
  * and -1 on malformed framing (truncated header or value running past buflen). */
 int tlv_next(const uint8_t *buf, int buflen, int *off, uint8_t *tag, const uint8_t **val,
              uint16_t *vlen);
+
+/* ── RFC 9460 SVCB / HTTPS service binding ────────────────────────────────────
+ * SvcParamKeys (IANA registry). */
+#define SVCB_KEY_MANDATORY 0
+#define SVCB_KEY_ALPN 1
+#define SVCB_KEY_NO_DEFAULT_ALPN 2
+#define SVCB_KEY_PORT 3
+#define SVCB_KEY_IPV4HINT 4
+#define SVCB_KEY_ECH 5
+#define SVCB_KEY_IPV6HINT 6
+#define SVCB_KEY_MAX 6
+
+/* On-Valkey value is a TLV blob (ADR-003 — SvcParams off the pipe delimiter):
+ *   SVCB_TLV_PRIORITY(u16)  SVCB_TLV_TARGET(presentation name)
+ *   { (SVCB_TLV_PARAM_BASE | key) : SvcParamValue in RFC 9460 wire form }*
+ * One param tag per key; svcb_tlv_to_wire emits them ascending by key. */
+#define SVCB_TLV_VERSION 1
+#define SVCB_TLV_PRIORITY 0x01
+#define SVCB_TLV_TARGET 0x02
+#define SVCB_TLV_PARAM_BASE 0x10 /* 0x10..0x16 = SvcParamKey 0..6 */
+
+/* Parse RFC 9460 §2.1 zone-file presentation (e.g.
+ * "1 svc.example.net. alpn=h2,h3 port=8443 ipv4hint=192.0.2.1 ipv6hint=2001:db8::1")
+ * into a TLV blob. AliasMode (priority 0) carries only the target. Returns the
+ * blob length or -1 on malformed input / overflow. Used by the control plane. */
+int svcb_present_to_tlv(const char *present, uint8_t *tlv, int cap);
+
+/* Emit RFC 9460 §2.2 rdata (SvcPriority(2) | TargetName | SvcParams sorted by
+ * key) from a TLV blob. Returns the rdata length or -1. Used by dnsd. */
+int svcb_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap);
 
 /* ── Schema version contract (ADR-003) ────────────────────────────────────────
  * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the

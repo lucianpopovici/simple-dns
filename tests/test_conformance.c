@@ -72,23 +72,12 @@ static void test_type_names(void) {
         uint16_t t;
         const char *name;
     } cases[] = {
-        {DNS_TYPE_A, "A"},
-        {DNS_TYPE_NS, "NS"},
-        {DNS_TYPE_CNAME, "CNAME"},
-        {DNS_TYPE_SOA, "SOA"},
-        {DNS_TYPE_PTR, "PTR"},
-        {DNS_TYPE_MX, "MX"},
-        {DNS_TYPE_TXT, "TXT"},
-        {DNS_TYPE_AAAA, "AAAA"},
-        {DNS_TYPE_SRV, "SRV"},
-        {DNS_TYPE_TLSA, "TLSA"},
-        {DNS_TYPE_CAA, "CAA"},
-        {DNS_TYPE_DS, "DS"},
-        {DNS_TYPE_RRSIG, "RRSIG"},
-        {DNS_TYPE_NSEC, "NSEC"},
-        {DNS_TYPE_DNSKEY, "DNSKEY"},
-        {DNS_TYPE_NSEC3, "NSEC3"},
-        {DNS_TYPE_ANY, "ANY"},
+        {DNS_TYPE_A, "A"},         {DNS_TYPE_NS, "NS"},     {DNS_TYPE_CNAME, "CNAME"},
+        {DNS_TYPE_SOA, "SOA"},     {DNS_TYPE_PTR, "PTR"},   {DNS_TYPE_MX, "MX"},
+        {DNS_TYPE_TXT, "TXT"},     {DNS_TYPE_AAAA, "AAAA"}, {DNS_TYPE_SRV, "SRV"},
+        {DNS_TYPE_TLSA, "TLSA"},   {DNS_TYPE_CAA, "CAA"},   {DNS_TYPE_DS, "DS"},
+        {DNS_TYPE_RRSIG, "RRSIG"}, {DNS_TYPE_NSEC, "NSEC"}, {DNS_TYPE_DNSKEY, "DNSKEY"},
+        {DNS_TYPE_NSEC3, "NSEC3"}, {DNS_TYPE_ANY, "ANY"},
     };
     for (int i = 0; i < (int) (sizeof(cases) / sizeof(cases[0])); i++) {
         const char *got = type2str(cases[i].t);
@@ -180,23 +169,23 @@ static void test_edns_parse(void) {
     off = 12;
 
     /* Question: root (1-byte 0), type A, class IN */
-    pkt[off++] = 0;        /* root name */
+    pkt[off++] = 0; /* root name */
     put16(pkt, off, DNS_TYPE_A);
     off += 2;
     put16(pkt, off, DNS_CLASS_IN);
     off += 2;
 
     /* OPT RR: name=0 (root), type=41, class=maxudp, ttl=version|flags, rdlen=0 */
-    pkt[off++] = 0;                /* root name */
+    pkt[off++] = 0; /* root name */
     put16(pkt, off, DNS_TYPE_OPT);
     off += 2;
-    put16(pkt, off, 1232);         /* max UDP payload */
+    put16(pkt, off, 1232); /* max UDP payload */
     off += 2;
-    pkt[off++] = 0;                /* extended rcode = 0 */
-    pkt[off++] = 0;                /* EDNS version = 0 */
-    pkt[off++] = 0x80;             /* DO bit (byte 6 of OPT RR from owner start) */
+    pkt[off++] = 0;    /* extended rcode = 0 */
+    pkt[off++] = 0;    /* EDNS version = 0 */
+    pkt[off++] = 0x80; /* DO bit (byte 6 of OPT RR from owner start) */
     pkt[off++] = 0;
-    put16(pkt, off, 0);            /* rdlen = 0 */
+    put16(pkt, off, 0); /* rdlen = 0 */
     off += 2;
 
     int plen = off;
@@ -255,14 +244,17 @@ static void test_edns_parse_nsid_cookie(void) {
     int off = 0;
 
     /* Header */
-    for (int i = 0; i < 12; i++) pkt[i] = 0;
+    for (int i = 0; i < 12; i++)
+        pkt[i] = 0;
     put16(pkt, 10, 1); /* arcount=1 */
     off = 12;
 
     /* OPT RR owner (root) */
     pkt[off++] = 0;
-    put16(pkt, off, DNS_TYPE_OPT); off += 2;
-    put16(pkt, off, 1232);         off += 2;
+    put16(pkt, off, DNS_TYPE_OPT);
+    off += 2;
+    put16(pkt, off, 1232);
+    off += 2;
     pkt[off++] = 0; /* rcode ext */
     pkt[off++] = 0; /* version */
     pkt[off++] = 0; /* flags hi */
@@ -270,18 +262,24 @@ static void test_edns_parse_nsid_cookie(void) {
 
     /* RDATA: NSID(code=3, len=0) + Cookie(code=10, len=8, value=1..8) */
     int rdlen_off = off;
-    put16(pkt, off, 0); off += 2; /* rdlen placeholder */
+    put16(pkt, off, 0);
+    off += 2; /* rdlen placeholder */
 
     int rdata_start = off;
-    put16(pkt, off, EDNS_OPT_NSID); off += 2;
-    put16(pkt, off, 0);             off += 2;   /* zero-length NSID request */
+    put16(pkt, off, EDNS_OPT_NSID);
+    off += 2;
+    put16(pkt, off, 0);
+    off += 2; /* zero-length NSID request */
 
     static const uint8_t ccookie[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    put16(pkt, off, EDNS_OPT_COOKIE); off += 2;
-    put16(pkt, off, 8);               off += 2;
-    memcpy(pkt + off, ccookie, 8);    off += 8;
+    put16(pkt, off, EDNS_OPT_COOKIE);
+    off += 2;
+    put16(pkt, off, 8);
+    off += 2;
+    memcpy(pkt + off, ccookie, 8);
+    off += 8;
 
-    put16(pkt, rdlen_off, (uint16_t)(off - rdata_start));
+    put16(pkt, rdlen_off, (uint16_t) (off - rdata_start));
 
     edns_info_t ei;
     edns_parse(pkt, off, &ei);
@@ -299,8 +297,7 @@ static void test_edns_append(void) {
     uint8_t buf[512];
     memset(buf, 0, sizeof(buf));
     /* arcount starts at 0 */
-    int off = edns_append_opt(buf, 12, sizeof(buf),
-                              0, 1, 0, NULL, NULL, NULL, -1, NULL);
+    int off = edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL);
     check(off > 12, "edns_append_opt returns new offset > 12");
     check(get16(buf, 10) == 1, "arcount incremented to 1");
     /* Verify OPT type at wire position 12: 1 byte root name + 2 bytes type */

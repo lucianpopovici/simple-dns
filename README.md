@@ -99,7 +99,7 @@ glance:
   locally-served zones, 8482 minimal-ANY, 9619 QDCOUNT enforcement.
 - **Record types**: A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV (2782),
   CAA (8659), SSHFP (4255), TLSA/DANE (6698/7671), LOC (1876), URI (7553),
-  NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078).
+  NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078), SVCB + HTTPS (9460).
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
   and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
   authenticated denial. Validation (in `resolverd.c`) covers the full
@@ -217,8 +217,18 @@ zone:example.local:TXT:_acme-challenge.host.example.local → 60|abc...123
 zone:example.local:MX:example.local                    →  300|10|mail.example.local
 zone:example.com:SRV:_xmpp._tcp.example.com            →  60|10|20|5222|xmpp.example.com
 zone:example.com:TLSA:_443._tcp.www.example.com        →  300|3|1|1|<sha256 hex>
+zone:example.com:HTTPS:www.example.com                 →  300|<hex-TLV>   (RFC 9460, see below)
 ddns:example.local:A:laptop.example.local              →  192.0.2.42   (TTL stored as key TTL)
 ```
+
+`SVCB`/`HTTPS` (RFC 9460) values are stored as `ttl|<hex-TLV>`, where the TLV is
+the ADR-003 structured encoding of SvcPriority + TargetName + SvcParams (kept off
+the fragile pipe delimiter). The blob is produced from zone-file presentation —
+e.g. `1 svc.example.net. alpn=h2,h3 port=8443 ipv4hint=192.0.2.1` — by
+`svcb_present_to_tlv` in `libdnswire` (the control plane's writer; the test
+helper `tests/test_svcb --encode "<presentation>"` emits the same hex). Supported
+SvcParamKeys: `mandatory`, `alpn`, `no-default-alpn`, `port`, `ipv4hint`, `ech`,
+`ipv6hint`.
 
 The primary zone (`config:zone_name`) seeds itself from the legacy global
 `config:*`/`dnssec:*` keys, so a single-zone deployment keeps its existing
