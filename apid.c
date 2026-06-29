@@ -446,68 +446,8 @@ static void serial_bump_zone(const char *zn) {
         dns_log(LOG_WARNING, "[apid] serial bump failed (Valkey down?)\n");
 }
 
-/* ── Record-type names (the types the management API provisions) ─────────── */
-static const char *type2str(uint16_t t) {
-    switch (t) {
-        case 1:
-            return "A";
-        case 2:
-            return "NS";
-        case 5:
-            return "CNAME";
-        case 12:
-            return "PTR";
-        case 15:
-            return "MX";
-        case 16:
-            return "TXT";
-        case 28:
-            return "AAAA";
-        case 29:
-            return "LOC";
-        case 33:
-            return "SRV";
-        case 39:
-            return "DNAME";
-        case 44:
-            return "SSHFP";
-        case 52:
-            return "TLSA";
-        case 257:
-            return "CAA";
-        default:
-            return "?";
-    }
-}
-static uint16_t str2type(const char *s) {
-    if (!strcasecmp(s, "A"))
-        return 1;
-    if (!strcasecmp(s, "NS"))
-        return 2;
-    if (!strcasecmp(s, "CNAME"))
-        return 5;
-    if (!strcasecmp(s, "PTR"))
-        return 12;
-    if (!strcasecmp(s, "MX"))
-        return 15;
-    if (!strcasecmp(s, "TXT"))
-        return 16;
-    if (!strcasecmp(s, "AAAA"))
-        return 28;
-    if (!strcasecmp(s, "LOC"))
-        return 29;
-    if (!strcasecmp(s, "SRV"))
-        return 33;
-    if (!strcasecmp(s, "DNAME"))
-        return 39;
-    if (!strcasecmp(s, "SSHFP"))
-        return 44;
-    if (!strcasecmp(s, "TLSA"))
-        return 52;
-    if (!strcasecmp(s, "CAA"))
-        return 257;
-    return 0;
-}
+/* Record-type name <-> number come from libdnswire (type2str/str2type in
+ * dns_wire.h) — the single shared table. apid no longer keeps its own copy. */
 
 /* ── TLS context (server side; mTLS when CA provided) ────────────────────── */
 static SSL_CTX *tls_ctx_from_pem(const char *cert_pem, const char *key_pem, const char *ca_pem,
