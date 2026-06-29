@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -429,6 +429,38 @@ check-negttl: $(BIN_DEBUG)
 	 if [ -n "$$SAVE_TTL" ]; then $$VC set config:soa_ttl "$$SAVE_TTL" >/dev/null; else $$VC del config:soa_ttl >/dev/null; fi; \
 	 test $$rc -eq 0 || exit 1;                                                        \
 	 echo "  OK  RFC 9077 negative TTLs capped to min(MINIMUM, SOA-TTL); positive SOA at SOA-TTL"
+
+# RFC 9460 SVCB/HTTPS. First the libdnswire codec known-answer/negative tests
+# (presentation -> TLV -> wire); then an end-to-end serve check: encode a record
+# with the same test binary, store it as a hex-TLV HTTPS value, and confirm dnsd
+# emits wire that dig parses back to the expected SvcParams.
+check-svcb: tests/test_svcb.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_svcb"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_svcb \
+	      tests/test_svcb.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_svcb
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
+	 Z=example.local; N=svc.$$Z;                                                       \
+	 PRES="1 svc.example.net. alpn=h2,h3 port=8443 ipv4hint=192.0.2.1";               \
+	 HEX=$$(./tests/test_svcb --encode "$$PRES");                                      \
+	 test -n "$$HEX" || { echo "  FAIL  encoder produced no TLV"; exit 1; };           \
+	 $$VC set zone:$$Z:HTTPS:$$N "300|$$HEX" >/dev/null;                               \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_svcb.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 OUT=$$(dig +nocookie +noall +answer @127.0.0.1 -p $(TPORT) $$N HTTPS +time=2 +tries=1); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone:$$Z:HTTPS:$$N >/dev/null;                                           \
+	 echo "  dig: $$(echo "$$OUT" | tr -s ' ')";                                       \
+	 echo "$$OUT" | grep -qiE "TYPE65|\\\\#" && { echo "  SKIP  dig too old to parse HTTPS (generic format)"; exit 0; }; \
+	 echo "$$OUT" | grep -qi "HTTPS" || { echo "  FAIL  no HTTPS record served"; exit 1; }; \
+	 echo "$$OUT" | grep -qi "1 svc.example.net" || { echo "  FAIL  wrong priority/target"; exit 1; }; \
+	 echo "$$OUT" | grep -qi "alpn=.*h2.*h3" || { echo "  FAIL  alpn not h2,h3"; exit 1; }; \
+	 echo "$$OUT" | grep -qi "port=8443" || { echo "  FAIL  port != 8443"; exit 1; }; \
+	 echo "$$OUT" | grep -qi "ipv4hint=192.0.2.1" || { echo "  FAIL  ipv4hint != 192.0.2.1"; exit 1; }; \
+	 echo "  OK  SVCB/HTTPS codec KAT + dnsd serves HTTPS that dig parses"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"

@@ -149,8 +149,16 @@ record formats here use the Phase-1 schema decision.
      field); the SOA RR is served at that TTL while negative-response NSEC/NSEC3
      + authority SOA are capped at `min(soa_ttl, soa_minimum)` per RFC 9077.
      `make check-negttl` (both min() arms) in CI. **Phase 2.2 correctness done
-     (9715 + 1982 + 9077).** Next: feature record types — **9460 (SVCB/HTTPS)**
-     on TLV per ADR-003, then 8976 (ZONEMD), 7477 (CSYNC), ENUM/NAPTR, etc.
+     (9715 + 1982 + 9077).**
+   - Feature record types: **9460 (SVCB/HTTPS) DONE 2026-06-26** — types 64/65
+     on TLV per ADR-003 (`svcb_present_to_tlv` + `svcb_tlv_to_wire` in
+     libdnswire; keys mandatory/alpn/no-default-alpn/port/ipv4hint/ech/ipv6hint).
+     dnsd serves over query + AXFR, DNSSEC-signed; `make check-svcb` (codec KAT +
+     dig integration) in CI. **Follow-up:** apid/dashboard presentation→TLV
+     writer (operators currently store the hex TLV directly; the encoder is
+     shared in libdnswire ready to adopt). Generic `keyNNNNN` SvcParams deferred.
+   - Next: 8976 (ZONEMD), 7477 (CSYNC), 5782 (DNSxL), 1794 (RR rotation),
+     6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation).
    - Then new record types/features: 9460 (SVCB/HTTPS), 8976 (ZONEMD), 7477
      (CSYNC), 5782 (DNSxL), 1794 (RR rotation), 6116/6117/6118 (ENUM over
      NAPTR), 2317 (classless reverse delegation), and the batch-3 complementary

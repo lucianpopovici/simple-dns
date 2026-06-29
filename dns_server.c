@@ -22,6 +22,8 @@
  *   6303       Locally served DNS zones (RFC 6303)
  *   7344/8078  CDS/CDNSKEY – child signals for DNSSEC delegation
  *   7553       URI records
+ *   9460       SVCB / HTTPS service-binding records (SvcParams stored as TLV;
+ *              query + AXFR serve, DNSSEC-signed)
  *   1035 PTR   Reverse DNS — serve in-addr.arpa / ip6.arpa zones (query/AXFR);
  *              optional auto-PTR for DDNS A/AAAA (config:ddns_auto_ptr)
  *   9250 stub  NAPTR records (query/serve)
@@ -5117,6 +5119,16 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
                 rp2 += nn2;
             return rp2;
         }
+        case DNS_TYPE_SVCB:
+        case DNS_TYPE_HTTPS: {
+            /* Stored value is hex(TLV) — the ADR-003 structured SvcParams
+             * encoding. Decode to the TLV blob, then emit RFC 9460 wire. */
+            uint8_t tlv[512];
+            int tl = hex_dec(pipe, tlv, sizeof(tlv));
+            if (tl < 0)
+                return -1;
+            return svcb_tlv_to_wire(tlv, tl, rd, rdcap);
+        }
         default:
             return -1;
     }
@@ -5993,6 +6005,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                           DNS_TYPE_LOC,
                           DNS_TYPE_URI,
                           DNS_TYPE_NAPTR,
+                          DNS_TYPE_SVCB,
+                          DNS_TYPE_HTTPS,
                           0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
@@ -6958,6 +6972,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
         {"SRV", DNS_TYPE_SRV},   {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
         {"TLSA", DNS_TYPE_TLSA}, {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
         {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
+        {"SVCB", DNS_TYPE_SVCB}, {"HTTPS", DNS_TYPE_HTTPS},
     };
     /* ddns:* leases that transfer: A/AAAA plus auto-PTR reverse records. */
     static const xtype_t dtypes[] = {
