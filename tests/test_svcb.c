@@ -77,8 +77,8 @@ static void kat_parse_back(void) {
             order_ok = 0;
         last_key = key;
         if (key == SVCB_KEY_ALPN)
-            seen_alpn = (vl == 6 && w[o] == 2 && w[o + 1] == 'h' && w[o + 2] == '2' && w[o + 3] == 2 &&
-                         w[o + 4] == 'h' && w[o + 5] == '3');
+            seen_alpn = (vl == 6 && w[o] == 2 && w[o + 1] == 'h' && w[o + 2] == '2' &&
+                         w[o + 3] == 2 && w[o + 4] == 'h' && w[o + 5] == '3');
         else if (key == SVCB_KEY_NO_DEFAULT_ALPN)
             seen_ndalpn = (vl == 0);
         else if (key == SVCB_KEY_PORT)
