@@ -469,13 +469,20 @@ int tlv_next(const uint8_t *buf, int buflen, int *off, uint8_t *tag, const uint8
 /* Map a SvcParamKey presentation name to its number (known keys only). Returns
  * -1 for unknown / generic keyNNNNN (unsupported in this version). */
 static int svcb_keyname(const char *s) {
-    if (!strcasecmp(s, "mandatory"))       return SVCB_KEY_MANDATORY;
-    if (!strcasecmp(s, "alpn"))            return SVCB_KEY_ALPN;
-    if (!strcasecmp(s, "no-default-alpn")) return SVCB_KEY_NO_DEFAULT_ALPN;
-    if (!strcasecmp(s, "port"))            return SVCB_KEY_PORT;
-    if (!strcasecmp(s, "ipv4hint"))        return SVCB_KEY_IPV4HINT;
-    if (!strcasecmp(s, "ech"))             return SVCB_KEY_ECH;
-    if (!strcasecmp(s, "ipv6hint"))        return SVCB_KEY_IPV6HINT;
+    if (!strcasecmp(s, "mandatory"))
+        return SVCB_KEY_MANDATORY;
+    if (!strcasecmp(s, "alpn"))
+        return SVCB_KEY_ALPN;
+    if (!strcasecmp(s, "no-default-alpn"))
+        return SVCB_KEY_NO_DEFAULT_ALPN;
+    if (!strcasecmp(s, "port"))
+        return SVCB_KEY_PORT;
+    if (!strcasecmp(s, "ipv4hint"))
+        return SVCB_KEY_IPV4HINT;
+    if (!strcasecmp(s, "ech"))
+        return SVCB_KEY_ECH;
+    if (!strcasecmp(s, "ipv6hint"))
+        return SVCB_KEY_IPV6HINT;
     return -1;
 }
 
@@ -680,35 +687,64 @@ int svcb_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap) {
 
 const char *type2str(uint16_t t) {
     switch (t) {
-        case DNS_TYPE_A:       return "A";
-        case DNS_TYPE_NS:      return "NS";
-        case DNS_TYPE_CNAME:   return "CNAME";
-        case DNS_TYPE_SOA:     return "SOA";
-        case DNS_TYPE_PTR:     return "PTR";
-        case DNS_TYPE_MX:      return "MX";
-        case DNS_TYPE_TXT:     return "TXT";
-        case DNS_TYPE_AAAA:    return "AAAA";
-        case DNS_TYPE_LOC:     return "LOC";
-        case DNS_TYPE_SRV:     return "SRV";
-        case DNS_TYPE_NAPTR:   return "NAPTR";
-        case DNS_TYPE_DNAME:   return "DNAME";
-        case DNS_TYPE_SSHFP:   return "SSHFP";
-        case DNS_TYPE_DS:      return "DS";
-        case DNS_TYPE_RRSIG:   return "RRSIG";
-        case DNS_TYPE_NSEC:    return "NSEC";
-        case DNS_TYPE_DNSKEY:  return "DNSKEY";
-        case DNS_TYPE_NSEC3:   return "NSEC3";
-        case DNS_TYPE_NSEC3PARAM: return "NSEC3PARAM";
-        case DNS_TYPE_TLSA:    return "TLSA";
-        case DNS_TYPE_CDS:     return "CDS";
-        case DNS_TYPE_CDNSKEY: return "CDNSKEY";
-        case DNS_TYPE_SVCB:    return "SVCB";
-        case DNS_TYPE_HTTPS:   return "HTTPS";
-        case DNS_TYPE_URI:     return "URI";
-        case DNS_TYPE_CAA:     return "CAA";
-        case DNS_TYPE_IXFR:    return "IXFR";
-        case DNS_TYPE_AXFR:    return "AXFR";
-        case DNS_TYPE_ANY:     return "ANY";
+        case DNS_TYPE_A:
+            return "A";
+        case DNS_TYPE_NS:
+            return "NS";
+        case DNS_TYPE_CNAME:
+            return "CNAME";
+        case DNS_TYPE_SOA:
+            return "SOA";
+        case DNS_TYPE_PTR:
+            return "PTR";
+        case DNS_TYPE_MX:
+            return "MX";
+        case DNS_TYPE_TXT:
+            return "TXT";
+        case DNS_TYPE_AAAA:
+            return "AAAA";
+        case DNS_TYPE_LOC:
+            return "LOC";
+        case DNS_TYPE_SRV:
+            return "SRV";
+        case DNS_TYPE_NAPTR:
+            return "NAPTR";
+        case DNS_TYPE_DNAME:
+            return "DNAME";
+        case DNS_TYPE_SSHFP:
+            return "SSHFP";
+        case DNS_TYPE_DS:
+            return "DS";
+        case DNS_TYPE_RRSIG:
+            return "RRSIG";
+        case DNS_TYPE_NSEC:
+            return "NSEC";
+        case DNS_TYPE_DNSKEY:
+            return "DNSKEY";
+        case DNS_TYPE_NSEC3:
+            return "NSEC3";
+        case DNS_TYPE_NSEC3PARAM:
+            return "NSEC3PARAM";
+        case DNS_TYPE_TLSA:
+            return "TLSA";
+        case DNS_TYPE_CDS:
+            return "CDS";
+        case DNS_TYPE_CDNSKEY:
+            return "CDNSKEY";
+        case DNS_TYPE_SVCB:
+            return "SVCB";
+        case DNS_TYPE_HTTPS:
+            return "HTTPS";
+        case DNS_TYPE_URI:
+            return "URI";
+        case DNS_TYPE_CAA:
+            return "CAA";
+        case DNS_TYPE_IXFR:
+            return "IXFR";
+        case DNS_TYPE_AXFR:
+            return "AXFR";
+        case DNS_TYPE_ANY:
+            return "ANY";
         default: {
             static char buf[12];
             snprintf(buf, sizeof(buf), "TYPE%u", (unsigned) t);
@@ -718,35 +754,64 @@ const char *type2str(uint16_t t) {
 }
 
 uint16_t str2type(const char *s) {
-    if (!strcasecmp(s, "A"))         return DNS_TYPE_A;
-    if (!strcasecmp(s, "NS"))        return DNS_TYPE_NS;
-    if (!strcasecmp(s, "CNAME"))     return DNS_TYPE_CNAME;
-    if (!strcasecmp(s, "SOA"))       return DNS_TYPE_SOA;
-    if (!strcasecmp(s, "PTR"))       return DNS_TYPE_PTR;
-    if (!strcasecmp(s, "MX"))        return DNS_TYPE_MX;
-    if (!strcasecmp(s, "TXT"))       return DNS_TYPE_TXT;
-    if (!strcasecmp(s, "AAAA"))      return DNS_TYPE_AAAA;
-    if (!strcasecmp(s, "LOC"))       return DNS_TYPE_LOC;
-    if (!strcasecmp(s, "SRV"))       return DNS_TYPE_SRV;
-    if (!strcasecmp(s, "NAPTR"))     return DNS_TYPE_NAPTR;
-    if (!strcasecmp(s, "DNAME"))     return DNS_TYPE_DNAME;
-    if (!strcasecmp(s, "SSHFP"))     return DNS_TYPE_SSHFP;
-    if (!strcasecmp(s, "DS"))        return DNS_TYPE_DS;
-    if (!strcasecmp(s, "RRSIG"))     return DNS_TYPE_RRSIG;
-    if (!strcasecmp(s, "NSEC"))      return DNS_TYPE_NSEC;
-    if (!strcasecmp(s, "DNSKEY"))    return DNS_TYPE_DNSKEY;
-    if (!strcasecmp(s, "NSEC3"))     return DNS_TYPE_NSEC3;
-    if (!strcasecmp(s, "NSEC3PARAM")) return DNS_TYPE_NSEC3PARAM;
-    if (!strcasecmp(s, "TLSA"))      return DNS_TYPE_TLSA;
-    if (!strcasecmp(s, "CDS"))       return DNS_TYPE_CDS;
-    if (!strcasecmp(s, "CDNSKEY"))   return DNS_TYPE_CDNSKEY;
-    if (!strcasecmp(s, "SVCB"))      return DNS_TYPE_SVCB;
-    if (!strcasecmp(s, "HTTPS"))     return DNS_TYPE_HTTPS;
-    if (!strcasecmp(s, "URI"))       return DNS_TYPE_URI;
-    if (!strcasecmp(s, "CAA"))       return DNS_TYPE_CAA;
-    if (!strcasecmp(s, "IXFR"))      return DNS_TYPE_IXFR;
-    if (!strcasecmp(s, "AXFR"))      return DNS_TYPE_AXFR;
-    if (!strcasecmp(s, "ANY"))       return DNS_TYPE_ANY;
+    if (!strcasecmp(s, "A"))
+        return DNS_TYPE_A;
+    if (!strcasecmp(s, "NS"))
+        return DNS_TYPE_NS;
+    if (!strcasecmp(s, "CNAME"))
+        return DNS_TYPE_CNAME;
+    if (!strcasecmp(s, "SOA"))
+        return DNS_TYPE_SOA;
+    if (!strcasecmp(s, "PTR"))
+        return DNS_TYPE_PTR;
+    if (!strcasecmp(s, "MX"))
+        return DNS_TYPE_MX;
+    if (!strcasecmp(s, "TXT"))
+        return DNS_TYPE_TXT;
+    if (!strcasecmp(s, "AAAA"))
+        return DNS_TYPE_AAAA;
+    if (!strcasecmp(s, "LOC"))
+        return DNS_TYPE_LOC;
+    if (!strcasecmp(s, "SRV"))
+        return DNS_TYPE_SRV;
+    if (!strcasecmp(s, "NAPTR"))
+        return DNS_TYPE_NAPTR;
+    if (!strcasecmp(s, "DNAME"))
+        return DNS_TYPE_DNAME;
+    if (!strcasecmp(s, "SSHFP"))
+        return DNS_TYPE_SSHFP;
+    if (!strcasecmp(s, "DS"))
+        return DNS_TYPE_DS;
+    if (!strcasecmp(s, "RRSIG"))
+        return DNS_TYPE_RRSIG;
+    if (!strcasecmp(s, "NSEC"))
+        return DNS_TYPE_NSEC;
+    if (!strcasecmp(s, "DNSKEY"))
+        return DNS_TYPE_DNSKEY;
+    if (!strcasecmp(s, "NSEC3"))
+        return DNS_TYPE_NSEC3;
+    if (!strcasecmp(s, "NSEC3PARAM"))
+        return DNS_TYPE_NSEC3PARAM;
+    if (!strcasecmp(s, "TLSA"))
+        return DNS_TYPE_TLSA;
+    if (!strcasecmp(s, "CDS"))
+        return DNS_TYPE_CDS;
+    if (!strcasecmp(s, "CDNSKEY"))
+        return DNS_TYPE_CDNSKEY;
+    if (!strcasecmp(s, "SVCB"))
+        return DNS_TYPE_SVCB;
+    if (!strcasecmp(s, "HTTPS"))
+        return DNS_TYPE_HTTPS;
+    if (!strcasecmp(s, "URI"))
+        return DNS_TYPE_URI;
+    if (!strcasecmp(s, "CAA"))
+        return DNS_TYPE_CAA;
+    if (!strcasecmp(s, "IXFR"))
+        return DNS_TYPE_IXFR;
+    if (!strcasecmp(s, "AXFR"))
+        return DNS_TYPE_AXFR;
+    if (!strcasecmp(s, "ANY"))
+        return DNS_TYPE_ANY;
     /* Numeric TYPE<n> notation (RFC 3597) */
     if (!strncasecmp(s, "TYPE", 4) && s[4] >= '0' && s[4] <= '9')
         return (uint16_t) atoi(s + 4);
@@ -758,8 +823,7 @@ uint16_t str2type(const char *s) {
 /* ── RFC 1982 serial-number arithmetic ───────────────────────────────────── */
 
 int serial_lt(uint32_t a, uint32_t b) {
-    return (a != b) &&
-           (((b - a) & 0x80000000u) == 0);
+    return (a != b) && (((b - a) & 0x80000000u) == 0);
 }
 
 int serial_ge(uint32_t a, uint32_t b) {

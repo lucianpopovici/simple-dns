@@ -2745,8 +2745,8 @@ finish_answer:
                         sizeof(hinfo_rd));
     /* We don't count this in answers to avoid recursion */ }
     /* EDNS OPT in response */
-    off = edns_append_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei,
-                          g_nsid[0] ? g_nsid : NULL, NULL, ede_code, ede_text);
+    off = edns_append_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, g_nsid[0] ? g_nsid : NULL,
+                          NULL, ede_code, ede_text);
     return off;
 }
 

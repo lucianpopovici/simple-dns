@@ -4778,8 +4778,7 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
         const struct in_addr zero = {0};
         compute_server_cookie(ei->client_cookie, cip ? cip : &zero, (uint32_t) time(NULL), sc);
     }
-    return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei,
-                           g_nsid[0] ? g_nsid : NULL,
+    return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei, g_nsid[0] ? g_nsid : NULL,
                            (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text);
 }
 
@@ -5525,7 +5524,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         rh->flags = htons(DNS_QR | DNS_AA | (DNS_RCODE_BADVERS & 0xF));
         rh->ancount = rh->nscount = htons(0);
         off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0,
-                              (uint16_t) ((DNS_RCODE_BADVERS >> 4) & 0xFF), &ei, cip, -1, NULL);
+                            (uint16_t) ((DNS_RCODE_BADVERS >> 4) & 0xFF), &ei, cip, -1, NULL);
         return off;
     }
     if (!cookie_verify(&ei, cip)) {
@@ -5535,7 +5534,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         rh->flags = htons(DNS_QR | DNS_AA | (DNS_RCODE_BADCOOKIE & 0xF));
         rh->ancount = rh->nscount = htons(0);
         off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0,
-                              (uint16_t) ((DNS_RCODE_BADCOOKIE >> 4) & 0xFF), &ei, cip, -1, NULL);
+                            (uint16_t) ((DNS_RCODE_BADCOOKIE >> 4) & 0xFF), &ei, cip, -1, NULL);
         dns_log(LOG_DEBUG, "[COOKIE] BADCOOKIE %s %s\n", type2str(qtype), qname);
         return off;
     }
@@ -5574,7 +5573,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             } else
                 off = 12;
             off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, EDE_NOT_AUTH,
-                                  "Not authoritative for this zone");
+                                "Not authoritative for this zone");
             dns_log(LOG_DEBUG, "[REFUSED] %s %s\n", type2str(qtype), qname);
             STAT_INC(g_stat_refused);
             return off;
@@ -5614,7 +5613,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             rh->nscount = htons(ntohs(rh->nscount) + (uint16_t) ac2);
         }
         off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, EDE_NXDOMAIN,
-                              "Locally served zone");
+                            "Locally served zone");
         return off;
     }
     /* DNSSEC signing keys for the matched zone (NULL for locally-served zones). */
@@ -5993,21 +5992,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Provisioned record types from Valkey */
     {
-        uint16_t pts[] = {DNS_TYPE_CNAME,
-                          DNS_TYPE_MX,
-                          DNS_TYPE_TXT,
-                          DNS_TYPE_NS,
-                          DNS_TYPE_SRV,
-                          DNS_TYPE_CAA,
-                          DNS_TYPE_SSHFP,
-                          DNS_TYPE_TLSA,
-                          DNS_TYPE_DNAME,
-                          DNS_TYPE_LOC,
-                          DNS_TYPE_URI,
-                          DNS_TYPE_NAPTR,
-                          DNS_TYPE_SVCB,
-                          DNS_TYPE_HTTPS,
-                          0};
+        uint16_t pts[] = {
+            DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,  DNS_TYPE_NS,    DNS_TYPE_SRV,
+            DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA, DNS_TYPE_DNAME, DNS_TYPE_LOC,
+            DNS_TYPE_URI,   DNS_TYPE_NAPTR, DNS_TYPE_SVCB, DNS_TYPE_HTTPS, 0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)

@@ -33,7 +33,7 @@
 #define DNS_TYPE_DNAME 39
 #define DNS_TYPE_OPT 41
 #define DNS_TYPE_SSHFP 44
-#define DNS_TYPE_DS 43      /* RFC 4034 §5 — delegation signer */
+#define DNS_TYPE_DS 43 /* RFC 4034 §5 — delegation signer */
 #define DNS_TYPE_RRSIG 46
 #define DNS_TYPE_NSEC 47
 #define DNS_TYPE_DNSKEY 48
@@ -78,9 +78,9 @@
 #define DNS_RCODE_NOTIMP 4
 #define DNS_RCODE_REFUSED 5
 #define DNS_RCODE_YXDOMAIN 6
-#define DNS_RCODE_YXRRSET 7   /* RFC 2136: RRset should not exist but does */
-#define DNS_RCODE_NXRRSET 8   /* RFC 2136: RRset should exist but does not */
-#define DNS_RCODE_NOTAUTH 9   /* RFC 2136 §2.2: not authoritative / not authorized */
+#define DNS_RCODE_YXRRSET 7 /* RFC 2136: RRset should not exist but does */
+#define DNS_RCODE_NXRRSET 8 /* RFC 2136: RRset should exist but does not */
+#define DNS_RCODE_NOTAUTH 9 /* RFC 2136 §2.2: not authoritative / not authorized */
 #define DNS_RCODE_NOTZONE 10
 #define DNS_RCODE_BADVERS 16
 #define DNS_RCODE_BADSIG 17
