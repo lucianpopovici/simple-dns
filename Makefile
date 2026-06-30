@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -461,6 +461,44 @@ check-svcb: tests/test_svcb.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h
 	 echo "$$OUT" | grep -qi "port=8443" || { echo "  FAIL  port != 8443"; exit 1; }; \
 	 echo "$$OUT" | grep -qi "ipv4hint=192.0.2.1" || { echo "  FAIL  ipv4hint != 192.0.2.1"; exit 1; }; \
 	 echo "  OK  SVCB/HTTPS codec KAT + dnsd serves HTTPS that dig parses"
+
+# RFC 8976 ZONEMD — codec KAT (TLV + canonical name ordering) plus an end-to-end
+# check: enable ZONEMD for the zone, let dnsd compute + publish the apex digest,
+# then have an INDEPENDENT python verifier AXFR the live zone and recompute the
+# SIMPLE/SHA-384 digest, asserting it matches what dnsd published. Needs Valkey +
+# python3 (+ dig for the optional presentation-format sanity).
+check-zonemd: tests/test_zonemd.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_zonemd"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_zonemd \
+	      tests/test_zonemd.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_zonemd
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };  \
+	 Z=example.local;                                                                  \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
+	 SAVE_ZM=$$($$VC get config:zone:$$Z:zonemd);                                      \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
+	 $$VC set config:zone:$$Z:zonemd 1 >/dev/null;                                     \
+	 $$VC set zone:$$Z:A:web.$$Z "120|10.1.2.3|10.1.2.4" >/dev/null;                   \
+	 $$VC set zone:$$Z:TXT:info.$$Z "120|hello-zonemd" >/dev/null;                     \
+	 $$VC del zone:$$Z:ZONEMD:$$Z >/dev/null;                                          \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_zonemd.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 DIGO=$$(dig +nocookie +noall +answer @127.0.0.1 -p $(TPORT) $$Z ZONEMD +time=2 +tries=1); \
+	 VER=$$(python3 tests/zonemd_verify.py 127.0.0.1 $(TPORT) $$Z 2>&1);               \
+	 RC=$$?;                                                                            \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z zone:$$Z:ZONEMD:$$Z >/dev/null; \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 if [ -n "$$SAVE_ZM" ]; then $$VC set config:zone:$$Z:zonemd "$$SAVE_ZM" >/dev/null; else $$VC del config:zone:$$Z:zonemd >/dev/null; fi; \
+	 echo "  dig: $$(echo "$$DIGO" | tr -s ' ')";                                      \
+	 echo "  verify: $$VER";                                                           \
+	 test "$$RC" -eq 0 || { echo "  FAIL  independent AXFR recompute disagrees with published ZONEMD"; exit 1; }; \
+	 echo "$$DIGO" | grep -qiE "TYPE63|\\\\#" && echo "  NOTE  dig too old for ZONEMD presentation (generic) — digest still verified"; \
+	 echo "$$DIGO" | grep -qi "ZONEMD" && { echo "$$DIGO" | grep -qi " 1 1 " || { echo "  FAIL  served ZONEMD is not scheme 1 / SHA-384"; exit 1; }; }; \
+	 echo "  OK  ZONEMD codec KAT + dnsd publishes a SIMPLE/SHA-384 digest that an independent AXFR recompute confirms"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1387,6 +1425,7 @@ clean:
 	      resolverd resolverd_debug \
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
+	      tests/test_zonemd \
 	      fuzz/fuzz_name_from_wire
 	@echo "  done"
 
@@ -1414,6 +1453,7 @@ help:
 	@echo "  make uninstall    Remove installed files"
 	@echo "  make check        Quick smoke-test (needs Valkey)"
 	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
+	@echo "  make check-zonemd    RFC 8976 ZONEMD codec KAT + AXFR digest recompute (needs Valkey + python3)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

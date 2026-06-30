@@ -31,6 +31,7 @@ tests/test_rollover
 tests/test_name_from_wire
 tests/test_conformance
 tests/test_svcb
+tests/test_zonemd
 fuzz/fuzz_name_from_wire
 fuzz/fuzz_response
 fuzz/fuzz_tlv

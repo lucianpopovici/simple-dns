@@ -683,6 +683,120 @@ int svcb_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap) {
     return o;
 }
 
+/* ── RFC 8976 ZONEMD codec (TLV schema documented in dns_wire.h) ───────────── */
+
+int zonemd_build_tlv(uint32_t serial, uint8_t scheme, uint8_t hashalg, const uint8_t *digest,
+                     int diglen, uint8_t *tlv, int cap) {
+    if (diglen < 0 || !digest)
+        return -1;
+    int off = tlv_begin(tlv, cap, ZONEMD_TLV_VERSION);
+    if (off < 0)
+        return -1;
+    off = tlv_put_u32(tlv, cap, off, ZONEMD_TLV_SERIAL, serial);
+    if (off < 0)
+        return -1;
+    off = tlv_put_u8(tlv, cap, off, ZONEMD_TLV_SCHEME, scheme);
+    if (off < 0)
+        return -1;
+    off = tlv_put_u8(tlv, cap, off, ZONEMD_TLV_HASHALG, hashalg);
+    if (off < 0)
+        return -1;
+    off = tlv_put(tlv, cap, off, ZONEMD_TLV_DIGEST, digest, diglen);
+    return off;
+}
+
+int zonemd_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap) {
+    if (tlv_version(tlv, tlvlen) != ZONEMD_TLV_VERSION)
+        return -1;
+    int have_serial = 0, have_scheme = 0, have_hashalg = 0, have_digest = 0;
+    uint32_t serial = 0;
+    uint8_t scheme = 0, hashalg = 0;
+    const uint8_t *digest = NULL;
+    uint16_t diglen = 0;
+    int off = 1;
+    uint8_t tag;
+    const uint8_t *val;
+    uint16_t vlen;
+    int rc;
+    while ((rc = tlv_next(tlv, tlvlen, &off, &tag, &val, &vlen)) == 1) {
+        if (tag == ZONEMD_TLV_SERIAL) {
+            if (vlen != 4)
+                return -1;
+            serial = ((uint32_t) val[0] << 24) | ((uint32_t) val[1] << 16) |
+                     ((uint32_t) val[2] << 8) | val[3];
+            have_serial = 1;
+        } else if (tag == ZONEMD_TLV_SCHEME) {
+            if (vlen != 1)
+                return -1;
+            scheme = val[0];
+            have_scheme = 1;
+        } else if (tag == ZONEMD_TLV_HASHALG) {
+            if (vlen != 1)
+                return -1;
+            hashalg = val[0];
+            have_hashalg = 1;
+        } else if (tag == ZONEMD_TLV_DIGEST) {
+            digest = val;
+            diglen = vlen;
+            have_digest = 1;
+        }
+        /* unknown tag → skip (additive forward-compat) */
+    }
+    if (rc < 0 || !have_serial || !have_scheme || !have_hashalg || !have_digest)
+        return -1;
+    if (6 + (int) diglen > outcap)
+        return -1;
+    int o = 0;
+    out[o++] = (uint8_t) (serial >> 24);
+    out[o++] = (uint8_t) (serial >> 16);
+    out[o++] = (uint8_t) (serial >> 8);
+    out[o++] = (uint8_t) (serial & 0xFF);
+    out[o++] = scheme;
+    out[o++] = hashalg;
+    if (diglen > 0) {
+        memcpy(out + o, digest, diglen);
+        o += diglen;
+    }
+    return o;
+}
+
+/* RFC 4034 §6.1 canonical name ordering — compare label-by-label from the right
+ * (TLD first), each label octet-wise on its lowercased form. */
+int canon_name_cmp(const char *a, const char *b) {
+    /* Split into labels (root "." → zero labels). */
+    char na[256], nb[256];
+    safe_strcpy(na, a, sizeof(na));
+    safe_strcpy(nb, b, sizeof(nb));
+    strlower(na);
+    strlower(nb);
+    const char *la[128];
+    const char *lb[128];
+    int ca = 0, cb = 0;
+    char *sp = NULL, *t;
+    for (t = strtok_r(na, ".", &sp); t && ca < 128; t = strtok_r(NULL, ".", &sp))
+        la[ca++] = t;
+    sp = NULL;
+    for (t = strtok_r(nb, ".", &sp); t && cb < 128; t = strtok_r(NULL, ".", &sp))
+        lb[cb++] = t;
+    /* Walk from the least significant (rightmost) label toward the root. */
+    int ia = ca - 1, ib = cb - 1;
+    while (ia >= 0 && ib >= 0) {
+        const char *sa = la[ia];
+        const char *sb = lb[ib];
+        size_t lena = strlen(sa), lenb = strlen(sb);
+        size_t min = lena < lenb ? lena : lenb;
+        int c = memcmp(sa, sb, min);
+        if (c)
+            return c;
+        if (lena != lenb)
+            return lena < lenb ? -1 : 1;
+        ia--;
+        ib--;
+    }
+    /* Shared suffix equal: the name with fewer labels sorts first. */
+    return (ca - cb);
+}
+
 /* ── DNS type name utilities ─────────────────────────────────────────────── */
 
 const char *type2str(uint16_t t) {
@@ -731,6 +845,8 @@ const char *type2str(uint16_t t) {
             return "CDS";
         case DNS_TYPE_CDNSKEY:
             return "CDNSKEY";
+        case DNS_TYPE_ZONEMD:
+            return "ZONEMD";
         case DNS_TYPE_SVCB:
             return "SVCB";
         case DNS_TYPE_HTTPS:
@@ -798,6 +914,8 @@ uint16_t str2type(const char *s) {
         return DNS_TYPE_CDS;
     if (!strcasecmp(s, "CDNSKEY"))
         return DNS_TYPE_CDNSKEY;
+    if (!strcasecmp(s, "ZONEMD"))
+        return DNS_TYPE_ZONEMD;
     if (!strcasecmp(s, "SVCB"))
         return DNS_TYPE_SVCB;
     if (!strcasecmp(s, "HTTPS"))

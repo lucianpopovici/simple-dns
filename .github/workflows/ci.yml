@@ -66,6 +66,12 @@ jobs:
           make check-conformance OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make check-svcb        OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 8976 ZONEMD (codec KAT + independent AXFR digest recompute)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-zonemd OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1
