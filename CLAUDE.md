@@ -342,7 +342,7 @@ HTTP front-ends. Define and enforce this.
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
 | `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid | Runtime configuration |
-| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
+| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
 | `ddns:*` | dnsd (RFC 2136 UPDATE), apid (HTTP `/update`, `ddns_secret`-gated) | dnsd | Dynamic records |
 | `ixfr:*` | dnsd (records each A/AAAA change) | dnsd | RFC 1995 IXFR journal (incremental diff; gap → AXFR fallback) |
 | `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |

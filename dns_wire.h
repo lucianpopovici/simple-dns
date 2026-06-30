@@ -42,6 +42,7 @@
 #define DNS_TYPE_TLSA 52
 #define DNS_TYPE_CDS 59     /* RFC 7344 — child DS */
 #define DNS_TYPE_CDNSKEY 60 /* RFC 7344 — child DNSKEY */
+#define DNS_TYPE_ZONEMD 63  /* RFC 8976 — message digest for DNS zones */
 #define DNS_TYPE_SVCB 64    /* RFC 9460 — service binding */
 #define DNS_TYPE_HTTPS 65   /* RFC 9460 — HTTPS-specific service binding */
 #define DNS_TYPE_URI 256    /* RFC 7553 */
@@ -356,6 +357,38 @@ int svcb_present_to_tlv(const char *present, uint8_t *tlv, int cap);
 /* Emit RFC 9460 §2.2 rdata (SvcPriority(2) | TargetName | SvcParams sorted by
  * key) from a TLV blob. Returns the rdata length or -1. Used by dnsd. */
 int svcb_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap);
+
+/* ── RFC 8976 ZONEMD (message digest for DNS zones) ───────────────────────────
+ * Schemes / hash algorithms (IANA). */
+#define ZONEMD_SCHEME_SIMPLE 1
+#define ZONEMD_HASH_SHA384 1
+#define ZONEMD_HASH_SHA512 2
+#define ZONEMD_SHA384_LEN 48
+#define ZONEMD_SHA512_LEN 64
+
+/* On-Valkey value is a server-generated TLV blob (ADR-003 — off the pipe
+ * delimiter; the variable-length binary digest fits a TLV item cleanly):
+ *   ZONEMD_TLV_SERIAL(u32) ZONEMD_TLV_SCHEME(u8) ZONEMD_TLV_HASHALG(u8)
+ *   ZONEMD_TLV_DIGEST(bytes) */
+#define ZONEMD_TLV_VERSION 1
+#define ZONEMD_TLV_SERIAL 0x01
+#define ZONEMD_TLV_SCHEME 0x02
+#define ZONEMD_TLV_HASHALG 0x03
+#define ZONEMD_TLV_DIGEST 0x04
+
+/* Build the ZONEMD TLV blob from components. Returns blob length or -1. */
+int zonemd_build_tlv(uint32_t serial, uint8_t scheme, uint8_t hashalg, const uint8_t *digest,
+                     int diglen, uint8_t *tlv, int cap);
+
+/* Emit RFC 8976 §2.2 rdata (Serial(4) | Scheme(1) | Hash Algorithm(1) |
+ * Digest) from a TLV blob. Returns the rdata length or -1. Used by dnsd. */
+int zonemd_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap);
+
+/* RFC 4034 §6.1 canonical DNS name ordering: compare two presentation names
+ * label-by-label from the RIGHT (TLD first), each label octet-wise on the
+ * lowercased form. Returns <0, 0, >0 like memcmp. (canon_rr_cmp is a bytewise
+ * compare valid only WITHIN one RRset; whole-zone ordering needs this.) */
+int canon_name_cmp(const char *a, const char *b);
 
 /* ── Schema version contract (ADR-003) ────────────────────────────────────────
  * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the

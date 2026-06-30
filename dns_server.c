@@ -24,6 +24,9 @@
  *   7553       URI records
  *   9460       SVCB / HTTPS service-binding records (SvcParams stored as TLV;
  *              query + AXFR serve, DNSSEC-signed)
+ *   8976       ZONEMD – whole-zone message digest (SIMPLE scheme, SHA-384);
+ *              server-computed over the AXFR RRset, recomputed on every serial
+ *              bump, opt-in via config:[zone:<z>:]zonemd (default off)
  *   1035 PTR   Reverse DNS — serve in-addr.arpa / ip6.arpa zones (query/AXFR);
  *              optional auto-PTR for DDNS A/AAAA (config:ddns_auto_ptr)
  *   9250 stub  NAPTR records (query/serve)
@@ -152,6 +155,9 @@
  *   config:zone:<zone>:serial  Per-zone SOA serial counter (primary keeps config:zone_serial)
  *   config:zone:<zone>:nsec3_iters / :nsec3_salt / :dnssec_nsec_mode
  *                              Per-zone denial config (defaults from the global config:* values)
+ *   config:[zone:<zone>:]zonemd  RFC 8976 opt-in (1 = publish apex ZONEMD; default off).
+ *                              dnsd writes the digest to zone:<zone>:ZONEMD:<apex> as
+ *                              ttl|hex(TLV) — server-generated, recomputed on each serial bump.
  *   dnssec:<zone>:{zsk,zsk_ed25519,ksk,ksk_ed25519}
  *                              Per-zone DNSSEC keys (primary adopts the legacy dnssec:* keys)
  *   The legacy single-zone keys (zone:<TYPE>:<name>, dnssec:zsk, …) are migrated
@@ -465,6 +471,10 @@ static void zone_rollover_load(zone_entry_t *z);
 static void zone_dnssec_reload(zone_entry_t *z);
 /* Reconcile catalog-zone (RFC 9432) membership: provision/deprovision members. */
 static void catalog_scan_all(void);
+/* RFC 8976: recompute the apex ZONEMD only if the stored digest is absent or
+ * stale (its serial != the zone's current serial). Idempotent — safe to call on
+ * boot and on every config/zone_table reload without churning a static zone. */
+static void zonemd_seed_if_stale(zone_entry_t *z);
 /* Serializes catalog scans so the boot / keyspace / rollover callers cannot
  * interleave a provision against a deprovision for the same slot. */
 static pthread_mutex_t g_catalog_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2277,6 +2287,12 @@ static void config_load_from_valkey(void) {
     dns_log(LOG_INFO, "[Config] dns:%d dot:%d http:%d https:%d zone:%s serial:%u\n", g_dns_port,
             g_dot_port, g_http_port, g_https_port, g_zone_name, g_soa_serial);
 }
+/* RFC 8976 ZONEMD recompute hook — defined later (needs the record encoders +
+ * SOA/DNSKEY builders). Called at the end of serial_bump so the apex ZONEMD
+ * digest always reflects the just-committed zone content (§3 — recompute on
+ * change, never per query). */
+static void zonemd_update(zone_entry_t *z, uint32_t new_serial);
+
 /* Bump a zone's SOA serial.  The persistent counter lives at
  * config:zone:<zone>:serial; the primary zone keeps the legacy
  * config:zone_serial key for backward compatibility. */
@@ -2295,6 +2311,7 @@ static uint32_t serial_bump(zone_entry_t *z) {
         if (primary)
             g_soa_serial = (uint32_t) ns;
         pthread_mutex_unlock(&g_soa_mutex);
+        zonemd_update(z, (uint32_t) ns);
         return (uint32_t) ns;
     }
     pthread_mutex_lock(&g_soa_mutex);
@@ -2309,6 +2326,7 @@ static uint32_t serial_bump(zone_entry_t *z) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%u", nv);
     vk_set(ikey, buf, 0);
+    zonemd_update(z, nv);
     return nv;
 }
 
@@ -3637,6 +3655,7 @@ static void zones_post_load(void) {
         zone_apply_config(&g_zones[i]);
         if (!g_zones[i].zsk && !g_zones[i].zsk_ed && !g_zones[i].ksk && !g_zones[i].ksk_ed)
             zone_dnssec_init(&g_zones[i]);
+        zonemd_seed_if_stale(&g_zones[i]);
     }
 }
 static void dnssec_init(void) {
@@ -5128,6 +5147,16 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
                 return -1;
             return svcb_tlv_to_wire(tlv, tl, rd, rdcap);
         }
+        case DNS_TYPE_ZONEMD: {
+            /* Stored value is hex(TLV) — the ADR-003 structured ZONEMD encoding
+             * (server-generated, see zonemd_update). Decode, then emit RFC 8976
+             * Serial|Scheme|HashAlg|Digest wire. */
+            uint8_t tlv[256];
+            int tl = hex_dec(pipe, tlv, sizeof(tlv));
+            if (tl < 0)
+                return -1;
+            return zonemd_tlv_to_wire(tlv, tl, rd, rdcap);
+        }
         default:
             return -1;
     }
@@ -5992,10 +6021,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Provisioned record types from Valkey */
     {
-        uint16_t pts[] = {
-            DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,  DNS_TYPE_NS,    DNS_TYPE_SRV,
-            DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA, DNS_TYPE_DNAME, DNS_TYPE_LOC,
-            DNS_TYPE_URI,   DNS_TYPE_NAPTR, DNS_TYPE_SVCB, DNS_TYPE_HTTPS, 0};
+        uint16_t pts[] = {DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,    DNS_TYPE_NS,
+                          DNS_TYPE_SRV,   DNS_TYPE_CAA,   DNS_TYPE_SSHFP,  DNS_TYPE_TLSA,
+                          DNS_TYPE_DNAME, DNS_TYPE_LOC,   DNS_TYPE_URI,    DNS_TYPE_NAPTR,
+                          DNS_TYPE_SVCB,  DNS_TYPE_HTTPS, DNS_TYPE_ZONEMD, 0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)
@@ -6942,6 +6971,359 @@ static void axfr_emit_one(int fd, SSL *ssl, uint16_t qid, const char *name, uint
     tcp_send_msg(fd, ssl, mb, mo);
 }
 
+/* ==========================================================================
+ * RFC 8976 ZONEMD — whole-zone message digest (SIMPLE scheme, SHA-384).
+ *
+ * The digest is computed over exactly the set of RRs that an AXFR of the zone
+ * transfers (SOA + static_zone + zone:<z>:* + ddns:<z>:A/AAAA/PTR + ZSK
+ * DNSKEY), reusing the same per-record encoders (build_soa_rdata_serial,
+ * stored_rdata, dnskey_rdata_*) so the digest can never diverge from the
+ * transfer. dnsd is an online signer, so RRSIG/NSEC are not materialised into
+ * the zone and are therefore (correctly) not part of the transferred set or the
+ * digest. The apex ZONEMD RRset itself is excluded (RFC 8976 §3.3.2). Recomputed
+ * only on serial_bump, then served + signed like any apex RRset — never per
+ * query. Opt-in: config:[zone:<z>:]zonemd (default off). check-zonemd's Python
+ * verifier independently recomputes the digest over the live AXFR.
+ * ======================================================================= */
+
+/* One canonical RR (RFC 4034 §6.2 form) collected for the digest. */
+typedef struct {
+    char owner[256]; /* lowercased owner — §6.1 cross-RRset ordering */
+    uint16_t type;
+    uint8_t *wire; /* canonical RR: owner|type|class|ttl|rdlen|canon_rdata */
+    int wirelen;
+    uint8_t *rdata; /* -> canonical rdata within wire (RRset tie-break) */
+    int rdatalen;
+} zmd_rr_t;
+
+#define ZMD_MAX_RR 200000
+
+/* Canonicalize one RR and append it to the growable collection. Returns 0 on
+ * success, -1 on error (encoding failure / overflow / OOM). */
+static int zmd_add(zmd_rr_t **arr, int *n, int *cap, const char *owner, uint16_t type, uint32_t ttl,
+                   const uint8_t *rdata, int rdlen) {
+    if (*n >= ZMD_MAX_RR)
+        return -1;
+    uint8_t canon[CANON_RR_MAX];
+    int clen = canon_rdata(rdata, rdlen, 0, rdlen, type, canon, (int) sizeof(canon));
+    if (clen < 0)
+        return -1;
+    char low[256];
+    safe_strcpy(low, owner, sizeof(low));
+    strlower(low);
+    uint8_t ow[256];
+    int owl = name_to_wire(low, ow, (int) sizeof(ow));
+    if (owl < 0)
+        return -1;
+    int wl = owl + 10 + clen;
+    uint8_t *w = malloc((size_t) wl);
+    if (!w)
+        return -1;
+    int p = 0;
+    memcpy(w, ow, (size_t) owl);
+    p += owl;
+    w[p++] = (uint8_t) (type >> 8);
+    w[p++] = (uint8_t) (type & 0xFF);
+    w[p++] = 0;
+    w[p++] = DNS_CLASS_IN;
+    w[p++] = (uint8_t) (ttl >> 24);
+    w[p++] = (uint8_t) ((ttl >> 16) & 0xFF);
+    w[p++] = (uint8_t) ((ttl >> 8) & 0xFF);
+    w[p++] = (uint8_t) (ttl & 0xFF);
+    w[p++] = (uint8_t) (clen >> 8);
+    w[p++] = (uint8_t) (clen & 0xFF);
+    memcpy(w + p, canon, (size_t) clen);
+    if (*n == *cap) {
+        int nc = *cap ? *cap * 2 : 256;
+        zmd_rr_t *na = realloc(*arr, (size_t) nc * sizeof(zmd_rr_t));
+        if (!na) {
+            free(w);
+            return -1;
+        }
+        *arr = na;
+        *cap = nc;
+    }
+    zmd_rr_t *e = &(*arr)[*n];
+    safe_strcpy(e->owner, low, sizeof(e->owner));
+    e->type = type;
+    e->wire = w;
+    e->wirelen = wl;
+    e->rdata = w + owl + 10;
+    e->rdatalen = clen;
+    (*n)++;
+    return 0;
+}
+
+/* RFC 8976 §3.3 ordering: by canonical owner (§6.1), then type, then canonical
+ * rdata as octet strings (§6.3). */
+static int zmd_cmp(const void *pa, const void *pb) {
+    const zmd_rr_t *a = (const zmd_rr_t *) pa;
+    const zmd_rr_t *b = (const zmd_rr_t *) pb;
+    int c = canon_name_cmp(a->owner, b->owner);
+    if (c)
+        return c;
+    if (a->type != b->type)
+        return a->type < b->type ? -1 : 1;
+    int min = a->rdatalen < b->rdatalen ? a->rdatalen : b->rdatalen;
+    c = memcmp(a->rdata, b->rdata, (size_t) min);
+    if (c)
+        return c;
+    return a->rdatalen - b->rdatalen;
+}
+
+/* Enumerate one ddns/zone A or AAAA stored value (ttl|ip|ip… or a bare ip) into
+ * per-address RRs. Mirrors axfr_send_runtime's A/AAAA handling. */
+static void zmd_add_addr(zmd_rr_t **arr, int *n, int *cap, const char *owner, uint16_t type,
+                         uint32_t ttl, char *iplist) {
+    const int af = (type == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
+    const int alen = (type == DNS_TYPE_AAAA) ? 16 : 4;
+    char *sp = NULL;
+    for (char *ip = strtok_r(iplist, "|", &sp); ip; ip = strtok_r(NULL, "|", &sp)) {
+        uint8_t rd[16];
+        if (inet_pton(af, ip, rd) == 1)
+            zmd_add(arr, n, cap, owner, type, ttl, rd, alen);
+    }
+}
+
+/* Compute the SIMPLE/SHA-384 digest of zone `z` at `serial`. Returns the digest
+ * length (48) on success, -1 on error. Caller sets t_zone = z. */
+static int zonemd_compute(zone_entry_t *z, uint32_t serial, uint8_t *out_digest) {
+    const char *zname = z ? z->name : g_zone_name;
+    zmd_rr_t *arr = NULL;
+    int n = 0, cap = 0;
+    int rc = 0;
+    /* Apex SOA — TTL matches the AXFR (soa_minimum). */
+    uint8_t soa_rd[512];
+    int soa_len = build_soa_rdata_serial(soa_rd, sizeof(soa_rd), serial);
+    uint32_t soa_ttl = z ? z->soa_minimum : g_soa_minimum;
+    if (soa_len > 0)
+        zmd_add(&arr, &n, &cap, zname, DNS_TYPE_SOA, soa_ttl, soa_rd, soa_len);
+    /* static_zone[] records belonging to this zone (same filter as AXFR). */
+    size_t znl = strlen(zname);
+    for (int i = 0; i < static_zone_sz; i++) {
+        dns_rec_t *r = &static_zone[i];
+        size_t rnl = strlen(r->name);
+        int in_zone = (rnl == znl && strcasecmp(r->name, zname) == 0) ||
+                      (rnl > znl + 1 && r->name[rnl - znl - 1] == '.' &&
+                       strcasecmp(r->name + rnl - znl, zname) == 0);
+        if (!in_zone)
+            continue;
+        uint8_t rd[256];
+        uint16_t rdlen = 0;
+        switch (r->type) {
+            case DNS_TYPE_A:
+                memcpy(rd, r->rdata_a, 4);
+                rdlen = 4;
+                break;
+            case DNS_TYPE_AAAA: {
+                struct in6_addr a6;
+                if (inet_pton(AF_INET6, r->rdata_str, &a6) != 1)
+                    continue;
+                memcpy(rd, &a6, 16);
+                rdlen = 16;
+                break;
+            }
+            case DNS_TYPE_CNAME:
+            case DNS_TYPE_NS: {
+                int nn = name_to_wire(r->rdata_str, rd, sizeof(rd));
+                if (nn < 0)
+                    continue;
+                rdlen = (uint16_t) nn;
+                break;
+            }
+            case DNS_TYPE_MX: {
+                rd[0] = r->rdata_pref >> 8;
+                rd[1] = r->rdata_pref & 0xFF;
+                int nn = name_to_wire(r->rdata_str, rd + 2, sizeof(rd) - 2);
+                if (nn < 0)
+                    continue;
+                rdlen = (uint16_t) (2 + nn);
+                break;
+            }
+            case DNS_TYPE_TXT: {
+                int tl = txt_encode(r->rdata_str, rd, (int) sizeof(rd));
+                if (tl < 0)
+                    continue;
+                rdlen = (uint16_t) tl;
+                break;
+            }
+            default:
+                continue;
+        }
+        zmd_add(&arr, &n, &cap, r->name, r->type, r->ttl, rd, rdlen);
+    }
+    /* Provisioned + dynamic records (zone:<z>:* and ddns:<z>:A/AAAA/PTR),
+     * mirroring axfr_send_runtime — but the apex ZONEMD RRset is EXCLUDED from
+     * its own digest (RFC 8976 §3.3.2), so it is omitted from ztypes here. */
+    static const uint16_t ztypes[] = {
+        DNS_TYPE_A,   DNS_TYPE_AAAA,  DNS_TYPE_CNAME, DNS_TYPE_MX,   DNS_TYPE_TXT,   DNS_TYPE_NS,
+        DNS_TYPE_SRV, DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA, DNS_TYPE_DNAME, DNS_TYPE_LOC,
+        DNS_TYPE_URI, DNS_TYPE_NAPTR, DNS_TYPE_PTR,   DNS_TYPE_SVCB, DNS_TYPE_HTTPS,
+    };
+    static const uint16_t dtypes[] = {DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_PTR};
+    for (int pass = 0; pass < 2; pass++) {
+        const char *ns = (pass == 0) ? "zone" : "ddns";
+        const uint16_t *tt = (pass == 0) ? ztypes : dtypes;
+        int ntypes = (pass == 0) ? (int) (sizeof(ztypes) / sizeof(ztypes[0]))
+                                 : (int) (sizeof(dtypes) / sizeof(dtypes[0]));
+        for (int ti = 0; ti < ntypes; ti++) {
+            uint16_t T = tt[ti];
+            char prefix[768], pat[800];
+            int pl = snprintf(prefix, sizeof(prefix), "%s:%s:%s:", ns, zname, type2str(T));
+            snprintf(pat, sizeof(pat), "%s*", prefix);
+            char **keys = NULL;
+            int nk = vk_list_keys(pat, &keys);
+            for (int i = 0; i < nk; i++) {
+                const char *name = keys[i] + pl;
+                char val[768];
+                if (!vk_get(keys[i], val, sizeof(val)) || !val[0])
+                    continue;
+                if (T == DNS_TYPE_A || T == DNS_TYPE_AAAA) {
+                    if (pass == 1) { /* ddns: bare IP, TTL = remaining lease */
+                        long tl = vk_ttl(keys[i]);
+                        if (tl < 1)
+                            tl = 1;
+                        zmd_add_addr(&arr, &n, &cap, name, T, (uint32_t) tl, val);
+                    } else { /* zone: ttl|ip|ip|... */
+                        uint32_t ttl = DEFAULT_TTL;
+                        char *pipe = strchr(val, '|');
+                        if (pipe) {
+                            ttl = (uint32_t) atoi(val);
+                            pipe++;
+                        } else {
+                            pipe = val;
+                        }
+                        zmd_add_addr(&arr, &n, &cap, name, T, ttl, pipe);
+                    }
+                } else if (pass == 1) { /* ddns PTR lease: bare target */
+                    long tl = vk_ttl(keys[i]);
+                    if (tl < 1)
+                        tl = 1;
+                    uint8_t rd[300];
+                    int rl = name_to_wire(val, rd, sizeof(rd));
+                    if (rl > 0)
+                        zmd_add(&arr, &n, &cap, name, T, (uint32_t) tl, rd, rl);
+                } else { /* rich provisioned types via the shared encoder */
+                    uint32_t ttl = DEFAULT_TTL;
+                    char *pipe = strchr(val, '|');
+                    if (pipe) {
+                        ttl = (uint32_t) atoi(val);
+                        pipe++;
+                    } else {
+                        pipe = val;
+                    }
+                    uint8_t rd[512];
+                    int rl = stored_rdata(T, pipe, rd, (int) sizeof(rd));
+                    if (rl > 0)
+                        zmd_add(&arr, &n, &cap, name, T, ttl, rd, (uint16_t) rl);
+                }
+            }
+            for (int i = 0; i < nk; i++)
+                free(keys[i]);
+            free(keys);
+        }
+    }
+    /* ZSK DNSKEY RRset (ECDSA + Ed25519), TTL 3600 — matches the AXFR. */
+    if (z) {
+        uint8_t dkrd[68];
+        if (z->zsk && dnskey_rdata_ecdsa(z->zsk, dkrd, sizeof(dkrd)) > 0)
+            zmd_add(&arr, &n, &cap, zname, DNS_TYPE_DNSKEY, 3600, dkrd, 68);
+        if (z->zsk_ed && dnskey_rdata_ed25519(z->zsk_ed, dkrd, sizeof(dkrd)) > 0)
+            zmd_add(&arr, &n, &cap, zname, DNS_TYPE_DNSKEY, 3600, dkrd, 36);
+    }
+    /* Sort canonically, then hash, suppressing duplicate RRs (RFC 8976 §3.3.1). */
+    qsort(arr, (size_t) n, sizeof(zmd_rr_t), zmd_cmp);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        rc = -1;
+        goto cleanup;
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha384(), NULL) != 1) {
+        EVP_MD_CTX_free(ctx);
+        rc = -1;
+        goto cleanup;
+    }
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && arr[i].wirelen == arr[i - 1].wirelen &&
+            memcmp(arr[i].wire, arr[i - 1].wire, (size_t) arr[i].wirelen) == 0)
+            continue; /* duplicate RR */
+        if (EVP_DigestUpdate(ctx, arr[i].wire, (size_t) arr[i].wirelen) != 1) {
+            EVP_MD_CTX_free(ctx);
+            rc = -1;
+            goto cleanup;
+        }
+    }
+    unsigned int dl = 0;
+    if (EVP_DigestFinal_ex(ctx, out_digest, &dl) != 1 || dl != ZONEMD_SHA384_LEN)
+        rc = -1;
+    else
+        rc = (int) dl;
+    EVP_MD_CTX_free(ctx);
+cleanup:
+    for (int i = 0; i < n; i++)
+        free(arr[i].wire);
+    free(arr);
+    return rc;
+}
+
+/* Recompute + store zone `z`'s apex ZONEMD (opt-in via config:[zone:<z>:]zonemd,
+ * default off). Stored as zone:<z>:ZONEMD:<apex> = ttl|hex(TLV). Called from
+ * serial_bump after the new serial is committed. */
+static void zonemd_update(zone_entry_t *z, uint32_t new_serial) {
+    const char *zname = z ? z->name : g_zone_name;
+    if (roll_cfg(zname, "zonemd", 0) == 0)
+        return; /* not enabled for this zone */
+    zone_entry_t *saved = t_zone;
+    t_zone = z;
+    uint8_t dg[ZONEMD_SHA384_LEN];
+    int dlen = zonemd_compute(z, new_serial, dg);
+    t_zone = saved;
+    if (dlen != ZONEMD_SHA384_LEN)
+        return;
+    uint8_t tlv[256];
+    int tl = zonemd_build_tlv(new_serial, ZONEMD_SCHEME_SIMPLE, ZONEMD_HASH_SHA384, dg,
+                              ZONEMD_SHA384_LEN, tlv, sizeof(tlv));
+    if (tl < 0)
+        return;
+    char hex[2 * 256 + 1];
+    hex_enc(tlv, tl, hex);
+    uint32_t ttl = z ? z->soa_minimum : g_soa_minimum;
+    char key[768], val[700];
+    snprintf(key, sizeof(key), "zone:%s:ZONEMD:%s", zname, zname);
+    snprintf(val, sizeof(val), "%u|%s", ttl, hex);
+    vk_set(key, val, 0);
+}
+
+/* Recompute the apex ZONEMD at boot/reload only when it is missing or its
+ * embedded serial no longer matches the zone's current serial. A zone whose
+ * content never changes (so serial_bump never fires) still publishes an
+ * up-to-date digest; an unchanged zone is left untouched so a config reload of
+ * a large zone does not rehash on every keyspace notification. */
+static void zonemd_seed_if_stale(zone_entry_t *z) {
+    const char *zname = z ? z->name : g_zone_name;
+    if (roll_cfg(zname, "zonemd", 0) == 0)
+        return; /* not enabled for this zone */
+    uint32_t cur = z ? z->soa_serial : g_soa_serial;
+    char key[768], val[700];
+    snprintf(key, sizeof(key), "zone:%s:ZONEMD:%s", zname, zname);
+    if (vk_get(key, val, sizeof(val)) && val[0]) {
+        /* Stored as ttl|hex(TLV); the wire form leads with the 4-byte serial. */
+        char *pipe = strchr(val, '|');
+        const char *hexp = pipe ? pipe + 1 : val;
+        uint8_t tlv[256];
+        int tl = hex_dec(hexp, tlv, sizeof(tlv));
+        uint8_t wire[128];
+        int wl = (tl > 0) ? zonemd_tlv_to_wire(tlv, tl, wire, sizeof(wire)) : -1;
+        if (wl >= 4) {
+            uint32_t stored = ((uint32_t) wire[0] << 24) | ((uint32_t) wire[1] << 16) |
+                              ((uint32_t) wire[2] << 8) | wire[3];
+            if (stored == cur)
+                return; /* up to date */
+        }
+    }
+    zonemd_update(z, cur);
+}
+
 /* Append every runtime record of `zname` to an in-progress AXFR: the
  * zone:<zname>:* records (every provisioned type) and the ddns:<zname>:A/AAAA
  * dynamic leases (TTL = remaining lease). These are served locally but were
@@ -6960,7 +7342,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
         {"SRV", DNS_TYPE_SRV},   {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
         {"TLSA", DNS_TYPE_TLSA}, {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
         {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
-        {"SVCB", DNS_TYPE_SVCB}, {"HTTPS", DNS_TYPE_HTTPS},
+        {"SVCB", DNS_TYPE_SVCB}, {"HTTPS", DNS_TYPE_HTTPS}, {"ZONEMD", DNS_TYPE_ZONEMD},
     };
     /* ddns:* leases that transfer: A/AAAA plus auto-PTR reverse records. */
     static const xtype_t dtypes[] = {
