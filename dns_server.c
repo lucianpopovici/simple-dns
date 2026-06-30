@@ -6021,11 +6021,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Provisioned record types from Valkey */
     {
-        uint16_t pts[] = {
-            DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,  DNS_TYPE_NS,    DNS_TYPE_SRV,
-            DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA, DNS_TYPE_DNAME, DNS_TYPE_LOC,
-            DNS_TYPE_URI,   DNS_TYPE_NAPTR, DNS_TYPE_SVCB, DNS_TYPE_HTTPS, DNS_TYPE_ZONEMD,
-            0};
+        uint16_t pts[] = {DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,    DNS_TYPE_NS,
+                          DNS_TYPE_SRV,   DNS_TYPE_CAA,   DNS_TYPE_SSHFP,  DNS_TYPE_TLSA,
+                          DNS_TYPE_DNAME, DNS_TYPE_LOC,   DNS_TYPE_URI,    DNS_TYPE_NAPTR,
+                          DNS_TYPE_SVCB,  DNS_TYPE_HTTPS, DNS_TYPE_ZONEMD, 0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)
@@ -7157,17 +7156,16 @@ static int zonemd_compute(zone_entry_t *z, uint32_t serial, uint8_t *out_digest)
      * mirroring axfr_send_runtime — but the apex ZONEMD RRset is EXCLUDED from
      * its own digest (RFC 8976 §3.3.2), so it is omitted from ztypes here. */
     static const uint16_t ztypes[] = {
-        DNS_TYPE_A,     DNS_TYPE_AAAA, DNS_TYPE_CNAME, DNS_TYPE_MX,   DNS_TYPE_TXT,
-        DNS_TYPE_NS,    DNS_TYPE_SRV,  DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA,
-        DNS_TYPE_DNAME, DNS_TYPE_LOC,  DNS_TYPE_URI,   DNS_TYPE_NAPTR, DNS_TYPE_PTR,
-        DNS_TYPE_SVCB,  DNS_TYPE_HTTPS,
+        DNS_TYPE_A,   DNS_TYPE_AAAA,  DNS_TYPE_CNAME, DNS_TYPE_MX,   DNS_TYPE_TXT,   DNS_TYPE_NS,
+        DNS_TYPE_SRV, DNS_TYPE_CAA,   DNS_TYPE_SSHFP, DNS_TYPE_TLSA, DNS_TYPE_DNAME, DNS_TYPE_LOC,
+        DNS_TYPE_URI, DNS_TYPE_NAPTR, DNS_TYPE_PTR,   DNS_TYPE_SVCB, DNS_TYPE_HTTPS,
     };
     static const uint16_t dtypes[] = {DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_PTR};
     for (int pass = 0; pass < 2; pass++) {
         const char *ns = (pass == 0) ? "zone" : "ddns";
         const uint16_t *tt = (pass == 0) ? ztypes : dtypes;
         int ntypes = (pass == 0) ? (int) (sizeof(ztypes) / sizeof(ztypes[0]))
-                                  : (int) (sizeof(dtypes) / sizeof(dtypes[0]));
+                                 : (int) (sizeof(dtypes) / sizeof(dtypes[0]));
         for (int ti = 0; ti < ntypes; ti++) {
             uint16_t T = tt[ti];
             char prefix[768], pat[800];

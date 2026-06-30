@@ -57,8 +57,8 @@ static void kat_roundtrip(void) {
         CHECK(0, "round-trip emits rdata");
         return;
     }
-    uint32_t serial = ((uint32_t) w[0] << 24) | ((uint32_t) w[1] << 16) | ((uint32_t) w[2] << 8) |
-                      w[3];
+    uint32_t serial =
+        ((uint32_t) w[0] << 24) | ((uint32_t) w[1] << 16) | ((uint32_t) w[2] << 8) | w[3];
     CHECK(n == 6 + ZONEMD_SHA384_LEN, "rdata length = 6 + 48");
     CHECK(serial == 0xDEADBEEFu, "serial survives round-trip");
     CHECK(w[4] == ZONEMD_SCHEME_SIMPLE, "scheme == SIMPLE(1)");
@@ -88,8 +88,8 @@ static void kat_unknown_tag(void) {
 static void negatives(void) {
     uint8_t dg[8] = {0};
     uint8_t tlv[256];
-    int tl = zonemd_build_tlv(1u, ZONEMD_SCHEME_SIMPLE, ZONEMD_HASH_SHA384, dg, 8, tlv,
-                              sizeof(tlv));
+    int tl =
+        zonemd_build_tlv(1u, ZONEMD_SCHEME_SIMPLE, ZONEMD_HASH_SHA384, dg, 8, tlv, sizeof(tlv));
     uint8_t w[256];
     /* Wrong version byte → reject. */
     uint8_t bad = tlv[0];
