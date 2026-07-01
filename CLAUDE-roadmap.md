@@ -19,8 +19,8 @@ The backlog files are not all the same kind of work. Sort before sequencing:
 |------|-------|---------------|
 | **Live code vulnerabilities** | `SECURITY_AUDIT.md` | Phase 0 — first |
 | **System decisions (no/low code)** | `CLAUDE-architecture.md` (ADR-003…007) | Phase 1 — before new record types |
-| **Feature specs** | `CLAUDE-rfc-additions*.md`, `CLAUDE-ENUM.md`, `CLAUDE-libdnswire.md`, `CLAUDE-certd.md`, `CLAUDE-mdnsd.md`, `CLAUDE-resolverd*.md`, `CLAUDE-DoQ.md`, `CLAUDE-eppd.md` | Phase 2 |
-| **In-flight feature plans** | `CLAUDE-discovery.md`, `CLAUDE-hidden-master.md`, `CLAUDE-loadbalance.md` | Own track — see below |
+| **Feature specs** | `CLAUDE-rfc-additions-batch3.md`, `CLAUDE-ENUM.md`, `CLAUDE-libdnswire.md`, `CLAUDE-certd.md`, `CLAUDE-mdnsd.md`, `CLAUDE-resolverd*.md`, `CLAUDE-DoQ.md`, `CLAUDE-eppd.md` | Phase 2 |
+| **Feature specs — done, archived untracked** | `specs/CLAUDE-rfc-additions.md`, `specs/CLAUDE-rfc-additions-batch4.md`, `specs/CLAUDE-discovery.md`, `specs/CLAUDE-hidden-master.md`, `specs/CLAUDE-loadbalance.md` | Done — see below |
 | **Skill edits (not codebase)** | `c-security-audit-improvements.md`, `c-security-audit.patch.md` | Out-of-band — Settings → Capabilities |
 | **Research playbook (not code)** | `CLAUDE-sec.md` | Background, parallel |
 | **Triage / exclusion record** | `CLAUDE-rfc-skipped.md` | Read-and-track only (no code) |
@@ -29,12 +29,27 @@ The backlog files are not all the same kind of work. Sort before sequencing:
 
 In-flight on their own track (do not re-sequence) — feature plans landed (PRs
 #7–#19); **corrected 2026-07-01: all three were already complete, this section
-was stale.** `CLAUDE-hidden-master.md` says outright "All hidden-master gaps
+was stale.** `specs/CLAUDE-hidden-master.md` says outright "All hidden-master gaps
 (1–8) are complete," including the master-side NOTIFY-sender TSIG hardening
 this file used to list as a tail (independently reconfirmed this session via
-`make check-notify`: TSIG-signed, retried until ACK). `CLAUDE-loadbalance.md`
-marks Gap 2 (health checks) done. `CLAUDE-discovery.md` says gaps 1–4 done,
-nothing outstanding. Nothing left on this track.
+`make check-notify`: TSIG-signed, retried until ACK). `specs/CLAUDE-loadbalance.md`
+marks Gap 2 (health checks) done. `specs/CLAUDE-discovery.md` says gaps 1–4 done,
+nothing outstanding. Nothing left on this track. **2026-07-01 (plan audit):**
+these three, plus `specs/CLAUDE-rfc-additions.md` (batch 1–2) and
+`specs/CLAUDE-rfc-additions-batch4.md`, were moved from repo root into `specs/`
+(already gitignored) and untracked from git, matching the existing
+`specs/CLAUDE-{fixes,migration}.md` archival convention for fully-done specs.
+`CLAUDE-certd.md`, `CLAUDE-libdnswire.md`, `CLAUDE-ENUM.md`, and
+`CLAUDE-rfc-additions-batch3.md` were considered for the same move but kept at
+root on purpose — each has a real remaining item (certd: RFC 8659 CAA-before-
+issuance, unimplemented; libdnswire: the libFuzzer harness never moved into the
+lib's own test tree; ENUM: the `+E.164`→reversed-name provisioning writer
+doesn't exist, operators write the raw Valkey key by hand; batch3: Add 8 glue-
+in-referrals and Add 11 compact denial are intentionally-deferred forward
+items, not done work) — not just a stale checkbox like the five that moved.
+`CLAUDE-rfc-skipped.md` also stays at root: it's a permanent decision record
+(why things were *not* built), not a spec of something implemented, so
+"archived" doesn't apply to it.
 - Remaining, not stale: the `resolverd` seccomp `audit`→`enforce` flip after
   whitelist harvest (not a spec file; tracked in `CLAUDE.md`) — already
   `enforce` by default per `CLAUDE.md`, re-harvest only needed when porting to

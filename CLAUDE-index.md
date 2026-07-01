@@ -19,12 +19,16 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | File | Component | Covers |
 |------|-----------|--------|
 | `CLAUDE.md` | (root) | Master instructions *(pre-existing)* |
-| `CLAUDE-fixes.md` | dnsd | Code-defect fixes *(pre-existing)* |
-| `CLAUDE-migration.md` | all | Monolith → daemons decomposition checklist *(pre-existing)* |
+| `specs/CLAUDE-fixes.md` | dnsd | Code-defect fixes — **done**, archived untracked |
+| `specs/CLAUDE-migration.md` | all | Monolith → daemons decomposition checklist *(pre-existing)* |
+| `specs/CLAUDE-hidden-master.md` | dnsd | Hidden-master / public-secondary — **done**, archived untracked |
+| `specs/CLAUDE-loadbalance.md` | dnsd | A/AAAA rotation + health checks — **done**, archived untracked |
+| `specs/CLAUDE-forwarder.md` | dnsd | Out-of-zone forwarding — **done**, archived untracked |
+| `specs/CLAUDE-discovery.md` | dnsd | Automatic FQDN registration — **done**, archived untracked |
 | `CLAUDE-architecture.md` | all | System-level ADRs (schema, atomicity, data access, keys, HA/DR) |
-| `CLAUDE-rfc-additions.md` | dnsd | Batch 1–2: Adds 1–5 + doc reconciliations |
+| `specs/CLAUDE-rfc-additions.md` | dnsd | Batch 1–2: Adds 1–5 + doc reconciliations — **done**, archived untracked |
 | `CLAUDE-rfc-additions-batch3.md` | dnsd (+libdnswire) | Batch 3: Adds 7–11 + complementary + reference |
-| `CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317, Done) + 3258 anycast note (Done) |
+| `specs/CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317, Done) + 3258 anycast note (Done) — archived untracked |
 | `CLAUDE-ENUM.md` | dnsd | ADR-001, Add 6 (ENUM), bind config, ENUM roadmap |
 | `CLAUDE-eppd.md` | eppd | ADR-002, registry back-end (phased) |
 | `CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance |

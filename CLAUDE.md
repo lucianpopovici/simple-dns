@@ -16,11 +16,12 @@ buildable and passing `make check`.
 > their spec is archived untracked at `specs/CLAUDE-fixes.md`; the work itself
 > is documented in the migration tracker's Step 0 and the git history.
 
-> Feature work plans (independent of the process split, but coordinate with
-> it): `CLAUDE-hidden-master.md` (hidden-master / public-secondary deployment
-> gap analysis), `CLAUDE-loadbalance.md` (A/AAAA rotation + health checks),
-> `CLAUDE-forwarder.md` (out-of-zone forwarding), `CLAUDE-discovery.md`
-> (automatic FQDN registration for VMs/containers).
+> Feature work plans (independent of the process split, coordinated with it):
+> hidden-master / public-secondary deployment, A/AAAA rotation + health checks,
+> out-of-zone forwarding, and automatic FQDN registration for VMs/containers
+> are all **complete** — their specs are archived untracked at
+> `specs/CLAUDE-{hidden-master,loadbalance,forwarder,discovery}.md`; the work
+> itself is documented in `CLAUDE-roadmap.md` and the git history.
 
 ---
 
