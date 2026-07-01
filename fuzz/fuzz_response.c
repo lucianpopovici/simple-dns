@@ -70,8 +70,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
      *     covered too. */
     uint16_t id = get16(resp, 0);
     uint16_t qtype = get16(resp, 4); /* arbitrary input-derived 16 bits */
-    (void) response_matches_query(resp, rlen, id, "example.com", qtype);
-    (void) response_matches_query(resp, rlen, (uint16_t) (id ^ 0x55), "example.com", qtype);
+    (void) response_matches_query(resp, rlen, id, "example.com", qtype, 0);
+    (void) response_matches_query(resp, rlen, (uint16_t) (id ^ 0x55), "example.com", qtype, 0);
+    /* enforce_case exercises qname_from_wire_case_preserving (RFC 5452 0x20)
+     * on the same untrusted bytes — new parser surface, same coverage. */
+    (void) response_matches_query(resp, rlen, id, "example.com", qtype, 1);
+    (void) response_matches_query(resp, rlen, id, "ExAmPlE.CoM", qtype, 1);
 
     /* (3) Full response -> cache entry: answer RRs, NXDOMAIN/NODATA negative
      *     caching, SOA-minimum extraction, per-RR rdata allocation. Free what it
