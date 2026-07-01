@@ -42,6 +42,7 @@
 #define DNS_TYPE_TLSA 52
 #define DNS_TYPE_CDS 59     /* RFC 7344 — child DS */
 #define DNS_TYPE_CDNSKEY 60 /* RFC 7344 — child DNSKEY */
+#define DNS_TYPE_CSYNC 62   /* RFC 7477 — child-to-parent synchronisation */
 #define DNS_TYPE_ZONEMD 63  /* RFC 8976 — message digest for DNS zones */
 #define DNS_TYPE_SVCB 64    /* RFC 9460 — service binding */
 #define DNS_TYPE_HTTPS 65   /* RFC 9460 — HTTPS-specific service binding */
@@ -389,6 +390,14 @@ int zonemd_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap)
  * lowercased form. Returns <0, 0, >0 like memcmp. (canon_rr_cmp is a bytewise
  * compare valid only WITHIN one RRset; whole-zone ordering needs this.) */
 int canon_name_cmp(const char *a, const char *b);
+
+/* ── RFC 7477 CSYNC (child-to-parent synchronisation, type 62) ───────────────
+ * Emit RFC 7477 §2.1 rdata: SOA-serial(4) flags(2) type-bitmap(NSEC format).
+ * types_csv: comma-separated type mnemonics to include (e.g. "NS,A,AAAA");
+ * types >= 256 are silently ignored (window 0 only).
+ * Returns rdata length or -1 on overflow / no buffer. */
+int csync_encode_rdata(uint32_t serial, uint16_t flags, const char *types_csv, uint8_t *out,
+                       int outsz);
 
 /* ── Schema version contract (ADR-003) ────────────────────────────────────────
  * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the

@@ -760,6 +760,45 @@ int zonemd_tlv_to_wire(const uint8_t *tlv, int tlvlen, uint8_t *out, int outcap)
     return o;
 }
 
+/* ── RFC 7477 CSYNC rdata encoder ─────────────────────────────────────────── */
+
+int csync_encode_rdata(uint32_t serial, uint16_t flags, const char *types_csv, uint8_t *out,
+                       int outsz) {
+    if (outsz < 6)
+        return -1;
+    out[0] = (uint8_t) (serial >> 24);
+    out[1] = (uint8_t) (serial >> 16);
+    out[2] = (uint8_t) (serial >> 8);
+    out[3] = (uint8_t) serial;
+    out[4] = (uint8_t) (flags >> 8);
+    out[5] = (uint8_t) flags;
+    /* Type bitmap: NSEC window-block format, window 0 only (all CSYNC types < 256). */
+    uint8_t bitmap[32] = {0};
+    int max_bit = -1;
+    char buf[256];
+    safe_strcpy(buf, types_csv ? types_csv : "", sizeof(buf));
+    char *sp = NULL;
+    for (char *tn = strtok_r(buf, ",", &sp); tn; tn = strtok_r(NULL, ",", &sp)) {
+        uint16_t t = str2type(tn);
+        if (t == 0 || t >= 256)
+            continue;
+        bitmap[t / 8] |= (uint8_t) (0x80u >> (t % 8));
+        if ((int) t > max_bit)
+            max_bit = (int) t;
+    }
+    int blen = (max_bit >= 0) ? (max_bit / 8 + 1) : 0;
+    if (outsz < 6 + (blen > 0 ? 2 + blen : 0))
+        return -1;
+    int pos = 6;
+    if (blen > 0) {
+        out[pos++] = 0; /* window block 0 */
+        out[pos++] = (uint8_t) blen;
+        memcpy(out + pos, bitmap, blen);
+        pos += blen;
+    }
+    return pos;
+}
+
 /* RFC 4034 §6.1 canonical name ordering — compare label-by-label from the right
  * (TLD first), each label octet-wise on its lowercased form. */
 int canon_name_cmp(const char *a, const char *b) {
@@ -845,6 +884,8 @@ const char *type2str(uint16_t t) {
             return "CDS";
         case DNS_TYPE_CDNSKEY:
             return "CDNSKEY";
+        case DNS_TYPE_CSYNC:
+            return "CSYNC";
         case DNS_TYPE_ZONEMD:
             return "ZONEMD";
         case DNS_TYPE_SVCB:
@@ -914,6 +955,8 @@ uint16_t str2type(const char *s) {
         return DNS_TYPE_CDS;
     if (!strcasecmp(s, "CDNSKEY"))
         return DNS_TYPE_CDNSKEY;
+    if (!strcasecmp(s, "CSYNC"))
+        return DNS_TYPE_CSYNC;
     if (!strcasecmp(s, "ZONEMD"))
         return DNS_TYPE_ZONEMD;
     if (!strcasecmp(s, "SVCB"))

@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -499,6 +499,31 @@ check-zonemd: tests/test_zonemd.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wi
 	 echo "$$DIGO" | grep -qiE "TYPE63|\\\\#" && echo "  NOTE  dig too old for ZONEMD presentation (generic) — digest still verified"; \
 	 echo "$$DIGO" | grep -qi "ZONEMD" && { echo "$$DIGO" | grep -qi " 1 1 " || { echo "  FAIL  served ZONEMD is not scheme 1 / SHA-384"; exit 1; }; }; \
 	 echo "  OK  ZONEMD codec KAT + dnsd publishes a SIMPLE/SHA-384 digest that an independent AXFR recompute confirms"
+
+# RFC 7477 CSYNC — codec KAT (csync_encode_rdata in libdnswire) plus an
+# integration test: store a CSYNC record in Valkey, run dnsd, and verify `dig`
+# returns the correct type 62 answer.
+check-csync: tests/test_csync.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_csync"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_csync \
+	      tests/test_csync.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_csync
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
+	 Z=example.local; N=$$Z;                                                           \
+	 VAL="300|1|3|NS,A,AAAA";                                                         \
+	 $$VC set "zone:$$Z:CSYNC:$$N" "$$VAL" >/dev/null;                                 \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_csync.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 OUT=$$(dig +nocookie +noall +answer @127.0.0.1 -p $(TPORT) $$N CSYNC +time=2 +tries=1); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 $$VC del "zone:$$Z:CSYNC:$$N" >/dev/null;                                         \
+	 echo "  dig: $$(echo "$$OUT" | tr -s ' ')";                                       \
+	 test -n "$$OUT" || { echo "  FAIL  no answer for CSYNC query"; exit 1; };         \
+	 echo "$$OUT" | grep -qiE "TYPE62|CSYNC" || { echo "  FAIL  no CSYNC/TYPE62 in answer"; exit 1; }; \
+	 echo "  OK  CSYNC codec KAT + dnsd serves type-62 CSYNC that dig sees"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1425,7 +1450,7 @@ clean:
 	      resolverd resolverd_debug \
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
-	      tests/test_zonemd \
+	      tests/test_zonemd tests/test_csync \
 	      fuzz/fuzz_name_from_wire
 	@echo "  done"
 
@@ -1454,6 +1479,7 @@ help:
 	@echo "  make check        Quick smoke-test (needs Valkey)"
 	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
 	@echo "  make check-zonemd    RFC 8976 ZONEMD codec KAT + AXFR digest recompute (needs Valkey + python3)"
+	@echo "  make check-csync     RFC 7477 CSYNC codec KAT + dnsd serves type-62 (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

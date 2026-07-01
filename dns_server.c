@@ -21,6 +21,8 @@
  *   4592       Wildcard records (*.label synthesis)
  *   6303       Locally served DNS zones (RFC 6303)
  *   7344/8078  CDS/CDNSKEY – child signals for DNSSEC delegation
+ *   7477       CSYNC – child-to-parent synchronisation record (type 62);
+ *              stored as serial|flags|NS,A,AAAA; query + AXFR serve, DNSSEC-signed
  *   7553       URI records
  *   9460       SVCB / HTTPS service-binding records (SvcParams stored as TLV;
  *              query + AXFR serve, DNSSEC-signed)
@@ -5157,6 +5159,22 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
                 return -1;
             return zonemd_tlv_to_wire(tlv, tl, rd, rdcap);
         }
+        case DNS_TYPE_CSYNC: { /* serial|flags|NS,A,AAAA (comma-separated type list) */
+            uint32_t serial = 0;
+            uint16_t flags = 0;
+            char types[256] = "";
+            char *sp20 = NULL;
+            char *tok = strtok_r(pipe, "|", &sp20);
+            if (tok)
+                serial = (uint32_t) strtoul(tok, NULL, 10);
+            tok = strtok_r(NULL, "|", &sp20);
+            if (tok)
+                flags = (uint16_t) atoi(tok);
+            tok = strtok_r(NULL, "|", &sp20);
+            if (tok)
+                safe_strcpy(types, tok, sizeof(types));
+            return csync_encode_rdata(serial, flags, types, rd, rdcap);
+        }
         default:
             return -1;
     }
@@ -6021,10 +6039,23 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Provisioned record types from Valkey */
     {
-        uint16_t pts[] = {DNS_TYPE_CNAME, DNS_TYPE_MX,    DNS_TYPE_TXT,    DNS_TYPE_NS,
-                          DNS_TYPE_SRV,   DNS_TYPE_CAA,   DNS_TYPE_SSHFP,  DNS_TYPE_TLSA,
-                          DNS_TYPE_DNAME, DNS_TYPE_LOC,   DNS_TYPE_URI,    DNS_TYPE_NAPTR,
-                          DNS_TYPE_SVCB,  DNS_TYPE_HTTPS, DNS_TYPE_ZONEMD, 0};
+        uint16_t pts[] = {DNS_TYPE_CNAME,
+                          DNS_TYPE_MX,
+                          DNS_TYPE_TXT,
+                          DNS_TYPE_NS,
+                          DNS_TYPE_SRV,
+                          DNS_TYPE_CAA,
+                          DNS_TYPE_SSHFP,
+                          DNS_TYPE_TLSA,
+                          DNS_TYPE_DNAME,
+                          DNS_TYPE_LOC,
+                          DNS_TYPE_URI,
+                          DNS_TYPE_NAPTR,
+                          DNS_TYPE_SVCB,
+                          DNS_TYPE_HTTPS,
+                          DNS_TYPE_ZONEMD,
+                          DNS_TYPE_CSYNC,
+                          0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)
@@ -7337,12 +7368,13 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
         uint16_t t;
     } xtype_t;
     static const xtype_t ztypes[] = {
-        {"A", DNS_TYPE_A},       {"AAAA", DNS_TYPE_AAAA},   {"CNAME", DNS_TYPE_CNAME},
-        {"MX", DNS_TYPE_MX},     {"TXT", DNS_TYPE_TXT},     {"NS", DNS_TYPE_NS},
-        {"SRV", DNS_TYPE_SRV},   {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
-        {"TLSA", DNS_TYPE_TLSA}, {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
-        {"URI", DNS_TYPE_URI},   {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
-        {"SVCB", DNS_TYPE_SVCB}, {"HTTPS", DNS_TYPE_HTTPS}, {"ZONEMD", DNS_TYPE_ZONEMD},
+        {"A", DNS_TYPE_A},         {"AAAA", DNS_TYPE_AAAA},   {"CNAME", DNS_TYPE_CNAME},
+        {"MX", DNS_TYPE_MX},       {"TXT", DNS_TYPE_TXT},     {"NS", DNS_TYPE_NS},
+        {"SRV", DNS_TYPE_SRV},     {"CAA", DNS_TYPE_CAA},     {"SSHFP", DNS_TYPE_SSHFP},
+        {"TLSA", DNS_TYPE_TLSA},   {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
+        {"URI", DNS_TYPE_URI},     {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
+        {"SVCB", DNS_TYPE_SVCB},   {"HTTPS", DNS_TYPE_HTTPS}, {"ZONEMD", DNS_TYPE_ZONEMD},
+        {"CSYNC", DNS_TYPE_CSYNC},
     };
     /* ddns:* leases that transfer: A/AAAA plus auto-PTR reverse records. */
     static const xtype_t dtypes[] = {

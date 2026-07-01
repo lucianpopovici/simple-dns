@@ -157,12 +157,14 @@ record formats here use the Phase-1 schema decision.
      dig integration) in CI. **Follow-up:** apid/dashboard presentation→TLV
      writer (operators currently store the hex TLV directly; the encoder is
      shared in libdnswire ready to adopt). Generic `keyNNNNN` SvcParams deferred.
-   - Next: 8976 (ZONEMD), 7477 (CSYNC), 5782 (DNSxL), 1794 (RR rotation),
+   - **7477 CSYNC DONE 2026-07-01** — type 62, `csync_encode_rdata` in libdnswire;
+     stored as `serial|flags|NS,A,AAAA`; dnsd serves+AXFR, DNSSEC-signed;
+     `make check-csync` (6 KATs + dig integration). In CI.
+   - Next: 5782 (DNSxL), 1794 (RR rotation),
      6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation).
-   - Then new record types/features: 9460 (SVCB/HTTPS), 8976 (ZONEMD), 7477
-     (CSYNC), 5782 (DNSxL), 1794 (RR rotation), 6116/6117/6118 (ENUM over
-     NAPTR), 2317 (classless reverse delegation), and the batch-3 complementary
-     items.
+   - Then new record types/features: 5782 (DNSxL), 1794 (RR rotation),
+     6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation),
+     and the batch-3 complementary items.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd
