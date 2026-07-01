@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -671,6 +671,42 @@ check-2317: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$PTR"   | grep -qi "host5.customer.example" || { echo "  FAIL  PTR target missing from subzone"; exit 1; }; \
 	 test "$$SIGS" -ge 1 || { echo "  FAIL  no RRSIG on subzone PTR"; exit 1; };                  \
 	 echo "  OK  CNAME in /24 zone + PTR in co-hosted subzone; subzone PTR DNSSEC-signed"
+
+# RFC 9660 ZONEVERSION EDNS option. Requests OPTION-CODE 19 (dig +ednsopt=19,
+# empty payload as the spec requires for queries) and checks the echoed
+# OPTION-DATA: LABELCOUNT matches the answering zone's label count, TYPE is
+# 0 (SOA-SERIAL), and VERSION is the zone's actual SOA serial. Also checks the
+# option is opt-in only (absent without +ednsopt) and omitted when no zone
+# matched (REFUSED), since a server must never echo a version it doesn't have.
+check-zoneversion: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 9660 ZONEVERSION EDNS option (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                     \
+	 ZN=$$($$VC get config:zone_name); test -n "$$ZN" || ZN=example.local;                        \
+	 SERIAL=$$($$VC get config:zone_serial); test -n "$$SERIAL" || SERIAL=1;                      \
+	 NLABELS=$$(echo "$$ZN" | awk -F. '{print NF}');                                              \
+	 NLABELS_HEX=$$(printf '%02x' $$NLABELS);                                                     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_zv.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                    \
+	 OUT=$$(dig +ednsopt=19 +nocookie @127.0.0.1 -p $(TPORT) "$$ZN" A +time=2 +tries=1);          \
+	 OUT_NOOPT=$$(dig +nocookie @127.0.0.1 -p $(TPORT) "$$ZN" A +time=2 +tries=1);                \
+	 OUT_REFUSED=$$(dig +ednsopt=19 +nocookie @127.0.0.1 -p $(TPORT) not-our-zone.example A +time=2 +tries=1); \
+	 kill $$DNS 2>/dev/null || true;                                                               \
+	 ZVLINE=$$(echo "$$OUT" | grep "OPT=19:");                                                    \
+	 LABELS=$$(echo "$$ZVLINE" | awk '{print $$3}');                                              \
+	 TYPE=$$(echo "$$ZVLINE" | awk '{print $$4}');                                                \
+	 SERIALHEX=$$(echo "$$ZVLINE" | awk '{print $$5 $$6 $$7 $$8}');                               \
+	 GOTSERIAL=$$(printf '%d' 0x$$SERIALHEX 2>/dev/null || echo -1);                               \
+	 echo "  zone=$$ZN labels=$$NLABELS serial=$$SERIAL";                                         \
+	 echo "  OPT=19 line: $$ZVLINE";                                                              \
+	 test -n "$$ZVLINE" || { echo "  FAIL  no OPT=19 in response to +ednsopt=19 query"; exit 1; }; \
+	 test "$$LABELS" = "$$NLABELS_HEX" || { echo "  FAIL  LABELCOUNT $$LABELS != expected $$NLABELS_HEX"; exit 1; }; \
+	 test "$$TYPE" = "00" || { echo "  FAIL  TYPE $$TYPE != 00 (SOA-SERIAL)"; exit 1; };           \
+	 test "$$GOTSERIAL" = "$$SERIAL" || { echo "  FAIL  echoed serial $$GOTSERIAL != actual $$SERIAL"; exit 1; }; \
+	 echo "$$OUT_NOOPT" | grep -q "OPT=19:" && { echo "  FAIL  ZONEVERSION emitted without client request"; exit 1; }; \
+	 echo "$$OUT_REFUSED" | grep -q "OPT=19:" && { echo "  FAIL  ZONEVERSION emitted on REFUSED/out-of-zone"; exit 1; }; \
+	 echo "  OK  ZONEVERSION echoes zone label count + SOA serial; opt-in only; omitted when not authoritative"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1631,6 +1667,7 @@ help:
 	@echo "  make check-rr-rotate RFC 1794 per-name round-robin rotation; DNSSEC still valid (needs Valkey + dig)"
 	@echo "  make check-enum      RFC 6116 ENUM NAPTR: ordered rules, '|' in regexp, RRSIG (needs Valkey + dig)"
 	@echo "  make check-2317      RFC 2317 classless /24 sub-block delegation CNAME→PTR + RRSIG (needs Valkey + dig)"
+	@echo "  make check-zoneversion RFC 9660 ZONEVERSION EDNS option echoes zone SOA serial (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

@@ -297,7 +297,7 @@ static void test_edns_append(void) {
     uint8_t buf[512];
     memset(buf, 0, sizeof(buf));
     /* arcount starts at 0 */
-    int off = edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL);
+    int off = edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL, -1, 0);
     check(off > 12, "edns_append_opt returns new offset > 12");
     check(get16(buf, 10) == 1, "arcount incremented to 1");
     /* Verify OPT type at wire position 12: 1 byte root name + 2 bytes type */

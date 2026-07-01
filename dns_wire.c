@@ -1083,6 +1083,11 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
                 } else if (oc == EDNS_OPT_PADDING) {
                     ei->has_padding = 1;
                     ei->padding_req = ol;
+                } else if (oc == EDNS_OPT_ZONEVERSION && ol == 0) {
+                    /* RFC 9660 §3: OPTION-LENGTH must be 0 in a query; a
+                     * nonzero length here is malformed and ignored rather
+                     * than honored. */
+                    ei->zoneversion_req = 1;
                 }
                 if (rp + (int) ol > plen)
                     break;
@@ -1099,7 +1104,7 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
 
 int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
                     const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
-                    int ede_code, const char *ede_text) {
+                    int ede_code, const char *ede_text, int zv_labels, uint32_t zv_serial) {
     if (off + 11 > blen)
         return off;
     buf[off++] = 0; /* root name */
@@ -1163,6 +1168,21 @@ int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uin
                 memcpy(buf + rdata_off + 6, ede_text, tlen);
             rdata_off += 4 + 2 + tlen;
             rdata_len += 4 + 2 + tlen;
+        }
+    }
+    /* ZONEVERSION (RFC 9660): echo the SOA serial of the zone that answered.
+     * Only when the client asked (req_ei->zoneversion_req) AND the caller
+     * knows which zone answered (zv_labels >= 0) — a server must not guess an
+     * authority it doesn't have (e.g. REFUSED / no zone match). */
+    if (req_ei && req_ei->zoneversion_req && zv_labels >= 0 && zv_labels <= 255) {
+        if (rdata_off + 4 + 6 < blen) {
+            put16(buf, rdata_off, EDNS_OPT_ZONEVERSION);
+            put16(buf, rdata_off + 2, 6); /* LABELCOUNT(1) + TYPE(1) + VERSION(4) */
+            buf[rdata_off + 4] = (uint8_t) zv_labels;
+            buf[rdata_off + 5] = EDNS_ZV_TYPE_SOA_SERIAL;
+            put32(buf, rdata_off + 6, zv_serial);
+            rdata_off += 4 + 6;
+            rdata_len += 4 + 6;
         }
     }
     /* Padding (RFC 7830 / RFC 8467):

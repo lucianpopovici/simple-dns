@@ -182,8 +182,18 @@ record formats here use the Phase-1 schema decision.
      (`/25`-`/31`) as a `/24`-zone CNAME per address plus either a co-hosted
      subzone in `zone_table` or an NS delegation; `make check-2317` drives the
      wire path directly against Valkey (CNAME→subzone PTR, RRSIG present). In CI.
-   - Next: the batch-3 complementary items (9103 XoT, 9859 generalized NOTIFY,
-     9660 ZONEVERSION, 9567 error reporting) and 3258 anycast deployment note.
+   - **9660 ZONEVERSION DONE 2026-07-01** — EDNS option 19 (`EDNS_OPT_ZONEVERSION`
+     in libdnswire): `edns_parse` records a bare-length-0 request, `dnsd_edns_opt`
+     sources LABELCOUNT (label count of `t_zone->name`) + the zone's SOA serial
+     from `t_zone`, `edns_append_opt` gains `zv_labels`/`zv_serial` params and
+     emits TYPE=0 (SOA-SERIAL) only when both the client asked and a zone
+     actually matched (`zv_labels >= 0` — never echoed on REFUSED/no-zone-match);
+     `make check-zoneversion` decodes the wire OPT bytes via `dig +ednsopt=19`
+     and checks LABELCOUNT/TYPE/serial plus the opt-in-only and
+     not-authoritative-omits-it cases. In CI.
+   - Next: the remaining batch-3 complementary items (9103 XoT conformance,
+     9859 generalized NOTIFY, 9567 error reporting) and the 3258 anycast
+     deployment note.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd

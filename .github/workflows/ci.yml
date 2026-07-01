@@ -102,6 +102,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-2317 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 9660 ZONEVERSION EDNS option (echoes zone SOA serial)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-zoneversion OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

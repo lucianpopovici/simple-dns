@@ -57,8 +57,10 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | 11 | 9824 (+4470) | Compact denial of existence | Follow-on | batch3 |
 | 12 | 2317 | Classless reverse delegation | **Done** (dnsd already wire-capable — CNAME chain + co-hosted subzone PTR, DNSSEC-signed; `POST /reverse/classless` provisioning in apid; `make check-2317`) | batch4 |
 
-Complementary (batch3): 9103 (XoT), 9859 (generalized NOTIFY), 9660
-(ZONEVERSION), 9567 (error reporting). Deployment note (batch4): 3258 (anycast,
+Complementary (batch3): 9103 (XoT), 9859 (generalized NOTIFY), **9660
+ZONEVERSION Done** (EDNS option 19; echoes the answering zone's LABELCOUNT +
+SOA serial, opt-in only, omitted when no zone matched; `make check-zoneversion`),
+9567 (error reporting). Deployment note (batch4): 3258 (anycast,
 no code). Doc reconciliations (rfc-additions): 8484 Done, 2671→6891, 3833/7626
 coverage matrix, 8499/9499, **NAPTR = 3403** (header mislabels it 9250).
 

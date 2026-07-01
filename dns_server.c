@@ -4848,10 +4848,25 @@ static uint32_t zone_negative_ttl(void) {
     return st < mn ? st : mn;
 }
 
+/* Number of DNS labels in a dotted zone name ("example.local" -> 2; "" -> 0).
+ * Zone names in g_zones[] are stored without a trailing dot (see zone_table:
+ * loading above), so this is just dot-count + 1 for a non-empty name. */
+static int zone_label_count(const char *name) {
+    if (!name || !name[0])
+        return 0;
+    int n = 1;
+    for (const char *p = name; *p; p++)
+        if (*p == '.')
+            n++;
+    return n;
+}
+
 /* ==========================================================================
  * EDNS(0) — edns_info_t, edns_parse, edns_append_opt live in libdnswire.
- * dnsd_edns_opt wraps edns_append_opt with daemon-specific NSID and
- * IP-bound server-cookie computation (RFC 9018 §4.2).
+ * dnsd_edns_opt wraps edns_append_opt with daemon-specific NSID, IP-bound
+ * server-cookie computation (RFC 9018 §4.2), and the ZONEVERSION option
+ * (RFC 9660) — the latter sourced from t_zone, the zone this request was
+ * matched to (NULL when no configured zone matched, e.g. REFUSED).
  * ======================================================================= */
 static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit,
                          uint16_t rcode_ext, const edns_info_t *ei, const struct in_addr *cip,
@@ -4861,8 +4876,11 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
         const struct in_addr zero = {0};
         compute_server_cookie(ei->client_cookie, cip ? cip : &zero, (uint32_t) time(NULL), sc);
     }
+    int zv_labels = t_zone ? zone_label_count(t_zone->name) : -1;
+    uint32_t zv_serial = t_zone ? t_zone->soa_serial : 0;
     return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei, g_nsid[0] ? g_nsid : NULL,
-                           (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text);
+                           (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text, zv_labels,
+                           zv_serial);
 }
 
 /* ==========================================================================

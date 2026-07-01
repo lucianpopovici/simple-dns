@@ -96,6 +96,8 @@
 #define EDNS_OPT_KEEPALIVE 11
 #define EDNS_OPT_PADDING 12
 #define EDNS_OPT_EDE 15
+#define EDNS_OPT_ZONEVERSION 19 /* RFC 9660 */
+#define EDNS_ZV_TYPE_SOA_SERIAL 0 /* RFC 9660 §3: the only defined VERSION type */
 
 /* Extended DNS Error info codes (RFC 8914) */
 #define EDE_OTHER 0
@@ -152,6 +154,7 @@ typedef struct {
     int has_padding;
     uint16_t padding_req;
     int keepalive_req;
+    int zoneversion_req; /* RFC 9660: client sent OPTION-CODE 19, OPTION-LENGTH 0 */
 } edns_info_t;
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
@@ -263,12 +266,18 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei);
  *             NULL omits the cookie option. The client cookie is taken from
  *             req_ei->client_cookie when req_ei != NULL and scookie != NULL.
  *   ede_code - RFC 8914 info code; -1 omits the EDE option.
+ *   zv_labels - RFC 9660: label count of the zone that answered, for the
+ *             ZONEVERSION option; -1 means "no authoritative zone matched"
+ *             and omits the option even if the client requested it (a server
+ *             must only echo a version it actually has).
+ *   zv_serial - that zone's SOA serial (SOA-SERIAL VERSION type, the only one
+ *             this codebase implements); ignored when zv_labels < 0.
  *
  * The correct server cookie is IP-bound (RFC 9018 §4.2): callers must compute
  * it before calling this function and pass the result as scookie. */
 int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
                     const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
-                    int ede_code, const char *ede_text);
+                    int ede_code, const char *ede_text, int zv_labels, uint32_t zv_serial);
 
 /* ── RFC 4034 §6 canonical-form helpers ──────────────────────────────────── */
 
