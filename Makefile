@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -524,6 +524,43 @@ check-csync: tests/test_csync.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wire
 	 test -n "$$OUT" || { echo "  FAIL  no answer for CSYNC query"; exit 1; };         \
 	 echo "$$OUT" | grep -qiE "TYPE62|CSYNC" || { echo "  FAIL  no CSYNC/TYPE62 in answer"; exit 1; }; \
 	 echo "  OK  CSYNC codec KAT + dnsd serves type-62 CSYNC that dig sees"
+
+# RFC 5782 DNSxL — integration test: configure a dnsxl zone, set a listing,
+# run dnsd, and verify:
+#   - listed IP's reversed name returns A 127.0.0.2 + TXT reason
+#   - unlisted IP's reversed name returns NXDOMAIN
+#   - RFC 5782 §5 mandated test points (2.0.0.127 listed, 1.0.0.127 not listed)
+check-dnsxl: $(BIN_DEBUG) | ossl-sanity
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                    \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };           \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                 \
+	 Z=bl.example.local;                                                                      \
+	 SAVE_DX=$$($$VC get config:dnsxl_zones);                                                 \
+	 $$VC set config:dnsxl_zones "$$Z" >/dev/null;                                            \
+	 $$VC set "dnsxl:$$Z:192.0.2.66"    "2|spam source"              >/dev/null;              \
+	 $$VC set "dnsxl:$$Z:127.0.0.2"     "2|RFC5782 mandatory listed"  >/dev/null;             \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dnsxl.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                               \
+	 OUT_A=$$(dig  +nocookie +noall +answer @127.0.0.1 -p $(TPORT) 66.2.0.192.$$Z A   +time=2 +tries=1); \
+	 OUT_TXT=$$(dig +nocookie +noall +answer @127.0.0.1 -p $(TPORT) 66.2.0.192.$$Z TXT +time=2 +tries=1); \
+	 OUT_UN=$$(dig  +nocookie           @127.0.0.1 -p $(TPORT) 1.2.0.192.$$Z A    +time=2 +tries=1); \
+	 OUT_M2=$$(dig  +nocookie +noall +answer @127.0.0.1 -p $(TPORT) 2.0.0.127.$$Z A   +time=2 +tries=1); \
+	 OUT_M1=$$(dig  +nocookie           @127.0.0.1 -p $(TPORT) 1.0.0.127.$$Z A    +time=2 +tries=1); \
+	 kill $$DNS 2>/dev/null || true;                                                          \
+	 $$VC del "dnsxl:$$Z:192.0.2.66" "dnsxl:$$Z:127.0.0.2" >/dev/null;                       \
+	 if [ -n "$$SAVE_DX" ]; then $$VC set config:dnsxl_zones "$$SAVE_DX" >/dev/null;         \
+	 else $$VC del config:dnsxl_zones >/dev/null; fi;                                        \
+	 echo "  A:      $$(echo "$$OUT_A"   | tr -s ' ')";                                      \
+	 echo "  TXT:    $$(echo "$$OUT_TXT" | tr -s ' ')";                                      \
+	 echo "  unlisted (expect NXDOMAIN): $$(echo "$$OUT_UN" | grep -i status | tr -s ' ')";  \
+	 echo "  §5 2.0.0.127: $$(echo "$$OUT_M2" | tr -s ' ')";                                 \
+	 echo "  §5 1.0.0.127 (expect NXDOMAIN): $$(echo "$$OUT_M1" | grep -i status | tr -s ' ')"; \
+	 echo "$$OUT_A"   | grep -q "127.0.0.2"      || { echo "  FAIL  listed A not 127.0.0.2";     exit 1; }; \
+	 echo "$$OUT_TXT" | grep -qi "spam"           || { echo "  FAIL  TXT reason missing";         exit 1; }; \
+	 echo "$$OUT_UN"  | grep -qi "NXDOMAIN"       || { echo "  FAIL  unlisted should be NXDOMAIN"; exit 1; }; \
+	 echo "$$OUT_M2"  | grep -q "127.0.0.2"       || { echo "  FAIL  §5 2.0.0.127 not listed";    exit 1; }; \
+	 echo "$$OUT_M1"  | grep -qi "NXDOMAIN"       || { echo "  FAIL  §5 1.0.0.127 must be NXDOMAIN"; exit 1; }; \
+	 echo "  OK  DNSxL listed→A 127.0.0.2 + TXT; unlisted→NXDOMAIN; RFC 5782 §5 test points"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1480,6 +1517,7 @@ help:
 	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
 	@echo "  make check-zonemd    RFC 8976 ZONEMD codec KAT + AXFR digest recompute (needs Valkey + python3)"
 	@echo "  make check-csync     RFC 7477 CSYNC codec KAT + dnsd serves type-62 (needs Valkey + dig)"
+	@echo "  make check-dnsxl     RFC 5782 DNSxL synthesis listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

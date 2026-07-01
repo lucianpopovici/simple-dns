@@ -45,7 +45,7 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | Add | RFC | Feature | Status | File |
 |----:|-----|---------|--------|------|
 | 1 | 1794 | Round-robin RRset rotation | Specced | rfc-additions |
-| 2 | 5782 | DNSxL (DNSBL/DNSWL) synthesis | Specced | rfc-additions |
+| 2 | 5782 | DNSxL (DNSBL/DNSWL) synthesis | **Done** (dnsxl_try synthesis handler; config:dnsxl_zones; `make check-dnsxl`) | rfc-additions |
 | 3 | 9460 | SVCB / HTTPS records (64/65) | **Done** (TLV; dnsd serves; apid writer TODO) | rfc-additions |
 | 4 | 9077 | NSEC/NSEC3 + negative-response TTL | **Done** | rfc-additions |
 | 5 | 7477 | CSYNC record (62) | **Done** (pipe serial\|flags\|NS,A,AAAA; dnsd serves+AXFR; DNSSEC-signed; `make check-csync`) | rfc-additions |

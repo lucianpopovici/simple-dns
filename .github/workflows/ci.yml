@@ -78,6 +78,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-csync OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 5782 DNSxL synthesis (listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-dnsxl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

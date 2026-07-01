@@ -21,6 +21,9 @@
  *   4592       Wildcard records (*.label synthesis)
  *   6303       Locally served DNS zones (RFC 6303)
  *   7344/8078  CDS/CDNSKEY – child signals for DNSSEC delegation
+ *   5782       DNSxL – DNS blocklist/allowlist synthesis (A 127.0.0.x + TXT);
+ *              opt-in via config:dnsxl_zones (comma-separated suffixes);
+ *              listings stored as dnsxl:<zone>:<ip> → <low_octet>|<reason>
  *   7477       CSYNC – child-to-parent synchronisation record (type 62);
  *              stored as serial|flags|NS,A,AAAA; query + AXFR serve, DNSSEC-signed
  *   7553       URI records
@@ -95,6 +98,13 @@
  *                              are probed (port default 80).
  *   config:lb_health_interval  Seconds between probe rounds (default 10).
  *   config:lb_health_timeout_ms  Per-probe TCP connect timeout (default 1000).
+ *   config:dnsxl_zones           Comma-separated DNSxL zone suffixes to host
+ *                              (RFC 5782, empty = disabled). Listed IPs are looked
+ *                              up as dnsxl:<zone>:<ip> → "<low_octet>|<reason>".
+ *                              The zone must be a configured authoritative zone.
+ *   dnsxl:<zone>:<ip>            DNSxL listing: low_octet|reason
+ *                              (e.g. "2|spam source"). A query for the reversed
+ *                              name synthesizes A 127.0.0.<low_octet> + TXT reason.
  *   config:dot_require_client_cert  "1" to require a verified client cert (mTLS)
  *                              on the DoT/transfer listener (needs
  *                              config:mtls_ca_pem). Default 0 — keep OFF on
@@ -580,6 +590,12 @@ typedef struct {
 static lb_health_entry_t *g_lb_health = NULL;
 static int g_lb_health_count = 0;
 static pthread_mutex_t g_lb_health_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* RFC 5782 DNS Blocklist / Allowlist synthesis.
+ * g_dnsxl_zones: comma-separated DNSxL zone suffixes this server hosts
+ * (config:dnsxl_zones, empty = disabled). Per-IP listings live in Valkey as
+ * dnsxl:<zone>:<ip> → "<low_octet>|<reason>". */
+static char g_dnsxl_zones[1024] = ""; /* config:dnsxl_zones */
 
 /* Structured query log */
 static char g_query_log_path[512] = ""; /* "" = disabled */
@@ -2212,6 +2228,9 @@ static void config_load_from_valkey(void) {
     GI("lb_health_interval", g_lb_health_interval);
     g_lb_health_timeout_ms = 1000;
     GI("lb_health_timeout_ms", g_lb_health_timeout_ms);
+    /* RFC 5782 DNSxL synthesis (config:dnsxl_zones, empty = disabled). */
+    g_dnsxl_zones[0] = 0;
+    G("dnsxl_zones", g_dnsxl_zones);
     /* TSIG secret (base64) */
     if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
         g_tsig_secret_len = b64std_dec(val, g_tsig_secret, sizeof(g_tsig_secret));
@@ -5532,6 +5551,60 @@ static int forward_should(const uint8_t *pkt, int plen, const struct in_addr *ci
     return 1;
 }
 
+/* RFC 5782 DNSxL synthesis.  Returns 1 and emits A/TXT if qname ends in a
+ * configured dnsxl suffix AND the un-reversed IP is listed in Valkey; returns 0
+ * to fall through.  Not-listed falls through so the normal NXDOMAIN path fires.
+ * Enabled only when config:dnsxl_zones is non-empty (g_dnsxl_zones).
+ *
+ * On-Valkey encoding:  dnsxl:<zone>:<ip>  →  "<low_octet>|<reason>"
+ * RFC 5782 §5 mandates: 2.0.0.127.<zone> listed, 1.0.0.127.<zone> not listed. */
+static int dnsxl_try(uint8_t *resp, int *offp, int resp_len, const char *qname, uint16_t qtype,
+                     int dnssec_ok, int *answers) {
+    if (!g_dnsxl_zones[0])
+        return 0;
+    char zones[sizeof(g_dnsxl_zones)];
+    safe_strcpy(zones, g_dnsxl_zones, sizeof(zones));
+    char *sp = NULL;
+    for (char *z = strtok_r(zones, ",", &sp); z; z = strtok_r(NULL, ",", &sp)) {
+        size_t zl = strlen(z);
+        size_t nl = strlen(qname);
+        if (nl <= zl + 1 || strcasecmp(qname + nl - zl, z) != 0 || qname[nl - zl - 1] != '.')
+            continue;
+        /* Leading labels must be a reversed IPv4 dotted-quad: d.c.b.a */
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (sscanf(qname, "%u.%u.%u.%u.", &d, &c, &b, &a) != 4)
+            return 0;
+        if (a > 255 || b > 255 || c > 255 || d > 255)
+            return 0;
+        char ip[16];
+        snprintf(ip, sizeof(ip), "%u.%u.%u.%u", a, b, c, d);
+        char key[768];
+        snprintf(key, sizeof(key), "dnsxl:%s:%s", z, ip);
+        char val[256];
+        if (!vk_get(key, val, sizeof(val)))
+            return 0; /* not listed — fall through to NXDOMAIN */
+        char *bar = strchr(val, '|');
+        unsigned code = (unsigned) atoi(val); /* leading digits before '|' */
+        if (code == 0)
+            code = 2; /* default: 127.0.0.2 */
+        const char *reason = bar ? bar + 1 : "listed";
+        if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
+            uint8_t rd[4] = {127, 0, 0, (uint8_t) code};
+            *offp =
+                emit_rr(resp, *offp, resp_len, qname, DNS_TYPE_A, 3600, rd, 4, dnssec_ok, answers);
+        }
+        if (qtype == DNS_TYPE_TXT || qtype == DNS_TYPE_ANY) {
+            uint8_t rd[256];
+            int tl = txt_encode(reason, rd, sizeof(rd));
+            if (tl > 0)
+                *offp = emit_rr(resp, *offp, resp_len, qname, DNS_TYPE_TXT, 3600, rd, (uint16_t) tl,
+                                dnssec_ok, answers);
+        }
+        return 1; /* handled — caller sets found=1 */
+    }
+    return 0;
+}
+
 static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int resp_len, int is_tcp,
                             const struct in_addr *cip) {
     if (qlen < 12)
@@ -5685,6 +5758,12 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     uint16_t g_ksk_ed_next_tag = t_zone ? t_zone->ksk_ed_next_tag : 0;
     int cds_old = (ksk_phase != KROLL_RETIRE); /* advertise current KSK's DS */
     int cds_new = (ksk_phase != KROLL_NONE);   /* advertise incoming KSK's DS */
+    /* RFC 5782 DNSxL synthesis: before the record-lookup path so a listed IP
+     * gets its synthesized A/TXT; not-listed falls through to NXDOMAIN. */
+    if (dnsxl_try(resp, &off, resp_len, qname, qtype, dnssec_ok, &answers)) {
+        found = 1;
+        goto finish_answer;
+    }
     /* DNSKEY — serve ZSK (flag 256) + KSK (flag 257), KSK signs DNSKEY RRset */
     if ((qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
         uint8_t dkrd[68];
