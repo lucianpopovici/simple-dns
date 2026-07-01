@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1811,6 +1811,62 @@ check-resolverd-cookie: resolverd_debug
 	 test "$$A" = "203.0.113.77" || { echo "  FAIL  resolverd did not return the cookie-gated answer"; cat /tmp/resolverd_cookie.log; exit 1; }; \
 	 echo "  OK  resolverd completed the RFC 7873 cookie handshake and resolved"
 
+# RFC 5452 §2.2 0x20 case randomization (resolverd Option A, Add 4): resolverd
+# already had a CSPRNG transaction ID and randomized source port; this adds the
+# third leg — mixing the outbound QNAME's letter case and rejecting a response
+# whose echoed QNAME doesn't match that exact pattern. tests/dns0x20_upstream.py
+# runs in two modes: "echo" (a conforming server, echoes the question back
+# byte-for-byte) and "corrupt" (flips one letter's case before echoing, as a
+# forger who got the query's content but not its exact case would). Checks:
+# (1) against "echo", resolution succeeds and the captured QNAME bytes actually
+# vary in case across two different queries (proof of randomization, not a
+# fixed pattern); (2) against "corrupt" with 0x20 enabled (default), resolution
+# fails (SERVFAIL) — the mismatch is correctly rejected; (3) against "corrupt"
+# with DNS0X20_ENABLED=0, resolution succeeds — proving the enforcement really
+# is gated by the config, not something else; (4) against "corrupt" with 0x20
+# enabled but this upstream listed in DNS0X20_DISABLE, resolution succeeds too
+# — the per-upstream opt-out guardrail works.
+check-dns0x20: resolverd_debug
+	@echo "  CHECK  RFC 5452 0x20 QNAME case randomization (requires python3 + dig)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 python3 tests/dns0x20_upstream.py 127.0.0.1 5410 echo 203.0.113.55 > /tmp/dns0x20_echo.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5411 ./resolverd_debug --upstream 127.0.0.1:5410 \
+	     --no-dnssec --no-valkey > /tmp/resolverd_0x20_echo.log 2>&1 & RD=$$!;                \
+	 sleep 1.5;                                                                                 \
+	 A1=$$(dig @127.0.0.1 -p 5411 zerotwentyone.test A +short +time=2 +tries=1);                \
+	 A2=$$(dig @127.0.0.1 -p 5411 zerotwentytwo.test A +short +time=2 +tries=1);                \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                            \
+	 Q1=$$(sed -n '1p' /tmp/dns0x20_echo.log | awk '{print $$2}');                              \
+	 Q2=$$(sed -n '2p' /tmp/dns0x20_echo.log | awk '{print $$2}');                               \
+	 python3 tests/dns0x20_upstream.py 127.0.0.1 5410 corrupt 203.0.113.55 > /tmp/dns0x20_c1.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5411 ./resolverd_debug --upstream 127.0.0.1:5410 \
+	     --no-dnssec --no-valkey > /tmp/resolverd_0x20_c1.log 2>&1 & RD=$$!;                   \
+	 sleep 1.5;                                                                                 \
+	 C1=$$(dig @127.0.0.1 -p 5411 corrupt1.test A +short +time=2 +tries=1);                     \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                            \
+	 python3 tests/dns0x20_upstream.py 127.0.0.1 5410 corrupt 203.0.113.55 > /tmp/dns0x20_c2.log 2>&1 & STUB=$$!; \
+	 DNS0X20_ENABLED=0 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5411 ./resolverd_debug           \
+	     --upstream 127.0.0.1:5410 --no-dnssec --no-valkey > /tmp/resolverd_0x20_c2.log 2>&1 & RD=$$!; \
+	 sleep 1.5;                                                                                 \
+	 C2=$$(dig @127.0.0.1 -p 5411 corrupt2.test A +short +time=2 +tries=1);                     \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                            \
+	 python3 tests/dns0x20_upstream.py 127.0.0.1 5410 corrupt 203.0.113.55 > /tmp/dns0x20_c3.log 2>&1 & STUB=$$!; \
+	 DNS0X20_ENABLED=1 DNS0X20_DISABLE=127.0.0.1 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5411    \
+	     ./resolverd_debug --upstream 127.0.0.1:5410 --no-dnssec --no-valkey > /tmp/resolverd_0x20_c3.log 2>&1 & RD=$$!; \
+	 sleep 1.5;                                                                                 \
+	 C3=$$(dig @127.0.0.1 -p 5411 corrupt3.test A +short +time=2 +tries=1);                     \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                            \
+	 echo "  echo mode:      A1=[$$A1] A2=[$$A2]  qname bytes vary: Q1=$$Q1 Q2=$$Q2";           \
+	 echo "  corrupt+0x20:   resolved=[$$C1] (expect empty — rejected)";                        \
+	 echo "  corrupt+noenf:  resolved=[$$C2] (expect answer — 0x20 disabled)";                  \
+	 echo "  corrupt+optout: resolved=[$$C3] (expect answer — this upstream exempted)";         \
+	 test "$$A1" = "203.0.113.55" -a "$$A2" = "203.0.113.55" || { echo "  FAIL  echo-mode resolution broke"; exit 1; }; \
+	 test -n "$$Q1" -a -n "$$Q2" -a "$$Q1" != "$$Q2" || { echo "  FAIL  QNAME case pattern did not vary between queries"; exit 1; }; \
+	 test -z "$$C1" || { echo "  FAIL  a case-corrupted response was accepted (0x20 not enforced)"; exit 1; }; \
+	 test "$$C2" = "203.0.113.55" || { echo "  FAIL  DNS0X20_ENABLED=0 should still resolve against the corrupt stub"; exit 1; }; \
+	 test "$$C3" = "203.0.113.55" || { echo "  FAIL  per-upstream DNS0X20_DISABLE opt-out did not work"; exit 1; }; \
+	 echo "  OK  0x20 randomizes QNAME case, rejects a case-mismatched reply, and honors the enabled/opt-out config"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -1872,6 +1928,7 @@ help:
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make check-resolverd-cache resolverd Valkey cache-load regression (needs Valkey + dig)"
 	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"
+	@echo "  make check-dns0x20   resolverd RFC 5452 0x20 QNAME case randomization (needs dig + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

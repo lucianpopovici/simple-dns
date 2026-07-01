@@ -283,8 +283,29 @@ record formats here use the Phase-1 schema decision.
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd
    Option A** (`CLAUDE-resolverd.md` / `-1.md`: 9156 QNAME-min, 8198 aggressive
    NSEC, 8767+9520 serve-stale, 5452 anti-spoof, 8914 EDE, 9462/9463 DDR/DNR,
-   6147 DNS64). Coordinate 5452 with the Phase-0 resolver anti-spoofing work so
-   they don't collide.
+   6147 DNS64).
+   - **5452 anti-spoof DONE 2026-07-01** — coordinated with the Phase-0
+     resolver anti-spoofing work as planned: transaction ID (CSPRNG) and
+     per-query source port randomization were already in place from that
+     pass, so this added the missing third leg, 0x20 QNAME case
+     randomization. `dns0x20_mix` lowercases then flips a random subset of
+     letters to uppercase (fresh `RAND_bytes` per query — replaying an old
+     pattern doesn't help a forger); `dns0x20_active_for` gates it globally
+     (`DNS0X20_ENABLED`, default on) with a per-upstream opt-out
+     (`DNS0X20_DISABLE`, comma-separated hostnames) per the RFC's own
+     guardrail for upstreams that break on it. The verification side needed
+     a new `qname_from_wire_case_preserving` in resolverd.c specifically:
+     libdnswire's shared `name_from_wire` always lowercases (correct for
+     cache keys/comparisons everywhere else), which would silently defeat
+     0x20 if reused for the case check, so `response_matches_query` gained
+     an `enforce_case` path using the case-preserving decode instead — any
+     mismatch is treated as a forged/stray packet and dropped, same as an
+     ID or QNAME-content mismatch. `make check-dns0x20` (a Python stub
+     upstream with "echo" vs "corrupt" modes) confirms the case pattern
+     varies across queries, a case-mismatched reply is rejected by default,
+     and both `DNS0X20_ENABLED=0` and the per-upstream opt-out correctly
+     restore acceptance. In CI. The other six resolverd items and the mdnsd
+     Discovery Proxy remain.
 5. **DoQ** (`CLAUDE-DoQ.md`) — new transport, larger effort.
 6. **eppd** (`CLAUDE-eppd.md`) — separate program. Gate on the
    public-vs-private-registry decision before starting phase 1 (core EPP).

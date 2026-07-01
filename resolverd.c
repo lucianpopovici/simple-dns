@@ -202,6 +202,10 @@ typedef struct {
     char search_domains[MAX_SEARCH_DOMAINS][256];
     int search_domain_count;
     uint32_t cache_neg_ttl_min; /* floor for negative cache TTL */
+    /* RFC 5452 §2.2 0x20 case randomization (defense-in-depth alongside the
+     * CSPRNG transaction ID + source port already in upstream_query_one). */
+    int dns0x20_enabled;
+    char dns0x20_disable[512]; /* comma-separated upstream hostnames to exempt */
 } config_t;
 
 /* =========================================================================
@@ -1472,13 +1476,99 @@ static int names_equal_nocase(const char *a, const char *b) {
     return la == lb && strncasecmp(a, b, la) == 0;
 }
 
+/* RFC 5452 §2.2 0x20 case randomization: mix the outbound QNAME's letter case
+ * so an off-path attacker must also guess this query's case pattern, not just
+ * the ID and source port. Fresh randomness per call — case-flip decisions are
+ * independent of any previous query, so replaying an old pattern doesn't help
+ * a forger. Non-letters pass through unchanged. */
+static void dns0x20_mix(const char *qname, char *out, size_t outsz) {
+    size_t n = strlen(qname);
+    if (n >= outsz)
+        n = outsz - 1;
+    uint8_t bits[32];
+    if (RAND_bytes(bits, (int) sizeof(bits)) != 1)
+        memset(bits, 0, sizeof(bits)); /* fail closed to "no mixing", never UB */
+    int bi = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char) qname[i];
+        if (c >= 'A' && c <= 'Z')
+            c = (unsigned char) (c - 'A' + 'a');
+        if (c >= 'a' && c <= 'z') {
+            int byte = bi / 8, bit = bi % 8;
+            if (byte < (int) sizeof(bits) && (bits[byte] & (1 << bit)))
+                c = (unsigned char) (c - 'a' + 'A');
+            bi++;
+        }
+        out[i] = (char) c;
+    }
+    out[n] = 0;
+}
+
+/* True if 0x20 is active for this upstream: globally enabled and not listed in
+ * DNS0X20_DISABLE (RFC 5452 guardrail — some upstreams demonstrably break on
+ * mixed-case QNAMEs; keep a per-upstream opt-out rather than an all-or-nothing
+ * switch). */
+static int dns0x20_active_for(int upstream_idx) {
+    if (!g_cfg.dns0x20_enabled)
+        return 0;
+    if (!g_cfg.dns0x20_disable[0])
+        return 1;
+    char list[512];
+    safe_strcpy(list, g_cfg.dns0x20_disable, sizeof(list));
+    char *sp = NULL;
+    for (char *tok = strtok_r(list, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        while (*tok == ' ')
+            tok++;
+        if (strcasecmp(tok, g_cfg.upstream_host[upstream_idx]) == 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* Read the question-section QNAME preserving case (name_from_wire in
+ * libdnswire always lowercases — correct for cache keys/comparisons
+ * everywhere else, but it destroys the very case information 0x20 needs to
+ * verify). Rejects any compression pointer: the question section is the
+ * first thing after the 12-byte header, so nothing earlier in the message is
+ * a valid backward target — a conforming server never compresses it, and a
+ * forger inserting a pointer here is exactly the case to reject, not follow. */
+static int qname_from_wire_case_preserving(const uint8_t *pkt, int plen, char *out, int outsz) {
+    int off = 12, oi = 0;
+    while (off < plen) {
+        int lablen = pkt[off];
+        if (lablen & 0xC0)
+            return -1;
+        if (lablen == 0) {
+            off++;
+            break;
+        }
+        if (off + 1 + lablen > plen)
+            return -1;
+        if (oi > 0) {
+            if (oi + 1 >= outsz)
+                return -1;
+            out[oi++] = '.';
+        }
+        if (oi + lablen >= outsz)
+            return -1;
+        memcpy(out + oi, pkt + off + 1, (size_t) lablen);
+        oi += lablen;
+        off += 1 + lablen;
+    }
+    out[oi] = 0;
+    return off;
+}
+
 /* RFC 5452 response acceptance: a reply is trusted only if its transaction ID
  * matches the query, the QR bit is set, and the question section echoes the asked
  * QNAME (case-insensitive), QTYPE, and QCLASS. Without this an off-path spoofer
  * only has to guess the 16-bit source port; with it they must also guess the
- * 16-bit ID. */
-static int response_matches_query(const uint8_t *resp, int rlen, uint16_t id, const char *qname,
-                                  uint16_t qtype) {
+ * 16-bit ID. When enforce_case is set (0x20 was applied to this query),
+ * additionally require the echoed QNAME to match sent_qname byte-for-byte in
+ * case — a forger who doesn't see the query never learns the exact pattern,
+ * so any mismatch here is treated as a forged/stray packet and dropped. */
+static int response_matches_query(const uint8_t *resp, int rlen, uint16_t id,
+                                  const char *sent_qname, uint16_t qtype, int enforce_case) {
     if (rlen < 12)
         return 0;
     if (get16(resp, 0) != id)
@@ -1495,7 +1585,24 @@ static int response_matches_query(const uint8_t *resp, int rlen, uint16_t id, co
         return 0;
     if (get16(resp, off + 2) != DNS_CLASS_IN) /* we only ever ask IN */
         return 0;
-    return names_equal_nocase(rqname, qname);
+    if (!names_equal_nocase(rqname, sent_qname))
+        return 0;
+    if (enforce_case) {
+        char rqname_cs[256];
+        if (qname_from_wire_case_preserving(resp, rlen, rqname_cs, sizeof(rqname_cs)) < 0)
+            return 0;
+        /* Strip a single trailing dot from each side before comparing, same
+         * convention as names_equal_nocase — sent_qname may or may not carry
+         * one depending on the caller. */
+        size_t rl = strlen(rqname_cs), sl = strlen(sent_qname);
+        if (rl && rqname_cs[rl - 1] == '.')
+            rl--;
+        if (sl && sent_qname[sl - 1] == '.')
+            sl--;
+        if (rl != sl || strncmp(rqname_cs, sent_qname, rl) != 0)
+            return 0;
+    }
+    return 1;
 }
 
 /* =========================================================================
@@ -2061,14 +2168,24 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
                     sizeof(g_cfg.upstream_host[0]));
     g_cfg.upstream_port[0] = g_cfg.upstream_port[upstream_idx];
     g_cfg.proto = g_cfg.upstream_proto[upstream_idx];
-    int qlen = build_query(query, sizeof(query), qname, qtype, id, 1, upstream_idx);
+    /* RFC 5452 §2.2 0x20: wire-encode (and later verify) a case-mixed QNAME
+     * instead of the plain one when this upstream hasn't opted out. qname
+     * itself is left untouched — callers outside this function (cache keys,
+     * logging) still see the original case. */
+    int use_0x20 = dns0x20_active_for(upstream_idx);
+    char qname_sent[256];
+    if (use_0x20)
+        dns0x20_mix(qname, qname_sent, sizeof(qname_sent));
+    else
+        safe_strcpy(qname_sent, qname, sizeof(qname_sent));
+    int qlen = build_query(query, sizeof(query), qname_sent, qtype, id, 1, upstream_idx);
     int rlen = -1;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     rlen = upstream_dispatch(query, qlen, resp, resp_sz);
     /* RFC 5452: drop any reply whose ID/question does not match what we asked —
      * fail closed so a spoofed or stray packet is never cached or trusted. */
-    if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname, qtype))
+    if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname_sent, qtype, use_0x20))
         rlen = -1;
     /* RFC 7873: learn the Server Cookie from the (now validated) response; if the
      * upstream rejected us with BADCOOKIE (no/stale Server Cookie), retry once
@@ -2082,9 +2199,11 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
             cookie_store_server(upstream_idx, scookie, slen);
         if (full_rcode == DNS_RCODE_BADCOOKIE && slen > 0) {
             id = csprng_u16();
-            qlen = build_query(query, sizeof(query), qname, qtype, id, 1, upstream_idx);
+            if (use_0x20)
+                dns0x20_mix(qname, qname_sent, sizeof(qname_sent));
+            qlen = build_query(query, sizeof(query), qname_sent, qtype, id, 1, upstream_idx);
             rlen = upstream_dispatch(query, qlen, resp, resp_sz);
-            if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname, qtype))
+            if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname_sent, qtype, use_0x20))
                 rlen = -1;
             if (rlen >= 12) {
                 int slen2 = 0;
@@ -3552,6 +3671,9 @@ static void config_load_env(void) {
     safe_strcpy(g_cfg.doh_path, getenv_or("DOH_PATH", "/dns-query"), sizeof(g_cfg.doh_path));
     g_cfg.doh_port = atoi(getenv_or("DOH_PORT", "443"));
     g_cfg.listen_tcp = atoi(getenv_or("LISTEN_TCP", "1"));
+    g_cfg.dns0x20_enabled = atoi(getenv_or("DNS0X20_ENABLED", "1"));
+    safe_strcpy(g_cfg.dns0x20_disable, getenv_or("DNS0X20_DISABLE", ""),
+                sizeof(g_cfg.dns0x20_disable));
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count = 0;
     const char *sdomains = getenv_or("SEARCH_DOMAINS", "");

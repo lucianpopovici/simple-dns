@@ -92,7 +92,7 @@ coverage matrix, 8499/9499, **NAPTR = 3403** (header mislabels it 9250).
 | 1 | 9156 | QNAME minimisation | Specced |
 | 2 | 8198 | Aggressive use of DNSSEC-validated cache | Specced |
 | 3 | 8767 + 9520 | Serve-stale + failure caching | Specced |
-| 4 | 5452 | Resilience to forged answers (port + 0x20) | Specced |
+| 4 | 5452 | Resilience to forged answers (port + 0x20) | **Done** (port + transaction ID were already CSPRNG from the Phase-0 security pass; 0x20 QNAME case randomization added — `dns0x20_mix`/`dns0x20_active_for` in resolverd, case-sensitive verification via a case-preserving question decode, per-upstream opt-out; `make check-dns0x20`) |
 | 5 | 8914 | Extended DNS Errors (generation) | Specced |
 | 6 | 9462 / 9463 | DDR / DNR | Specced (lighter) |
 | 7 | 6147 | DNS64 (NAT64 AAAA synthesis) | Specced |
