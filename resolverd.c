@@ -2995,8 +2995,7 @@ static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_resu
         memset(fake, 0, sizeof(fake));
         if (ce->rrs[i].rdata && ce->rrs[i].rdlen > 0)
             memcpy(fake, ce->rrs[i].rdata,
-                   ce->rrs[i].rdlen < (int) sizeof(fake) ? ce->rrs[i].rdlen
-                                                         : (int) sizeof(fake));
+                   ce->rrs[i].rdlen < (int) sizeof(fake) ? ce->rrs[i].rdlen : (int) sizeof(fake));
         rdata_to_str(fake, ce->rrs[i].rdlen, 0, ce->rrs[i].rdlen, ce->rrs[i].type,
                      result->answers[i], sizeof(result->answers[i]));
         safe_strcpy(result->answer_names[i], qname, sizeof(result->answer_names[i]));
