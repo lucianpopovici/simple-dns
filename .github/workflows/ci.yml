@@ -84,6 +84,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-dnsxl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 1794 per-name round-robin rotation (RRSIGs intact)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-rr-rotate OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

@@ -105,6 +105,12 @@
  *   dnsxl:<zone>:<ip>            DNSxL listing: low_octet|reason
  *                              (e.g. "2|spam source"). A query for the reversed
  *                              name synthesizes A 127.0.0.<low_octet> + TXT reason.
+ *   config:rr_rotate           "1" to enable per-name round-robin rotation of
+ *                              multi-address A/AAAA RRsets (RFC 1794). Distinct
+ *                              from config:lb_mode — uses per-name counters keyed
+ *                              by djb2(name) so different names rotate independently.
+ *                              lb_mode takes precedence when set. Local serving
+ *                              policy only — not zone data, never travels in AXFR.
  *   config:dot_require_client_cert  "1" to require a verified client cert (mTLS)
  *                              on the DoT/transfer listener (needs
  *                              config:mtls_ca_pem). Default 0 — keep OFF on
@@ -596,6 +602,28 @@ static pthread_mutex_t g_lb_health_mutex = PTHREAD_MUTEX_INITIALIZER;
  * (config:dnsxl_zones, empty = disabled). Per-IP listings live in Valkey as
  * dnsxl:<zone>:<ip> → "<low_octet>|<reason>". */
 static char g_dnsxl_zones[1024] = ""; /* config:dnsxl_zones */
+
+/* RFC 1794 per-name round-robin rotation for multi-address A/AAAA RRsets.
+ * Distinct from config:lb_mode (which is a single global cursor): each name
+ * gets its own counter in g_rr_rot[], keyed by djb2(name)&mask. lb_mode takes
+ * precedence when set. Local serving policy only; never travels in AXFR. */
+static int g_rr_rotate = 0; /* config:rr_rotate */
+#define RR_ROT_BUCKETS 1024
+static uint32_t g_rr_rot[RR_ROT_BUCKETS];
+static pthread_mutex_t g_rr_rot_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int rr_rotate_offset(const char *name, int n) {
+    if (!g_rr_rotate || n <= 1)
+        return 0;
+    uint32_t h = 5381u;
+    for (const char *p = name; *p; p++)
+        h = ((h << 5) + h) + (uint8_t) *p;
+    uint32_t idx = (h ^ (h >> 16)) & (RR_ROT_BUCKETS - 1);
+    pthread_mutex_lock(&g_rr_rot_mutex);
+    int off = (int) (g_rr_rot[idx]++ % (uint32_t) n);
+    pthread_mutex_unlock(&g_rr_rot_mutex);
+    return off;
+}
 
 /* Structured query log */
 static char g_query_log_path[512] = ""; /* "" = disabled */
@@ -2231,6 +2259,9 @@ static void config_load_from_valkey(void) {
     /* RFC 5782 DNSxL synthesis (config:dnsxl_zones, empty = disabled). */
     g_dnsxl_zones[0] = 0;
     G("dnsxl_zones", g_dnsxl_zones);
+    /* RFC 1794 per-name round-robin rotation (config:rr_rotate, default 0). */
+    g_rr_rotate = 0;
+    GI("rr_rotate", g_rr_rotate);
     /* TSIG secret (base64) */
     if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
         g_tsig_secret_len = b64std_dec(val, g_tsig_secret, sizeof(g_tsig_secret));
@@ -5258,12 +5289,15 @@ static int emit_addr_rrset(uint8_t *resp, int off, int resp_len, const char *nam
             pthread_mutex_unlock(&g_stat_mutex);
         }
     }
-    /* 2. pick rotation start (over the emitted set) */
+    /* 2. pick rotation start (over the emitted set).
+     * lb_mode takes precedence; RFC 1794 per-name rotation applies when none. */
     int start = 0;
     if (g_lb_mode == LB_RR)
         start = (int) (atomic_fetch_add(&g_lb_counter, 1u) % (uint32_t) sn);
     else if (g_lb_mode == LB_RANDOM)
         start = rand() % sn;
+    else
+        start = rr_rotate_offset(name, sn);
     /* 3. emit rotated */
     for (int i = 0; i < sn; i++) {
         const char *ip = set[(start + i) % sn];
@@ -6190,59 +6224,21 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                                    strcasecmp(cur + nl - zl, zn) == 0);
                     if (!in_zone)
                         break;
-                    /* A records at this hop */
+                    /* A/AAAA records at this hop — emit_addr_rrset applies
+                     * health filtering + RFC 1794/lb_mode rotation. */
                     if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
-                        char ck[768];
+                        char ck[768], cv[256];
                         zkey(ck, sizeof(ck), "A", cur);
-                        char cv[256];
-                        if (vk_get(ck, cv, sizeof(cv))) {
-                            uint32_t t2 = DEFAULT_TTL;
-                            char *pp = strchr(cv, '|');
-                            char *ip = pp ? pp + 1 : cv;
-                            if (pp)
-                                t2 = (uint32_t) atoi(cv);
-                            char cbuf[256];
-                            safe_strcpy(cbuf, ip, sizeof(cbuf));
-                            char *sp20 = NULL;
-                            char *tok = strtok_r(cbuf, "|", &sp20);
-                            while (tok) {
-                                struct in_addr a4;
-                                if (inet_pton(AF_INET, tok, &a4) == 1) {
-                                    uint8_t rd4[4];
-                                    memcpy(rd4, &a4, 4);
-                                    off = emit_rr(resp, off, resp_len, cur, DNS_TYPE_A, t2, rd4, 4,
+                        if (vk_get(ck, cv, sizeof(cv)))
+                            off = emit_addr_rrset(resp, off, resp_len, cur, DNS_TYPE_A, cv,
                                                   dnssec_ok, &answers);
-                                }
-                                tok = strtok_r(NULL, "|", &sp20);
-                            }
-                        }
                     }
-                    /* AAAA records */
                     if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
-                        char ck[768];
+                        char ck[768], cv[256];
                         zkey(ck, sizeof(ck), "AAAA", cur);
-                        char cv[256];
-                        if (vk_get(ck, cv, sizeof(cv))) {
-                            uint32_t t2 = DEFAULT_TTL;
-                            char *pp = strchr(cv, '|');
-                            char *ip = pp ? pp + 1 : cv;
-                            if (pp)
-                                t2 = (uint32_t) atoi(cv);
-                            char cbuf[256];
-                            safe_strcpy(cbuf, ip, sizeof(cbuf));
-                            char *sp21 = NULL;
-                            char *tok = strtok_r(cbuf, "|", &sp21);
-                            while (tok) {
-                                struct in6_addr a6;
-                                if (inet_pton(AF_INET6, tok, &a6) == 1) {
-                                    uint8_t rd6[16];
-                                    memcpy(rd6, &a6, 16);
-                                    off = emit_rr(resp, off, resp_len, cur, DNS_TYPE_AAAA, t2, rd6,
-                                                  16, dnssec_ok, &answers);
-                                }
-                                tok = strtok_r(NULL, "|", &sp21);
-                            }
-                        }
+                        if (vk_get(ck, cv, sizeof(cv)))
+                            off = emit_addr_rrset(resp, off, resp_len, cur, DNS_TYPE_AAAA, cv,
+                                                  dnssec_ok, &answers);
                     }
                     /* Next CNAME hop? */
                     zkey(cname_key, sizeof(cname_key), "CNAME", cur);
@@ -6324,7 +6320,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 off = emit_rr(resp, off, resp_len, qname, r->type, r->ttl, rd, rdlen, dnssec_ok,
                               &answers);
             }
-            /* Also check Valkey wildcard */
+            /* Also check Valkey wildcard — emit with synthesised owner qname
+             * so rotation and health filtering apply via emit_addr_rrset. */
             if (!found) {
                 char wk[768];
                 if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
@@ -6332,20 +6329,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                     char wv[128];
                     if (vk_get(wk, wv, sizeof(wv))) {
                         found = 1;
-                        uint32_t wttl = DEFAULT_TTL;
-                        char *wp = strchr(wv, '|');
-                        if (wp) {
-                            wttl = (uint32_t) atoi(wv);
-                            wp++;
-                        } else
-                            wp = wv;
-                        struct in_addr wa4;
-                        if (inet_pton(AF_INET, wp, &wa4) == 1) {
-                            uint8_t rd[4];
-                            memcpy(rd, &wa4, 4);
-                            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_A, wttl, rd, 4,
-                                          dnssec_ok, &answers);
-                        }
+                        off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, wv, dnssec_ok,
+                                              &answers);
                     }
                 }
                 if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
@@ -6353,20 +6338,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                     char wv[256];
                     if (vk_get(wk, wv, sizeof(wv))) {
                         found = 1;
-                        uint32_t wttl = DEFAULT_TTL;
-                        char *wp = strchr(wv, '|');
-                        if (wp) {
-                            wttl = (uint32_t) atoi(wv);
-                            wp++;
-                        } else
-                            wp = wv;
-                        struct in6_addr wa6;
-                        if (inet_pton(AF_INET6, wp, &wa6) == 1) {
-                            uint8_t rd[16];
-                            memcpy(rd, &wa6, 16);
-                            off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_AAAA, wttl, rd, 16,
-                                          dnssec_ok, &answers);
-                        }
+                        off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, wv,
+                                              dnssec_ok, &answers);
                     }
                 }
             }

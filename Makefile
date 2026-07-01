@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -561,6 +561,45 @@ check-dnsxl: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$OUT_M2"  | grep -q "127.0.0.2"       || { echo "  FAIL  §5 2.0.0.127 not listed";    exit 1; }; \
 	 echo "$$OUT_M1"  | grep -qi "NXDOMAIN"       || { echo "  FAIL  §5 1.0.0.127 must be NXDOMAIN"; exit 1; }; \
 	 echo "  OK  DNSxL listed→A 127.0.0.2 + TXT; unlisted→NXDOMAIN; RFC 5782 §5 test points"
+
+check-rr-rotate: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 1794 per-name round-robin rotation (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                    \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };           \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                 \
+	 Z=example.local; QN=rr.$$Z; REC=zone:$$Z:A:$$QN;                                        \
+	 SAVE_RR=$$($$VC get config:rr_rotate);                                                   \
+	 $$VC set $$REC "300|10.0.1.1|10.0.1.2|10.0.1.3" >/dev/null;                             \
+	 $$VC set config:rr_rotate 1 >/dev/null;                                                  \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_rrr.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                               \
+	 FIRSTS=""; NLINES_MIN=9;                                                                 \
+	 for i in 1 2 3 4 5 6; do                                                                 \
+	   OUT=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1);          \
+	   F=$$(echo "$$OUT" | head -1);                                                          \
+	   C=$$(echo "$$OUT" | grep -c '^10\.0\.1\.');                                            \
+	   FIRSTS="$$FIRSTS $$F";                                                                 \
+	   if [ "$$C" -lt 3 ]; then NLINES_MIN=0; fi;                                             \
+	 done;                                                                                    \
+	 DISTINCT=$$(echo $$FIRSTS | tr ' ' '\n' | sort -u | grep -c '^10\.0\.1\.');              \
+	 SIGS=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | grep -c 'RRSIG'); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                               \
+	 $$VC set config:rr_rotate 0 >/dev/null;                                                  \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_rrr0.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                               \
+	 N1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | head -1);  \
+	 N2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$QN A +time=2 +tries=1 | head -1);  \
+	 kill $$DNS 2>/dev/null || true;                                                          \
+	 $$VC del $$REC >/dev/null;                                                               \
+	 if [ -n "$$SAVE_RR" ]; then $$VC set config:rr_rotate "$$SAVE_RR" >/dev/null;           \
+	 else $$VC del config:rr_rotate >/dev/null; fi;                                           \
+	 echo "  rr_rotate=1: first-addr sequence =$$FIRSTS  (distinct=$$DISTINCT, all3=$$NLINES_MIN, rrsigs=$$SIGS)"; \
+	 echo "  rr_rotate=0: first-addr q1=$$N1 q2=$$N2";                                       \
+	 test "$$DISTINCT" -ge 2   || { echo "  FAIL  rr_rotate did not rotate (distinct first-addr < 2)"; exit 1; }; \
+	 test "$$NLINES_MIN" -ge 3 || { echo "  FAIL  rotation dropped addresses (<3 A in a response)"; exit 1; }; \
+	 test "$$SIGS" -ge 1       || { echo "  FAIL  +dnssec returned no RRSIG for the rotated RRset"; exit 1; }; \
+	 test -n "$$N1" -a "$$N1" = "$$N2" || { echo "  FAIL  rr_rotate=0 not stable ($$N1 vs $$N2)"; exit 1; }; \
+	 echo "  OK  per-name rotation active (all addrs kept, RRSIGs intact), disabled is stable"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1518,6 +1557,7 @@ help:
 	@echo "  make check-zonemd    RFC 8976 ZONEMD codec KAT + AXFR digest recompute (needs Valkey + python3)"
 	@echo "  make check-csync     RFC 7477 CSYNC codec KAT + dnsd serves type-62 (needs Valkey + dig)"
 	@echo "  make check-dnsxl     RFC 5782 DNSxL synthesis listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN (needs Valkey + dig)"
+	@echo "  make check-rr-rotate RFC 1794 per-name round-robin rotation; DNSSEC still valid (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

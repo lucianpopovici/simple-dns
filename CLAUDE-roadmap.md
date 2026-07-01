@@ -164,10 +164,13 @@ record formats here use the Phase-1 schema decision.
      `config:dnsxl_zones` (comma-separated suffixes); per-IP in Valkey as
      `dnsxl:<zone>:<ip>` → `low_octet|reason`; listed→A 127.0.0.x + TXT,
      unlisted→NXDOMAIN; RFC 5782 §5 mandatory test points in `make check-dnsxl`. In CI.
-   - Next: 1794 (RR rotation),
-     6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation).
-   - Then new record types/features: 5782 (DNSxL), 1794 (RR rotation),
-     6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation),
+   - **1794 RR rotation DONE 2026-07-01** — `config:rr_rotate`; per-name djb2
+     counter array `g_rr_rot[1024]` mutex-guarded; `rr_rotate_offset()` in dnsd;
+     applied at all three A/AAAA emit paths via `emit_addr_rrset()` (main zone +
+     CNAME-chain hop now refactored to call `emit_addr_rrset`, wildcard Valkey
+     path likewise); lb_mode takes precedence when set; `make check-rr-rotate`
+     (3 distinct first-addrs in 6 queries + RRSIGs intact + disabled is stable).
+   - Next: 6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation),
      and the batch-3 complementary items.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
