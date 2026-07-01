@@ -175,7 +175,15 @@ record formats here use the Phase-1 schema decision.
      ENUM regexps with alternation survive round-trip); Enumservice warning when
      service field is not `E2U+...`; RFC 6116/6117/6118 in header comment +
      mislabelled "9250" corrected to "3403"; `make check-enum` in CI.
-   - Next: 2317 (classless reverse delegation), and the batch-3 complementary items.
+   - **2317 classless reverse delegation DONE 2026-07-01** — `dnsd` was already
+     wire-capable (CNAME chain in the `/24` + PTR in a co-hosted classless
+     subzone, both DNSSEC-signed) so no `dns_server.c` change was needed; added
+     `POST /reverse/classless` (mgmt-only) to `apid` to provision a CIDR
+     (`/25`-`/31`) as a `/24`-zone CNAME per address plus either a co-hosted
+     subzone in `zone_table` or an NS delegation; `make check-2317` drives the
+     wire path directly against Valkey (CNAME→subzone PTR, RRSIG present). In CI.
+   - Next: the batch-3 complementary items (9103 XoT, 9859 generalized NOTIFY,
+     9660 ZONEVERSION, 9567 error reporting) and 3258 anycast deployment note.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd

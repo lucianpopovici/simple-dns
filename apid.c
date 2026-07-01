@@ -1303,6 +1303,121 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         return;
     }
 
+    /* RFC 2317 classless in-addr.arpa delegation provisioning (mgmt only).
+     * Params: cidr (e.g. 192.0.2.0/27), delimiter (- or /, default -),
+     *         cohost (1=co-host subzone default, 0=write NS for delegation),
+     *         delegate_to (NS target FQDN, only when cohost=0). */
+    if (is_mgmt && !strcasecmp(method, "POST") && !strcmp(path, "/reverse/classless")) {
+        char *bdy = strstr(buf, "\r\n\r\n");
+        if (!bdy) {
+            api_send(fd, ssl, 400, "no body\n");
+            return;
+        }
+        bdy += 4;
+        char cidr_s[64] = {0}, delim_s[4] = {0}, cohost_s[4] = {0}, delegate_s[256] = {0};
+        qs_get(bdy, "cidr", cidr_s, sizeof(cidr_s));
+        qs_get(bdy, "delimiter", delim_s, sizeof(delim_s));
+        qs_get(bdy, "cohost", cohost_s, sizeof(cohost_s));
+        qs_get(bdy, "delegate_to", delegate_s, sizeof(delegate_s));
+        if (!cidr_s[0]) {
+            api_send(fd, ssl, 400, "missing cidr\n");
+            return;
+        }
+        /* Parse cidr: split on '/' */
+        char ip_s[40] = {0};
+        int prefixlen = -1;
+        {
+            char tmp[64];
+            safe_strcpy(tmp, cidr_s, sizeof(tmp));
+            char *slash = strchr(tmp, '/');
+            if (!slash) {
+                api_send(fd, ssl, 400, "cidr must include prefix length (e.g. 192.0.2.0/27)\n");
+                return;
+            }
+            *slash = '\0';
+            safe_strcpy(ip_s, tmp, sizeof(ip_s));
+            prefixlen = atoi(slash + 1);
+        }
+        if (prefixlen < 25 || prefixlen > 31) {
+            api_send(fd, ssl, 400,
+                     "cidr prefix length must be 25-31 (classless /24 sub-block)\n");
+            return;
+        }
+        struct in_addr addr4;
+        if (inet_pton(AF_INET, ip_s, &addr4) != 1) {
+            api_send(fd, ssl, 400, "invalid IPv4 address in cidr\n");
+            return;
+        }
+        uint32_t ip32 = ntohl(addr4.s_addr);
+        uint32_t mask = (uint32_t)(0xFFFFFFFFu << (32 - prefixlen));
+        if ((ip32 & ~mask) != 0) {
+            api_send(fd, ssl, 400, "cidr host bits are not zero (use the network address)\n");
+            return;
+        }
+        /* Octets */
+        unsigned o1 = (ip32 >> 24) & 0xFF;
+        unsigned o2 = (ip32 >> 16) & 0xFF;
+        unsigned o3 = (ip32 >> 8) & 0xFF;
+        unsigned o4_start = ip32 & 0xFF;
+        unsigned blocksize = 1u << (32 - prefixlen);
+        char delim = (delim_s[0] == '/') ? '/' : '-';
+        int cohost = (cohost_s[0] == '0') ? 0 : 1;
+        /* /24 reverse zone name: o3.o2.o1.in-addr.arpa */
+        char rev24[128];
+        snprintf(rev24, sizeof(rev24), "%u.%u.%u.in-addr.arpa", o3, o2, o1);
+        /* classless subzone label and name */
+        char subzone[256], sublabel[32];
+        snprintf(sublabel, sizeof(sublabel), "%u%c%d", o4_start, delim, prefixlen);
+        snprintf(subzone, sizeof(subzone), "%s.%s", sublabel, rev24);
+        /* Verify /24 zone is configured */
+        char rev24_zone[256];
+        resolve_zone(rev24, rev24_zone, sizeof(rev24_zone));
+        if (!rev24_zone[0]) {
+            char err[256];
+            snprintf(err, sizeof(err),
+                     "no authoritative zone for %s — create it first with /zone/add\n", rev24);
+            api_send(fd, ssl, 400, err);
+            return;
+        }
+        /* Write one CNAME per address in the block (in the /24 zone).
+         * Buffers sized for zone:<256>:CNAME:<256> worst-case. */
+        int written = 0;
+        for (unsigned off = 0; off < blocksize; off++) {
+            unsigned host = o4_start + off;
+            char owner[320], target[320], vkey[768], vval[640];
+            snprintf(owner, sizeof(owner), "%u.%s", host, rev24);
+            snprintf(target, sizeof(target), "%u.%s", host, subzone);
+            snprintf(vkey, sizeof(vkey), "zone:%s:CNAME:%s", rev24_zone, owner);
+            snprintf(vval, sizeof(vval), "3600|%s", target);
+            vk_set(vkey, vval, 0);
+            written++;
+        }
+        serial_bump_zone(rev24_zone);
+        /* Co-host: register the subzone in zone_table so dnsd serves its PTRs */
+        if (cohost) {
+            char subkey[320], subval[768];
+            snprintf(subkey, sizeof(subkey), "zone_table:%s", subzone);
+            /* mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify */
+            snprintf(subval, sizeof(subval), "ns1.%s|hostmaster.%s|1|3600|900|604800|300||",
+                     rev24_zone, rev24_zone);
+            vk_set(subkey, subval, 0);
+        } else if (delegate_s[0]) {
+            /* Delegated: write NS record in the /24 zone pointing at delegate_to */
+            char nskey[768], nsval[640];
+            snprintf(nskey, sizeof(nskey), "zone:%s:NS:%s", rev24_zone, subzone);
+            snprintf(nsval, sizeof(nsval), "3600|%s", delegate_s);
+            vk_set(nskey, nsval, 0);
+            serial_bump_zone(rev24_zone);
+        }
+        char rb[768];
+        snprintf(rb, sizeof(rb),
+                 "ok: %u CNAMEs written in %s → subzone %s (%s)\n", written, rev24_zone,
+                 subzone, cohost ? "co-hosted" : "delegated");
+        dns_log(LOG_NOTICE, "[2317] %s", rb);
+        api_send(fd, ssl, 201, rb);
+        return;
+    }
+
     api_send(fd, ssl, 404, "unknown endpoint\n");
 }
 

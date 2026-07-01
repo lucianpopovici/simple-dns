@@ -55,7 +55,7 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | 9 | 1982 | Serial-number arithmetic | **Done** (libdnswire + IXFR uses serial_lt) | batch3 |
 | 10 | 9715 | UDP fragmentation avoidance | **Done** | batch3 |
 | 11 | 9824 (+4470) | Compact denial of existence | Follow-on | batch3 |
-| 12 | 2317 | Classless reverse delegation | Specced | batch4 |
+| 12 | 2317 | Classless reverse delegation | **Done** (dnsd already wire-capable — CNAME chain + co-hosted subzone PTR, DNSSEC-signed; `POST /reverse/classless` provisioning in apid; `make check-2317`) | batch4 |
 
 Complementary (batch3): 9103 (XoT), 9859 (generalized NOTIFY), 9660
 (ZONEVERSION), 9567 (error reporting). Deployment note (batch4): 3258 (anycast,

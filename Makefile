@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -634,6 +634,43 @@ check-enum: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$OUT2" | grep -q "a|b@x.com"            || { echo "  FAIL  '|' in regexp not preserved";   exit 1; }; \
 	 test "$$SIGS" -ge 1                            || { echo "  FAIL  +dnssec returned no RRSIG";      exit 1; }; \
 	 echo "  OK  ENUM NAPTR ordered rules serve correctly; '|' in regexp preserved; RRSIG present"
+
+# RFC 2317 classless in-addr.arpa delegation. Writes a /24 zone + /27 subzone
+# directly to Valkey (as the apid /reverse/classless endpoint would), then
+# verifies that a PTR query for an address in the block follows the CNAME to the
+# subzone PTR and returns the correct hostname. DNSSEC must sign both legs.
+check-2317: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 2317 classless reverse delegation CNAME→PTR chain (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                      \
+	 REV24=2.0.192.in-addr.arpa; SUB=0-27.$$REV24;                                               \
+	 SAVE_ZT_REV=$$($$VC get zone_table:$$REV24);                                                 \
+	 SAVE_ZT_SUB=$$($$VC get zone_table:$$SUB);                                                   \
+	 $$VC set "zone_table:$$REV24"  "ns1.$$REV24|hostmaster.$$REV24|1|3600|900|604800|300||" >/dev/null; \
+	 $$VC set "zone_table:$$SUB"    "ns1.$$REV24|hostmaster.$$REV24|1|3600|900|604800|300||" >/dev/null; \
+	 for i in 0 1 2 3 4 5; do                                                                     \
+	   $$VC set "zone:$$REV24:CNAME:$$i.$$REV24" "3600|$$i.$$SUB" >/dev/null;                     \
+	 done;                                                                                         \
+	 $$VC set "zone:$$SUB:PTR:5.$$SUB"  "3600|host5.customer.example." >/dev/null;                \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_2317.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                    \
+	 CNAME=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) 5.$$REV24 CNAME +time=2 +tries=1);     \
+	 PTR=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) 5.$$SUB PTR +time=2 +tries=1);            \
+	 SIGS=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) 5.$$SUB PTR +time=2 +tries=1 | grep -c RRSIG); \
+	 kill $$DNS 2>/dev/null || true;                                                               \
+	 $$VC del "zone_table:$$REV24" "zone_table:$$SUB" >/dev/null;                                 \
+	 for i in 0 1 2 3 4 5; do $$VC del "zone:$$REV24:CNAME:$$i.$$REV24" >/dev/null; done;         \
+	 $$VC del "zone:$$SUB:PTR:5.$$SUB" >/dev/null;                                                \
+	 if [ -n "$$SAVE_ZT_REV" ]; then $$VC set zone_table:$$REV24 "$$SAVE_ZT_REV" >/dev/null; fi; \
+	 if [ -n "$$SAVE_ZT_SUB" ]; then $$VC set zone_table:$$SUB "$$SAVE_ZT_SUB" >/dev/null; fi;   \
+	 echo "  /24 CNAME: 5.$$REV24 → $$CNAME";                                                     \
+	 echo "  Subzone PTR: 5.$$SUB → $$PTR";                                                        \
+	 echo "  RRSIGs on PTR in subzone: $$SIGS";                                                   \
+	 echo "$$CNAME" | grep -q "5.0-27" || { echo "  FAIL  CNAME to subzone missing"; exit 1; };   \
+	 echo "$$PTR"   | grep -qi "host5.customer.example" || { echo "  FAIL  PTR target missing from subzone"; exit 1; }; \
+	 test "$$SIGS" -ge 1 || { echo "  FAIL  no RRSIG on subzone PTR"; exit 1; };                  \
+	 echo "  OK  CNAME in /24 zone + PTR in co-hosted subzone; subzone PTR DNSSEC-signed"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1593,6 +1630,7 @@ help:
 	@echo "  make check-dnsxl     RFC 5782 DNSxL synthesis listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN (needs Valkey + dig)"
 	@echo "  make check-rr-rotate RFC 1794 per-name round-robin rotation; DNSSEC still valid (needs Valkey + dig)"
 	@echo "  make check-enum      RFC 6116 ENUM NAPTR: ordered rules, '|' in regexp, RRSIG (needs Valkey + dig)"
+	@echo "  make check-2317      RFC 2317 classless /24 sub-block delegation CNAME→PTR + RRSIG (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
