@@ -237,9 +237,27 @@ record formats here use the Phase-1 schema decision.
      configured domain, is omitted when unset, and is omitted for a
      subdomain-of-zone agent. In CI.
    - **Batch 3 is now fully closed** — every item in
-     `CLAUDE-rfc-additions-batch3.md` is Done; only the batch-4 RFC 3258
-     anycast deployment note (no code) remains from the reverse-DNS/anycast
-     batch.
+     `CLAUDE-rfc-additions-batch3.md` is Done.
+   - **3258 anycast deployment note DONE 2026-07-01** (batch4) — mostly
+     operational guidance, not a wire feature: run N identical `dnsd` nodes on
+     a shared service IP, keep their zone data at the same serial (shared or
+     replicated Valkey, or per-node Valkey kept in sync via the existing
+     AXFR/IXFR+NOTIFY path — pick one and hold nodes at the same serial), set a
+     distinct `config:nsid` per node, and keep AXFR/IXFR on each node's
+     *unicast* management address rather than the anycast service IP (a
+     re-route mid-transfer must not sever it). The one concrete optional code
+     add the note names — CHAOS-class `id.server`/`hostname.bind` (RFC 4892 /
+     the BIND convention) — is implemented: `qclass`/`qtype` gate a new
+     early-return branch in `build_query_resp` (ahead of the zone-authority
+     check, since these names aren't part of any zone) that answers `CH TXT`
+     with `config:nsid` (already discloses the same identity over EDNS NSID,
+     so no new config knob). An `IN`-class query for the same literal name
+     (`id.server A`) is unaffected — the branch is class-gated, not
+     name-gated. `make check-id-server` covers both names, the IN-class
+     non-interception case, and that ordinary queries still work. In CI.
+   - This closes out both RFC-addition batches (3 and 4) entirely; remaining
+     spec work is items 3–6 below plus the in-flight-plan tails in
+     `CLAUDE.md`.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd

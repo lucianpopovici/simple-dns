@@ -5779,6 +5779,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         return -1;
     memcpy(resp + off, query + off, qsec);
     uint16_t qtype = get16(query, after);
+    uint16_t qclass = get16(query, after + 2);
     off += qsec;
     edns_info_t ei;
     edns_parse(query, qlen, &ei);
@@ -5803,6 +5804,27 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         return off;
     }
     int dnssec_ok = ei.do_bit;
+    /* RFC 4892 / BIND convention: CHAOS-class id.server / hostname.bind TXT
+     * query returns this node's identity — the classic anycast/cluster
+     * debugging aid (CLAUDE-rfc-additions-batch4.md, RFC 3258 optional add).
+     * Reuses g_nsid (the same identity NSID already discloses over EDNS)
+     * rather than a separate config knob. Answered ahead of the zone-authority
+     * check below: these names are not part of any configured zone. */
+    if (qclass == DNS_CLASS_CH && qtype == DNS_TYPE_TXT &&
+        (strcasecmp(qname, "id.server") == 0 || strcasecmp(qname, "hostname.bind") == 0)) {
+        uint8_t rd[256];
+        int rdl = txt_encode(g_nsid[0] ? g_nsid : "unknown", rd, sizeof(rd));
+        if (rdl > 0) {
+            int n = append_rr(resp, off, resp_len, qname, DNS_TYPE_TXT, DNS_CLASS_CH, 0, rd,
+                              (uint16_t) rdl);
+            if (n > 0) {
+                off = n;
+                rh->ancount = htons(1);
+            }
+        }
+        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, -1, NULL);
+        return off;
+    }
     /* RFC 1035 §4.3.1: return REFUSED for names outside our zone.
      * This prevents systemd-resolved (and other validators) from
      * caching false NXDOMAIN when they accidentally route public

@@ -56,6 +56,7 @@
 /* ── DNS class constants ─────────────────────────────────────────────────── */
 
 #define DNS_CLASS_IN 1
+#define DNS_CLASS_CH 3 /* RFC 1035 — CHAOS; used for id.server/hostname.bind (RFC 4892) */
 #define DNS_CLASS_ANY 255
 #define DNS_CLASS_NONE 254
 

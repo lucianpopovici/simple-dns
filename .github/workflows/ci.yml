@@ -126,6 +126,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-error-reporting OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 3258/4892 CHAOS id.server/hostname.bind (anycast debugging aid)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-id-server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

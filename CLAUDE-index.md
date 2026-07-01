@@ -24,7 +24,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-architecture.md` | all | System-level ADRs (schema, atomicity, data access, keys, HA/DR) |
 | `CLAUDE-rfc-additions.md` | dnsd | Batch 1–2: Adds 1–5 + doc reconciliations |
 | `CLAUDE-rfc-additions-batch3.md` | dnsd (+libdnswire) | Batch 3: Adds 7–11 + complementary + reference |
-| `CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317) + 3258 anycast note |
+| `CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317, Done) + 3258 anycast note (Done) |
 | `CLAUDE-ENUM.md` | dnsd | ADR-001, Add 6 (ENUM), bind config, ENUM roadmap |
 | `CLAUDE-eppd.md` | eppd | ADR-002, registry back-end (phased) |
 | `CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance |
@@ -73,7 +73,13 @@ Complementary (batch3) — **all Done, batch 3 fully closed 2026-07-01**:
   unset or when the agent would be a subdomain of the answering zone (§4 MUST
   NOT); `make check-error-reporting`.
 
-Deployment note (batch4): 3258 (anycast, no code — see batch4 doc).
+Deployment note (batch4): **3258 Done** — mostly operational guidance (no
+protocol code: zone-data consistency choice, per-node `config:nsid`, keep
+AXFR off the anycast service IP), plus the one concrete optional add it names:
+CHAOS-class `id.server`/`hostname.bind` (RFC 4892 / BIND convention) so
+`dig CH TXT id.server` reveals which anycast node answered, reusing
+`config:nsid`; class-gated (an `IN`-class query for the same name is
+unaffected); `make check-id-server`.
 Doc reconciliations (rfc-additions): 8484 Done, 2671→6891, 3833/7626
 coverage matrix, 8499/9499, **NAPTR = 3403** (header mislabels it 9250).
 

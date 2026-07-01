@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -807,6 +807,38 @@ check-error-reporting: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$UNSET"  | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted with no agent configured"; exit 1; }; \
 	 echo "$$SUBDOM" | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted for a subdomain-of-zone agent (RFC 9567 §4 MUST NOT)"; exit 1; }; \
 	 echo "  OK  Report-Channel option present with the configured agent; omitted when unset or when agent is a subdomain of the zone"
+
+# RFC 3258 anycast deployment note (CLAUDE-rfc-additions-batch4.md): the note
+# itself is operational guidance (zone-data consistency, per-node config:nsid,
+# keep AXFR off the anycast service IP), not a protocol feature — but it names
+# one concrete optional add: CHAOS-class id.server/hostname.bind (RFC 4892 /
+# the BIND convention) so `dig CH TXT id.server` reveals which anycast node
+# answered, reusing the same identity config:nsid already discloses over EDNS.
+# Checks: CH TXT id.server and hostname.bind both return the configured nsid;
+# an ordinary IN A query is unaffected; and id.server under class IN (not CH)
+# is NOT intercepted — it falls through to the normal zone-authority path.
+check-id-server: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 4892 CHAOS id.server/hostname.bind (RFC 3258 anycast debugging aid) (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                      \
+	 SAVE_N=$$($$VC get config:nsid);                                                              \
+	 $$VC set config:nsid "anycast-node-3" >/dev/null;                                             \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_3258.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                     \
+	 IDS=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) CH TXT id.server +time=2 +tries=1);        \
+	 HB=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) CH TXT hostname.bind +time=2 +tries=1);     \
+	 A=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) example.local A +time=2 +tries=1);           \
+	 INCLASS=$$(dig +nocookie @127.0.0.1 -p $(TPORT) id.server A +time=2 +tries=1 | grep "status:"); \
+	 kill $$DNS 2>/dev/null || true;                                                                \
+	 if [ -n "$$SAVE_N" ]; then $$VC set config:nsid "$$SAVE_N" >/dev/null; else $$VC del config:nsid >/dev/null; fi; \
+	 echo "  CH TXT id.server: $$IDS   CH TXT hostname.bind: $$HB";                                 \
+	 echo "  ordinary IN A still works: $$A   id.server/IN: $$INCLASS";                             \
+	 echo "$$IDS" | grep -q "anycast-node-3" || { echo "  FAIL  CH TXT id.server did not return the node identity"; exit 1; }; \
+	 echo "$$HB"  | grep -q "anycast-node-3" || { echo "  FAIL  CH TXT hostname.bind did not return the node identity"; exit 1; }; \
+	 test "$$A" = "192.168.1.10" || { echo "  FAIL  ordinary IN A query broke"; exit 1; };          \
+	 echo "$$INCLASS" | grep -q "REFUSED" || { echo "  FAIL  id.server under class IN was intercepted (must be class-gated, not name-gated)"; exit 1; }; \
+	 echo "  OK  CH TXT id.server/hostname.bind reveal node identity; IN queries unaffected; class-gated correctly"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1771,6 +1803,7 @@ help:
 	@echo "  make check-xot       RFC 9103 XoT: 'dot' ALPN actually selected on DoT/XFR listener (needs Valkey + openssl + dig)"
 	@echo "  make check-parent-notify RFC 9859 generalized NOTIFY(CDS/CDNSKEY) to a parent on KSK rollover (needs Valkey + python3)"
 	@echo "  make check-error-reporting RFC 9567 EDNS0 Report-Channel option; omitted when unset/subdomain (needs Valkey + dig)"
+	@echo "  make check-id-server RFC 3258/4892 CHAOS id.server/hostname.bind anycast identity (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
