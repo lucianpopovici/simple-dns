@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -839,6 +839,61 @@ check-id-server: $(BIN_DEBUG) | ossl-sanity
 	 test "$$A" = "192.168.1.10" || { echo "  FAIL  ordinary IN A query broke"; exit 1; };          \
 	 echo "$$INCLASS" | grep -q "REFUSED" || { echo "  FAIL  id.server under class IN was intercepted (must be class-gated, not name-gated)"; exit 1; }; \
 	 echo "  OK  CH TXT id.server/hostname.bind reveal node identity; IN queries unaffected; class-gated correctly"
+
+# RFC 9773 ACME Renewal Information (ARI, CLAUDE-certd.md Add 1): the CA tells
+# certd *when* to renew via a renewalInfo suggestedWindow instead of a fixed
+# threshold. Spins up a local CA + a Python HTTPS stub serving just enough of
+# an ACME directory (so certd's directory fetch succeeds) plus /renewal-info,
+# and drives certd's decision (not full issuance — that still needs a real/
+# staging CA per this file's own test section) with a future window (must NOT
+# renew) and a past window (must renew), checking the ARI decision log line
+# both times.
+check-ari: certd_debug | ossl-sanity
+	@echo "  CHECK  RFC 9773 ACME Renewal Information drives certd's renewal decision (requires Valkey + openssl + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };              \
+	 D=$$(mktemp -d); PORT=5398; EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes";     \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=test-ca" \
+	   -addext "subjectKeyIdentifier=hash" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1; \
+	 printf 'subjectAltName=IP:127.0.0.1\nauthorityKeyIdentifier=keyid,issuer\nbasicConstraints=CA:FALSE\n' > $$D/srv.ext; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1;   \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial \
+	   -out $$D/srv.pem -days 2 -extfile $$D/srv.ext >/dev/null 2>&1;                              \
+	 printf 'authorityKeyIdentifier=keyid,issuer\nbasicConstraints=CA:FALSE\n' > $$D/leaf.ext;      \
+	 openssl req $$EC -keyout $$D/leaf.key -out $$D/leaf.csr -subj "/CN=ari-test.example" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/leaf.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial \
+	   -out $$D/leaf.pem -days 2 -extfile $$D/leaf.ext >/dev/null 2>&1;                             \
+	 cat $$D/leaf.pem $$D/leaf.key > $$D/cert_current.pem;                                          \
+	 SAVE_D=$$($$VC get config:acme_domain); SAVE_C=$$($$VC get config:acme_ca);                    \
+	 SAVE_CA=$$($$VC get config:acme_ca_pem); SAVE_CUR=$$($$VC get cert:current);                   \
+	 $$VC set config:acme_domain "ari-test.example" >/dev/null;                                     \
+	 $$VC set config:acme_ca "https://127.0.0.1:$$PORT/dir" >/dev/null;                             \
+	 $$VC set config:acme_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                                    \
+	 $$VC set cert:current "$$(cat $$D/cert_current.pem)" >/dev/null;                                \
+	 FUTURE_S=$$(date -u -d "+2 hours" +%Y-%m-%dT%H:%M:%SZ); FUTURE_E=$$(date -u -d "+3 hours" +%Y-%m-%dT%H:%M:%SZ); \
+	 python3 tests/ari_stub.py 127.0.0.1 $$PORT $$D/srv.pem $$D/srv.key "$$FUTURE_S" "$$FUTURE_E" 5 >/tmp/ari_stub_f.log 2>&1 & STUB=$$!; \
+	 sleep 1;                                                                                        \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_future.log 2>&1;                   \
+	 wait $$STUB 2>/dev/null || true;                                                                \
+	 PAST_S=$$(date -u -d "-3 hours" +%Y-%m-%dT%H:%M:%SZ); PAST_E=$$(date -u -d "-2 hours" +%Y-%m-%dT%H:%M:%SZ); \
+	 python3 tests/ari_stub.py 127.0.0.1 $$PORT $$D/srv.pem $$D/srv.key "$$PAST_S" "$$PAST_E" 5 >/tmp/ari_stub_p.log 2>&1 & STUB=$$!; \
+	 sleep 1;                                                                                        \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_past.log 2>&1;                     \
+	 wait $$STUB 2>/dev/null || true;                                                                \
+	 if [ -n "$$SAVE_D" ]; then $$VC set config:acme_domain "$$SAVE_D" >/dev/null; else $$VC del config:acme_domain >/dev/null; fi; \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:acme_ca "$$SAVE_C" >/dev/null; else $$VC del config:acme_ca >/dev/null; fi; \
+	 if [ -n "$$SAVE_CA" ]; then $$VC set config:acme_ca_pem "$$SAVE_CA" >/dev/null; else $$VC del config:acme_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
+	 $$VC del acme:account_key acme:account_url >/dev/null 2>&1;                                    \
+	 rm -rf $$D;                                                                                     \
+	 FUTURE_LINE=$$(grep "ARI window" /tmp/certd_future.log); PAST_LINE=$$(grep "ARI window" /tmp/certd_past.log); \
+	 echo "  future window: $$FUTURE_LINE";                                                          \
+	 echo "  past window:   $$PAST_LINE";                                                            \
+	 echo "$$FUTURE_LINE" | grep -q "not yet due" || { echo "  FAIL  future ARI window did not suppress renewal"; cat /tmp/certd_future.log; exit 1; }; \
+	 echo "$$PAST_LINE"   | grep -q "renewing"    || { echo "  FAIL  past ARI window did not trigger renewal"; cat /tmp/certd_past.log; exit 1; }; \
+	 echo "  OK  ARI window drives the renewal decision (future window suppresses, past window triggers)"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1804,6 +1859,7 @@ help:
 	@echo "  make check-parent-notify RFC 9859 generalized NOTIFY(CDS/CDNSKEY) to a parent on KSK rollover (needs Valkey + python3)"
 	@echo "  make check-error-reporting RFC 9567 EDNS0 Report-Channel option; omitted when unset/subdomain (needs Valkey + dig)"
 	@echo "  make check-id-server RFC 3258/4892 CHAOS id.server/hostname.bind anycast identity (needs Valkey + dig)"
+	@echo "  make check-ari       RFC 9773 ACME Renewal Information drives certd's renewal decision (needs Valkey + openssl + python3)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

@@ -108,7 +108,7 @@ Done: 8555 (ACME DNS-01), 7030 (EST).
 
 | Add | RFC | Feature | Status |
 |----:|-----|---------|--------|
-| 1 | 9773 | ACME Renewal Information (ARI) | Specced |
+| 1 | 9773 | ACME Renewal Information (ARI) | **Done** (`ari_cert_id`/`ari_fetch_window` in certd; falls back to the fixed-threshold check when unavailable; `make check-ari`) |
 | 2 | 8737 | ACME TLS-ALPN-01 | Optional |
 | 3 | 8738 | ACME for IP identifiers | Optional |
 

@@ -132,6 +132,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-id-server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 9773 ACME Renewal Information (ARI) drives certd's renewal decision
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-ari OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

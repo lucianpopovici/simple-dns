@@ -27,13 +27,18 @@ The backlog files are not all the same kind of work. Sort before sequencing:
 | **The maps** | `CLAUDE-index.md`, `CLAUDE.md` (master), `README.md` | Keep in sync as items land |
 | **Decision tracker** | `CLAUDE-roadmap.md` (this file) | — |
 
-In-flight on their own track (do not re-sequence) — feature plans largely landed
-(PRs #7–#19), only the tails remain:
-- `CLAUDE-hidden-master.md` — NOTIFY-sender TSIG.
-- `CLAUDE-loadbalance.md` — LB health checks.
-- `CLAUDE-discovery.md` — gaps 1–4 done; nothing outstanding.
-- Plus the `resolverd` seccomp `audit`→`enforce` flip after whitelist harvest
-  (not a spec file; tracked in `CLAUDE.md`).
+In-flight on their own track (do not re-sequence) — feature plans landed (PRs
+#7–#19); **corrected 2026-07-01: all three were already complete, this section
+was stale.** `CLAUDE-hidden-master.md` says outright "All hidden-master gaps
+(1–8) are complete," including the master-side NOTIFY-sender TSIG hardening
+this file used to list as a tail (independently reconfirmed this session via
+`make check-notify`: TSIG-signed, retried until ACK). `CLAUDE-loadbalance.md`
+marks Gap 2 (health checks) done. `CLAUDE-discovery.md` says gaps 1–4 done,
+nothing outstanding. Nothing left on this track.
+- Remaining, not stale: the `resolverd` seccomp `audit`→`enforce` flip after
+  whitelist harvest (not a spec file; tracked in `CLAUDE.md`) — already
+  `enforce` by default per `CLAUDE.md`, re-harvest only needed when porting to
+  a different libc/kernel.
 
 ---
 
@@ -258,8 +263,23 @@ record formats here use the Phase-1 schema decision.
    - This closes out both RFC-addition batches (3 and 4) entirely; remaining
      spec work is items 3–6 below plus the in-flight-plan tails in
      `CLAUDE.md`.
-3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
-   touched this file (CSA-TLS-001).
+3. **certd ARI DONE 2026-07-01** (`CLAUDE-certd.md` Add 1, RFC 9773) — the CA
+   now drives renewal timing instead of a fixed threshold. `ari_cert_id`
+   computes the RFC 9773 §4.1 CertID (base64url AKI keyIdentifier + "." +
+   base64url serial value bytes, both unpadded) from the active cert;
+   `acme_needs_renewal` refreshes the ACME directory (populating
+   `g_acme_dir_renewalinfo` even on a freshly started certd that has never
+   run `acme_issue`) and, when the CA offers `renewalInfo`, fetches the
+   suggested window via `ari_fetch_window` (unauthenticated GET, RFC 3339
+   `start`/`end` parsed with `timegm` since the window is always UTC) and
+   renews at a randomized point inside it — never exactly at window start,
+   per the §4.1 anti-thundering-herd guardrail. Falls back to the existing
+   fixed-threshold check whenever ARI is absent, unreachable, or malformed;
+   ARI availability never blocks renewal. `make check-ari` spins up a local
+   CA + a minimal Python HTTPS stub (ACME directory + `/renewal-info` only —
+   full issuance still needs a real/staging CA per this file's own test
+   section) and confirms a future window suppresses renewal while a past
+   window triggers it, via the ARI decision log line. In CI.
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd
    Option A** (`CLAUDE-resolverd.md` / `-1.md`: 9156 QNAME-min, 8198 aggressive
    NSEC, 8767+9520 serve-stale, 5452 anti-spoof, 8914 EDE, 9462/9463 DDR/DNR,

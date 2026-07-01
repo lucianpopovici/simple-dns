@@ -100,6 +100,7 @@ static char g_acme_account_url[512] = "";
 static char g_acme_dir_newnonce[512] = "";
 static char g_acme_dir_newacct[512] = "";
 static char g_acme_dir_neworder[512] = "";
+static char g_acme_dir_renewalinfo[512] = ""; /* RFC 9773 ARI; empty if the CA doesn't offer it */
 static char g_acme_nonce[256] = "";
 
 static const char *cfgenv(const char *k, const char *def) {
@@ -815,6 +816,8 @@ static int acme_directory(const char *host, int port) {
     json_str(body, "newNonce", g_acme_dir_newnonce, sizeof(g_acme_dir_newnonce));
     json_str(body, "newAccount", g_acme_dir_newacct, sizeof(g_acme_dir_newacct));
     json_str(body, "newOrder", g_acme_dir_neworder, sizeof(g_acme_dir_neworder));
+    g_acme_dir_renewalinfo[0] = 0;
+    json_str(body, "renewalInfo", g_acme_dir_renewalinfo, sizeof(g_acme_dir_renewalinfo));
     free(body);
     dns_log(LOG_NOTICE, "[ACME] Directory OK\n");
     (void) host;
@@ -1119,6 +1122,93 @@ static int acme_issue(void) {
     return 0;
 }
 
+/* RFC 9773 §4.1: CertID = base64url(AKI keyIdentifier) + "." +
+ * base64url(DER value bytes of the Serial Number, i.e. without the ASN.1
+ * tag/length octets that wrap it) — both halves unpadded. Returns 0 on
+ * success (out is NUL-terminated), -1 if the cert lacks an AKI extension
+ * (self-signed / non-ACME certs — ARI simply isn't offered for those). */
+static int ari_cert_id(X509 *cert, char *out, size_t outsz) {
+    AUTHORITY_KEYID *akid = X509_get_ext_d2i(cert, NID_authority_key_identifier, NULL, NULL);
+    if (!akid || !akid->keyid) {
+        if (akid)
+            AUTHORITY_KEYID_free(akid);
+        return -1;
+    }
+    const ASN1_INTEGER *serial = X509_get0_serialNumber(cert);
+    if (!serial) {
+        AUTHORITY_KEYID_free(akid);
+        return -1;
+    }
+    char akid_b64[128], serial_b64[64];
+    int akid_n = b64url_enc(ASN1_STRING_get0_data(akid->keyid), ASN1_STRING_length(akid->keyid),
+                            akid_b64, sizeof(akid_b64));
+    int serial_n = b64url_enc(serial->data, serial->length, serial_b64, sizeof(serial_b64));
+    AUTHORITY_KEYID_free(akid);
+    if (akid_n <= 0 || serial_n <= 0)
+        return -1;
+    snprintf(out, outsz, "%s.%s", akid_b64, serial_b64);
+    return 0;
+}
+
+/* Parse an RFC 3339 UTC timestamp ("2025-01-02T04:00:00Z") to epoch seconds.
+ * RFC 9773's suggestedWindow is always UTC, so timegm (not mktime) is
+ * correct here — it must not apply the local timezone. */
+static time_t rfc3339_to_epoch(const char *s) {
+    struct tm tmv = {0};
+    if (!strptime(s, "%Y-%m-%dT%H:%M:%S", &tmv))
+        return (time_t) -1;
+    return timegm(&tmv);
+}
+
+/* RFC 9773 §4.2: unauthenticated GET {renewalInfo}/{certID}. On success,
+ * fills win_start and win_end from suggestedWindow and returns 0; returns -1
+ * (window untouched) if ARI isn't offered, unreachable, or malformed — the
+ * caller must fall back to the fixed-threshold check, never block renewal on
+ * ARI availability. */
+static int ari_fetch_window(const char *cert_id, time_t *win_start, time_t *win_end) {
+    if (!g_acme_dir_renewalinfo[0])
+        return -1;
+    char host[256], path[512];
+    int port;
+    parse_url(g_acme_dir_renewalinfo, host, &port, path, sizeof(path));
+    size_t plen = strlen(path);
+    if (plen > 0 && path[plen - 1] == '/')
+        path[plen - 1] = 0;
+    char fullpath[768];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", path, cert_id);
+    int code = 0;
+    char hdrs[2048] = {0};
+    /* Unauthenticated: no client cert/key (RFC 9773 §4.2 "unauthenticated GET"). */
+    char *body =
+        https_req_mtls(host, port, "GET", fullpath, NULL, NULL, NULL,
+                       g_acme_ca_pem[0] ? g_acme_ca_pem : NULL, NULL, &code, hdrs, sizeof(hdrs));
+    if (!body || code < 200 || code >= 300) {
+        free(body);
+        return -1;
+    }
+    char start_s[64] = "", end_s[64] = "";
+    int have = json_str(body, "start", start_s, sizeof(start_s)) &&
+               json_str(body, "end", end_s, sizeof(end_s));
+    free(body);
+    if (!have)
+        return -1;
+    time_t s = rfc3339_to_epoch(start_s), e = rfc3339_to_epoch(end_s);
+    if (s == (time_t) -1 || e == (time_t) -1 || e < s)
+        return -1;
+    char ra[16] = {0};
+    if (hdr_val(hdrs, "Retry-After", ra, sizeof(ra)) && ra[0])
+        dns_log(LOG_NOTICE,
+                "[ACME] ARI Retry-After: %ss (next check follows the normal %ds tick)\n", ra,
+                RENEW_CHECK_SECS);
+    *win_start = s;
+    *win_end = e;
+    return 0;
+}
+
+/* RFC 9773: ARI-driven renewal when the CA offers a renewalInfo endpoint,
+ * falling back to the fixed remaining-lifetime check otherwise — ARI
+ * unavailable/unreachable must never block renewal (guardrail in
+ * CLAUDE-certd.md Add 1). */
 static int acme_needs_renewal(void) {
     if (!g_acme_domain[0])
         return 0;
@@ -1129,11 +1219,34 @@ static int acme_needs_renewal(void) {
     BIO_free(b);
     if (!cert)
         return 1;
-    int days = 0, secs = 0;
-    ASN1_TIME_diff(&days, &secs, NULL, X509_get0_notAfter(cert));
+    /* Refresh the directory so a freshly (re)started certd (which has never
+     * run acme_issue and so never populated g_acme_dir_renewalinfo) still
+     * gets to use ARI on its very first renewal check. Best-effort: a failed
+     * fetch just leaves g_acme_dir_renewalinfo as it was (possibly empty),
+     * and the ARI branch below degrades to the fixed-threshold fallback. */
+    acme_directory(NULL, 0);
+    char cert_id[256];
+    int have_ari = 0, due = 0;
+    time_t s = 0, e = 0;
+    if (g_acme_dir_renewalinfo[0] && ari_cert_id(cert, cert_id, sizeof(cert_id)) == 0 &&
+        ari_fetch_window(cert_id, &s, &e) == 0) {
+        /* Renew at a random point within the window (RFC 9773 §4.1) to spread
+         * load — never exactly at window start. */
+        time_t span = e > s ? (e - s) : 1;
+        time_t target = s + (time_t) (((double) rand() / ((double) RAND_MAX + 1)) * span);
+        have_ari = 1;
+        due = time(NULL) >= target;
+        dns_log(LOG_NOTICE, "[ACME] ARI window [%lld,%lld], target %lld — %s\n", (long long) s,
+                (long long) e, (long long) target, due ? "renewing" : "not yet due");
+    }
+    if (!have_ari) {
+        int days = 0, secs = 0;
+        ASN1_TIME_diff(&days, &secs, NULL, X509_get0_notAfter(cert));
+        dns_log(LOG_NOTICE, "[ACME] Cert expires in %d days\n", days);
+        due = days < ACME_RENEW_DAYS;
+    }
     X509_free(cert);
-    dns_log(LOG_NOTICE, "[ACME] Cert expires in %d days\n", days);
-    return days < ACME_RENEW_DAYS;
+    return due;
 }
 
 /* ── EST client (RFC 7030) ───────────────────────────────────────────────── */
