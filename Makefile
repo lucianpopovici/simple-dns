@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -600,6 +600,40 @@ check-rr-rotate: $(BIN_DEBUG) | ossl-sanity
 	 test "$$SIGS" -ge 1       || { echo "  FAIL  +dnssec returned no RRSIG for the rotated RRset"; exit 1; }; \
 	 test -n "$$N1" -a "$$N1" = "$$N2" || { echo "  FAIL  rr_rotate=0 not stable ($$N1 vs $$N2)"; exit 1; }; \
 	 echo "  OK  per-name rotation active (all addrs kept, RRSIGs intact), disabled is stable"
+
+# RFC 6116/6117/6118 ENUM over NAPTR: reversed-digit name, two ordered rules,
+# '|'-in-regexp round-trip, RRSIG present. Uses e164.example.local as the apex
+# so the test zone is the existing example.local (no second zone required).
+check-enum: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 6116 ENUM over NAPTR: ordered rules, '|' in regexp, DNSSEC (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                     \
+	 Z=example.local; APEX=e164.$$Z;                                                              \
+	 NAME1=4.3.2.1.5.5.5.0.0.8.1.$$APEX;                                                         \
+	 NAME2=1.1.9.1.4.3.2.1.$$APEX;                                                               \
+	 SAVE_EA=$$($$VC get config:enum_apex);                                                       \
+	 $$VC set config:enum_apex "$$APEX" >/dev/null;                                               \
+	 $$VC set "zone:$$Z:NAPTR:$$NAME1" "3600|100|10|u|E2U+sip|!^.*\$$!sip:info@example.com!|." >/dev/null; \
+	 $$VC set "zone:$$Z:NAPTR:$$NAME2" "3600|102|10|u|E2U+email:mailto|!^.*\$$!mailto:a|b@x.com!|." >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_enum.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                   \
+	 OUT1=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) "$$NAME1" NAPTR +time=2 +tries=1);       \
+	 OUT2=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) "$$NAME2" NAPTR +time=2 +tries=1);       \
+	 SIGS=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) "$$NAME1" NAPTR +time=2 +tries=1 | grep -c RRSIG); \
+	 kill $$DNS 2>/dev/null || true;                                                              \
+	 $$VC del "zone:$$Z:NAPTR:$$NAME1" "zone:$$Z:NAPTR:$$NAME2" >/dev/null;                       \
+	 if [ -n "$$SAVE_EA" ]; then $$VC set config:enum_apex "$$SAVE_EA" >/dev/null;               \
+	 else $$VC del config:enum_apex >/dev/null; fi;                                              \
+	 echo "  NAME1 NAPTR: $$(echo "$$OUT1" | tr -s ' ')";                                        \
+	 echo "  NAME2 NAPTR ('|' in regexp): $$(echo "$$OUT2" | tr -s ' ')";                        \
+	 echo "  RRSIGs: $$SIGS";                                                                     \
+	 echo "$$OUT1" | grep -q "E2U+sip"             || { echo "  FAIL  NAPTR service E2U+sip missing";  exit 1; }; \
+	 echo "$$OUT1" | grep -q "sip:info@example.com" || { echo "  FAIL  NAPTR regexp missing";          exit 1; }; \
+	 echo "$$OUT2" | grep -qi "E2U+email"           || { echo "  FAIL  NAPTR E2U+email missing";       exit 1; }; \
+	 echo "$$OUT2" | grep -q "a|b@x.com"            || { echo "  FAIL  '|' in regexp not preserved";   exit 1; }; \
+	 test "$$SIGS" -ge 1                            || { echo "  FAIL  +dnssec returned no RRSIG";      exit 1; }; \
+	 echo "  OK  ENUM NAPTR ordered rules serve correctly; '|' in regexp preserved; RRSIG present"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1558,6 +1592,7 @@ help:
 	@echo "  make check-csync     RFC 7477 CSYNC codec KAT + dnsd serves type-62 (needs Valkey + dig)"
 	@echo "  make check-dnsxl     RFC 5782 DNSxL synthesis listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN (needs Valkey + dig)"
 	@echo "  make check-rr-rotate RFC 1794 per-name round-robin rotation; DNSSEC still valid (needs Valkey + dig)"
+	@echo "  make check-enum      RFC 6116 ENUM NAPTR: ordered rules, '|' in regexp, RRSIG (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

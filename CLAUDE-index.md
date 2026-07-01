@@ -49,7 +49,7 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | 3 | 9460 | SVCB / HTTPS records (64/65) | **Done** (TLV; dnsd serves; apid writer TODO) | rfc-additions |
 | 4 | 9077 | NSEC/NSEC3 + negative-response TTL | **Done** | rfc-additions |
 | 5 | 7477 | CSYNC record (62) | **Done** (pipe serial\|flags\|NS,A,AAAA; dnsd serves+AXFR; DNSSEC-signed; `make check-csync`) | rfc-additions |
-| 6 | 6116/6117/6118 | ENUM profile over NAPTR | Specced | ENUM |
+| 6 | 6116/6117/6118 | ENUM profile over NAPTR | **Done** (config:enum_apex; NAPTR `\|`-in-regexp parser fix; Enumservice warning; `make check-enum`) | ENUM |
 | 7 | 8976 | ZONEMD (63) | Specced | batch3 |
 | 8 | 9471 | Glue in referrals | Conditional | batch3 |
 | 9 | 1982 | Serial-number arithmetic | **Done** (libdnswire + IXFR uses serial_lt) | batch3 |

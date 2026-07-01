@@ -170,8 +170,12 @@ record formats here use the Phase-1 schema decision.
      CNAME-chain hop now refactored to call `emit_addr_rrset`, wildcard Valkey
      path likewise); lb_mode takes precedence when set; `make check-rr-rotate`
      (3 distinct first-addrs in 6 queries + RRSIGs intact + disabled is stable).
-   - Next: 6116/6117/6118 (ENUM over NAPTR), 2317 (classless reverse delegation),
-     and the batch-3 complementary items.
+   - **6116/6117/6118 ENUM DONE 2026-07-01** — `config:enum_apex` (tree root);
+     NAPTR `|`-in-regexp parser fix (split at LAST `|` after first 4 fields so
+     ENUM regexps with alternation survive round-trip); Enumservice warning when
+     service field is not `E2U+...`; RFC 6116/6117/6118 in header comment +
+     mislabelled "9250" corrected to "3403"; `make check-enum` in CI.
+   - Next: 2317 (classless reverse delegation), and the batch-3 complementary items.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd

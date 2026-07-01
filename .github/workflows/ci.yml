@@ -90,6 +90,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-rr-rotate OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 6116/6117/6118 ENUM NAPTR (ordered rules, '|' in regexp, RRSIG)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-enum OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

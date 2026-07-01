@@ -34,7 +34,11 @@
  *              bump, opt-in via config:[zone:<z>:]zonemd (default off)
  *   1035 PTR   Reverse DNS — serve in-addr.arpa / ip6.arpa zones (query/AXFR);
  *              optional auto-PTR for DDNS A/AAAA (config:ddns_auto_ptr)
- *   9250 stub  NAPTR records (query/serve)
+ *   3403       NAPTR records — DDDS DNS database (query/serve; was mislabelled 9250)
+ *   6116/6117/6118 ENUM — E.164-to-URI mapping over NAPTR, Enumservice registry,
+ *              and registration guidelines. config:enum_apex sets the tree root
+ *              (e.g. "e164.arpa"). Records provisioned as zone:NAPTR:<revdigit>
+ *              (existing path). NAPTR parser fixed to allow '|' in regexp field.
  *   5001       NSID – Name Server Identifier EDNS option
  *   5155       NSEC3 – hashed authenticated denial of existence
  *   5936       AXFR – Full Zone Transfer over TCP
@@ -105,6 +109,10 @@
  *   dnsxl:<zone>:<ip>            DNSxL listing: low_octet|reason
  *                              (e.g. "2|spam source"). A query for the reversed
  *                              name synthesizes A 127.0.0.<low_octet> + TXT reason.
+ *   config:enum_apex           ENUM tree root served by this instance (RFC 6116),
+ *                              e.g. "e164.arpa" or "e164.example.local". Informational:
+ *                              the serving path is the existing zone:NAPTR: store.
+ *                              Used by: NAPTR Enumservice warning + provisioning helper.
  *   config:rr_rotate           "1" to enable per-name round-robin rotation of
  *                              multi-address A/AAAA RRsets (RFC 1794). Distinct
  *                              from config:lb_mode — uses per-name counters keyed
@@ -602,6 +610,7 @@ static pthread_mutex_t g_lb_health_mutex = PTHREAD_MUTEX_INITIALIZER;
  * (config:dnsxl_zones, empty = disabled). Per-IP listings live in Valkey as
  * dnsxl:<zone>:<ip> → "<low_octet>|<reason>". */
 static char g_dnsxl_zones[1024] = ""; /* config:dnsxl_zones */
+static char g_enum_apex[256] = "";    /* config:enum_apex — ENUM tree root (RFC 6116) */
 
 /* RFC 1794 per-name round-robin rotation for multi-address A/AAAA RRsets.
  * Distinct from config:lb_mode (which is a single global cursor): each name
@@ -2262,6 +2271,9 @@ static void config_load_from_valkey(void) {
     /* RFC 1794 per-name round-robin rotation (config:rr_rotate, default 0). */
     g_rr_rotate = 0;
     GI("rr_rotate", g_rr_rotate);
+    /* RFC 6116 ENUM apex (config:enum_apex, e.g. "e164.arpa", empty = not set). */
+    g_enum_apex[0] = 0;
+    G("enum_apex", g_enum_apex);
     /* TSIG secret (base64) */
     if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
         g_tsig_secret_len = b64std_dec(val, g_tsig_secret, sizeof(g_tsig_secret));
@@ -5145,7 +5157,10 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
             memcpy(rd + 4, tok, tlen);
             return 4 + tlen;
         }
-        case DNS_TYPE_NAPTR: { /* order|pref|flags|service|regexp|replacement */
+        case DNS_TYPE_NAPTR: { /* order|pref|flags|service|regexp|replacement
+                                * ENUM regexps (RFC 6116) may contain '|' as alternation;
+                                * split only the first four stable fields on '|' then split
+                                * regexp|replacement at the LAST '|' so the regexp is intact. */
             uint16_t order2 = 0, pref2 = 0;
             char flags2[64] = "", svc2[64] = "", re2[256] = "", repl2[256] = "";
             char *sp19 = NULL;
@@ -5161,12 +5176,25 @@ static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
             tok = strtok_r(NULL, "|", &sp19);
             if (tok)
                 safe_strcpy(svc2, tok, sizeof(svc2));
-            tok = strtok_r(NULL, "|", &sp19);
-            if (tok)
-                safe_strcpy(re2, tok, sizeof(re2));
-            tok = strtok_r(NULL, "|", &sp19);
-            if (tok)
-                safe_strcpy(repl2, tok, sizeof(repl2));
+            /* Remainder: "regexp|replacement". Split at LAST '|' so the regexp
+             * may legally contain '|'. replacement is a DNS name — no '|'. */
+            if (sp19 && *sp19) {
+                char *last_bar = strrchr(sp19, '|');
+                if (last_bar) {
+                    *last_bar = '\0';
+                    safe_strcpy(re2, sp19, sizeof(re2));
+                    safe_strcpy(repl2, last_bar + 1, sizeof(repl2));
+                } else {
+                    safe_strcpy(re2, sp19, sizeof(re2));
+                }
+            }
+            /* RFC 6116 §3: warn when service does not match E2U+<type> under
+             * an ENUM apex (advisory only — we still serve the record). */
+            if (g_enum_apex[0] && svc2[0] && strncasecmp(svc2, "E2U+", 4) != 0)
+                dns_log(LOG_WARNING,
+                        "[ENUM] NAPTR service '%s' is not an Enumservice (E2U+...) — "
+                        "verify RFC 6117 registration\n",
+                        svc2);
             int rp2 = 0;
             rd[rp2++] = order2 >> 8;
             rd[rp2++] = order2 & 0xFF;
