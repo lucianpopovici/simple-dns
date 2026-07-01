@@ -18,6 +18,10 @@
  *   - In-memory fallback cache (LRU, configurable size) when Valkey is down
  *   - CNAME chain following (up to 8 hops)
  *   - Negative caching: NXDOMAIN + NODATA cached per SOA minimum TTL
+ *   - RFC 8767 serve-stale: on upstream failure/SERVFAIL, serve a recently
+ *     expired cache entry (bounded by SERVE_STALE_MAX) instead of failing
+ *   - RFC 9520 failure caching: cache upstream SERVFAIL briefly
+ *     (SERVFAIL_CACHE_TTL) to suppress repeated queries to a broken name
  *   - Thread-safe: per-bucket rwlock on memory cache
  *   - Prefetch: re-queries records when TTL < 10% of original
  *   - CLI: dig-like output + cache stats + cache flush/inspect commands
@@ -36,6 +40,8 @@
  *   CACHE_SIZE        Max in-memory cache entries      (default: 8192)
  *   CACHE_TTL_MAX     Max TTL to cache (seconds)       (default: 3600)
  *   CACHE_NEG_TTL     Max negative TTL (seconds)       (default: 300)
+ *   SERVE_STALE_MAX   RFC 8767 stale-serve window (s)  (default: 3600, 0=off)
+ *   SERVFAIL_CACHE_TTL RFC 9520 cached-SERVFAIL TTL (s) (default: 30, 0=off)
  *   DOT_CA_PEM        Path to CA cert PEM for DoT      (default: system)
  *
  * Sandbox (Valkey config:* keys, env override in parens; applied after the
@@ -202,6 +208,12 @@ typedef struct {
     char search_domains[MAX_SEARCH_DOMAINS][256];
     int search_domain_count;
     uint32_t cache_neg_ttl_min; /* floor for negative cache TTL */
+    /* RFC 8767: max seconds past expiry a cache entry may be served on
+     * upstream failure/SERVFAIL (0 = serve-stale disabled). */
+    uint32_t serve_stale_max;
+    /* RFC 9520: TTL for a cached SERVFAIL, to suppress repeated queries to a
+     * persistently failing name (0 = failure caching disabled). */
+    uint32_t servfail_cache_ttl;
     /* RFC 5452 §2.2 0x20 case randomization (defense-in-depth alongside the
      * CSPRNG transaction ID + source port already in upstream_query_one). */
     int dns0x20_enabled;
@@ -2325,6 +2337,30 @@ static uint32_t entry_remaining_ttl(const cache_entry_t *e) {
     return min_remain == UINT32_MAX ? 0 : min_remain;
 }
 
+/* How long ago an already-expired entry became expired (0 if still live or
+ * has no RRs to judge from). Shared by the in-memory and Valkey-backed
+ * stale-serve windows (RFC 8767). */
+static uint32_t entry_expired_for(const cache_entry_t *e) {
+    time_t now = time(NULL);
+    if (e->negative) {
+        uint32_t elapsed = (uint32_t) (now - e->inserted_at);
+        return elapsed > e->neg_ttl ? elapsed - e->neg_ttl : 0;
+    }
+    if (e->nrr == 0 || !e->rrs)
+        return 0;
+    uint32_t max_age = 0, min_orig = UINT32_MAX;
+    for (int i = 0; i < e->nrr; i++) {
+        uint32_t age = (uint32_t) (now - e->rrs[i].inserted_at);
+        if (age > max_age)
+            max_age = age;
+        if (e->rrs[i].ttl_original < min_orig)
+            min_orig = e->rrs[i].ttl_original;
+    }
+    if (min_orig == UINT32_MAX)
+        return 0;
+    return max_age > min_orig ? max_age - min_orig : 0;
+}
+
 static void lru_touch(cache_entry_t *e) {
     pthread_mutex_lock(&g_lru_mutex);
     /* Remove from current position */
@@ -2445,10 +2481,14 @@ static void cache_insert(cache_entry_t *e) {
 }
 
 /*
- * cache_lookup — find a live entry.  Returns a copy (caller frees).
- * Returns NULL on miss or expiry.
+ * cache_lookup — find a cache entry. Returns a copy (caller frees).
+ * With allow_stale=0 (the normal live-lookup path), returns NULL on miss or
+ * expiry — a fresh answer or nothing, never opportunistically-stale data.
+ * With allow_stale=1 (the RFC 8767 upstream-failure fallback), also returns
+ * an already-expired entry if it's still within g_cfg.serve_stale_max,
+ * marked served_stale=1.
  */
-static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype) {
+static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_stale) {
     uint32_t bkt = cache_hash(qname, qtype);
     pthread_rwlock_rdlock(&g_cache[bkt].lock);
     cache_entry_t *e = g_cache[bkt].head;
@@ -2461,43 +2501,15 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype) {
         pthread_rwlock_unlock(&g_cache[bkt].lock);
         return NULL;
     }
-    /* Check expiry — serve stale for up to STALE_MAX_AGE seconds while
-     * triggering a background revalidation (stale-while-revalidate). */
-#define STALE_MAX_AGE 30u
     int is_stale = 0;
     if (entry_remaining_ttl(e) == 0) {
-        /* check if within stale window */
-        uint32_t staleness;
-        if (e->negative) {
-            staleness = (uint32_t) (time(NULL) - e->inserted_at);
-            if (staleness > e->neg_ttl + STALE_MAX_AGE) {
-                pthread_rwlock_unlock(&g_cache[bkt].lock);
-                pthread_mutex_lock(&g_stat_mutex);
-                g_stat_expired++;
-                pthread_mutex_unlock(&g_stat_mutex);
-                return NULL;
-            }
-        } else if (e->nrr > 0) {
-            /* oldest RR determines stale age */
-            uint32_t max_age = 0;
-            for (int si = 0; si < e->nrr; si++) {
-                uint32_t age = (uint32_t) (time(NULL) - e->rrs[si].inserted_at);
-                if (age > max_age)
-                    max_age = age;
-            }
-            uint32_t min_orig = UINT32_MAX;
-            for (int si = 0; si < e->nrr; si++)
-                if (e->rrs[si].ttl_original < min_orig)
-                    min_orig = e->rrs[si].ttl_original;
-            if (min_orig == UINT32_MAX || max_age > min_orig + STALE_MAX_AGE) {
-                pthread_rwlock_unlock(&g_cache[bkt].lock);
-                pthread_mutex_lock(&g_stat_mutex);
-                g_stat_expired++;
-                pthread_mutex_unlock(&g_stat_mutex);
-                return NULL;
-            }
-        } else {
+        if (!allow_stale || entry_expired_for(e) > g_cfg.serve_stale_max) {
             pthread_rwlock_unlock(&g_cache[bkt].lock);
+            if (allow_stale) {
+                pthread_mutex_lock(&g_stat_mutex);
+                g_stat_expired++;
+                pthread_mutex_unlock(&g_stat_mutex);
+            }
             return NULL;
         }
         is_stale = 1;
@@ -2661,7 +2673,7 @@ static void cache_store_valkey(const cache_entry_t *e) {
     vk_set(vk_key, buf, max_ttl);
 }
 
-static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype) {
+static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype, int allow_stale) {
     if (!g_cfg.valkey_enabled)
         return NULL;
     char vk_key[600];
@@ -2725,8 +2737,11 @@ static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype) {
      * allocated) dereferenced a NULL e->rrs and crashed on the first Valkey cache
      * hit after an in-memory miss (e.g. a freshly (re)started resolverd). */
     if (entry_remaining_ttl(e) == 0) {
-        cache_entry_free(e);
-        return NULL;
+        if (!allow_stale || entry_expired_for(e) > g_cfg.serve_stale_max) {
+            cache_entry_free(e);
+            return NULL;
+        }
+        e->served_stale = 1;
     }
     return e;
 }
@@ -2857,6 +2872,28 @@ fail:
     return NULL;
 }
 
+/*
+ * RFC 9520 — cache a synthetic SERVFAIL briefly so a persistently failing
+ * name doesn't retrigger an upstream query (and the query storm that invites)
+ * on every subsequent lookup. Mirrors the NXDOMAIN/NODATA negative-entry
+ * shape from parse_response_to_entry (nrr=0, negative=1).
+ */
+static void cache_servfail(const char *qname, uint16_t qtype) {
+    if (g_cfg.servfail_cache_ttl == 0)
+        return;
+    cache_entry_t *e = calloc(1, sizeof(cache_entry_t));
+    if (!e)
+        return;
+    safe_strcpy(e->qname, qname, sizeof(e->qname));
+    e->qtype = qtype;
+    e->rcode = 2 /* SERVFAIL */;
+    e->negative = 1;
+    e->neg_ttl = g_cfg.servfail_cache_ttl;
+    e->inserted_at = time(NULL);
+    cache_insert(e);
+    cache_store_valkey(e);
+}
+
 /* =========================================================================
  * Prefetch thread
  * ======================================================================= */
@@ -2870,7 +2907,10 @@ static void *prefetch_worker(void *arg) {
     uint8_t resp[DNS_BUF];
     long rtt = 0;
     int rlen = upstream_query(j->qname, j->qtype, resp, sizeof(resp), &rtt);
-    if (rlen > 0) {
+    /* A failed refresh (no response, or upstream SERVFAIL) must not clobber
+     * the entry it was meant to refresh — this fires right after a serve-
+     * stale hit (RFC 8767), i.e. exactly when upstream is known to be down. */
+    if (rlen >= 12 && (ntohs(((dns_hdr_t *) resp)->flags) & DNS_RCODE_MASK) != 2) {
         cache_entry_t *e = parse_response_to_entry(resp, rlen, j->qname, j->qtype);
         if (e) {
             cache_insert(e);
@@ -2910,6 +2950,60 @@ typedef struct {
     uint16_t answer_types[32];
     uint32_t answer_ttls[32];
 } resolve_result_t;
+
+/*
+ * Populate `result` from a cache entry obtained via cache_lookup/
+ * cache_load_valkey (which have already applied the stale-window check) and
+ * free it. Handles negative answers, prefetch triggering, and RFC 8767
+ * stale-serve accounting. Returns what dns_resolve should return: 0 for a
+ * positive answer (already filled in), or the cached rcode for a negative
+ * one.
+ */
+static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_result_t *result) {
+    pthread_mutex_lock(&g_stat_mutex);
+    g_stat_hits++;
+    pthread_mutex_unlock(&g_stat_mutex);
+    result->from_cache = 1;
+    result->cache_ttl_remaining = entry_remaining_ttl(ce);
+    result->rcode = ce->rcode;
+    if (ce->served_stale) {
+        prefetch_async(qname, ce->qtype);
+        result->from_cache = 2;
+        pthread_mutex_lock(&g_stat_mutex);
+        g_stat_stale++;
+        pthread_mutex_unlock(&g_stat_mutex);
+    } else if (!ce->negative && ce->prefetch_ttl > 0 &&
+               result->cache_ttl_remaining <= ce->prefetch_ttl) {
+        prefetch_async(qname, ce->qtype);
+    }
+    if (ce->negative) {
+        int rc = result->rcode;
+        cache_entry_copy_free(ce);
+        return rc;
+    }
+    int n = ce->nrr < 32 ? ce->nrr : 32;
+    result->ancount = n;
+    for (int i = 0; i < n; i++) {
+        result->answer_types[i] = ce->rrs[i].type;
+        result->answer_ttls[i] =
+            (uint32_t) (time(NULL) - ce->rrs[i].inserted_at < ce->rrs[i].ttl_original
+                            ? ce->rrs[i].ttl_original -
+                                  (uint32_t) (time(NULL) - ce->rrs[i].inserted_at)
+                            : 0);
+        /* Re-encode rdata as string using a fake packet context */
+        uint8_t fake[512];
+        memset(fake, 0, sizeof(fake));
+        if (ce->rrs[i].rdata && ce->rrs[i].rdlen > 0)
+            memcpy(fake, ce->rrs[i].rdata,
+                   ce->rrs[i].rdlen < (int) sizeof(fake) ? ce->rrs[i].rdlen
+                                                         : (int) sizeof(fake));
+        rdata_to_str(fake, ce->rrs[i].rdlen, 0, ce->rrs[i].rdlen, ce->rrs[i].type,
+                     result->answers[i], sizeof(result->answers[i]));
+        safe_strcpy(result->answer_names[i], qname, sizeof(result->answer_names[i]));
+    }
+    cache_entry_copy_free(ce);
+    return 0;
+}
 
 static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *result) {
     memset(result, 0, sizeof(*result));
@@ -2992,56 +3086,13 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
         /* All search domains exhausted — fall through to exact name */
     }
 
-    /* 1. Memory cache lookup */
-    cache_entry_t *ce = cache_lookup(qname, qtype);
+    /* 1. Memory cache lookup (fresh only — never opportunistically stale) */
+    cache_entry_t *ce = cache_lookup(qname, qtype, 0);
     /* 2. Valkey persistent cache fallback */
     if (!ce)
-        ce = cache_load_valkey(qname, qtype);
-    if (ce) {
-        pthread_mutex_lock(&g_stat_mutex);
-        g_stat_hits++;
-        pthread_mutex_unlock(&g_stat_mutex);
-        result->from_cache = 1;
-        result->cache_ttl_remaining = entry_remaining_ttl(ce);
-        result->rcode = ce->rcode;
-        /* Prefetch if TTL is low, or background-revalidate if stale */
-        if (ce->served_stale) {
-            prefetch_async(qname, qtype);
-            result->from_cache = 2;
-            pthread_mutex_lock(&g_stat_mutex);
-            g_stat_stale++;
-            pthread_mutex_unlock(&g_stat_mutex);
-        } else if (!ce->negative && ce->prefetch_ttl > 0 &&
-                   result->cache_ttl_remaining <= ce->prefetch_ttl) {
-            prefetch_async(qname, qtype);
-        }
-        if (ce->negative) {
-            cache_entry_copy_free(ce);
-            return result->rcode;
-        }
-        int n = ce->nrr < 32 ? ce->nrr : 32;
-        result->ancount = n;
-        for (int i = 0; i < n; i++) {
-            result->answer_types[i] = ce->rrs[i].type;
-            result->answer_ttls[i] =
-                (uint32_t) (time(NULL) - ce->rrs[i].inserted_at < ce->rrs[i].ttl_original
-                                ? ce->rrs[i].ttl_original -
-                                      (uint32_t) (time(NULL) - ce->rrs[i].inserted_at)
-                                : 0);
-            /* Re-encode rdata as string using a fake packet context */
-            uint8_t fake[512];
-            memset(fake, 0, sizeof(fake));
-            if (ce->rrs[i].rdata && ce->rrs[i].rdlen > 0)
-                memcpy(fake, ce->rrs[i].rdata,
-                       ce->rrs[i].rdlen < (int) sizeof(fake) ? ce->rrs[i].rdlen
-                                                             : (int) sizeof(fake));
-            rdata_to_str(fake, ce->rrs[i].rdlen, 0, ce->rrs[i].rdlen, ce->rrs[i].type,
-                         result->answers[i], sizeof(result->answers[i]));
-            safe_strcpy(result->answer_names[i], qname, sizeof(result->answer_names[i]));
-        }
-        cache_entry_copy_free(ce);
-        return 0;
-    }
+        ce = cache_load_valkey(qname, qtype, 0);
+    if (ce)
+        return serve_cached_entry(ce, qname, result);
 
     /* 3. Miss — query upstream */
     pthread_mutex_lock(&g_stat_mutex);
@@ -3049,9 +3100,27 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
     pthread_mutex_unlock(&g_stat_mutex);
     uint8_t resp[DNS_BUF * 2];
     int rlen = upstream_query(qname, qtype, resp, sizeof(resp), &result->rtt_us);
-    if (rlen < 12)
+    int upstream_failed = (rlen < 12);
+    if (!upstream_failed) {
+        result->rcode = ntohs(((dns_hdr_t *) resp)->flags) & DNS_RCODE_MASK;
+        /* RFC 8767 §3 / RFC 9520 treat an upstream SERVFAIL the same as no
+         * response at all — it is a resolution failure, not an answer to
+         * cache as one. */
+        upstream_failed = (result->rcode == 2 /* SERVFAIL */);
+    }
+    if (upstream_failed) {
+        /* RFC 8767: prefer a recently-expired cache entry over failing the
+         * query outright. */
+        cache_entry_t *sce = cache_lookup(qname, qtype, 1);
+        if (!sce)
+            sce = cache_load_valkey(qname, qtype, 1);
+        if (sce)
+            return serve_cached_entry(sce, qname, result);
+        /* RFC 9520: nothing to serve — cache the failure briefly so repeated
+         * queries for this name don't retrigger the same failing lookup. */
+        cache_servfail(qname, qtype);
         return -1;
-    result->rcode = ntohs(((dns_hdr_t *) resp)->flags) & DNS_RCODE_MASK;
+    }
     /* 4. Parse response + DNSSEC validation */
     ce = parse_response_to_entry(resp, rlen, qname, qtype);
     if (ce) {
@@ -3668,6 +3737,8 @@ static void config_load_env(void) {
     g_cfg.cache_neg_ttl = (uint32_t) atoi(getenv_or("CACHE_NEG_TTL", "300"));
     safe_strcpy(g_cfg.dot_ca_pem, getenv_or("DOT_CA_PEM", ""), sizeof(g_cfg.dot_ca_pem));
     g_cfg.cache_neg_ttl_min = (uint32_t) atoi(getenv_or("CACHE_NEG_TTL_MIN", "1"));
+    g_cfg.serve_stale_max = (uint32_t) atoi(getenv_or("SERVE_STALE_MAX", "3600"));
+    g_cfg.servfail_cache_ttl = (uint32_t) atoi(getenv_or("SERVFAIL_CACHE_TTL", "30"));
     safe_strcpy(g_cfg.doh_path, getenv_or("DOH_PATH", "/dns-query"), sizeof(g_cfg.doh_path));
     g_cfg.doh_port = atoi(getenv_or("DOH_PORT", "443"));
     g_cfg.listen_tcp = atoi(getenv_or("LISTEN_TCP", "1"));

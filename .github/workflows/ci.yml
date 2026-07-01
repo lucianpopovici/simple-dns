@@ -185,6 +185,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-dns0x20 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL caching
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-serve-stale OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Out-of-zone forwarding (failover + TC→TCP + RFC 5452 anti-spoof)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

@@ -319,8 +319,55 @@ record formats here use the Phase-1 schema decision.
      upstream with "echo" vs "corrupt" modes) confirms the case pattern
      varies across queries, a case-mismatched reply is rejected by default,
      and both `DNS0X20_ENABLED=0` and the per-upstream opt-out correctly
-     restore acceptance. In CI. The other six resolverd items and the mdnsd
-     Discovery Proxy remain.
+     restore acceptance. In CI.
+   - **8767+9520 serve-stale/SERVFAIL-caching DONE 2026-07-01.** 9156 QNAME-min
+     was skipped — it's genuinely inapplicable to a single-hop forwarder (no
+     delegation chain to hide labels from; would require pulling forward
+     Option B's iterative resolver), user chose to defer it rather than force
+     it. For serve-stale: `cache_lookup`/`cache_load_valkey` gained an
+     `allow_stale` parameter — the normal live-lookup path (`allow_stale=0`)
+     now returns NULL on any expired entry (previously it served stale data
+     unconditionally within a hardcoded 30s window as a latency
+     optimization, regardless of upstream health, which the plan's own
+     guardrail flagged as wrong: stale must be a failure fallback, not a
+     default). `dns_resolve`'s upstream-failure branch (`rlen<12` **or** a
+     real upstream response with `rcode==SERVFAIL` — RFC 8767 §3 treats both
+     as the same failure condition, so a live SERVFAIL response no longer
+     falls through and gets cached as a bogus empty-positive entry) now
+     retries the same lookup with `allow_stale=1`, serving an already-expired
+     entry if it's within `config SERVE_STALE_MAX` (default 3600s). Falling
+     back to Valkey's persisted cache too, so the resilience survives a
+     resolverd restart mid-outage, not just an in-memory hit. New
+     `entry_expired_for()` computes how long ago an entry passed its TTL,
+     shared by both cache layers. `serve_cached_entry()` factors out the
+     ~45-line "populate result from a cache entry" block that used to be
+     inlined in `dns_resolve`, since both the live-hit path and the new
+     stale-fallback path need it. RFC 9520: `cache_servfail()` inserts a
+     short-TTL (`SERVFAIL_CACHE_TTL`, default 30s) synthetic negative entry
+     (same shape as an NXDOMAIN entry) when neither a fresh nor a stale
+     answer exists, so a persistently failing name doesn't retrigger the
+     failing upstream query on every subsequent lookup. Caught one bug along
+     the way while wiring this up: `serve_cached_entry` fires
+     `prefetch_async` in the background on every stale-serve — but that's
+     precisely the moment upstream is known to be down, so `prefetch_worker`
+     would almost always get back another SERVFAIL and (before this fix)
+     cache *that* as a positive-but-empty entry, clobbering the good stale
+     data it was trying to refresh. Fixed by having `prefetch_worker` skip
+     the cache write when the refresh itself came back SERVFAIL (or no
+     response at all). Test: `make check-serve-stale`
+     (`tests/servfail_upstream.py`, a stub that answers the first query for a
+     "primed" name with a real short-TTL answer then SERVFAILs everything
+     after) confirms (a) a stale answer is served once the upstream starts
+     SERVFAILing, and (b) an immediate repeat query for a name that only ever
+     got SERVFAIL is answered without a second upstream query at all (log
+     shows exactly one `QUERY` line for it) — proving the RFC 9520 cache
+     suppressed the retry, not just resolverd happening not to ask. Gotcha:
+     the stub's name-match had to be case-insensitive — resolverd's 0x20
+     QNAME case randomization (previous item) mixes the case of what it
+     sends upstream by default, which silently broke the "is this the primed
+     name" check on the first attempt. In CI. The remaining resolverd items
+     (8198 aggressive NSEC, 8914 EDE, 9462/9463 DDR/DNR, 6147 DNS64) and the
+     mdnsd Discovery Proxy remain.
 5. **DoQ** (`CLAUDE-DoQ.md`) — new transport, larger effort.
 6. **eppd** (`CLAUDE-eppd.md`) — separate program. Gate on the
    public-vs-private-registry decision before starting phase 1 (core EPP).

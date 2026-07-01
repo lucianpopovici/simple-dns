@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1867,6 +1867,40 @@ check-dns0x20: resolverd_debug
 	 test "$$C3" = "203.0.113.55" || { echo "  FAIL  per-upstream DNS0X20_DISABLE opt-out did not work"; exit 1; }; \
 	 echo "  OK  0x20 randomizes QNAME case, rejects a case-mismatched reply, and honors the enabled/opt-out config"
 
+# RFC 8767 serve-stale + RFC 9520 SERVFAIL caching (resolverd Option A, Add 3).
+# tests/servfail_upstream.py answers the first query for a "primed" name with
+# a real (short-TTL) A record, then SERVFAILs everything after — simulating an
+# upstream that has gone bad, without waiting out a socket timeout. Checks:
+# (1) once the primed TTL has expired and the upstream is SERVFAILing,
+# resolverd still serves the last-known-good answer (RFC 8767) instead of
+# failing the query; (2) a name never seen before also gets SERVFAIL against a
+# SERVFAILing upstream (nothing to fall back to); (3) an immediate repeat
+# query for that never-seen name is answered without a second upstream query
+# at all — proof the RFC 9520 cached-SERVFAIL is what answered it, not a
+# coincidence.
+check-serve-stale: resolverd_debug
+	@echo "  CHECK  RFC 8767 serve-stale + RFC 9520 SERVFAIL caching (requires python3 + dig)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 python3 tests/servfail_upstream.py 127.0.0.1 5412 stale.test 1 203.0.113.88 > /tmp/servfail_stub.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5413 SERVE_STALE_MAX=3600 SERVFAIL_CACHE_TTL=30 \
+	     ./resolverd_debug --upstream 127.0.0.1:5412 --no-dnssec --no-valkey                 \
+	     > /tmp/resolverd_servfail.log 2>&1 & RD=$$!;                                        \
+	 sleep 1.5;                                                                               \
+	 A1=$$(dig @127.0.0.1 -p 5413 stale.test A +short +time=2 +tries=1);                     \
+	 sleep 2;                                                                                 \
+	 A2=$$(dig @127.0.0.1 -p 5413 stale.test A +short +time=2 +tries=1);                      \
+	 S1=$$(dig @127.0.0.1 -p 5413 neverseen.test A +time=2 +tries=1 | grep -o "status: [A-Z]*"); \
+	 S2=$$(dig @127.0.0.1 -p 5413 neverseen.test A +time=2 +tries=1 | grep -o "status: [A-Z]*"); \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                          \
+	 echo "  primed A1=[$$A1] stale-served A2=[$$A2] neverseen S1=[$$S1] S2=[$$S2]";         \
+	 test "$$A1" = "203.0.113.88" || { echo "  FAIL  initial priming query did not get the upstream answer"; cat /tmp/resolverd_servfail.log; exit 1; }; \
+	 test "$$A2" = "203.0.113.88" || { echo "  FAIL  resolverd did not serve stale data once upstream started SERVFAILing"; cat /tmp/resolverd_servfail.log; exit 1; }; \
+	 test "$$S1" = "status: SERVFAIL" || { echo "  FAIL  never-cached name did not SERVFAIL against a SERVFAILing upstream"; exit 1; }; \
+	 test "$$S2" = "status: SERVFAIL" || { echo "  FAIL  cached-SERVFAIL retry did not SERVFAIL"; exit 1; }; \
+	 NEVERCOUNT=$$(grep -ci "QUERY neverseen.test" /tmp/servfail_stub.log);                    \
+	 test "$$NEVERCOUNT" = "1" || { echo "  FAIL  RFC 9520 SERVFAIL caching did not suppress the retry (upstream saw $$NEVERCOUNT queries, expected 1)"; cat /tmp/servfail_stub.log; exit 1; }; \
+	 echo "  OK  stale cache served on upstream SERVFAIL, and the repeat SERVFAIL was suppressed via the RFC 9520 cache"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -1929,6 +1963,7 @@ help:
 	@echo "  make check-resolverd-cache resolverd Valkey cache-load regression (needs Valkey + dig)"
 	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"
 	@echo "  make check-dns0x20   resolverd RFC 5452 0x20 QNAME case randomization (needs dig + python3)"
+	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"
