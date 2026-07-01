@@ -108,6 +108,24 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-zoneversion OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 9103 XoT — 'dot' ALPN actually selected on the DoT/XFR listener
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-xot OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: RFC 9859 generalized NOTIFY (CDS/CDNSKEY to a parent on KSK rollover)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-parent-notify OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: RFC 9567 DNS Error Reporting (EDNS0 Report-Channel option)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-error-reporting OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

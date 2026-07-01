@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -707,6 +707,106 @@ check-zoneversion: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$OUT_NOOPT" | grep -q "OPT=19:" && { echo "  FAIL  ZONEVERSION emitted without client request"; exit 1; }; \
 	 echo "$$OUT_REFUSED" | grep -q "OPT=19:" && { echo "  FAIL  ZONEVERSION emitted on REFUSED/out-of-zone"; exit 1; }; \
 	 echo "  OK  ZONEVERSION echoes zone label count + SOA serial; opt-in only; omitted when not authoritative"
+
+# RFC 9103 Zone Transfer over TLS (XoT) conformance: §7.1 MUSTs the "dot" ALPN
+# token be *selected* in the handshake. SSL_CTX_set_alpn_protos alone (the old
+# code) is the client-side API and is a silent no-op on a server SSL_CTX — it
+# never actually answers the ClientHello's ALPN extension. Fixed via
+# SSL_CTX_set_alpn_select_cb (dot_alpn_select_cb). Checks: a client offering
+# "dot" gets it selected; a client offering an unrelated protocol gets no ALPN
+# (not a handshake failure); and an ordinary DoT query still works unaffected.
+check-xot: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 9103 XoT: 'dot' ALPN actually selected on the DoT/XFR listener (requires Valkey + openssl + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                      \
+	 D=$$(mktemp -d);                                                                              \
+	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+	   -keyout $$D/srv.key -out $$D/srv.pem -days 2 -subj "/CN=dns.test" >/dev/null 2>&1;          \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);              \
+	 $$VC set config:tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null;                                \
+	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                                 \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_xot.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                    \
+	 WITH=$$(echo | openssl s_client -connect 127.0.0.1:8853 -alpn dot 2>&1 | grep -c "ALPN protocol: dot"); \
+	 OTHER=$$(echo | openssl s_client -connect 127.0.0.1:8853 -alpn http/1.1 2>&1 | grep -c "No ALPN negotiated"); \
+	 DIGOK=$$(dig +tls +nocookie @127.0.0.1 -p 8853 example.local A +time=2 +tries=1 | grep -c "status: NOERROR"); \
+	 kill $$DNS 2>/dev/null || true;                                                                \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 rm -rf $$D;                                                                                    \
+	 echo "  offering dot: selected=$$WITH  offering http/1.1: correctly-unselected=$$OTHER  DoT query still ok=$$DIGOK"; \
+	 test "$$WITH" -ge 1   || { echo "  FAIL  'dot' ALPN was not selected when offered"; exit 1; }; \
+	 test "$$OTHER" -ge 1  || { echo "  FAIL  unrelated protocol was not correctly left unselected"; exit 1; }; \
+	 test "$$DIGOK" -ge 1  || { echo "  FAIL  ordinary DoT query broke after the ALPN fix"; exit 1; }; \
+	 echo "  OK  'dot' ALPN selected per RFC 9103 §7.1 / RFC 7858 §3.2; DoT queries unaffected"
+
+# RFC 9859 Generalized DNS Notifications: a child signals a parent (registry/
+# registrar) directly when its CDS/CDNSKEY RRset changes, using NOTIFY with
+# qtype=CDS/CDNSKEY in place of SOA (RFC 1996 message format unchanged — only
+# the qtype differs, per RFC 9859 §3). Provisions a throwaway zone, points
+# config:zone:<z>:parent_notify_target at a Python stub, triggers a KSK
+# rollover (config:zone:<z>:ksk_rollover_request) with a fast rollover tick,
+# and checks the stub saw NOTIFY(CDS) + NOTIFY(CDNSKEY) — not just the
+# ordinary NOTIFY(SOA) that also goes to any configured secondaries.
+check-parent-notify: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 9859 generalized NOTIFY: parent gets CDS/CDNSKEY, not just SOA (requires Valkey + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };               \
+	 Z=parentnotify.test; SP=5397;                                                                 \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null;           \
+	 $$VC set config:zone:$$Z:parent_notify_target "127.0.0.1:$$SP" >/dev/null;                     \
+	 $$VC set config:rollover_tick_secs 1 >/dev/null;                                               \
+	 python3 tests/notify_parent_stub.py 127.0.0.1 $$SP 6 >/tmp/notify_parent.out 2>/tmp/notify_parent.err & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_9859.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                     \
+	 $$VC set config:zone:$$Z:ksk_rollover_request $$(date +%s) >/dev/null;                         \
+	 sleep 4;                                                                                        \
+	 kill $$DNS 2>/dev/null || true; wait $$STUB 2>/dev/null || true;                               \
+	 OUT=$$(cat /tmp/notify_parent.out);                                                            \
+	 $$VC del zone_table:$$Z config:rollover_tick_secs >/dev/null;                                   \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "config:zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 QT=$$(echo "$$OUT" | awk '/^QTYPES/{print $$2}');                                              \
+	 echo "  stub saw NOTIFY qtypes: $$QT";                                                         \
+	 echo "$$QT" | grep -q "59" || { echo "  FAIL  no NOTIFY(CDS) received by the parent stub"; cat /tmp/notify_parent.err; exit 1; }; \
+	 echo "$$QT" | grep -q "60" || { echo "  FAIL  no NOTIFY(CDNSKEY) received by the parent stub"; exit 1; }; \
+	 echo "  OK  parent stub received generalized NOTIFY(CDS) + NOTIFY(CDNSKEY) on KSK rollover start"
+
+# RFC 9567 DNS Error Reporting: dnsd advertises an EDNS0 Report-Channel option
+# (code 18, AGENT-DOMAIN in uncompressed wire format) carrying
+# config:error_report_agent, unconditionally (not gated on an EDE code — the
+# resolver may only discover the error later, from its own cache). Checks: the
+# option appears with the configured domain when set; is omitted when unset;
+# and is omitted (§4 MUST NOT) when the configured agent would be a subdomain
+# of the zone being answered.
+check-error-reporting: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  RFC 9567 EDNS0 Report-Channel option (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };                      \
+	 SAVE_A=$$($$VC get config:error_report_agent);                                                \
+	 $$VC set config:error_report_agent "report.example.net" >/dev/null;                           \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_9567.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                    \
+	 SET=$$(dig +nocookie @127.0.0.1 -p $(TPORT) example.local A +time=2 +tries=1);                \
+	 $$VC set config:error_report_agent "" >/dev/null;                                             \
+	 sleep 1.5;                                                                                     \
+	 UNSET=$$(dig +nocookie @127.0.0.1 -p $(TPORT) example.local A +time=2 +tries=1);               \
+	 $$VC set config:error_report_agent "sub.example.local" >/dev/null;                             \
+	 sleep 1.5;                                                                                     \
+	 SUBDOM=$$(dig +nocookie @127.0.0.1 -p $(TPORT) example.local A +time=2 +tries=1);              \
+	 kill $$DNS 2>/dev/null || true;                                                                \
+	 if [ -n "$$SAVE_A" ]; then $$VC set config:error_report_agent "$$SAVE_A" >/dev/null; else $$VC del config:error_report_agent >/dev/null; fi; \
+	 echo "  agent set:    $$(echo "$$SET"    | grep -o 'OPT=18:.*')";                              \
+	 echo "  agent unset:  $$(echo "$$UNSET"  | grep -c 'OPT=18') occurrences";                     \
+	 echo "  subdomain:    $$(echo "$$SUBDOM" | grep -c 'OPT=18') occurrences";                     \
+	 echo "$$SET" | grep -q "OPT=18" || { echo "  FAIL  Report-Channel option missing when configured"; exit 1; }; \
+	 echo "$$SET" | grep -q "report.example.net" || { echo "  FAIL  agent domain not correctly wire-encoded"; exit 1; }; \
+	 echo "$$UNSET"  | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted with no agent configured"; exit 1; }; \
+	 echo "$$SUBDOM" | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted for a subdomain-of-zone agent (RFC 9567 §4 MUST NOT)"; exit 1; }; \
+	 echo "  OK  Report-Channel option present with the configured agent; omitted when unset or when agent is a subdomain of the zone"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"
@@ -1668,6 +1768,9 @@ help:
 	@echo "  make check-enum      RFC 6116 ENUM NAPTR: ordered rules, '|' in regexp, RRSIG (needs Valkey + dig)"
 	@echo "  make check-2317      RFC 2317 classless /24 sub-block delegation CNAME→PTR + RRSIG (needs Valkey + dig)"
 	@echo "  make check-zoneversion RFC 9660 ZONEVERSION EDNS option echoes zone SOA serial (needs Valkey + dig)"
+	@echo "  make check-xot       RFC 9103 XoT: 'dot' ALPN actually selected on DoT/XFR listener (needs Valkey + openssl + dig)"
+	@echo "  make check-parent-notify RFC 9859 generalized NOTIFY(CDS/CDNSKEY) to a parent on KSK rollover (needs Valkey + python3)"
+	@echo "  make check-error-reporting RFC 9567 EDNS0 Report-Channel option; omitted when unset/subdomain (needs Valkey + dig)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"

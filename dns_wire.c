@@ -1104,7 +1104,8 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
 
 int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
                     const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
-                    int ede_code, const char *ede_text, int zv_labels, uint32_t zv_serial) {
+                    int ede_code, const char *ede_text, int zv_labels, uint32_t zv_serial,
+                    const char *report_agent) {
     if (off + 11 > blen)
         return off;
     buf[off++] = 0; /* root name */
@@ -1183,6 +1184,22 @@ int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uin
             put32(buf, rdata_off + 6, zv_serial);
             rdata_off += 4 + 6;
             rdata_len += 4 + 6;
+        }
+    }
+    /* Report-Channel (RFC 9567 §4): tell the client where to send DNS Error
+     * Reports for names under this server's authority. Unconditional (not
+     * gated on ede_code) — the resolver may not discover the error itself
+     * until well after this response, from its own cache. AGENT-DOMAIN is
+     * uncompressed wire format (RFC 9567 §4), not a compression pointer. */
+    if (report_agent && report_agent[0]) {
+        uint8_t agent_wire[256];
+        int al = name_to_wire(report_agent, agent_wire, (int) sizeof(agent_wire));
+        if (al > 0 && rdata_off + 4 + al < blen) {
+            put16(buf, rdata_off, EDNS_OPT_REPORT_CHANNEL);
+            put16(buf, rdata_off + 2, (uint16_t) al);
+            memcpy(buf + rdata_off + 4, agent_wire, (size_t) al);
+            rdata_off += 4 + al;
+            rdata_len += 4 + al;
         }
     }
     /* Padding (RFC 7830 / RFC 8467):

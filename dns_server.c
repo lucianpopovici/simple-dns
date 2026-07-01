@@ -402,6 +402,10 @@ static zone_entry_t g_zones[MAX_ZONES];
 static int g_zone_count = 0;
 static pthread_mutex_t g_zones_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Forward declaration: defined near the rest of the NOTIFY subsystem, but
+ * needed by the KSK rollover phase transitions above it in the file. */
+static void notify_parent(const zone_entry_t *z, uint16_t qtype);
+
 /* The authoritative zone selected for the request currently being handled by
  * this worker thread.  Set by the query / UPDATE / AXFR entry points before any
  * record emission, and read by the SOA / NSEC / signing helpers so they operate
@@ -717,6 +721,10 @@ static int g_tsig_secret_len = 0;
 
 /* NSID */
 static char g_nsid[256] = "";
+/* RFC 9567 §3: EDNS0 Report-Channel — the domain resolvers should query to
+ * report DNS errors they encounter for names under this server's zones.
+ * Global only (no per-zone override): a single reporting agent per instance. */
+static char g_error_report_agent[256] = "";
 
 /* ==========================================================================
  * Syslog configuration
@@ -2190,6 +2198,8 @@ static void config_load_from_valkey(void) {
     GU("zone_serial", g_soa_serial);
     G("tsig_key_name", g_tsig_key_name);
     G("nsid", g_nsid);
+    g_error_report_agent[0] = 0;
+    G("error_report_agent", g_error_report_agent);
     G("axfr_allow", g_axfr_allow);
     G("notify_targets", g_notify_targets);
     G("zone_name", g_zone_name);
@@ -2447,6 +2457,21 @@ static SSL_CTX *tls_ctx_from_pem(const char *cert_pem, const char *key_pem, cons
     }
     return ctx;
 }
+/* ALPN select callback (server role — RFC 7301 §3.2). SSL_CTX_set_alpn_protos
+ * only configures the list a TLS *client* offers; a server must select via
+ * this callback or it silently sends no ALPN extension at all. Always
+ * selects "dot" (RFC 7858 §3.2 for plain DoT queries; RFC 9103 §7.1 MUSTs it
+ * for XoT zone transfers, which share this same listener/port). */
+static int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                              const unsigned char *in, unsigned int inlen, void *arg) {
+    (void) ssl;
+    (void) arg;
+    static const unsigned char dot_proto[] = {3, 'd', 'o', 't'};
+    if (SSL_select_next_proto((unsigned char **) out, outlen, dot_proto, sizeof(dot_proto), in,
+                              inlen) != OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_NOACK;
+    return SSL_TLSEXT_ERR_OK;
+}
 static void tls_reload(void) {
     pthread_mutex_lock(&g_tls_mutex);
     if (g_dot_ctx) {
@@ -2466,10 +2491,12 @@ static void tls_reload(void) {
     else if (dot_mtls)
         dns_log(LOG_NOTICE,
                 "[DoT] client-cert verification REQUIRED (mTLS) on the DoT/transfer listener\n");
-    /* RFC 7858 §3.2: advertise "dot" ALPN on the DoT listener */
+    /* RFC 7858 §3.2 / RFC 9103 §7.1: select "dot" ALPN on the DoT/XoT
+     * listener. SSL_CTX_set_alpn_select_cb (not set_alpn_protos, which is the
+     * client-side API and is a silent no-op on a server context) is what
+     * actually makes the server answer the ClientHello's ALPN extension. */
     if (g_dot_ctx) {
-        static const uint8_t dot_alpn[] = {3, 'd', 'o', 't'};
-        SSL_CTX_set_alpn_protos(g_dot_ctx, dot_alpn, sizeof(dot_alpn));
+        SSL_CTX_set_alpn_select_cb(g_dot_ctx, dot_alpn_select_cb, NULL);
         /* TLS session resumption — reduces reconnect latency for DoT clients.
          * Server-side session cache: stores session state keyed by session ID.
          * Session tickets: allows stateless resumption (client stores ticket). */
@@ -3427,6 +3454,18 @@ static long roll_cfg(const char *zone, const char *suffix, long def) {
     return def;
 }
 
+/* String equivalent of roll_cfg: per-zone config:zone:<z>:<suffix> overrides
+ * the global config:<suffix>, else out[0] stays 0. */
+static void zone_str_cfg(const char *zone, const char *suffix, char *out, size_t outsz) {
+    char k[360];
+    out[0] = 0;
+    snprintf(k, sizeof(k), "config:zone:%s:%s", zone, suffix);
+    if (vk_get(k, out, (int) outsz) && out[0])
+        return;
+    snprintf(k, sizeof(k), "config:%s", suffix);
+    vk_get(k, out, (int) outsz);
+}
+
 /* Begin a rollover: generate + store the incoming ZSK set, enter `publish`. */
 static void rollover_start(zone_entry_t *z) {
     char pem[MAX_PEM], k[360];
@@ -3534,6 +3573,11 @@ static void ksk_rollover_start(zone_entry_t *z) {
     zone_rollover_load(z); /* bring the next KSK set + phase into memory */
     serial_bump(z);        /* DNSKEY + CDS/CDNSKEY RRsets changed */
     notify_send();
+    /* RFC 9859: tell a configured parent (registry/registrar) directly rather
+     * than waiting for its own DS-polling interval — the CDS/CDNSKEY RRset
+     * just changed from {old} to {old, new}. */
+    notify_parent(z, DNS_TYPE_CDS);
+    notify_parent(z, DNS_TYPE_CDNSKEY);
     dns_log(LOG_NOTICE,
             "[Rollover] %s: KSK started — double (new KSK tags %u/%u); CDS/CDNSKEY = {old, new}\n",
             z->name, z->ksk_next_tag, z->ksk_ed_next_tag);
@@ -3549,6 +3593,9 @@ static void ksk_rollover_to_retire(zone_entry_t *z) {
     zone_rollover_load(z);
     serial_bump(z);
     notify_send();
+    /* RFC 9859: CDS/CDNSKEY just shrank to {new} — tell the parent to re-pull. */
+    notify_parent(z, DNS_TYPE_CDS);
+    notify_parent(z, DNS_TYPE_CDNSKEY);
     dns_log(LOG_NOTICE, "[Rollover] %s: KSK retire — CDS/CDNSKEY = {new} only (parent drops old)\n",
             z->name);
 }
@@ -4861,12 +4908,26 @@ static int zone_label_count(const char *name) {
     return n;
 }
 
+/* RFC 9567 §4: the configured report agent MUST NOT be a subdomain of the
+ * zone it is reporting on (a self-referential reporting loop). Case-
+ * insensitive equality-or-suffix check against the zone currently being
+ * answered; skipped (agent allowed) when no zone context is available. */
+static int report_agent_is_subdomain_of(const char *agent, const char *zone) {
+    size_t al = strlen(agent), zl = strlen(zone);
+    if (zl == 0 || al < zl)
+        return 0;
+    if (al == zl)
+        return strcasecmp(agent, zone) == 0;
+    return agent[al - zl - 1] == '.' && strcasecmp(agent + al - zl, zone) == 0;
+}
+
 /* ==========================================================================
  * EDNS(0) — edns_info_t, edns_parse, edns_append_opt live in libdnswire.
  * dnsd_edns_opt wraps edns_append_opt with daemon-specific NSID, IP-bound
- * server-cookie computation (RFC 9018 §4.2), and the ZONEVERSION option
- * (RFC 9660) — the latter sourced from t_zone, the zone this request was
- * matched to (NULL when no configured zone matched, e.g. REFUSED).
+ * server-cookie computation (RFC 9018 §4.2), the ZONEVERSION option
+ * (RFC 9660) and the Report-Channel option (RFC 9567) — both sourced from
+ * t_zone, the zone this request was matched to (NULL when no configured
+ * zone matched, e.g. REFUSED).
  * ======================================================================= */
 static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit,
                          uint16_t rcode_ext, const edns_info_t *ei, const struct in_addr *cip,
@@ -4878,9 +4939,12 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
     }
     int zv_labels = t_zone ? zone_label_count(t_zone->name) : -1;
     uint32_t zv_serial = t_zone ? t_zone->soa_serial : 0;
+    const char *report_agent = g_error_report_agent[0] ? g_error_report_agent : NULL;
+    if (report_agent && t_zone && report_agent_is_subdomain_of(report_agent, t_zone->name))
+        report_agent = NULL; /* fail closed on the RFC 9567 §4 MUST NOT */
     return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei, g_nsid[0] ? g_nsid : NULL,
                            (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text, zv_labels,
-                           zv_serial);
+                           zv_serial, report_agent);
 }
 
 /* ==========================================================================
@@ -8668,6 +8732,12 @@ typedef struct notify_job {
     char zone[256];
     struct sockaddr_in dst;
     uint16_t id;
+    /* RFC 9859: generalized NOTIFY — qtype is SOA for the ordinary RFC 1996
+     * secondary-refresh NOTIFY, or CDS/CDNSKEY/CSYNC when signalling a parent
+     * that one of those RRsets changed. Part of the job's identity (below) so
+     * a pending SOA notify and a pending CDS notify to the same target never
+     * coalesce into one. */
+    uint16_t qtype;
     int tries;
     time_t next_at; /* earliest next (re)send; 0 = send on the next worker pass */
     int fd;         /* UDP socket connect()ed to dst, polled for the ACK */
@@ -8678,9 +8748,13 @@ static notify_job_t *g_notify_jobs = NULL;
 static pthread_mutex_t g_notify_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_notify_cond = PTHREAD_COND_INITIALIZER;
 
-/* Build a (optionally TSIG-signed) NOTIFY request for `zone`. Returns length or
- * -1. The TSIG RR, when a key is configured, also bumps the header arcount. */
-static int notify_build_packet(const char *zone, uint16_t id, uint8_t *pkt, int cap) {
+/* Build a (optionally TSIG-signed) NOTIFY request for `zone`. `qtype` is SOA
+ * for an ordinary RFC 1996 NOTIFY, or CDS/CDNSKEY/CSYNC for a generalized
+ * parent-facing NOTIFY (RFC 9859 §3: same message format, qtype replaced).
+ * Returns length or -1. The TSIG RR, when a key is configured, also bumps the
+ * header arcount. */
+static int notify_build_packet(const char *zone, uint16_t id, uint16_t qtype, uint8_t *pkt,
+                               int cap) {
     if (cap < 12)
         return -1;
     memset(pkt, 0, 12);
@@ -8693,7 +8767,7 @@ static int notify_build_packet(const char *zone, uint16_t id, uint8_t *pkt, int 
     if (n <= 0 || off + n + 4 > cap)
         return -1;
     off += n;
-    put16(pkt, off, DNS_TYPE_SOA);
+    put16(pkt, off, qtype);
     off += 2;
     put16(pkt, off, DNS_CLASS_IN);
     off += 2;
@@ -8748,7 +8822,7 @@ static void *notify_thread(void *arg) {
                     continue;
                 }
                 uint8_t pkt[512];
-                int len = notify_build_packet(j->zone, j->id, pkt, sizeof(pkt));
+                int len = notify_build_packet(j->zone, j->id, j->qtype, pkt, sizeof(pkt));
                 if (len > 0 && send(j->fd, pkt, (size_t) len, 0) == len) {
                     int backoff = NOTIFY_BASE_RETRY_S << j->tries;
                     if (backoff > NOTIFY_MAX_RETRY_S)
@@ -8783,14 +8857,17 @@ static void *notify_thread(void *arg) {
     return NULL;
 }
 
-/* Enqueue (or re-arm) a NOTIFY for `zone` to one target. */
-static void notify_enqueue(const char *zone, const struct sockaddr_in *dst) {
+/* Enqueue (or re-arm) a NOTIFY for `zone`/`qtype` to one target. qtype is part
+ * of a job's identity (RFC 9859): a pending SOA notify to a target and a
+ * pending CDS notify to the same target are distinct jobs, not one coalesced
+ * notify. */
+static void notify_enqueue(const char *zone, const struct sockaddr_in *dst, uint16_t qtype) {
     pthread_mutex_lock(&g_notify_mutex);
     int count = 0;
     for (notify_job_t *j = g_notify_jobs; j; j = j->next) {
         count++;
-        if (strcasecmp(j->zone, zone) == 0 && j->dst.sin_addr.s_addr == dst->sin_addr.s_addr &&
-            j->dst.sin_port == dst->sin_port) {
+        if (strcasecmp(j->zone, zone) == 0 && j->qtype == qtype &&
+            j->dst.sin_addr.s_addr == dst->sin_addr.s_addr && j->dst.sin_port == dst->sin_port) {
             j->tries = 0; /* re-arm: the zone changed again — notify afresh (§3.5) */
             j->next_at = 0;
             pthread_cond_signal(&g_notify_cond);
@@ -8818,6 +8895,7 @@ static void notify_enqueue(const char *zone, const struct sockaddr_in *dst) {
     safe_strcpy(j->zone, zone, sizeof(j->zone));
     j->dst = *dst;
     j->id = csprng_u16();
+    j->qtype = qtype;
     j->tries = 0;
     j->next_at = 0; /* send on the next worker pass (immediately) */
     j->fd = fd;
@@ -8827,8 +8905,10 @@ static void notify_enqueue(const char *zone, const struct sockaddr_in *dst) {
     pthread_mutex_unlock(&g_notify_mutex);
 }
 
-/* Queue a NOTIFY for one zone to a comma-separated "ip[:port]" target list. */
-static void notify_zone(const char *zname, const char *targets_csv) {
+/* Queue a NOTIFY(qtype) for one zone to a comma-separated "ip[:port]" target
+ * list. Ordinary secondary-refresh NOTIFY passes DNS_TYPE_SOA; the
+ * generalized parent-facing case (RFC 9859) passes CDS/CDNSKEY/CSYNC. */
+static void notify_zone_type(const char *zname, const char *targets_csv, uint16_t qtype) {
     if (!zname[0] || !targets_csv[0])
         return;
     char targets[1024];
@@ -8848,8 +8928,13 @@ static void notify_zone(const char *zname, const char *targets_csv) {
         struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
         if (inet_pton(AF_INET, tok, &dst.sin_addr) != 1)
             continue;
-        notify_enqueue(zname, &dst);
+        notify_enqueue(zname, &dst, qtype);
     }
+}
+
+/* Ordinary RFC 1996 secondary-refresh NOTIFY (qtype SOA). */
+static void notify_zone(const char *zname, const char *targets_csv) {
+    notify_zone_type(zname, targets_csv, DNS_TYPE_SOA);
 }
 
 /* NOTIFY every configured zone's secondaries (RFC 1996). */
@@ -8880,6 +8965,34 @@ static void notify_one_zone(const char *zname) {
         safe_strcpy(targets, g_notify_targets, sizeof(targets)); /* legacy single-zone */
     if (targets[0])
         notify_zone(zname, targets);
+}
+
+/* RFC 9859 §3: generalized NOTIFY — signal a configured parent (registry/
+ * registrar listener) that this zone's CDS, CDNSKEY, or CSYNC RRset changed,
+ * using that type in place of SOA. Same RFC 1996 message format/state machine
+ * (retried via the same notify_thread/notify_enqueue path); only the qtype
+ * differs. A no-op when config:[zone:<z>:]parent_notify_target is unset —
+ * most deployments have no parent-side NOTIFY listener to signal. */
+static void notify_parent(const zone_entry_t *z, uint16_t qtype) {
+    char target[256] = "";
+    zone_str_cfg(z->name, "parent_notify_target", target, sizeof(target));
+    if (!target[0])
+        return;
+    char host[256];
+    safe_strcpy(host, target, sizeof(host));
+    int port = 53;
+    char *col = strchr(host, ':');
+    if (col) {
+        *col = 0;
+        port = atoi(col + 1);
+    }
+    struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
+    if (inet_pton(AF_INET, host, &dst.sin_addr) != 1) {
+        dns_log(LOG_WARNING, "[NOTIFY] %s: parent_notify_target '%s' is not a valid IPv4 address\n",
+                z->name, target);
+        return;
+    }
+    notify_enqueue(z->name, &dst, qtype);
 }
 
 /* ==========================================================================

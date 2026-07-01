@@ -57,11 +57,24 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | 11 | 9824 (+4470) | Compact denial of existence | Follow-on | batch3 |
 | 12 | 2317 | Classless reverse delegation | **Done** (dnsd already wire-capable — CNAME chain + co-hosted subzone PTR, DNSSEC-signed; `POST /reverse/classless` provisioning in apid; `make check-2317`) | batch4 |
 
-Complementary (batch3): 9103 (XoT), 9859 (generalized NOTIFY), **9660
-ZONEVERSION Done** (EDNS option 19; echoes the answering zone's LABELCOUNT +
-SOA serial, opt-in only, omitted when no zone matched; `make check-zoneversion`),
-9567 (error reporting). Deployment note (batch4): 3258 (anycast,
-no code). Doc reconciliations (rfc-additions): 8484 Done, 2671→6891, 3833/7626
+Complementary (batch3) — **all Done, batch 3 fully closed 2026-07-01**:
+- **9103 XoT Done** — server-side ALPN was a latent conformance bug
+  (`SSL_CTX_set_alpn_protos` is the client-side API and is a silent no-op on a
+  server `SSL_CTX`; fixed via `SSL_CTX_set_alpn_select_cb`); `make check-xot`.
+- **9859 generalized NOTIFY Done** — `notify_job_t`/`notify_build_packet` carry
+  a qtype; `notify_parent()` NOTIFYs a configured
+  `config:[zone:<z>:]parent_notify_target` with CDS/CDNSKEY on KSK rollover
+  phase transitions; `make check-parent-notify`.
+- **9660 ZONEVERSION Done** — EDNS option 19; echoes the answering zone's
+  LABELCOUNT + SOA serial, opt-in only, omitted when no zone matched;
+  `make check-zoneversion`.
+- **9567 error reporting Done** — EDNS0 Report-Channel option 18
+  (`config:error_report_agent`), unconditional (not gated on EDE), omitted when
+  unset or when the agent would be a subdomain of the answering zone (§4 MUST
+  NOT); `make check-error-reporting`.
+
+Deployment note (batch4): 3258 (anycast, no code — see batch4 doc).
+Doc reconciliations (rfc-additions): 8484 Done, 2671→6891, 3833/7626
 coverage matrix, 8499/9499, **NAPTR = 3403** (header mislabels it 9250).
 
 ---

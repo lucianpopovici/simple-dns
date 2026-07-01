@@ -191,9 +191,55 @@ record formats here use the Phase-1 schema decision.
      `make check-zoneversion` decodes the wire OPT bytes via `dig +ednsopt=19`
      and checks LABELCOUNT/TYPE/serial plus the opt-in-only and
      not-authoritative-omits-it cases. In CI.
-   - Next: the remaining batch-3 complementary items (9103 XoT conformance,
-     9859 generalized NOTIFY, 9567 error reporting) and the 3258 anycast
-     deployment note.
+   - **9103 XoT DONE 2026-07-01** — while verifying ALPN negotiation for the
+     conformance pass, found the DoT/XoT listener was never actually
+     *selecting* "dot": the old code called `SSL_CTX_set_alpn_protos` on the
+     server `SSL_CTX`, which is the client-side API and a silent no-op for a
+     server (confirmed empirically with `openssl s_client -alpn dot` — "No
+     ALPN negotiated" despite the code and its comment claiming otherwise).
+     Fixed with `SSL_CTX_set_alpn_select_cb` (`dot_alpn_select_cb`, using
+     `SSL_select_next_proto`), which shares the port with plain DoT queries.
+     Per-message EDNS padding (the batch3 doc's other conformance target) was
+     deliberately **not** added: RFC 9103 §7.9.1 states padding
+     recommendations are out of scope of the RFC itself (not a MUST), and this
+     codebase's AXFR/IXFR path streams one RR per DNS message, so padding
+     every message would be a large invasive change for a non-required nicety
+     — a conscious scope decision, not an oversight. `make check-xot` (needs
+     openssl s_client) confirms "dot" is selected when offered, an unrelated
+     protocol is correctly left unselected (not a handshake failure), and an
+     ordinary DoT query still works. In CI.
+   - **9859 generalized NOTIFY DONE 2026-07-01** — `notify_job_t` gained a
+     `qtype` field (part of the job's dedup identity, so a pending SOA notify
+     and a pending CDS notify to the same target never coalesce);
+     `notify_build_packet`/`notify_enqueue`/`notify_zone_type` thread it
+     through; `notify_parent()` (new) NOTIFYs
+     `config:[zone:<z>:]parent_notify_target` with CDS then CDNSKEY — hooked
+     into `ksk_rollover_start` and `ksk_rollover_to_retire` (the two KSK
+     rollover phase transitions where the advertised CDS/CDNSKEY RRset
+     actually changes; `ksk_rollover_finish` doesn't change the advertised
+     set, so it deliberately does not fire one). CSYNC-triggered parent
+     NOTIFY was considered but not implemented: CSYNC records are written
+     directly by the control plane (apid/dashboard) via the ordinary
+     `zone:*` namespace, which dnsd only subscribes to for record-cache
+     invalidation and only when the record cache is enabled — not a reliable
+     trigger to hang a parent-NOTIFY on, so this stays a control-plane
+     concern rather than a dnsd one. `make check-parent-notify` (Python stub
+     parent listener) confirms NOTIFY(CDS)+NOTIFY(CDNSKEY) fire on a KSK
+     rollover start. In CI.
+   - **9567 error reporting DONE 2026-07-01** — EDNS0 Report-Channel option
+     (`EDNS_OPT_REPORT_CHANNEL` = 18) carrying `config:error_report_agent` in
+     uncompressed wire format; unconditional (unlike EDE, not gated on an
+     error code in *this* response — the resolver may only discover the
+     error later, from its own cache); the RFC 9567 §4 MUST NOT (agent must
+     not be a subdomain of the zone it reports on) is enforced per-response
+     against `t_zone`, failing closed (option omitted) rather than just
+     logged. `make check-error-reporting` checks the option appears with the
+     configured domain, is omitted when unset, and is omitted for a
+     subdomain-of-zone agent. In CI.
+   - **Batch 3 is now fully closed** — every item in
+     `CLAUDE-rfc-additions-batch3.md` is Done; only the batch-4 RFC 3258
+     anycast deployment note (no code) remains from the reverse-DNS/anycast
+     batch.
 3. **certd ARI** (`CLAUDE-certd.md`, RFC 9773) — small. Note Phase 0 already
    touched this file (CSA-TLS-001).
 4. **mdnsd Discovery Proxy** (`CLAUDE-mdnsd.md`, RFC 8766) and **resolverd
