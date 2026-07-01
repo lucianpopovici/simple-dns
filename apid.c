@@ -1339,8 +1339,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             prefixlen = atoi(slash + 1);
         }
         if (prefixlen < 25 || prefixlen > 31) {
-            api_send(fd, ssl, 400,
-                     "cidr prefix length must be 25-31 (classless /24 sub-block)\n");
+            api_send(fd, ssl, 400, "cidr prefix length must be 25-31 (classless /24 sub-block)\n");
             return;
         }
         struct in_addr addr4;
@@ -1349,7 +1348,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             return;
         }
         uint32_t ip32 = ntohl(addr4.s_addr);
-        uint32_t mask = (uint32_t)(0xFFFFFFFFu << (32 - prefixlen));
+        uint32_t mask = (uint32_t) (0xFFFFFFFFu << (32 - prefixlen));
         if ((ip32 & ~mask) != 0) {
             api_send(fd, ssl, 400, "cidr host bits are not zero (use the network address)\n");
             return;
@@ -1381,7 +1380,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         }
         /* Write one CNAME per address in the block (in the /24 zone).
          * Buffers sized for zone:<256>:CNAME:<256> worst-case. */
-        int written = 0;
+        unsigned written = 0;
         for (unsigned off = 0; off < blocksize; off++) {
             unsigned host = o4_start + off;
             char owner[320], target[320], vkey[768], vval[640];
@@ -1410,9 +1409,8 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             serial_bump_zone(rev24_zone);
         }
         char rb[768];
-        snprintf(rb, sizeof(rb),
-                 "ok: %u CNAMEs written in %s → subzone %s (%s)\n", written, rev24_zone,
-                 subzone, cohost ? "co-hosted" : "delegated");
+        snprintf(rb, sizeof(rb), "ok: %u CNAMEs written in %s → subzone %s (%s)\n", written,
+                 rev24_zone, subzone, cohost ? "co-hosted" : "delegated");
         dns_log(LOG_NOTICE, "[2317] %s", rb);
         api_send(fd, ssl, 201, rb);
         return;

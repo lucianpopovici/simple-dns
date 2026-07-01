@@ -97,8 +97,8 @@
 #define EDNS_OPT_PADDING 12
 #define EDNS_OPT_EDE 15
 #define EDNS_OPT_REPORT_CHANNEL 18 /* RFC 9567 */
-#define EDNS_OPT_ZONEVERSION 19 /* RFC 9660 */
-#define EDNS_ZV_TYPE_SOA_SERIAL 0 /* RFC 9660 §3: the only defined VERSION type */
+#define EDNS_OPT_ZONEVERSION 19    /* RFC 9660 */
+#define EDNS_ZV_TYPE_SOA_SERIAL 0  /* RFC 9660 §3: the only defined VERSION type */
 
 /* Extended DNS Error info codes (RFC 8914) */
 #define EDE_OTHER 0
