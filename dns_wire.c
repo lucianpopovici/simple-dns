@@ -230,10 +230,13 @@ void nsec3_hash_raw(const char *name, const uint8_t *salt, int saltlen, int iter
     strlower(lname);
     uint8_t wire[257];
     int wlen = 0;
-    char tmp[256];
-    safe_strcpy(tmp, lname, sizeof(tmp));
+    /* strtok_r destroys its input, but lname isn't needed again after this
+     * loop — tokenize it in place instead of taking a second bounded copy
+     * (which GCC's -Wstringop-truncation flags here: with two chained
+     * fixed-size safe_strcpy calls it can prove the second copy's source is
+     * exactly as long as the destination buffer). */
     char *sp = NULL;
-    char *lbl = strtok_r(tmp, ".", &sp);
+    char *lbl = strtok_r(lname, ".", &sp);
     while (lbl) {
         int ll = (int) strlen(lbl);
         if (ll > 63 || wlen + ll + 1 > 255)

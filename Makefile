@@ -913,12 +913,15 @@ check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) d
 	      tests/test_name_from_wire.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
 	./tests/test_name_from_wire
 
-# libFuzzer smoke target for the name parser (requires clang).
-fuzz-wire: fuzz/fuzz_name_from_wire.c $(WIRE_SRC) dns_wire.h
+# libFuzzer smoke target for the name parser (requires clang). Links OpenSSL
+# because libdnswire's nsec3_hash_raw (RFC 8198 aggressive-cache support) uses
+# EVP SHA-1.
+fuzz-wire: fuzz/fuzz_name_from_wire.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [FUZZ]  fuzz_name_from_wire (clang, ASan+UBSan+libFuzzer)"
-	clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -I. -I$(OSSL_INC) \
 	      -o fuzz/fuzz_name_from_wire \
-	      fuzz/fuzz_name_from_wire.c $(WIRE_SRC)
+	      fuzz/fuzz_name_from_wire.c $(WIRE_SRC) \
+	      -L$(OSSL_LIB) -lssl -lcrypto -Wl,-rpath,$(OSSL_LIB)
 	mkdir -p fuzz/corpus
 	./fuzz/fuzz_name_from_wire -max_total_time=60 fuzz/corpus
 
@@ -938,11 +941,13 @@ fuzz-response: fuzz/fuzz_response.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_w
 
 # libFuzzer over the ADR-003 length-prefixed TLV codec (structured Valkey values).
 # Reader parses untrusted inter-daemon-bus bytes; writer must not overflow.
-fuzz-tlv: fuzz/fuzz_tlv.c $(WIRE_SRC) dns_wire.h
+# Links OpenSSL for the same reason as fuzz-wire above.
+fuzz-tlv: fuzz/fuzz_tlv.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	@echo "  CC [FUZZ]  fuzz_tlv (TLV codec; clang, ASan+UBSan+libFuzzer)"
-	clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -I. -I$(OSSL_INC) \
 	      -o fuzz/fuzz_tlv \
-	      fuzz/fuzz_tlv.c $(WIRE_SRC)
+	      fuzz/fuzz_tlv.c $(WIRE_SRC) \
+	      -L$(OSSL_LIB) -lssl -lcrypto -Wl,-rpath,$(OSSL_LIB)
 	mkdir -p fuzz/corpus_tlv
 	./fuzz/fuzz_tlv -max_total_time=60 fuzz/corpus_tlv
 

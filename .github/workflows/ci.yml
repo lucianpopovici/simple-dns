@@ -383,12 +383,13 @@ jobs:
     # invalid; the files are committed now, so no guard is needed.)
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install clang + OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
       - name: Build fuzzer
         run: |
           clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
-                fuzz/fuzz_name_from_wire.c dns_wire.c -o fuzz_name_from_wire
+                fuzz/fuzz_name_from_wire.c dns_wire.c -o fuzz_name_from_wire \
+                -lssl -lcrypto
       - name: Run 60s smoke + replay regression corpus
         run: |
           mkdir -p fuzz/corpus
@@ -424,12 +425,13 @@ jobs:
     # inter-daemon-bus bytes; this proves it stays in bounds.
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install clang + OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
       - name: Build fuzzer
         run: |
           clang -g -O1 -fsanitize=fuzzer,address,undefined -I. \
-                fuzz/fuzz_tlv.c dns_wire.c -o fuzz_tlv
+                fuzz/fuzz_tlv.c dns_wire.c -o fuzz_tlv \
+                -lssl -lcrypto
       - name: Run 60s smoke + replay regression corpus
         run: |
           mkdir -p fuzz/corpus_tlv
