@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -2013,6 +2013,64 @@ check-dns64: tests/test_dns64.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.
 	 test "$$EXCLCOUNT" = "0" || { echo "  FAIL  DNS64_EXCLUDE did not suppress synthesis"; exit 1; }; \
 	 echo "  OK  DNS64 synthesizes on genuine NODATA, passes real AAAA through unchanged, and honors the exclude list"
 
+# RFC 8766 Discovery Proxy (mdnsd Add 1): bridges unicast DNS-SD queries to
+# link-local mDNS. Drives a fake mDNS responder (tests/dp_mdns_responder.py)
+# on a made-up service name (never a real one — a real device on the test
+# network answering the same generic service type would contaminate the
+# result, which is exactly how this test was first debugged) and confirms
+# the unicast reply translates PTR/SRV/TXT/A correctly, drops the
+# link-local AAAA (RFC 8766 §5.3 guardrail), and REFUSES an unconfigured
+# subdomain. The multicast interface is auto-detected (first UP+MULTICAST
+# non-loopback interface) since CI's interface name isn't known in advance.
+check-dp: mdnsd_debug
+	@echo "  CHECK  RFC 8766 Discovery Proxy (requires Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 IFACE=""; \
+	 for i in $$(ip -o link show up 2>/dev/null | awk -F': ' '{print $$2}'); do \
+	   case "$$i" in lo|lo@*) continue ;; esac; \
+	   F=$$(ip link show "$$i" 2>/dev/null); \
+	   echo "$$F" | grep -q MULTICAST || continue; \
+	   echo "$$F" | grep -q LOWER_UP || continue; \
+	   IFACE="$$i"; break; \
+	 done; \
+	 test -n "$$IFACE" || { echo "  SKIP  no UP+MULTICAST+carrier non-loopback interface found"; exit 0; }; \
+	 SAVE_EN=$$($$VC get config:mdns_enabled); SAVE_IF=$$($$VC get config:mdns_interfaces); \
+	 SAVE_HN=$$($$VC get config:mdns_hostname); SAVE_DPE=$$($$VC get config:dp_enabled); \
+	 SAVE_DPS=$$($$VC get config:dp_subdomains); SAVE_DPP=$$($$VC get config:dp_port); \
+	 SAVE_DPT=$$($$VC get config:dp_ttl_cap); \
+	 $$VC set config:mdns_enabled 1 >/dev/null; \
+	 $$VC set config:mdns_interfaces "$$IFACE" >/dev/null; \
+	 $$VC set config:mdns_hostname dptest.local >/dev/null; \
+	 $$VC set config:dp_enabled 1 >/dev/null; \
+	 $$VC set config:dp_subdomains lab.example.com >/dev/null; \
+	 $$VC set config:dp_port 8532 >/dev/null; \
+	 $$VC set config:dp_ttl_cap 30 >/dev/null; \
+	 python3 tests/dp_mdns_responder.py > /tmp/dp_stub.log 2>&1 & STUB=$$!; \
+	 sleep 1; \
+	 ASAN_OPTIONS=detect_leaks=0 ./mdnsd_debug > /tmp/mdnsd_dp.log 2>&1 & MD=$$!; \
+	 sleep 2; \
+	 PTR=$$(dig @127.0.0.1 -p 8532 +short +time=3 +tries=1 _dpxtest9k2._tcp.lab.example.com PTR | head -1); \
+	 FULL=$$(dig @127.0.0.1 -p 8532 +noall +answer +time=3 +tries=1 _dpxtest9k2._tcp.lab.example.com PTR); \
+	 REFUSED=$$(dig @127.0.0.1 -p 8532 +noall +comment +time=3 +tries=1 foo.other.com A | grep -c "status: REFUSED"); \
+	 kill $$MD $$STUB 2>/dev/null || true; wait 2>/dev/null || true; \
+	 if [ -n "$$SAVE_EN" ]; then $$VC set config:mdns_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:mdns_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_IF" ]; then $$VC set config:mdns_interfaces "$$SAVE_IF" >/dev/null; else $$VC del config:mdns_interfaces >/dev/null; fi; \
+	 if [ -n "$$SAVE_HN" ]; then $$VC set config:mdns_hostname "$$SAVE_HN" >/dev/null; else $$VC del config:mdns_hostname >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPE" ]; then $$VC set config:dp_enabled "$$SAVE_DPE" >/dev/null; else $$VC del config:dp_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPS" ]; then $$VC set config:dp_subdomains "$$SAVE_DPS" >/dev/null; else $$VC del config:dp_subdomains >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPP" ]; then $$VC set config:dp_port "$$SAVE_DPP" >/dev/null; else $$VC del config:dp_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPT" ]; then $$VC set config:dp_ttl_cap "$$SAVE_DPT" >/dev/null; else $$VC del config:dp_ttl_cap >/dev/null; fi; \
+	 echo "  iface=$$IFACE PTR=[$$PTR] REFUSED=[$$REFUSED]"; \
+	 test "$$PTR" = "myinst._dpxtest9k2._tcp.lab.example.com." || { echo "  FAIL  PTR did not translate correctly"; cat /tmp/mdnsd_dp.log; exit 1; }; \
+	 echo "$$FULL" | grep -q "SRV.*0 0 8080 myhost.lab.example.com." || { echo "  FAIL  SRV missing/wrong"; echo "$$FULL"; exit 1; }; \
+	 echo "$$FULL" | grep -q 'TXT.*"path=/"' || { echo "  FAIL  TXT missing/wrong"; echo "$$FULL"; exit 1; }; \
+	 echo "$$FULL" | grep -q "A.*192.168.1.50" || { echo "  FAIL  A missing/wrong"; echo "$$FULL"; exit 1; }; \
+	 echo "$$FULL" | grep -qi "fe80" && { echo "  FAIL  link-local AAAA leaked into the unicast answer"; echo "$$FULL"; exit 1; }; \
+	 test "$$REFUSED" = "1" || { echo "  FAIL  unconfigured subdomain was not REFUSED"; exit 1; }; \
+	 echo "  OK  PTR/SRV/TXT/A translate correctly, link-local AAAA dropped, unconfigured subdomain REFUSED"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -2081,6 +2139,7 @@ help:
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"
 	@echo "  make check-dns64     resolverd RFC 6147 DNS64 AAAA synthesis (KAT + live, needs dig + python3)"
+	@echo "  make check-dp        mdnsd RFC 8766 Discovery Proxy (needs Valkey + dig + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

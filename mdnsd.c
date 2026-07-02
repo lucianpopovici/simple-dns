@@ -19,6 +19,16 @@
  *
  * Other config: config:mdns_enabled ("1" to run), config:mdns_hostname,
  * config:zone_name (hostname default). Env: DNS_VALKEY_HOST/PORT/PASSWORD.
+ *
+ * RFC 8766 Discovery Proxy (opt-in): bridges unicast DNS-SD queries under a
+ * configured subdomain to link-local mDNS, so services that only advertise
+ * on-link become reachable from other subnets. config:dp_enabled +
+ * config:dp_subdomains (comma-separated, e.g. "lab.example.com" — queries
+ * for <name>.lab.example.com map to <name>.local on the mDNS side) —
+ * unconfigured subdomains are REFUSED, never forwarded. config:dp_port
+ * (default 8530), config:dp_ttl_cap (default 30s — RFC 8766 §5.3, the
+ * source mDNS TTL is never reused unchanged). Never proxies a link-scoped
+ * (fe80::/10) AAAA to the unicast side.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +91,16 @@ static char g_ifaces[MAX_IFACES][64];
 static int g_iface_count = 0; /* -1 = "all" */
 static int g_mdns4_sock = -1;
 static int g_mdns6_sock = -1;
+
+/* RFC 8766 Discovery Proxy (Add 1) — off by default; requires an explicit
+ * proxied subdomain list, same "never implicitly on" posture as the
+ * interface allowlist above. */
+#define DP_MAX_SUBDOMAINS 8
+static int g_dp_enabled = 0;
+static char g_dp_subdomains[DP_MAX_SUBDOMAINS][256];
+static int g_dp_subdomain_count = 0;
+static int g_dp_port = 8530;
+static uint32_t g_dp_ttl_cap = 30;
 
 static const char *cfgenv(const char *k, const char *def) {
     const char *v = getenv(k);
@@ -997,6 +1017,395 @@ static int mdns_open_socket(int af) {
     return fd;
 }
 
+/* ==========================================================================
+ * RFC 8766 Discovery Proxy — bridges unicast DNS-SD queries to link-local
+ * mDNS, so services that only advertise on-link become reachable from other
+ * subnets. Runs as its own thread + UDP listener (config:dp_port), separate
+ * from the multicast responder's port 5353. Its multicast query/collect
+ * step (dp_mdns_collect below) sends via, and buffers responses observed
+ * by, the SAME socket mdns_recv_loop already reads (g_mdns4_sock) rather
+ * than opening a second one — see the comment on dp_maybe_collect for why.
+ * dp_listen_thread itself is a single serial loop (one request handled
+ * start-to-finish, including its collection window, before the next); the
+ * shared g_dp_collected buffer's mutex protects it against mdns_recv_loop
+ * (a different thread) but assumes only one Discovery Proxy request is ever
+ * in flight at a time, which that serial loop guarantees. This is a
+ * first-milestone, one-shot-discovery feature per CLAUDE-mdnsd.md, not
+ * meant to sustain high QPS.
+ * ======================================================================= */
+#define DP_COLLECT_MS 600
+#define DP_MAX_RESPONSES 16
+#define DP_MAX_ANSWERS 32
+
+/* True if name ends with suffix on a whole-label boundary (mdnsd has no
+ * shared translation unit with resolverd's identical name_in_zone). */
+static int dp_suffix_match(const char *name, const char *suffix) {
+    size_t nlen = strlen(name), slen = strlen(suffix);
+    if (nlen < slen)
+        return 0;
+    if (strcasecmp(name + (nlen - slen), suffix) != 0)
+        return 0;
+    return nlen == slen || name[nlen - slen - 1] == '.';
+}
+
+/* unicast <prefix>.<suffix> -> mDNS <prefix>.local (bare "local" if prefix
+ * is empty, i.e. the query was for the proxied subdomain's apex itself). */
+static int dp_to_mdns_name(const char *qname, const char *suffix, char *out, int outsz) {
+    size_t nlen = strlen(qname), slen = strlen(suffix);
+    if (nlen == slen)
+        return snprintf(out, (size_t) outsz, "local") < outsz ? 0 : -1;
+    if (nlen < slen + 1)
+        return -1;
+    size_t plen = nlen - slen - 1; /* also drop the separating dot */
+    return snprintf(out, (size_t) outsz, "%.*s.local", (int) plen, qname) < outsz ? 0 : -1;
+}
+
+/* Inverse: mDNS <prefix>.local (or bare "local") -> unicast <prefix>.<suffix>.
+ * Returns -1 if mdns_name isn't actually under .local (defensive — the
+ * caller should leave such a name untouched, not proxy it). */
+static int dp_from_mdns_name(const char *mdns_name, const char *suffix, char *out, int outsz) {
+    if (!strcasecmp(mdns_name, "local"))
+        return snprintf(out, (size_t) outsz, "%s", suffix) < outsz ? 0 : -1;
+    static const char LOCAL[] = ".local";
+    size_t nlen = strlen(mdns_name), llen = sizeof(LOCAL) - 1;
+    if (nlen <= llen || strcasecmp(mdns_name + nlen - llen, LOCAL) != 0)
+        return -1;
+    size_t plen = nlen - llen;
+    return snprintf(out, (size_t) outsz, "%.*s.%s", (int) plen, mdns_name, suffix) < outsz ? 0 : -1;
+}
+
+/*
+ * Discovery Proxy response collection — deliberately reuses mdnsd's single
+ * existing port-5353 socket (g_mdns4_sock, via mdns_send/mdns_recv_loop)
+ * rather than opening a second socket bound to the same port. A second
+ * SO_REUSEPORT socket sharing that port was the first implementation here,
+ * and it silently missed most responses: Linux hash-routes each incoming
+ * UDP datagram to exactly ONE socket among a REUSEPORT group sharing a
+ * port, not to all of them — so the query (and its multicast replies) would
+ * land on whichever of the two sockets won the hash, which in practice was
+ * almost always the pre-existing g_mdns4_sock, starving the query socket.
+ * Routing every inbound packet through the one socket mdnsd already reads
+ * sidesteps the whole class of problem.
+ */
+static pthread_mutex_t g_dp_collect_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_dp_armed = 0;
+static uint8_t g_dp_collected[DP_MAX_RESPONSES][MDNS_MAX_MSG];
+static int g_dp_collected_lens[DP_MAX_RESPONSES];
+static int g_dp_collected_count = 0;
+
+/* Called from mdns_recv_loop for every packet it receives, before/alongside
+ * its normal query-answering logic — buffers a response packet only while a
+ * Discovery Proxy collection window is open. */
+static void dp_maybe_collect(const uint8_t *pkt, int plen) {
+    if (plen < 12)
+        return;
+    uint16_t flags = get16(pkt, 2);
+    int ancount = get16(pkt, 6);
+    if (!(flags & 0x8000) || ancount == 0)
+        return; /* not a response, or an empty one */
+    pthread_mutex_lock(&g_dp_collect_mutex);
+    if (g_dp_armed && g_dp_collected_count < DP_MAX_RESPONSES) {
+        int len = plen < MDNS_MAX_MSG ? plen : MDNS_MAX_MSG;
+        memcpy(g_dp_collected[g_dp_collected_count], pkt, (size_t) len);
+        g_dp_collected_lens[g_dp_collected_count] = len;
+        g_dp_collected_count++;
+    }
+    pthread_mutex_unlock(&g_dp_collect_mutex);
+}
+
+/*
+ * dp_mdns_collect — send a multicast mDNS query for (qname,qtype) via the
+ * shared responder socket and collect EVERY response seen within
+ * DP_COLLECT_MS (not just the first, per resolverd's client-side
+ * mdns_query — a browse-style PTR query can get separate packets from
+ * multiple responders on the link, each advertising a different service
+ * instance; a lookup proxy has to gather them all). Returns the number of
+ * packets collected into out[]/out_lens[] (capped at max_out).
+ */
+static int dp_mdns_collect(const char *qname, uint16_t qtype, uint8_t out[][MDNS_MAX_MSG],
+                           int *out_lens, int max_out) {
+    uint8_t query[512];
+    memset(query, 0, 12);
+    put16(query, 4, 1); /* qdcount = 1 — a well-formed responder (and this
+                         * codebase's own DNS-SD stub tests) reject qdcount
+                         * != 1 outright, silently */
+    int off = mdns_put_name(query, 12, sizeof(query), qname);
+    if (off < 0 || off + 4 > (int) sizeof(query))
+        return 0;
+    put16(query, off, qtype);
+    off += 2;
+    put16(query, off, DNS_CLASS_IN);
+    off += 2;
+    int qlen = off;
+
+    pthread_mutex_lock(&g_dp_collect_mutex);
+    g_dp_collected_count = 0;
+    g_dp_armed = 1;
+    pthread_mutex_unlock(&g_dp_collect_mutex);
+
+    mdns_send(query, qlen);
+    usleep(DP_COLLECT_MS * 1000);
+
+    pthread_mutex_lock(&g_dp_collect_mutex);
+    g_dp_armed = 0;
+    int n = g_dp_collected_count < max_out ? g_dp_collected_count : max_out;
+    for (int i = 0; i < n; i++) {
+        memcpy(out[i], g_dp_collected[i], (size_t) g_dp_collected_lens[i]);
+        out_lens[i] = g_dp_collected_lens[i];
+    }
+    pthread_mutex_unlock(&g_dp_collect_mutex);
+    return n;
+}
+
+typedef struct {
+    char name[256];
+    uint16_t type;
+    uint32_t ttl;
+    uint8_t rdata[512];
+    int rdlen;
+} dp_answer_t;
+
+static int dp_answer_dup(const dp_answer_t *arr, int n, const dp_answer_t *cand) {
+    for (int i = 0; i < n; i++) {
+        if (arr[i].type == cand->type && strcasecmp(arr[i].name, cand->name) == 0 &&
+            arr[i].rdlen == cand->rdlen &&
+            memcmp(arr[i].rdata, cand->rdata, (size_t) cand->rdlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * dp_collect_answers — parse every RR in one mDNS response packet's answer
+ * section (matching qtype, or a CNAME) and additional section (glue:
+ * A/AAAA/TXT/SRV, per RFC 6763 §12 regardless of qtype — bridging a
+ * browse->resolve chain in one shot is the whole point), translate names
+ * from .local back to the proxied unicast subdomain, and append
+ * (deduplicated) to answers[], incrementing *n. Two guardrails enforced here, not
+ * optionally: never emit a link-scoped (fe80::/10) AAAA — a remote client
+ * can never route to it — and never reuse the source TTL unchanged (RFC
+ * 8766 §5.3) — cap it, since a one-shot proxy has no way to push an update
+ * when the service later disappears.
+ */
+static void dp_collect_answers(const uint8_t *pkt, int plen, uint16_t qtype, const char *suffix,
+                               uint32_t ttl_cap, dp_answer_t *answers, int *n, int max_n) {
+    if (plen < 12)
+        return;
+    int qdcount = get16(pkt, 4);
+    int ancount = get16(pkt, 6), nscount = get16(pkt, 8), arcount = get16(pkt, 10);
+    int off = 12;
+    for (int i = 0; i < qdcount && off < plen; i++) {
+        char tmp[256];
+        off = name_from_wire(pkt, plen, off, tmp, sizeof(tmp));
+        if (off < 0)
+            return;
+        off += 4;
+    }
+    int total = ancount + nscount + arcount;
+    for (int i = 0; i < total && off < plen && *n < max_n; i++) {
+        char rname[256];
+        int a = name_from_wire(pkt, plen, off, rname, sizeof(rname));
+        if (a < 0 || a + 10 > plen)
+            return;
+        uint16_t rtype = get16(pkt, a);
+        uint16_t rclass = get16(pkt, a + 2) & 0x7FFF; /* mask the mDNS cache-flush bit */
+        uint32_t ttl = get32(pkt, a + 4);
+        uint16_t rdlen = get16(pkt, a + 8);
+        int rdoff = a + 10;
+        if (rdoff + rdlen > plen)
+            return;
+        off = rdoff + rdlen;
+        if (rclass != DNS_CLASS_IN)
+            continue;
+        if (i < ancount) {
+            if (rtype != qtype && rtype != DNS_TYPE_CNAME)
+                continue;
+        } else if (i < ancount + nscount) {
+            continue; /* authority section: not meaningful for an mDNS answer here */
+        } else {
+            if (rtype != DNS_TYPE_A && rtype != DNS_TYPE_AAAA && rtype != DNS_TYPE_TXT &&
+                rtype != DNS_TYPE_SRV)
+                continue;
+        }
+        dp_answer_t cand;
+        memset(&cand, 0, sizeof(cand));
+        if (dp_from_mdns_name(rname, suffix, cand.name, sizeof(cand.name)) < 0)
+            continue; /* not actually under .local — ignore defensively */
+        cand.type = rtype;
+        cand.ttl = ttl < ttl_cap ? ttl : ttl_cap;
+        switch (rtype) {
+            case DNS_TYPE_A:
+                if (rdlen != 4)
+                    continue;
+                memcpy(cand.rdata, pkt + rdoff, 4);
+                cand.rdlen = 4;
+                break;
+            case DNS_TYPE_AAAA:
+                if (rdlen != 16)
+                    continue;
+                if (pkt[rdoff] == 0xfe && (pkt[rdoff + 1] & 0xc0) == 0x80)
+                    continue; /* fe80::/10 link-local — never leak off-link */
+                memcpy(cand.rdata, pkt + rdoff, 16);
+                cand.rdlen = 16;
+                break;
+            case DNS_TYPE_TXT:
+                if (rdlen > (uint16_t) sizeof(cand.rdata))
+                    continue;
+                memcpy(cand.rdata, pkt + rdoff, rdlen);
+                cand.rdlen = rdlen;
+                break;
+            case DNS_TYPE_PTR:
+            case DNS_TYPE_CNAME: {
+                char tgt[256], rewritten[256];
+                if (name_from_wire(pkt, plen, rdoff, tgt, sizeof(tgt)) < 0)
+                    continue;
+                if (dp_from_mdns_name(tgt, suffix, rewritten, sizeof(rewritten)) < 0)
+                    safe_strcpy(rewritten, tgt, sizeof(rewritten)); /* not .local; pass through */
+                int n2 = mdns_put_name(cand.rdata, 0, sizeof(cand.rdata), rewritten);
+                if (n2 < 0)
+                    continue;
+                cand.rdlen = n2;
+                break;
+            }
+            case DNS_TYPE_SRV: {
+                if (rdlen < 7)
+                    continue;
+                char tgt[256], rewritten[256];
+                if (name_from_wire(pkt, plen, rdoff + 6, tgt, sizeof(tgt)) < 0)
+                    continue;
+                if (dp_from_mdns_name(tgt, suffix, rewritten, sizeof(rewritten)) < 0)
+                    safe_strcpy(rewritten, tgt, sizeof(rewritten));
+                memcpy(cand.rdata, pkt + rdoff, 6);
+                int n2 = mdns_put_name(cand.rdata, 6, sizeof(cand.rdata), rewritten);
+                if (n2 < 0)
+                    continue;
+                cand.rdlen = n2;
+                break;
+            }
+            default:
+                continue; /* unsupported rdata shape — skip rather than guess */
+        }
+        if (!dp_answer_dup(answers, *n, &cand))
+            answers[(*n)++] = cand;
+    }
+}
+
+/* dp_handle_query — one Discovery Proxy request, start to finish: validate,
+ * translate the qname, run the multicast collection window, translate the
+ * answers back, and reply unicast. REFUSED for any name outside the
+ * configured proxied subdomains (CLAUDE-mdnsd.md guardrail: never proxy a
+ * subdomain we aren't explicitly configured for). */
+static void dp_handle_query(int srv_fd, const uint8_t *pkt, int plen, const struct sockaddr *src,
+                            socklen_t srclen) {
+    if (plen < 12)
+        return;
+    compress_reset(); /* per-message compression context — see append_rr below */
+    uint16_t qflags = get16(pkt, 2);
+    if (qflags & 0x8000)
+        return; /* ignore responses */
+    if (get16(pkt, 4) != 1)
+        return; /* qdcount != 1 */
+    char qname[256];
+    int after = name_from_wire(pkt, plen, 12, qname, sizeof(qname));
+    if (after < 0 || after + 4 > plen)
+        return;
+    uint16_t qtype = get16(pkt, after);
+    uint16_t qclass = get16(pkt, after + 2);
+
+    uint8_t resp[MDNS_MAX_MSG];
+    memset(resp, 0, 12);
+    put16(resp, 0, get16(pkt, 0)); /* echo the query id */
+    int qsec = after - 12 + 4;
+    int off = 12;
+    if (off + qsec < (int) sizeof(resp)) {
+        memcpy(resp + off, pkt + 12, qsec);
+        off += qsec;
+    }
+    put16(resp, 4, 1); /* qdcount */
+
+    const char *suffix = NULL;
+    for (int i = 0; i < g_dp_subdomain_count; i++)
+        if (dp_suffix_match(qname, g_dp_subdomains[i])) {
+            suffix = g_dp_subdomains[i];
+            break;
+        }
+    if (!suffix || qclass != DNS_CLASS_IN) {
+        put16(resp, 2, 0x8000 | 5 /* REFUSED */);
+        sendto(srv_fd, resp, off, 0, src, srclen);
+        return;
+    }
+
+    char mdns_qname[256];
+    if (dp_to_mdns_name(qname, suffix, mdns_qname, sizeof(mdns_qname)) < 0) {
+        put16(resp, 2, 0x8000 | 2 /* SERVFAIL */);
+        sendto(srv_fd, resp, off, 0, src, srclen);
+        return;
+    }
+
+    /* See the module-level comment above: these are static (not stack) both
+     * because they're too large to put on the stack repeatedly and because
+     * the listener processes one query at a time, serially. */
+    static uint8_t collected[DP_MAX_RESPONSES][MDNS_MAX_MSG];
+    static int collected_lens[DP_MAX_RESPONSES];
+    int nresp = dp_mdns_collect(mdns_qname, qtype, collected, collected_lens, DP_MAX_RESPONSES);
+
+    static dp_answer_t answers[DP_MAX_ANSWERS];
+    int nans = 0;
+    for (int i = 0; i < nresp; i++)
+        dp_collect_answers(collected[i], collected_lens[i], qtype, suffix, g_dp_ttl_cap, answers,
+                           &nans, DP_MAX_ANSWERS);
+
+    int ancount = 0;
+    for (int i = 0; i < nans; i++) {
+        /* append_rr (libdnswire) compresses the owner name against the
+         * names already written in this message — plain unicast clients
+         * (unlike mDNS's own uncompressed convention) expect this, and the
+         * repeated long owner names here (the same instance name for
+         * SRV+TXT, the proxied subdomain itself for PTR) compress well. */
+        int n2 = append_rr(resp, off, sizeof(resp), answers[i].name, answers[i].type, DNS_CLASS_IN,
+                           answers[i].ttl, answers[i].rdata, (uint16_t) answers[i].rdlen);
+        if (n2 < 0)
+            break;
+        off = n2;
+        ancount++;
+    }
+    put16(resp, 6, (uint16_t) ancount);
+    put16(resp, 2, 0x8400); /* QR|AA, rcode NOERROR */
+    sendto(srv_fd, resp, off, 0, src, srclen);
+    dns_log(LOG_INFO, "[DP] %s %s -> %d answer(s) (via mdns %s, %d response(s) collected)\n",
+            type2str(qtype), qname, ancount, mdns_qname, nresp);
+}
+
+static void *dp_listen_thread(void *arg) {
+    (void) arg;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        dns_log(LOG_ERR, "[DP] socket failed: %s\n", strerror(errno));
+        return NULL;
+    }
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in sa = {.sin_family = AF_INET,
+                             .sin_port = htons((uint16_t) g_dp_port),
+                             .sin_addr.s_addr = INADDR_ANY};
+    if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+        dns_log(LOG_ERR, "[DP] bind :%d failed: %s\n", g_dp_port, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    dns_log(LOG_NOTICE, "[DP] Discovery Proxy listening on :%d for %d subdomain(s)\n", g_dp_port,
+            g_dp_subdomain_count);
+    uint8_t buf[MDNS_MAX_MSG];
+    for (;;) {
+        struct sockaddr_in src;
+        socklen_t srclen = sizeof(src);
+        int n = (int) recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *) &src, &srclen);
+        if (n > 0)
+            dp_handle_query(fd, buf, n, (struct sockaddr *) &src, srclen);
+    }
+    return NULL;
+}
+
 /* ── Live reload via Valkey keyspace notifications (migration Step 6) ───────
  *
  * mdnsd serves mdns: and zone: records live per query already, so the value here
@@ -1136,6 +1545,10 @@ static void mdns_recv_loop(int fd4, int fd6) {
             if (n < 12)
                 continue;
 
+            /* RFC 8766 Discovery Proxy: buffer this packet if it's a
+             * response and a collection window is open (dp_mdns_collect). */
+            dp_maybe_collect(pkt, (int) n);
+
             /* Determine if this is a legacy unicast query (not from port 5353) */
             int is_legacy = 0;
             if (af == AF_INET)
@@ -1211,6 +1624,28 @@ static int load_config(void) {
             return -1;
         }
     }
+    /* RFC 8766 Discovery Proxy — opt-in, and only with an explicit proxied
+     * subdomain list (never implicitly proxy the whole link). */
+    g_dp_enabled = (vk_get("config:dp_enabled", val, sizeof(val)) && atoi(val) == 1);
+    if (g_dp_enabled) {
+        if (vk_get("config:dp_subdomains", val, sizeof(val)) && val[0]) {
+            char *sp = NULL;
+            for (char *tok = strtok_r(val, ",", &sp);
+                 tok && g_dp_subdomain_count < DP_MAX_SUBDOMAINS; tok = strtok_r(NULL, ",", &sp))
+                safe_strcpy(g_dp_subdomains[g_dp_subdomain_count++], tok,
+                            sizeof(g_dp_subdomains[0]));
+        }
+        if (g_dp_subdomain_count == 0) {
+            dns_log(LOG_ERR,
+                    "[DP] config:dp_enabled=1 but config:dp_subdomains is empty — Discovery "
+                    "Proxy stays OFF\n");
+            g_dp_enabled = 0;
+        }
+        if (vk_get("config:dp_port", val, sizeof(val)) && val[0])
+            g_dp_port = atoi(val);
+        if (vk_get("config:dp_ttl_cap", val, sizeof(val)) && val[0])
+            g_dp_ttl_cap = (uint32_t) atoi(val);
+    }
     return 0;
 }
 
@@ -1268,6 +1703,13 @@ int main(int argc, char **argv) {
             pthread_detach(kt);
         else
             dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
+    }
+    if (g_dp_enabled) {
+        pthread_t dpt;
+        if (pthread_create(&dpt, NULL, dp_listen_thread, NULL) == 0)
+            pthread_detach(dpt);
+        else
+            dns_log(LOG_ERR, "[DP] Failed to start Discovery Proxy listener\n");
     }
     mdns_recv_loop(g_mdns4_sock, g_mdns6_sock);
     return 0;

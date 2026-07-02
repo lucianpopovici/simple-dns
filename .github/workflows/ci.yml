@@ -210,6 +210,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-dns64 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: mdnsd RFC 8766 Discovery Proxy
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-dp OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Out-of-zone forwarding (failover + TC→TCP + RFC 5452 anti-spoof)
         env:
           DNS_VALKEY_HOST: 127.0.0.1
