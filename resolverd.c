@@ -32,6 +32,9 @@
  *     stub clients, self-advertised via RFC 9462 DDR
  *     (_dns.resolver.arpa SVCB) — never advertised unless the listener
  *     itself is actually up
+ *   - RFC 6147 DNS64 (opt-in, DNS64_ENABLED): synthesizes an AAAA from A on
+ *     a genuine AAAA NODATA for IPv6-only clients behind a NAT64 gateway;
+ *     never overwrites a real AAAA or a DNSSEC-SECURE-validated denial
  *   - Thread-safe: per-bucket rwlock on memory cache
  *   - Prefetch: re-queries records when TTL < 10% of original
  *   - CLI: dig-like output + cache stats + cache flush/inspect commands
@@ -59,6 +62,9 @@
  *   DOT_SERVER_CERT_PEM / DOT_SERVER_KEY_PEM  Server cert/key PEM file paths
  *   DOT_SERVER_ADN    Authentication domain name (must match the cert;
  *                     also the RFC 9462 DDR TargetName)
+ *   DNS64_ENABLED     RFC 6147 DNS64 AAAA synthesis    (default: 0)
+ *   DNS64_PREFIX      NAT64 prefix, /96 only           (default: 64:ff9b::/96)
+ *   DNS64_EXCLUDE     Comma-separated suffixes never synthesized for
  *
  * Sandbox (Valkey config:* keys, env override in parens; applied after the
  * listeners bind, before the proxy loop — no-op unless started as root):
@@ -246,6 +252,13 @@ typedef struct {
     char dot_server_cert_pem[MAX_PEM_PATH];
     char dot_server_key_pem[MAX_PEM_PATH];
     char dot_server_adn[256]; /* authentication domain name — must match the cert */
+    /* RFC 6147 DNS64: synthesize an AAAA from a name's A record(s) on a
+     * genuine AAAA NODATA, for IPv6-only clients behind a NAT64 gateway.
+     * Off by default — it's a synthesis of non-authentic data. */
+    int dns64_enabled;
+    uint8_t dns64_prefix[16]; /* well-known 64:ff9b::/96 by default */
+    int dns64_prefix_len;     /* only /96 is supported (see dns64_init) */
+    char dns64_exclude[512];  /* comma-separated suffixes never synthesized for */
 } config_t;
 
 /* =========================================================================
@@ -3411,6 +3424,7 @@ static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_resu
     result->from_cache = 1;
     result->cache_ttl_remaining = entry_remaining_ttl(ce);
     result->rcode = ce->rcode;
+    result->dnssec_status = ce->dnssec_status;
     if (ce->served_stale) {
         prefetch_async(qname, ce->qtype);
         result->from_cache = 2;
@@ -3449,7 +3463,7 @@ static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_resu
     return 0;
 }
 
-static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *result) {
+static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result_t *result) {
     memset(result, 0, sizeof(*result));
     char qname[256];
     safe_strcpy(qname, qname_in, sizeof(qname));
@@ -3522,7 +3536,7 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
             snprintf(expanded, sizeof(expanded), "%s.%s", qname, g_cfg.search_domains[sdi]);
             resolve_result_t sub;
             memset(&sub, 0, sizeof(sub));
-            if (dns_resolve(expanded, qtype, &sub) == 0 && sub.rcode != 3 /*NXDOMAIN*/) {
+            if (dns_resolve_core(expanded, qtype, &sub) == 0 && sub.rcode != 3 /*NXDOMAIN*/) {
                 *result = sub;
                 return 0;
             }
@@ -3641,7 +3655,7 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
         for (int hop = 0; hop < MAX_CNAME_HOPS && cname_target[0]; hop++) {
             resolve_result_t sub;
             memset(&sub, 0, sizeof(sub));
-            if (dns_resolve(cname_target, qtype, &sub) < 0)
+            if (dns_resolve_core(cname_target, qtype, &sub) < 0)
                 break;
             /* Append sub-results */
             for (int j = 0; j < sub.ancount && ridx < 32; j++) {
@@ -3661,6 +3675,110 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
         }
     }
     return 0;
+}
+
+/* =========================================================================
+ * RFC 6147 DNS64 — synthesize AAAA from A on a genuine AAAA NODATA
+ * ======================================================================= */
+
+/* RFC 6147 §5.1 / RFC 6052 §2.2, /96 well-known-prefix form only: the IPv4
+ * address occupies the last 32 bits unchanged, no interleaving needed. */
+static void dns64_synthesize(const uint8_t prefix[16], const uint8_t a4[4], uint8_t out_aaaa[16]) {
+    memcpy(out_aaaa, prefix, 16);
+    memcpy(out_aaaa + 12, a4, 4);
+}
+
+/* True if qname falls under any comma-separated suffix in dns64_exclude
+ * (e.g. networks already reachable over IPv6, or the NAT64 prefix's own
+ * reverse zone). Reuses the same suffix-match aggressive_nsec_answer uses
+ * for zone-scoping. */
+static int dns64_excluded(const char *qname) {
+    if (!g_cfg.dns64_exclude[0])
+        return 0;
+    char buf[512];
+    safe_strcpy(buf, g_cfg.dns64_exclude, sizeof(buf));
+    char *sp = NULL;
+    for (char *tok = strtok_r(buf, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        if (name_in_zone(qname, tok))
+            return 1;
+    }
+    return 0;
+}
+
+/* Pure: given a_result (an already-resolved A lookup for the same qname),
+ * synthesize AAAA answers into result in place of it, preserving any CNAME
+ * chain with the correct owner name at each hop. Split out from
+ * dns64_maybe_synthesize below so it's unit-testable without a live
+ * upstream (dns_resolve_core needs one; this doesn't). */
+static void dns64_synthesize_from_a(const resolve_result_t *a_result, resolve_result_t *result) {
+    int n = 0;
+    for (int i = 0; i < a_result->ancount && n < 32; i++) {
+        if (a_result->answer_types[i] == DNS_TYPE_CNAME) {
+            /* Preserve the chain so the synthesized AAAA's owner isn't a
+             * silent mismatch against the original query name. */
+            result->answer_types[n] = DNS_TYPE_CNAME;
+            result->answer_ttls[n] = a_result->answer_ttls[i];
+            safe_strcpy(result->answer_names[n], a_result->answer_names[i],
+                        sizeof(result->answer_names[n]));
+            safe_strcpy(result->answers[n], a_result->answers[i], sizeof(result->answers[n]));
+            n++;
+            continue;
+        }
+        if (a_result->answer_types[i] != DNS_TYPE_A)
+            continue;
+        struct in_addr a4;
+        if (inet_pton(AF_INET, a_result->answers[i], &a4) != 1)
+            continue;
+        uint8_t synth[16];
+        dns64_synthesize(g_cfg.dns64_prefix, (const uint8_t *) &a4, synth);
+        char txt[64];
+        if (!inet_ntop(AF_INET6, synth, txt, sizeof(txt)))
+            continue;
+        result->answer_types[n] = DNS_TYPE_AAAA;
+        result->answer_ttls[n] = a_result->answer_ttls[i];
+        safe_strcpy(result->answer_names[n], a_result->answer_names[i],
+                    sizeof(result->answer_names[n]));
+        safe_strcpy(result->answers[n], txt, sizeof(result->answers[n]));
+        n++;
+    }
+    result->ancount = n;
+}
+
+/*
+ * dns64_maybe_synthesize — called only from the outer dns_resolve() wrapper,
+ * only for qtype==AAAA, only on the top-level query (not CNAME-hop or
+ * search-domain recursion, which already resolve through dns_resolve_core
+ * directly). On a genuine NODATA (name exists, no AAAA), looks up A for the
+ * same name and, if any exist, synthesizes AAAA answers in their place.
+ */
+static void dns64_maybe_synthesize(const char *qname, uint16_t qtype, resolve_result_t *result,
+                                   int rc) {
+    if (!g_cfg.dns64_enabled || qtype != DNS_TYPE_AAAA)
+        return;
+    if (rc != 0 || result->rcode != 0 /* NOERROR */ || result->ancount != 0)
+        return; /* not a genuine NODATA — nothing to synthesize over */
+    /* RFC 6147 §3 / §5.5: never synthesize over a validated (SECURE) denial
+     * as if it were authentic — that's the classic DNS64×DNSSEC gotcha the
+     * plan explicitly calls out. */
+    if (result->dnssec_status == (int) DNSSEC_SECURE)
+        return;
+    if (dns64_excluded(qname))
+        return;
+    resolve_result_t a_result;
+    memset(&a_result, 0, sizeof(a_result));
+    if (dns_resolve_core(qname, DNS_TYPE_A, &a_result) != 0 || a_result.ancount == 0)
+        return;
+    dns64_synthesize_from_a(&a_result, result);
+}
+
+/* Public entry point: dns_resolve_core plus RFC 6147 DNS64 synthesis on top.
+ * Kept separate from the core so CNAME-hop and search-domain recursion
+ * (which call dns_resolve_core directly) don't each re-run synthesis. */
+static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *result) {
+    int rc = dns_resolve_core(qname_in, qtype, result);
+    if (rc >= 0)
+        dns64_maybe_synthesize(qname_in, qtype, result, rc);
+    return rc;
 }
 
 /*
@@ -4352,6 +4470,30 @@ static void config_load_env(void) {
                 sizeof(g_cfg.dot_server_key_pem));
     safe_strcpy(g_cfg.dot_server_adn, getenv_or("DOT_SERVER_ADN", ""),
                 sizeof(g_cfg.dot_server_adn));
+    g_cfg.dns64_enabled = atoi(getenv_or("DNS64_ENABLED", "0"));
+    {
+        char pfx[64];
+        safe_strcpy(pfx, getenv_or("DNS64_PREFIX", "64:ff9b::/96"), sizeof(pfx));
+        char *slash = strchr(pfx, '/');
+        int plen = 96;
+        if (slash) {
+            *slash = 0;
+            plen = atoi(slash + 1);
+        }
+        /* Only the /96 well-known-prefix form (RFC 6147 §2.2) is supported —
+         * shorter prefixes interleave the IPv4 bits around a reserved byte
+         * (RFC 6052 §2.2) and need a different synthesis routine. Fall back
+         * to the well-known prefix rather than silently mis-synthesizing. */
+        if (plen != 96 || inet_pton(AF_INET6, pfx, g_cfg.dns64_prefix) != 1) {
+            if (plen != 96 && g_cfg.dns64_enabled)
+                fprintf(stderr, "[dns64] only /96 prefixes are supported — falling back to the "
+                                "well-known 64:ff9b::/96\n");
+            inet_pton(AF_INET6, "64:ff9b::", g_cfg.dns64_prefix);
+            plen = 96;
+        }
+        g_cfg.dns64_prefix_len = plen;
+    }
+    safe_strcpy(g_cfg.dns64_exclude, getenv_or("DNS64_EXCLUDE", ""), sizeof(g_cfg.dns64_exclude));
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count = 0;
     const char *sdomains = getenv_or("SEARCH_DOMAINS", "");

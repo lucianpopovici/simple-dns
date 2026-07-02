@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1981,6 +1981,38 @@ check-ddr: resolverd_debug
 	 test "$$NODDR_ANS" = "0" || { echo "  FAIL  DDR SVCB served with DOT_SERVER_ENABLED unset — advertised a non-existent endpoint"; exit 1; }; \
 	 echo "  OK  DoT server resolves, DDR advertises it correctly, and nothing is advertised when disabled"
 
+# RFC 6147 DNS64: synthesize AAAA from A on a genuine AAAA NODATA, for
+# IPv6-only clients behind a NAT64 gateway. Two halves: a C known-answer
+# test covering the pure synthesis loop and every guard condition (disabled/
+# wrong qtype/real-AAAA-present/NXDOMAIN/DNSSEC-SECURE/excluded) without a
+# live upstream, and a live dig-driven check that the actual dns_resolve
+# integration synthesizes correctly, passes a real AAAA through unchanged,
+# and honors the exclude list.
+check-dns64: tests/test_dns64.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h resolverd_debug | ossl-sanity
+	@echo "  CC [TEST]  tests/test_dns64"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
+	      $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_dns64 \
+	      tests/test_dns64.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_dns64
+	@echo "  CHECK  RFC 6147 DNS64 on the wire (requires python3 + dig)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 python3 tests/dns64_upstream.py 127.0.0.1 5421 v4only.dns64.test dual.dns64.test 203.0.113.90 \
+	     > /tmp/dns64_stub.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5422 DNS64_ENABLED=1 DNS64_EXCLUDE=excluded.dns64.test \
+	     ./resolverd_debug --upstream 127.0.0.1:5421 --no-dnssec --no-valkey \
+	     > /tmp/resolverd_dns64.log 2>&1 & RD=$$!; \
+	 sleep 1.5; \
+	 SYNTH=$$(dig @127.0.0.1 -p 5422 +short +time=2 +tries=1 v4only.dns64.test AAAA); \
+	 REAL=$$(dig @127.0.0.1 -p 5422 +short +time=2 +tries=1 dual.dns64.test AAAA); \
+	 EXCLCOUNT=$$(dig @127.0.0.1 -p 5422 +time=2 +tries=1 host.excluded.dns64.test AAAA | grep -c "^host.excluded.dns64.test.*AAAA"); \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true; \
+	 echo "  synthesized=[$$SYNTH]  real-passthrough=[$$REAL]  excluded-answers=[$$EXCLCOUNT]"; \
+	 test "$$SYNTH" = "64:ff9b::cb00:715a" || { echo "  FAIL  AAAA NODATA was not synthesized (expected 64:ff9b::cb00:715a)"; cat /tmp/resolverd_dns64.log; exit 1; }; \
+	 test "$$REAL" = "::1234" || { echo "  FAIL  a real AAAA answer was altered (expected ::1234, got [$$REAL])"; exit 1; }; \
+	 test "$$EXCLCOUNT" = "0" || { echo "  FAIL  DNS64_EXCLUDE did not suppress synthesis"; exit 1; }; \
+	 echo "  OK  DNS64 synthesizes on genuine NODATA, passes real AAAA through unchanged, and honors the exclude list"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -1991,6 +2023,7 @@ clean:
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
 	      tests/test_zonemd tests/test_csync tests/test_aggressive_nsec tests/test_ede \
+	      tests/test_dns64 \
 	      fuzz/fuzz_name_from_wire
 	@echo "  done"
 
@@ -2047,6 +2080,7 @@ help:
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"
+	@echo "  make check-dns64     resolverd RFC 6147 DNS64 AAAA synthesis (KAT + live, needs dig + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"
