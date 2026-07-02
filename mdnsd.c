@@ -1317,7 +1317,7 @@ static void dp_handle_query(int srv_fd, const uint8_t *pkt, int plen, const stru
     put16(resp, 0, get16(pkt, 0)); /* echo the query id */
     int qsec = after - 12 + 4;
     int off = 12;
-    if (off + qsec < (int) sizeof(resp)) {
+    if (qsec >= 0 && off + qsec < (int) sizeof(resp)) {
         memcpy(resp + off, pkt + 12, qsec);
         off += qsec;
     }
