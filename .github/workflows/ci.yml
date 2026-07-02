@@ -198,6 +198,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-ede OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: resolverd RFC 7858 DoT server + RFC 9462 DDR
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-ddr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Out-of-zone forwarding (failover + TC→TCP + RFC 5452 anti-spoof)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

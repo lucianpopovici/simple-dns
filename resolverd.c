@@ -28,6 +28,10 @@
  *   - RFC 8914 Extended DNS Errors: an EDNS-speaking client that gets
  *     SERVFAIL learns why (DNSSEC Bogus / Network Error), reusing the
  *     libdnswire EDE emitter dnsd already uses
+ *   - RFC 7858 DoT server (opt-in, DOT_SERVER_ENABLED) for resolverd's own
+ *     stub clients, self-advertised via RFC 9462 DDR
+ *     (_dns.resolver.arpa SVCB) — never advertised unless the listener
+ *     itself is actually up
  *   - Thread-safe: per-bucket rwlock on memory cache
  *   - Prefetch: re-queries records when TTL < 10% of original
  *   - CLI: dig-like output + cache stats + cache flush/inspect commands
@@ -50,6 +54,11 @@
  *   SERVFAIL_CACHE_TTL RFC 9520 cached-SERVFAIL TTL (s) (default: 30, 0=off)
  *   AGGRESSIVE_NSEC   RFC 8198 aggressive NSEC/NSEC3   (default: 1)
  *   DOT_CA_PEM        Path to CA cert PEM for DoT      (default: system)
+ *   DOT_SERVER_ENABLED RFC 7858 DoT server for stubs    (default: 0)
+ *   DOT_SERVER_PORT   DoT server listen port           (default: 8854)
+ *   DOT_SERVER_CERT_PEM / DOT_SERVER_KEY_PEM  Server cert/key PEM file paths
+ *   DOT_SERVER_ADN    Authentication domain name (must match the cert;
+ *                     also the RFC 9462 DDR TargetName)
  *
  * Sandbox (Valkey config:* keys, env override in parens; applied after the
  * listeners bind, before the proxy loop — no-op unless started as root):
@@ -228,6 +237,15 @@ typedef struct {
     /* RFC 8198: synthesize NXDOMAIN/NODATA from a cached SECURE NSEC/NSEC3
      * denial span on a cache miss, instead of going upstream. */
     int aggressive_nsec_enabled;
+    /* RFC 7858 DoT server for resolverd's own stub clients + RFC 9462 DDR
+     * self-advertisement. Off by default — requires an operator-provisioned
+     * cert; resolverd must never advertise an encrypted endpoint it doesn't
+     * actually serve. */
+    int dot_server_enabled;
+    int dot_server_port;
+    char dot_server_cert_pem[MAX_PEM_PATH];
+    char dot_server_key_pem[MAX_PEM_PATH];
+    char dot_server_adn[256]; /* authentication domain name — must match the cert */
 } config_t;
 
 /* =========================================================================
@@ -276,8 +294,12 @@ static pthread_mutex_t g_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Valkey client (for persistent cache) */
 static resp_conn_t g_vk;
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
-/* SSL context for DoT */
+/* SSL context for DoT (client role — connecting to an upstream) */
 static SSL_CTX *g_dot_ctx = NULL;
+/* SSL context for DoT (server role — resolverd's own stub-facing listener,
+ * RFC 7858 / RFC 9462 DDR). NULL unless DOT_SERVER_ENABLED and a valid
+ * cert/key/ADN are configured. */
+static SSL_CTX *g_dot_server_ctx = NULL;
 /* Per-upstream EMA RTT in microseconds (exponential moving average, α=0.2) */
 static long g_upstream_rtt_ema[MAX_UPSTREAMS] = {0};
 static pthread_mutex_t g_upstream_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -3657,47 +3679,87 @@ static void ede_for_resolve_failure(int rc, int *ede_code, const char **ede_text
 }
 
 /* =========================================================================
- * Proxy mode: listen on local UDP, forward, respond from cache
+ * RFC 9462 DDR — Discovery of Designated Resolvers
+ *
+ * If resolverd's own DoT listener is configured (dot_server_init below), a
+ * client already talking to us in the clear can ask this same resolver
+ * "do you also offer encrypted transport?" by querying _dns.resolver.arpa
+ * SVCB. Precomputed once at startup — see dot_server_init — reused by every
+ * matching query, per RFC 9460 wire form (SvcPriority | TargetName |
+ * SvcParams), built via libdnswire's svcb_present_to_tlv/svcb_tlv_to_wire
+ * (the same encoder dnsd uses for zone SVCB records — no second copy).
  * ======================================================================= */
-static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct sockaddr *src,
-                         socklen_t srclen) {
+#define DDR_OWNER "_dns.resolver.arpa"
+#define DDR_TTL 300u
+static uint8_t g_ddr_svcb_rdata[512];
+static int g_ddr_svcb_rdata_len = 0;
+
+/*
+ * build_dns_response — resolve the query in pkt[0..plen) and build a
+ * complete response (header, question, answers, EDE) into resp[0..cap).
+ * Shared by the plain-UDP, plain-TCP, and DoT response paths so the
+ * per-type rdata encoding and EDE-attachment logic exists in exactly one
+ * place. Returns the response length, or -1 if the query is malformed
+ * enough that nothing should be sent back at all.
+ */
+static int build_dns_response(const uint8_t *pkt, int plen, int is_tcp, uint8_t *resp, int cap) {
     if (plen < 12)
-        return;
+        return -1;
     const dns_hdr_t *qh = (const dns_hdr_t *) pkt;
     if (ntohs(qh->flags) & DNS_QR)
-        return; /* ignore responses */
+        return -1; /* ignore responses */
     if (ntohs(qh->qdcount) != 1)
-        return;
+        return -1;
     char qname[256] = {0};
     int after = name_from_wire(pkt, plen, 12, qname, sizeof(qname));
     if (after < 0 || after + 3 >= plen)
-        return;
+        return -1;
     uint16_t qtype = get16(pkt, after);
-    resolve_result_t result;
-    int rc = dns_resolve(qname, qtype, &result);
-    /* Build response packet */
-    uint8_t resp[DNS_BUF * 2];
+
     memset(resp, 0, 12);
     dns_hdr_t *rh = (dns_hdr_t *) resp;
     rh->id = qh->id;
     uint16_t flags = DNS_QR | DNS_RA | (ntohs(qh->flags) & DNS_RD);
-    if (rc < 0) {
-        rh->flags = htons(flags | 2 /*SERVFAIL*/);
-        rh->qdcount = htons(1);
-    } else {
-        rh->flags = htons(flags | (uint16_t) result.rcode);
-    }
     rh->qdcount = htons(1);
     int off = 12;
-    /* Copy question section */
     int qsec = after - 12 + 4;
-    if (off + qsec < (int) sizeof(resp)) {
+    if (off + qsec < cap) {
         memcpy(resp + off, pkt + 12, qsec);
         off += qsec;
     }
-    /* Append answer RRs */
     int ancount = 0;
-    for (int i = 0; i < result.ancount && off + 32 < (int) sizeof(resp); i++) {
+
+    if (g_ddr_svcb_rdata_len > 0 && qtype == DNS_TYPE_SVCB && !strcasecmp(qname, DDR_OWNER)) {
+        /* Answer the discovery query directly — never touches dns_resolve,
+         * the cache, or an upstream; this is data about resolverd itself. */
+        rh->flags = htons(flags | 0 /* NOERROR */);
+        int n = name_to_wire(qname, resp + off, cap - off);
+        if (n > 0 && off + n + 10 + g_ddr_svcb_rdata_len <= cap) {
+            off += n;
+            put16(resp, off, DNS_TYPE_SVCB);
+            off += 2;
+            put16(resp, off, DNS_CLASS_IN);
+            off += 2;
+            put32(resp, off, DDR_TTL);
+            off += 4;
+            put16(resp, off, (uint16_t) g_ddr_svcb_rdata_len);
+            off += 2;
+            memcpy(resp + off, g_ddr_svcb_rdata, (size_t) g_ddr_svcb_rdata_len);
+            off += g_ddr_svcb_rdata_len;
+            ancount = 1;
+        }
+        rh->ancount = htons((uint16_t) ancount);
+        rh->arcount = 0;
+        return off;
+    }
+
+    resolve_result_t result;
+    memset(&result, 0, sizeof(result));
+    int rc = dns_resolve(qname, qtype, &result);
+    rh->flags = htons(flags | (uint16_t) (rc < 0 ? 2 /* SERVFAIL */ : result.rcode));
+
+    /* Append answer RRs */
+    for (int i = 0; i < result.ancount && off + 32 < cap; i++) {
         uint8_t rdata[512];
         int rdlen = 0;
         uint16_t rtype = result.answer_types[i];
@@ -3756,11 +3818,11 @@ static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct 
                 break;
         }
         if (rdlen > 0) {
-            int n = name_to_wire(result.answer_names[i], resp + off, sizeof(resp) - off);
+            int n = name_to_wire(result.answer_names[i], resp + off, cap - off);
             if (n < 0)
                 break;
             off += n;
-            if (off + 10 + rdlen > (int) sizeof(resp))
+            if (off + 10 + rdlen > cap)
                 break;
             put16(resp, off, rtype);
             off += 2;
@@ -3786,14 +3848,26 @@ static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct 
         const char *ede_text = NULL;
         if (rc < 0)
             ede_for_resolve_failure(rc, &ede_code, &ede_text);
-        int new_off = edns_append_opt(resp, off, (int) sizeof(resp), 0 /* is_tcp */, req_ei.do_bit,
-                                      0, &req_ei, NULL, NULL, ede_code, ede_text, -1, 0, NULL);
+        int new_off = edns_append_opt(resp, off, cap, is_tcp, req_ei.do_bit, 0, &req_ei, NULL, NULL,
+                                      ede_code, ede_text, -1, 0, NULL);
         if (new_off > off) {
             off = new_off;
             arcount = 1;
         }
     }
     rh->arcount = htons((uint16_t) arcount);
+    return off;
+}
+
+/* =========================================================================
+ * Proxy mode: listen on local UDP, forward, respond from cache
+ * ======================================================================= */
+static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct sockaddr *src,
+                         socklen_t srclen) {
+    uint8_t resp[DNS_BUF * 2];
+    int off = build_dns_response(pkt, plen, 0 /* is_tcp */, resp, (int) sizeof(resp));
+    if (off < 0)
+        return;
     sendto(srv_fd, resp, off, 0, src, srclen);
 }
 
@@ -3823,123 +3897,10 @@ static void proxy_handle_tcp(int cfd) {
     /* Resolve and send back over TCP */
     if (pkt[2] & 0x80)
         goto done; /* ignore responses */
-    char qname[256] = {0};
-    int after = name_from_wire(pkt, qlen, 12, qname, sizeof(qname));
-    if (after < 0 || after + 3 >= qlen)
-        goto done;
-    uint16_t qtype = get16(pkt, after);
-    resolve_result_t result;
-    int rc = dns_resolve(qname, qtype, &result);
     uint8_t resp[DNS_BUF * 2];
-    memset(resp, 0, 12);
-    dns_hdr_t *rh = (dns_hdr_t *) resp;
-    rh->id = ((dns_hdr_t *) pkt)->id;
-    uint16_t flags = DNS_QR | DNS_RA | (ntohs(((dns_hdr_t *) pkt)->flags) & DNS_RD);
-    rh->flags = htons(flags | (uint16_t) (rc < 0 ? 2 : result.rcode));
-    rh->qdcount = htons(1);
-    int off = 12;
-    int qsec = after - 12 + 4;
-    if (off + qsec < (int) sizeof(resp)) {
-        memcpy(resp + off, pkt + 12, qsec);
-        off += qsec;
-    }
-    int ancount = 0;
-    for (int i = 0; i < result.ancount && off + 32 < (int) sizeof(resp); i++) {
-        uint8_t rdata[512];
-        int rdlen = 0;
-        uint16_t rtype = result.answer_types[i];
-        switch (rtype) {
-            case DNS_TYPE_A: {
-                struct in_addr a4;
-                if (inet_pton(AF_INET, result.answers[i], &a4) == 1) {
-                    memcpy(rdata, &a4, 4);
-                    rdlen = 4;
-                }
-                break;
-            }
-            case DNS_TYPE_AAAA: {
-                struct in6_addr a6;
-                if (inet_pton(AF_INET6, result.answers[i], &a6) == 1) {
-                    memcpy(rdata, &a6, 16);
-                    rdlen = 16;
-                }
-                break;
-            }
-            case DNS_TYPE_CNAME:
-            case DNS_TYPE_PTR:
-            case DNS_TYPE_NS: {
-                int n = name_to_wire(result.answers[i], rdata, sizeof(rdata));
-                if (n > 0)
-                    rdlen = n;
-                break;
-            }
-            case DNS_TYPE_MX: {
-                char mx[256] = "";
-                uint16_t pref = 0;
-                sscanf(result.answers[i], "%hu %255s", &pref, mx);
-                rdata[0] = pref >> 8;
-                rdata[1] = pref & 0xFF;
-                int n = name_to_wire(mx, rdata + 2, sizeof(rdata) - 2);
-                if (n > 0)
-                    rdlen = 2 + n;
-                break;
-            }
-            case DNS_TYPE_TXT: {
-                const char *p = result.answers[i];
-                if (*p == '"')
-                    p++;
-                int sl = (int) strlen(p);
-                if (sl > 0 && p[sl - 1] == '"')
-                    sl--;
-                if (sl > 255)
-                    sl = 255;
-                rdata[0] = (uint8_t) sl;
-                memcpy(rdata + 1, p, sl);
-                rdlen = 1 + sl;
-                break;
-            }
-            default:
-                break;
-        }
-        if (rdlen > 0) {
-            int n = name_to_wire(result.answer_names[i], resp + off, sizeof(resp) - off);
-            if (n < 0)
-                break;
-            off += n;
-            if (off + 10 + rdlen > (int) sizeof(resp))
-                break;
-            put16(resp, off, rtype);
-            off += 2;
-            put16(resp, off, DNS_CLASS_IN);
-            off += 2;
-            put32(resp, off, result.answer_ttls[i]);
-            off += 4;
-            put16(resp, off, (uint16_t) rdlen);
-            off += 2;
-            memcpy(resp + off, rdata, rdlen);
-            off += rdlen;
-            ancount++;
-        }
-    }
-    rh->ancount = htons((uint16_t) ancount);
-    /* RFC 8914: tell an EDNS-speaking client why a failed resolution is
-     * SERVFAIL. Only attach an OPT record at all if the client sent one. */
-    edns_info_t req_ei;
-    edns_parse(pkt, qlen, &req_ei);
-    int arcount = 0;
-    if (req_ei.present) {
-        int ede_code = -1;
-        const char *ede_text = NULL;
-        if (rc < 0)
-            ede_for_resolve_failure(rc, &ede_code, &ede_text);
-        int new_off = edns_append_opt(resp, off, (int) sizeof(resp), 1 /* is_tcp */, req_ei.do_bit,
-                                      0, &req_ei, NULL, NULL, ede_code, ede_text, -1, 0, NULL);
-        if (new_off > off) {
-            off = new_off;
-            arcount = 1;
-        }
-    }
-    rh->arcount = htons((uint16_t) arcount);
+    int off = build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp));
+    if (off < 0)
+        goto done;
     /* Send with 2-byte length prefix */
     uint8_t hdr[2];
     hdr[0] = off >> 8;
@@ -3958,6 +3919,65 @@ static void *tcp_client_thread(void *arg) {
     int cfd = a->cfd;
     free(a);
     proxy_handle_tcp(cfd);
+    return NULL;
+}
+
+/* proxy_handle_dot — serve one DoT (RFC 7858) session: TLS handshake, then
+ * the same 2-byte length-prefixed framing as plain DNS-over-TCP, just
+ * inside the TLS record layer. One query per connection, matching
+ * proxy_handle_tcp's existing simplification (no pipelining). */
+static void proxy_handle_dot(int cfd) {
+    struct timeval tv = {.tv_sec = 5};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    SSL *ssl = SSL_new(g_dot_server_ctx);
+    if (!ssl) {
+        close(cfd);
+        return;
+    }
+    SSL_set_fd(ssl, cfd);
+    if (SSL_accept(ssl) <= 0)
+        goto done;
+    {
+        uint8_t lb[2];
+        int got = 0;
+        while (got < 2) {
+            int n = SSL_read(ssl, lb + got, 2 - got);
+            if (n <= 0)
+                goto done;
+            got += n;
+        }
+        int qlen = (lb[0] << 8) | lb[1];
+        if (qlen < 12 || qlen > DNS_BUF)
+            goto done;
+        uint8_t pkt[DNS_BUF];
+        got = 0;
+        while (got < qlen) {
+            int n = SSL_read(ssl, pkt + got, qlen - got);
+            if (n <= 0)
+                goto done;
+            got += n;
+        }
+        if (pkt[2] & 0x80)
+            goto done; /* ignore responses */
+        uint8_t resp[DNS_BUF * 2];
+        int off = build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp));
+        if (off < 0)
+            goto done;
+        uint8_t hdr[2] = {(uint8_t) (off >> 8), (uint8_t) (off & 0xFF)};
+        SSL_write(ssl, hdr, 2);
+        SSL_write(ssl, resp, off);
+    }
+done:
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(cfd);
+}
+
+static void *dot_client_thread(void *arg) {
+    tcp_client_arg_t *a = (tcp_client_arg_t *) arg;
+    int cfd = a->cfd;
+    free(a);
+    proxy_handle_dot(cfd);
     return NULL;
 }
 
@@ -4036,6 +4056,38 @@ static void *proxy_run(void *arg) {
         }
     }
 
+    /* ── DoT (RFC 7858) — resolverd's own stub-facing encrypted listener ──
+     * Only bound when dot_server_init() (main()) built a context; a client
+     * must never be pointed at an encrypted endpoint that doesn't exist. */
+    int dotfd4 = -1, dotfd6 = -1;
+    if (g_dot_server_ctx) {
+        dotfd4 = socket(AF_INET, SOCK_STREAM, 0);
+        if (dotfd4 >= 0) {
+            setsockopt(dotfd4, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            struct sockaddr_in sa4 = {.sin_family = AF_INET,
+                                      .sin_port = htons(g_cfg.dot_server_port),
+                                      .sin_addr.s_addr = INADDR_ANY};
+            if (bind(dotfd4, (struct sockaddr *) &sa4, sizeof(sa4)) < 0 || listen(dotfd4, 32) < 0) {
+                perror("proxy IPv4 DoT bind (non-fatal)");
+                close(dotfd4);
+                dotfd4 = -1;
+            }
+        }
+        dotfd6 = socket(AF_INET6, SOCK_STREAM, 0);
+        if (dotfd6 >= 0) {
+            setsockopt(dotfd6, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            int v6only = 1;
+            setsockopt(dotfd6, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+            struct sockaddr_in6 sa6 = {.sin6_family = AF_INET6,
+                                       .sin6_port = htons(g_cfg.dot_server_port)};
+            if (bind(dotfd6, (struct sockaddr *) &sa6, sizeof(sa6)) < 0 || listen(dotfd6, 32) < 0) {
+                perror("proxy IPv6 DoT bind (non-fatal)");
+                close(dotfd6);
+                dotfd6 = -1;
+            }
+        }
+    }
+
     if (fd4 < 0 && fd6 < 0) {
         fprintf(stderr, "[proxy] No sockets available\n");
         return NULL;
@@ -4046,6 +4098,10 @@ static void *proxy_run(void *arg) {
            g_cfg.listen_port, fd4 >= 0 ? "up" : "n/a", fd6 >= 0 ? "up" : "n/a",
            tcp4 >= 0 ? "up" : "n/a", tcp6 >= 0 ? "up" : "n/a", g_cfg.upstream_host[0],
            g_cfg.upstream_port[0], g_cfg.upstream_count, proto_label);
+    if (g_dot_server_ctx)
+        printf("[proxy] DoT (RFC 7858) on :%d  IPv4=%s IPv6=%s  DDR adn=%s\n",
+               g_cfg.dot_server_port, dotfd4 >= 0 ? "up" : "n/a", dotfd6 >= 0 ? "up" : "n/a",
+               g_cfg.dot_server_adn);
 
     /* All listeners are bound. Drop root, confine the filesystem, and install the
      * syscall filter before the loop touches untrusted query/response bytes. */
@@ -4075,6 +4131,16 @@ static void *proxy_run(void *arg) {
             FD_SET(tcp6, &fds);
             if (tcp6 > maxfd)
                 maxfd = tcp6;
+        }
+        if (dotfd4 >= 0) {
+            FD_SET(dotfd4, &fds);
+            if (dotfd4 > maxfd)
+                maxfd = dotfd4;
+        }
+        if (dotfd6 >= 0) {
+            FD_SET(dotfd6, &fds);
+            if (dotfd6 > maxfd)
+                maxfd = dotfd6;
         }
         if (maxfd < 0)
             break;
@@ -4136,6 +4202,36 @@ static void *proxy_run(void *arg) {
                 pthread_attr_destroy(&attr);
             }
         }
+
+        /* IPv4 DoT — spawn thread per connection */
+        if (dotfd4 >= 0 && FD_ISSET(dotfd4, &fds)) {
+            int cfd = accept(dotfd4, NULL, NULL);
+            if (cfd >= 0) {
+                tcp_client_arg_t *ta = malloc(sizeof(*ta));
+                ta->cfd = cfd;
+                pthread_t tid;
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                pthread_create(&tid, &attr, dot_client_thread, ta);
+                pthread_attr_destroy(&attr);
+            }
+        }
+
+        /* IPv6 DoT — spawn thread per connection */
+        if (dotfd6 >= 0 && FD_ISSET(dotfd6, &fds)) {
+            int cfd = accept(dotfd6, NULL, NULL);
+            if (cfd >= 0) {
+                tcp_client_arg_t *ta = malloc(sizeof(*ta));
+                ta->cfd = cfd;
+                pthread_t tid;
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                pthread_create(&tid, &attr, dot_client_thread, ta);
+                pthread_attr_destroy(&attr);
+            }
+        }
     }
     if (fd4 >= 0)
         close(fd4);
@@ -4145,6 +4241,10 @@ static void *proxy_run(void *arg) {
         close(tcp4);
     if (tcp6 >= 0)
         close(tcp6);
+    if (dotfd4 >= 0)
+        close(dotfd4);
+    if (dotfd6 >= 0)
+        close(dotfd6);
     return NULL;
 }
 
@@ -4244,6 +4344,14 @@ static void config_load_env(void) {
     safe_strcpy(g_cfg.dns0x20_disable, getenv_or("DNS0X20_DISABLE", ""),
                 sizeof(g_cfg.dns0x20_disable));
     g_cfg.aggressive_nsec_enabled = atoi(getenv_or("AGGRESSIVE_NSEC", "1"));
+    g_cfg.dot_server_enabled = atoi(getenv_or("DOT_SERVER_ENABLED", "0"));
+    g_cfg.dot_server_port = atoi(getenv_or("DOT_SERVER_PORT", "8854"));
+    safe_strcpy(g_cfg.dot_server_cert_pem, getenv_or("DOT_SERVER_CERT_PEM", ""),
+                sizeof(g_cfg.dot_server_cert_pem));
+    safe_strcpy(g_cfg.dot_server_key_pem, getenv_or("DOT_SERVER_KEY_PEM", ""),
+                sizeof(g_cfg.dot_server_key_pem));
+    safe_strcpy(g_cfg.dot_server_adn, getenv_or("DOT_SERVER_ADN", ""),
+                sizeof(g_cfg.dot_server_adn));
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count = 0;
     const char *sdomains = getenv_or("SEARCH_DOMAINS", "");
@@ -4344,6 +4452,79 @@ static void dot_init(void) {
         SSL_CTX_set_default_verify_paths(g_dot_ctx);
     }
     SSL_CTX_set_verify(g_dot_ctx, SSL_VERIFY_PEER, NULL);
+}
+
+/* Read a whole file into buf (NUL-terminated). Returns the length, or -1 on
+ * any I/O error or if it doesn't fit. */
+static int read_pem_file(const char *path, char *buf, int bufsz) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    int n = (int) fread(buf, 1, (size_t) (bufsz - 1), f);
+    int had_more = !feof(f);
+    fclose(f);
+    if (n <= 0 || had_more)
+        return -1;
+    buf[n] = 0;
+    return n;
+}
+
+#define DOT_SERVER_PEM_MAX 16384
+
+/*
+ * dot_server_init — RFC 7858 DoT server for resolverd's own stub clients,
+ * plus the RFC 9462 DDR record that advertises it. Both are opt-in and only
+ * activate together: a client must never be told about an encrypted
+ * endpoint resolverd doesn't actually serve, so the DDR SVCB record
+ * (g_ddr_svcb_rdata) is only populated when the DoT context itself loaded
+ * successfully. Cert/key are read into memory HERE, before apply_sandbox()
+ * confines the filesystem — same reasoning as dot_init's eager CA load
+ * above (the chroot may not carry these files).
+ */
+static void dot_server_init(void) {
+    if (!g_cfg.dot_server_enabled)
+        return;
+    if (!g_cfg.dot_server_cert_pem[0] || !g_cfg.dot_server_key_pem[0] || !g_cfg.dot_server_adn[0]) {
+        fprintf(stderr, "[dot-server] DOT_SERVER_ENABLED=1 but cert/key/ADN is not fully "
+                        "configured — DoT listener and DDR advertisement stay OFF\n");
+        return;
+    }
+    static char cert_pem[DOT_SERVER_PEM_MAX];
+    static char key_pem[DOT_SERVER_PEM_MAX];
+    if (read_pem_file(g_cfg.dot_server_cert_pem, cert_pem, sizeof(cert_pem)) < 0) {
+        fprintf(stderr, "[dot-server] could not read cert PEM '%s' — DoT listener stays OFF\n",
+                g_cfg.dot_server_cert_pem);
+        return;
+    }
+    if (read_pem_file(g_cfg.dot_server_key_pem, key_pem, sizeof(key_pem)) < 0) {
+        fprintf(stderr, "[dot-server] could not read key PEM '%s' — DoT listener stays OFF\n",
+                g_cfg.dot_server_key_pem);
+        return;
+    }
+    g_dot_server_ctx = tls_server_ctx_from_pem(cert_pem, key_pem, NULL, 0);
+    if (!g_dot_server_ctx) {
+        fprintf(stderr, "[dot-server] cert/key failed to load — DoT listener stays OFF\n");
+        return;
+    }
+    /* RFC 7858 §3.2: select "dot" ALPN (shared with dnsd — see dns_wire.c). */
+    SSL_CTX_set_alpn_select_cb(g_dot_server_ctx, dot_alpn_select_cb, NULL);
+
+    /* RFC 9462 DDR: precompute the SVCB record advertising this listener,
+     * via the same presentation-format encoder dnsd uses for zone SVCB
+     * records (svcb_present_to_tlv + svcb_tlv_to_wire) — no second encoder. */
+    char present[512];
+    snprintf(present, sizeof(present), "1 %s alpn=dot port=%d", g_cfg.dot_server_adn,
+             g_cfg.dot_server_port);
+    uint8_t tlv[512];
+    int tlvlen = svcb_present_to_tlv(present, tlv, sizeof(tlv));
+    if (tlvlen > 0)
+        g_ddr_svcb_rdata_len =
+            svcb_tlv_to_wire(tlv, tlvlen, g_ddr_svcb_rdata, sizeof(g_ddr_svcb_rdata));
+    if (g_ddr_svcb_rdata_len <= 0) {
+        fprintf(stderr, "[dot-server] failed to build the DDR SVCB record for ADN '%s'\n",
+                g_cfg.dot_server_adn);
+        g_ddr_svcb_rdata_len = 0;
+    }
 }
 
 /* =========================================================================
@@ -4737,6 +4918,7 @@ int main(int argc, char **argv) {
     cache_init();
     if (g_cfg.proto == PROTO_DOT || g_cfg.proto == PROTO_DOH)
         dot_init();
+    dot_server_init(); /* no-op unless DOT_SERVER_ENABLED=1; must run before apply_sandbox() */
     /* One-shot modes that don't need proxy */
     if (mode_stats) {
         print_stats();
@@ -4779,6 +4961,8 @@ int main(int argc, char **argv) {
     }
     if (g_dot_ctx)
         SSL_CTX_free(g_dot_ctx);
+    if (g_dot_server_ctx)
+        SSL_CTX_free(g_dot_server_ctx);
     return 0;
 }
 #endif /* UNIT_TEST */

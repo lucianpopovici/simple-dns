@@ -2406,72 +2406,11 @@ static uint32_t serial_bump(zone_entry_t *z) {
 
 /* ==========================================================================
  * TLS contexts from in-memory PEM
+ *
+ * tls_server_ctx_from_pem / dot_alpn_select_cb live in libdnswire — shared
+ * with resolverd's own DoT listener (RFC 9462 DDR) so the cert-loading and
+ * ALPN-selection code exists in exactly one place.
  * ======================================================================= */
-static SSL_CTX *tls_ctx_from_pem(const char *cert_pem, const char *key_pem, const char *ca_pem,
-                                 int verify_client) {
-    if (!cert_pem || !cert_pem[0] || !key_pem || !key_pem[0]) {
-        dns_log(LOG_ERR, "[TLS] No cert/key PEM\n");
-        return NULL;
-    }
-    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
-    if (!ctx)
-        return NULL;
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    BIO *bc = BIO_new_mem_buf(cert_pem, -1);
-    X509 *cert = PEM_read_bio_X509_AUX(bc, NULL, NULL, NULL);
-    if (!cert) {
-        BIO_free(bc);
-        SSL_CTX_free(ctx);
-        dns_log(LOG_ERR, "[TLS] Bad cert PEM\n");
-        return NULL;
-    }
-    SSL_CTX_use_certificate(ctx, cert);
-    X509_free(cert);
-    X509 *ca;
-    while ((ca = PEM_read_bio_X509(bc, NULL, NULL, NULL)) != NULL)
-        SSL_CTX_add_extra_chain_cert(ctx, ca);
-    BIO_free(bc);
-    BIO *bk = BIO_new_mem_buf(key_pem, -1);
-    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bk, NULL, NULL, NULL);
-    BIO_free(bk);
-    if (!pkey) {
-        SSL_CTX_free(ctx);
-        return NULL;
-    }
-    SSL_CTX_use_PrivateKey(ctx, pkey);
-    EVP_PKEY_free(pkey);
-    if (!SSL_CTX_check_private_key(ctx)) {
-        SSL_CTX_free(ctx);
-        return NULL;
-    }
-    if (verify_client && ca_pem && ca_pem[0]) {
-        X509_STORE *store = SSL_CTX_get_cert_store(ctx);
-        BIO *bca = BIO_new_mem_buf(ca_pem, -1);
-        X509 *cax;
-        while ((cax = PEM_read_bio_X509(bca, NULL, NULL, NULL)) != NULL) {
-            X509_STORE_add_cert(store, cax);
-            X509_free(cax);
-        }
-        BIO_free(bca);
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
-    }
-    return ctx;
-}
-/* ALPN select callback (server role — RFC 7301 §3.2). SSL_CTX_set_alpn_protos
- * only configures the list a TLS *client* offers; a server must select via
- * this callback or it silently sends no ALPN extension at all. Always
- * selects "dot" (RFC 7858 §3.2 for plain DoT queries; RFC 9103 §7.1 MUSTs it
- * for XoT zone transfers, which share this same listener/port). */
-static int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
-                              const unsigned char *in, unsigned int inlen, void *arg) {
-    (void) ssl;
-    (void) arg;
-    static const unsigned char dot_proto[] = {3, 'd', 'o', 't'};
-    if (SSL_select_next_proto((unsigned char **) out, outlen, dot_proto, sizeof(dot_proto), in,
-                              inlen) != OPENSSL_NPN_NEGOTIATED)
-        return SSL_TLSEXT_ERR_NOACK;
-    return SSL_TLSEXT_ERR_OK;
-}
 static void tls_reload(void) {
     pthread_mutex_lock(&g_tls_mutex);
     if (g_dot_ctx) {
@@ -2483,8 +2422,10 @@ static void tls_reload(void) {
      * otherwise stay open for ordinary RFC 7858 clients (fail safe: a missing CA
      * never silently locks out clients). */
     int dot_mtls = (g_dot_require_client_cert && g_mtls_ca_pem[0]);
-    g_dot_ctx =
-        tls_ctx_from_pem(g_tls_cert_pem, g_tls_key_pem, dot_mtls ? g_mtls_ca_pem : NULL, dot_mtls);
+    if (!g_tls_cert_pem[0] || !g_tls_key_pem[0])
+        dns_log(LOG_ERR, "[TLS] No cert/key PEM\n");
+    g_dot_ctx = tls_server_ctx_from_pem(g_tls_cert_pem, g_tls_key_pem,
+                                        dot_mtls ? g_mtls_ca_pem : NULL, dot_mtls);
     if (g_dot_require_client_cert && !g_mtls_ca_pem[0])
         dns_log(LOG_WARNING, "[DoT] dot_require_client_cert=1 but config:mtls_ca_pem is empty — "
                              "client-cert verification NOT enforced (no CA to verify against)\n");

@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <openssl/ssl.h> /* tls_server_ctx_from_pem / dot_alpn_select_cb */
 
 /* ── DNS type constants (RFC 1035 and later) ─────────────────────────────── */
 
@@ -436,6 +437,27 @@ int canon_name_cmp(const char *a, const char *b);
  * Returns rdata length or -1 on overflow / no buffer. */
 int csync_encode_rdata(uint32_t serial, uint16_t flags, const char *types_csv, uint8_t *out,
                        int outsz);
+
+/* ── TLS server helpers (DNS-over-TLS, RFC 7858) ─────────────────────────────
+ * Shared by dnsd (authoritative DoT/XoT listener) and resolverd (stub-facing
+ * DoT listener, RFC 9462 DDR) so the cert-loading and ALPN-selection code —
+ * previously a dnsd-only static pair — exists once. */
+
+/* Build a server-role SSL_CTX from in-memory cert+key PEM (TLS 1.2 minimum).
+ * ca_pem + verify_client enable mTLS (require and verify a client
+ * certificate); pass NULL/0 for a plain server. Returns NULL on any
+ * load/parse failure — the caller must fail closed (never start a listener
+ * without a context). Does not select ALPN; pair with
+ * SSL_CTX_set_alpn_select_cb(ctx, dot_alpn_select_cb, NULL). */
+SSL_CTX *tls_server_ctx_from_pem(const char *cert_pem, const char *key_pem, const char *ca_pem,
+                                 int verify_client);
+
+/* RFC 7858 §3.2 / RFC 9103 §7.1 ALPN select callback ("dot"). A TLS server
+ * that never calls SSL_CTX_set_alpn_select_cb silently sends no ALPN
+ * extension at all — SSL_CTX_set_alpn_protos only configures what a
+ * *client* offers, and is a no-op on a server SSL_CTX. */
+int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                       const unsigned char *in, unsigned int inlen, void *arg);
 
 /* ── Schema version contract (ADR-003) ────────────────────────────────────────
  * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the

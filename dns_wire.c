@@ -10,8 +10,11 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <stdio.h>
-#include <arpa/inet.h>   /* inet_pton — RFC 9460 ipv4hint/ipv6hint */
-#include <openssl/evp.h> /* nsec3_hash_raw */
+#include <arpa/inet.h>    /* inet_pton — RFC 9460 ipv4hint/ipv6hint */
+#include <openssl/evp.h>  /* nsec3_hash_raw */
+#include <openssl/x509.h> /* tls_server_ctx_from_pem */
+#include <openssl/pem.h>
+#include <openssl/bio.h>
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
 
@@ -1407,6 +1410,67 @@ int canon_rr_cmp(const canon_rr_t *a, const canon_rr_t *b) {
     if (c)
         return c;
     return a->len - b->len;
+}
+
+/* ── TLS server helpers (DNS-over-TLS, RFC 7858) ─────────────────────────── */
+
+SSL_CTX *tls_server_ctx_from_pem(const char *cert_pem, const char *key_pem, const char *ca_pem,
+                                 int verify_client) {
+    if (!cert_pem || !cert_pem[0] || !key_pem || !key_pem[0])
+        return NULL;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx)
+        return NULL;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    BIO *bc = BIO_new_mem_buf(cert_pem, -1);
+    X509 *cert = PEM_read_bio_X509_AUX(bc, NULL, NULL, NULL);
+    if (!cert) {
+        BIO_free(bc);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_use_certificate(ctx, cert);
+    X509_free(cert);
+    X509 *ca;
+    while ((ca = PEM_read_bio_X509(bc, NULL, NULL, NULL)) != NULL)
+        SSL_CTX_add_extra_chain_cert(ctx, ca);
+    BIO_free(bc);
+    BIO *bk = BIO_new_mem_buf(key_pem, -1);
+    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bk, NULL, NULL, NULL);
+    BIO_free(bk);
+    if (!pkey) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_use_PrivateKey(ctx, pkey);
+    EVP_PKEY_free(pkey);
+    if (!SSL_CTX_check_private_key(ctx)) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (verify_client && ca_pem && ca_pem[0]) {
+        X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+        BIO *bca = BIO_new_mem_buf(ca_pem, -1);
+        X509 *cax;
+        while ((cax = PEM_read_bio_X509(bca, NULL, NULL, NULL)) != NULL) {
+            X509_STORE_add_cert(store, cax);
+            X509_free(cax);
+        }
+        BIO_free(bca);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+    }
+    return ctx;
+}
+
+int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                       const unsigned char *in, unsigned int inlen, void *arg) {
+    (void) ssl;
+    (void) arg;
+    static const unsigned char dot_proto[] = {3, 'd', 'o', 't'};
+    if (SSL_select_next_proto((unsigned char **) out, outlen, dot_proto, sizeof(dot_proto), in,
+                              inlen) != OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_NOACK;
+    return SSL_TLSEXT_ERR_OK;
 }
 
 /* ── Schema version contract (ADR-003) ───────────────────────────────────────

@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1945,6 +1945,42 @@ check-ede: tests/test_ede.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sa
 	 test "$$ADDCOUNT" = "ADDITIONAL: 0" || { echo "  FAIL  resolverd attached an OPT record to a client that never sent EDNS"; exit 1; }; \
 	 echo "  OK  EDE_NETWORK_ERROR (23) surfaced only to the EDNS-speaking client"
 
+# RFC 7858 DoT server (resolverd's own stub-facing listener) + RFC 9462 DDR
+# self-advertisement. Positive: a real dig +tls query over the listener
+# resolves, and _dns.resolver.arpa SVCB advertises the right target/alpn/port.
+# Negative: without DOT_SERVER_ENABLED, no SVCB is served and the DoT port
+# never opens — resolverd must never advertise an endpoint it doesn't serve.
+check-ddr: resolverd_debug
+	@echo "  CHECK  RFC 7858 DoT server + RFC 9462 DDR (requires dig +tls + openssl + python3)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 dig -h 2>&1 | grep -q -- '+\[no\]tls ' || { echo "  SKIP  dig has no +tls support"; exit 0; }; \
+	 D=$$(mktemp -d); \
+	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+	   -keyout $$D/srv.key -out $$D/srv.pem -days 2 -subj "/CN=resolver.test" \
+	   -addext "subjectAltName=DNS:resolver.test" >/dev/null 2>&1; \
+	 python3 tests/servfail_upstream.py 127.0.0.1 5416 primed.dot.test 1 203.0.113.66 > /tmp/ddr_stub.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5417 DOT_SERVER_ENABLED=1 DOT_SERVER_PORT=5418 \
+	     DOT_SERVER_CERT_PEM=$$D/srv.pem DOT_SERVER_KEY_PEM=$$D/srv.key DOT_SERVER_ADN=resolver.test \
+	     ./resolverd_debug --upstream 127.0.0.1:5416 --no-dnssec --no-valkey \
+	     > /tmp/resolverd_ddr.log 2>&1 & RD=$$!; \
+	 sleep 1.5; \
+	 DOTANS=$$(dig @127.0.0.1 -p 5418 +tls +tls-ca=$$D/srv.pem +tls-hostname=resolver.test \
+	     +time=2 +tries=1 +short primed.dot.test A); \
+	 DDR=$$(dig @127.0.0.1 -p 5417 +time=2 +tries=1 +short _dns.resolver.arpa SVCB); \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true; \
+	 echo "  DoT answer=[$$DOTANS]  DDR=[$$DDR]"; \
+	 test "$$DOTANS" = "203.0.113.66" || { echo "  FAIL  DoT query did not resolve"; cat /tmp/resolverd_ddr.log; exit 1; }; \
+	 echo "$$DDR" | grep -q "^1 resolver.test\..*alpn=\"dot\".*port=5418" || { echo "  FAIL  DDR SVCB missing/wrong (target/alpn/port)"; exit 1; }; \
+	 python3 tests/servfail_upstream.py 127.0.0.1 5416 primed.dot.test 1 203.0.113.66 > /tmp/ddr_stub2.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5417 ./resolverd_debug --upstream 127.0.0.1:5416 \
+	     --no-dnssec --no-valkey > /tmp/resolverd_ddr2.log 2>&1 & RD=$$!; \
+	 sleep 1.5; \
+	 NODDR_ANS=$$(dig @127.0.0.1 -p 5417 +time=2 +tries=1 _dns.resolver.arpa SVCB | grep -c "^_dns.resolver.arpa.*SVCB"); \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true; \
+	 rm -rf $$D; \
+	 test "$$NODDR_ANS" = "0" || { echo "  FAIL  DDR SVCB served with DOT_SERVER_ENABLED unset — advertised a non-existent endpoint"; exit 1; }; \
+	 echo "  OK  DoT server resolves, DDR advertises it correctly, and nothing is advertised when disabled"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -2010,6 +2046,7 @@ help:
 	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
+	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"
