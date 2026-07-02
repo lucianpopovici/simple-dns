@@ -101,21 +101,34 @@
 #define EDNS_OPT_ZONEVERSION 19    /* RFC 9660 */
 #define EDNS_ZV_TYPE_SOA_SERIAL 0  /* RFC 9660 §3: the only defined VERSION type */
 
-/* Extended DNS Error info codes (RFC 8914) */
+/* Extended DNS Error info codes — RFC 8914 §4 / IANA "Extended DNS Error
+ * Codes" registry. Numbering must match the registry exactly; these are sent
+ * on the wire to real clients/validators, not just used internally. */
 #define EDE_OTHER 0
-#define EDE_DNSKEY_MISSING 1
-#define EDE_RRSIG_MISSING 3
-#define EDE_SIG_EXPIRED 5
-#define EDE_SIG_NOT_YET 6
-#define EDE_DNSKEY_MISSING2 7
-#define EDE_SIG_INVALID 8
-#define EDE_NXDOMAIN_NXZONE 12
+#define EDE_UNSUPPORTED_DNSKEY_ALG 1
+#define EDE_UNSUPPORTED_DS_DIGEST 2
+#define EDE_STALE_ANSWER 3
+#define EDE_FORGED_ANSWER 4
+#define EDE_DNSSEC_INDETERMINATE 5
+#define EDE_DNSSEC_BOGUS 6
+#define EDE_SIG_EXPIRED 7
+#define EDE_SIG_NOT_YET_VALID 8
+#define EDE_DNSKEY_MISSING 9
+#define EDE_RRSIGS_MISSING 10
+#define EDE_NO_ZONE_KEY_BIT_SET 11
+#define EDE_NSEC_MISSING 12
+#define EDE_CACHED_ERROR 13
+#define EDE_NOT_READY 14
 #define EDE_BLOCKED 15
+#define EDE_CENSORED 16
 #define EDE_FILTERED 17
-#define EDE_NOT_AUTH 18
-#define EDE_NOT_SUPPORTED 19
-#define EDE_NXDOMAIN 20
-#define EDE_NO_REACHABLE 22
+#define EDE_PROHIBITED 18
+#define EDE_STALE_NXDOMAIN_ANSWER 19
+#define EDE_NOT_AUTHORITATIVE 20
+#define EDE_NOT_SUPPORTED 21
+#define EDE_NO_REACHABLE_AUTHORITY 22
+#define EDE_NETWORK_ERROR 23
+#define EDE_INVALID_DATA 24
 
 /* ── DNS Cookie constants (RFC 9018) ─────────────────────────────────────── */
 
@@ -184,6 +197,14 @@ int b64url_enc(const uint8_t *in, int ilen, char *out, int olen);
 
 /* base32hex (RFC 4648 §7) encode, uppercase — used for NSEC3 owner names. */
 int base32hex_enc(const uint8_t *in, int ilen, char *out, int olen);
+/* base32hex decode, case-insensitive; returns decoded length or -1 on a
+ * non-alphabet character. */
+int base32hex_dec(const char *in, uint8_t *out, int outlen);
+
+/* RFC 5155 §5: iterated salted SHA-1 NSEC3 owner hash, raw 20-byte digest
+ * (not base32hex-encoded). Shared by dnsd (signing) and resolverd (RFC 8198
+ * aggressive-cache gap matching) so the two can never diverge. */
+void nsec3_hash_raw(const char *name, const uint8_t *salt, int saltlen, int iters, uint8_t out[20]);
 
 /* ── Fixed-width big-endian accessors ────────────────────────────────────── */
 

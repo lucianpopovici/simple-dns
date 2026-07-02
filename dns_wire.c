@@ -10,7 +10,8 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <stdio.h>
-#include <arpa/inet.h> /* inet_pton — RFC 9460 ipv4hint/ipv6hint */
+#include <arpa/inet.h>   /* inet_pton — RFC 9460 ipv4hint/ipv6hint */
+#include <openssl/evp.h> /* nsec3_hash_raw */
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
 
@@ -155,6 +156,111 @@ int base32hex_enc(const uint8_t *in, int ilen, char *out, int olen) {
     }
     out[o] = 0;
     return o;
+}
+
+static int b32h_val(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'V')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'v')
+        return c - 'a' + 10;
+    return -1;
+}
+
+int base32hex_dec(const char *in, uint8_t *out, int outlen) {
+    int ilen = (int) strlen(in);
+    int oi = 0, i = 0;
+    while (i < ilen) {
+        int take = ilen - i < 8 ? ilen - i : 8;
+        uint64_t v = 0;
+        for (int j = 0; j < take; j++) {
+            int val = b32h_val(in[i + j]);
+            if (val < 0)
+                return -1;
+            v |= (uint64_t) val << (35 - j * 5);
+        }
+        int obytes;
+        switch (take) {
+            case 8:
+                obytes = 5;
+                break;
+            case 7:
+                obytes = 4;
+                break;
+            case 5:
+                obytes = 3;
+                break;
+            case 4:
+                obytes = 2;
+                break;
+            case 2:
+                obytes = 1;
+                break;
+            default:
+                return -1; /* not a valid base32 group length */
+        }
+        if (oi + obytes > outlen)
+            return -1;
+        for (int j = 0; j < obytes; j++)
+            out[oi + j] = (uint8_t) ((v >> (32 - j * 8)) & 0xFF);
+        oi += obytes;
+        i += take;
+    }
+    return oi;
+}
+
+/* ── NSEC3 owner hash (RFC 5155 §5) ──────────────────────────────────────── */
+
+static void wire_sha1(const uint8_t *in, int n, uint8_t out[20]) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx)
+        return;
+    unsigned int dl = 20;
+    EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
+    EVP_DigestUpdate(ctx, in, n);
+    EVP_DigestFinal_ex(ctx, out, &dl);
+    EVP_MD_CTX_free(ctx);
+}
+
+void nsec3_hash_raw(const char *name, const uint8_t *salt, int saltlen, int iters,
+                    uint8_t out[20]) {
+    char lname[256];
+    safe_strcpy(lname, name, sizeof(lname));
+    strlower(lname);
+    uint8_t wire[257];
+    int wlen = 0;
+    char tmp[256];
+    safe_strcpy(tmp, lname, sizeof(tmp));
+    char *sp = NULL;
+    char *lbl = strtok_r(tmp, ".", &sp);
+    while (lbl) {
+        int ll = (int) strlen(lbl);
+        if (ll > 63 || wlen + ll + 1 > 255)
+            break; /* enforce label and total limits */
+        wire[wlen++] = (uint8_t) ll;
+        memcpy(wire + wlen, lbl, ll);
+        wlen += ll;
+        lbl = strtok_r(NULL, ".", &sp);
+    }
+    if (wlen < 256)
+        wire[wlen++] = 0; /* root label */
+    /* Iterative SHA-1: H(x) = SHA-1(x || salt), repeated iters+1 times */
+    uint8_t h[20];
+    uint8_t ibuf[256 + 64];
+    int iblen = wlen;
+    memcpy(ibuf, wire, wlen);
+    if (saltlen > 0)
+        memcpy(ibuf + wlen, salt, saltlen);
+    iblen += saltlen;
+    wire_sha1(ibuf, iblen, h);
+    for (int i = 0; i < iters; i++) {
+        memcpy(ibuf, h, 20);
+        if (saltlen > 0)
+            memcpy(ibuf + 20, salt, saltlen);
+        wire_sha1(ibuf, 20 + saltlen, h);
+    }
+    memcpy(out, h, 20);
 }
 
 /* ── Fixed-width big-endian accessors ────────────────────────────────────── */

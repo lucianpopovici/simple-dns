@@ -22,6 +22,12 @@
  *     expired cache entry (bounded by SERVE_STALE_MAX) instead of failing
  *   - RFC 9520 failure caching: cache upstream SERVFAIL briefly
  *     (SERVFAIL_CACHE_TTL) to suppress repeated queries to a broken name
+ *   - RFC 8198 aggressive NSEC/NSEC3 cache: a validated NXDOMAIN/NODATA's
+ *     denial-of-existence span (AGGRESSIVE_NSEC) answers later queries that
+ *     fall in the same gap without an upstream round trip
+ *   - RFC 8914 Extended DNS Errors: an EDNS-speaking client that gets
+ *     SERVFAIL learns why (DNSSEC Bogus / Network Error), reusing the
+ *     libdnswire EDE emitter dnsd already uses
  *   - Thread-safe: per-bucket rwlock on memory cache
  *   - Prefetch: re-queries records when TTL < 10% of original
  *   - CLI: dig-like output + cache stats + cache flush/inspect commands
@@ -42,6 +48,7 @@
  *   CACHE_NEG_TTL     Max negative TTL (seconds)       (default: 300)
  *   SERVE_STALE_MAX   RFC 8767 stale-serve window (s)  (default: 3600, 0=off)
  *   SERVFAIL_CACHE_TTL RFC 9520 cached-SERVFAIL TTL (s) (default: 30, 0=off)
+ *   AGGRESSIVE_NSEC   RFC 8198 aggressive NSEC/NSEC3   (default: 1)
  *   DOT_CA_PEM        Path to CA cert PEM for DoT      (default: system)
  *
  * Sandbox (Valkey config:* keys, env override in parens; applied after the
@@ -218,6 +225,9 @@ typedef struct {
      * CSPRNG transaction ID + source port already in upstream_query_one). */
     int dns0x20_enabled;
     char dns0x20_disable[512]; /* comma-separated upstream hostnames to exempt */
+    /* RFC 8198: synthesize NXDOMAIN/NODATA from a cached SECURE NSEC/NSEC3
+     * denial span on a cache miss, instead of going upstream. */
+    int aggressive_nsec_enabled;
 } config_t;
 
 /* =========================================================================
@@ -996,6 +1006,41 @@ out:
     return ok;
 }
 
+/* Query <name> for DNSKEY and copy the first DNSKEY rdata found into
+ * dnskey_rd (capacity cap). Returns the rdata length, or 0 if none
+ * found/unreachable. Shared by the positive- and negative-response
+ * validators so the DNSKEY-fetch parse exists in exactly one place. */
+static int dnssec_fetch_dnskey(const char *name, uint8_t *dnskey_rd, int cap) {
+    uint8_t dkresp[DNS_BUF * 2];
+    long rtt = 0;
+    int dkrlen = upstream_query(name, 48 /*DNSKEY*/, dkresp, sizeof(dkresp), &rtt);
+    if (dkrlen < 12)
+        return 0;
+    const dns_hdr_t *dkh = (const dns_hdr_t *) dkresp;
+    int dkoff = 12;
+    for (int i = 0; i < ntohs(dkh->qdcount) && dkoff < dkrlen; i++) {
+        char tmp[256];
+        dkoff = name_from_wire(dkresp, dkrlen, dkoff, tmp, sizeof(tmp));
+        if (dkoff < 0)
+            return 0;
+        dkoff += 4;
+    }
+    for (int i = 0; i < ntohs(dkh->ancount) && dkoff < dkrlen; i++) {
+        char rn[256];
+        int a = name_from_wire(dkresp, dkrlen, dkoff, rn, sizeof(rn));
+        if (a < 0 || a + 10 > dkrlen)
+            break;
+        uint16_t rt = get16(dkresp, a);
+        uint16_t rdl = get16(dkresp, a + 8);
+        if (rt == 48 && rdl > 0 && rdl <= (uint16_t) cap) {
+            memcpy(dnskey_rd, dkresp + a + 10, rdl);
+            return (int) rdl;
+        }
+        dkoff = a + 10 + (int) rdl;
+    }
+    return 0;
+}
+
 /*
  * dnssec_validate_response — validate RRSIG records in a DNS response.
  *
@@ -1072,36 +1117,8 @@ static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen, c
     if (rr_n == 0)
         return DNSSEC_BOGUS; /* signature over nothing present — fail closed */
     /* If no DNSKEY in response, fetch it */
-    if (dnskey_rdlen == 0) {
-        uint8_t dkresp[DNS_BUF * 2];
-        long rtt = 0;
-        int dkrlen = upstream_query(qname, 48 /*DNSKEY*/, dkresp, sizeof(dkresp), &rtt);
-        if (dkrlen < 12)
-            return DNSSEC_INSECURE;
-        const dns_hdr_t *dkh = (const dns_hdr_t *) dkresp;
-        int dkoff = 12;
-        for (int i = 0; i < ntohs(dkh->qdcount) && dkoff < dkrlen; i++) {
-            char tmp[256];
-            dkoff = name_from_wire(dkresp, dkrlen, dkoff, tmp, sizeof(tmp));
-            if (dkoff < 0)
-                break;
-            dkoff += 4;
-        }
-        for (int i = 0; i < ntohs(dkh->ancount) && dkoff < dkrlen; i++) {
-            char rn[256];
-            int a = name_from_wire(dkresp, dkrlen, dkoff, rn, sizeof(rn));
-            if (a < 0 || a + 10 > dkrlen)
-                break;
-            uint16_t rt = get16(dkresp, a);
-            uint16_t rdl = get16(dkresp, a + 8);
-            if (rt == 48 && rdl > 0 && rdl <= (int) sizeof(dnskey_rd)) {
-                memcpy(dnskey_rd, dkresp + a + 10, rdl);
-                dnskey_rdlen = (int) rdl;
-                break;
-            }
-            dkoff = a + 10 + (int) rdl;
-        }
-    }
+    if (dnskey_rdlen == 0)
+        dnskey_rdlen = dnssec_fetch_dnskey(qname, dnskey_rd, (int) sizeof(dnskey_rd));
     if (dnskey_rdlen == 0)
         return DNSSEC_INSECURE;
     /* Check trust anchor */
@@ -1121,6 +1138,293 @@ static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen, c
     if (r == 0)
         return DNSSEC_BOGUS;
     return DNSSEC_INSECURE; /* unsupported alg */
+}
+
+/* =========================================================================
+ * RFC 8198 — aggressive use of the DNSSEC-validated negative cache
+ *
+ * A validated NXDOMAIN/NODATA response carries an NSEC or NSEC3 record that
+ * proves a whole *range* of names doesn't exist (or that one name exists but
+ * lacks a whole set of types). Once that proof is SECURE, later queries that
+ * land in the same range can be answered from it without going upstream —
+ * see aggressive_nsec_answer(), in the cache section below.
+ * ======================================================================= */
+
+/* One validated denial-of-existence span, extracted from a SECURE negative
+ * response's authority section. */
+typedef struct {
+    int is_nsec3;
+    char zone[256]; /* SOA owner name — a candidate qname must be inside this
+                       zone before this span is even considered, so a proof
+                       from one forwarded domain never leaks into another. */
+    /* NSEC */
+    char owner[256]; /* lowercased dotted */
+    char next[256];  /* lowercased dotted; wraps to the zone apex at the end
+                        of the chain (canon_name_cmp(next, owner) <= 0). */
+    /* NSEC3 (RFC 5155) */
+    uint8_t owner_hash[20];
+    uint8_t next_hash[20];
+    uint8_t nsec3_alg;
+    uint16_t nsec3_iters;
+    uint8_t nsec3_salt[64];
+    int nsec3_saltlen;
+    int optout; /* RFC 5155 §7.2.1 opt-out: never use this span to prove
+                   non-existence — an unsigned delegation may live in the gap. */
+    /* Type bitmap at the owner (NSEC or NSEC3), raw window-encoded bytes —
+     * proves NODATA for the owner name itself when a queried type's bit is
+     * clear. */
+    uint8_t bitmap[128];
+    int bitmap_len;
+} nsec_proof_t;
+
+#define MAX_NEG_PROOFS 4
+
+/* RFC 4034 §4.1.2 windowed type bitmap: window(1) len(1) bits[len]. Returns
+ * 1 if `type`'s bit is set, 0 if clear or the bitmap doesn't cover it. */
+static int nsec_bitmap_has_type(const uint8_t *bm, int bmlen, uint16_t type) {
+    int win = type / 256;
+    int bit = type % 256;
+    int off = 0;
+    while (off + 2 <= bmlen) {
+        int w = bm[off];
+        int wl = bm[off + 1];
+        if (off + 2 + wl > bmlen)
+            break;
+        if (w == win && bit / 8 < wl)
+            return (bm[off + 2 + bit / 8] & (0x80 >> (bit % 8))) != 0;
+        off += 2 + wl;
+    }
+    return 0;
+}
+
+/* Parse an NSEC or NSEC3 RR's rdata (at pkt+rdoff, length rdlen, owner name
+ * already decoded) into *proof. Returns 1 on success, 0 on a malformed
+ * record (fail closed — the caller must not use a partially-filled proof). */
+static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uint16_t rtype,
+                            int rdoff, int rdlen, nsec_proof_t *proof) {
+    int rdend = rdoff + rdlen;
+    if (rdend > plen || rdlen < 0)
+        return 0;
+    memset(proof, 0, sizeof(*proof));
+    if (rtype == DNS_TYPE_NSEC) {
+        char next[256];
+        int after = name_from_wire(pkt, plen, rdoff, next, sizeof(next));
+        if (after < 0 || after > rdend)
+            return 0;
+        proof->is_nsec3 = 0;
+        safe_strcpy(proof->owner, owner, sizeof(proof->owner));
+        safe_strcpy(proof->next, next, sizeof(proof->next));
+        int bmlen = rdend - after;
+        if (bmlen < 0)
+            return 0;
+        if (bmlen > (int) sizeof(proof->bitmap))
+            bmlen = (int) sizeof(proof->bitmap);
+        memcpy(proof->bitmap, pkt + after, bmlen);
+        proof->bitmap_len = bmlen;
+        return 1;
+    }
+    if (rtype == DNS_TYPE_NSEC3) {
+        if (rdlen < 5)
+            return 0;
+        uint8_t alg = pkt[rdoff];
+        uint8_t flags = pkt[rdoff + 1];
+        uint16_t iters = get16(pkt, rdoff + 2);
+        uint8_t saltlen = pkt[rdoff + 4];
+        int p = rdoff + 5;
+        if (saltlen > (int) sizeof(proof->nsec3_salt) || p + saltlen > rdend)
+            return 0;
+        uint8_t salt[64];
+        memcpy(salt, pkt + p, saltlen);
+        p += saltlen;
+        if (p + 1 > rdend)
+            return 0;
+        uint8_t hashlen = pkt[p];
+        p += 1;
+        if (hashlen != 20 /* SHA-1 (alg 1) digest length */ || p + hashlen > rdend)
+            return 0;
+        if (alg != NSEC3_ALG_SHA1)
+            return 0;
+        proof->is_nsec3 = 1;
+        proof->nsec3_alg = alg;
+        proof->nsec3_iters = iters;
+        proof->nsec3_saltlen = saltlen;
+        memcpy(proof->nsec3_salt, salt, (size_t) saltlen);
+        proof->optout = (flags & 0x01) != 0;
+        memcpy(proof->next_hash, pkt + p, 20);
+        p += 20;
+        /* Owner hash is base32hex in the owner name's first label. */
+        char label[64];
+        const char *dot = strchr(owner, '.');
+        size_t llen = dot ? (size_t) (dot - owner) : strlen(owner);
+        if (llen == 0 || llen >= sizeof(label))
+            return 0;
+        memcpy(label, owner, llen);
+        label[llen] = 0;
+        if (base32hex_dec(label, proof->owner_hash, sizeof(proof->owner_hash)) != 20)
+            return 0;
+        int bmlen = rdend - p;
+        if (bmlen < 0)
+            return 0;
+        if (bmlen > (int) sizeof(proof->bitmap))
+            bmlen = (int) sizeof(proof->bitmap);
+        memcpy(proof->bitmap, pkt + p, bmlen);
+        proof->bitmap_len = bmlen;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * dnssec_validate_negative — validate the denial-of-existence proof in a
+ * NXDOMAIN/NODATA response's authority section (RFC 4035 §3.1.3, §5.4): the
+ * SOA RRset and every NSEC/NSEC3 RRset present must each carry a signature
+ * that verifies against a trusted key. On SECURE, every validated NSEC/NSEC3
+ * span found is written to proofs[] (a real NXDOMAIN response can carry up to
+ * three: closest-encloser, next-closer/covering, and wildcard denial — RFC
+ * 5155 §7.2 — and aggressive lookup needs to try each independently, since
+ * classifying which one is "the" covering span up front isn't reliable).
+ */
+static dnssec_status_t dnssec_validate_negative(const uint8_t *resp, int rlen, const char *qname,
+                                                nsec_proof_t *proofs, int max_proofs,
+                                                int *proof_count) {
+    (void) qname;
+    *proof_count = 0;
+    if (rlen < 12)
+        return DNSSEC_INSECURE;
+    const dns_hdr_t *h = (const dns_hdr_t *) resp;
+    int nscount = ntohs(h->nscount);
+    if (nscount == 0)
+        return DNSSEC_INSECURE;
+    int off = 12;
+    for (int i = 0; i < ntohs(h->qdcount) && off < rlen; i++) {
+        char tmp[256];
+        off = name_from_wire(resp, rlen, off, tmp, sizeof(tmp));
+        if (off < 0)
+            return DNSSEC_INSECURE;
+        off += 4;
+    }
+    for (int i = 0; i < ntohs(h->ancount) && off < rlen; i++) {
+        char tmp[256];
+        int a = name_from_wire(resp, rlen, off, tmp, sizeof(tmp));
+        if (a < 0 || a + 10 > rlen)
+            return DNSSEC_INSECURE;
+        off = a + 10 + (int) get16(resp, a + 8);
+    }
+    /* Scan the authority section once, recording every RR's owner-start
+     * offset/owner/type/rdata (mirrors dnssec_validate_response's answer
+     * scan). */
+#define NEG_MAX_RRS 24
+    int ns_start[NEG_MAX_RRS];
+    int ns_rdoff[NEG_MAX_RRS];
+    uint16_t ns_rdlen[NEG_MAX_RRS];
+    char ns_names[NEG_MAX_RRS][256];
+    uint16_t ns_types[NEG_MAX_RRS];
+    int ns_n = 0;
+    char zone[256] = {0};
+    uint8_t dnskey_rd[128];
+    int dnskey_rdlen = 0;
+    for (int i = 0; i < nscount && off < rlen; i++) {
+        int rr_start = off;
+        char rname[256];
+        int a = name_from_wire(resp, rlen, off, rname, sizeof(rname));
+        if (a < 0 || a + 10 > rlen)
+            break;
+        uint16_t rtype = get16(resp, a);
+        uint16_t rdlen = get16(resp, a + 8);
+        if (a + 10 + (int) rdlen > rlen)
+            break;
+        if (rtype == DNS_TYPE_SOA && !zone[0])
+            safe_strcpy(zone, rname, sizeof(zone));
+        if (ns_n < NEG_MAX_RRS) {
+            ns_start[ns_n] = rr_start;
+            ns_rdoff[ns_n] = a + 10;
+            ns_rdlen[ns_n] = rdlen;
+            safe_strcpy(ns_names[ns_n], rname, sizeof(ns_names[ns_n]));
+            ns_types[ns_n] = rtype;
+            ns_n++;
+        }
+        off = a + 10 + (int) rdlen;
+    }
+    /* A negative response doesn't normally carry its zone's DNSKEY, but if
+     * one happens to be glued into the additional section (mirrors the
+     * in-band check dnssec_validate_response does on the answer section),
+     * use it instead of an upstream round trip. */
+    for (int i = 0; i < ntohs(h->arcount) && off < rlen; i++) {
+        char rname[256];
+        int a = name_from_wire(resp, rlen, off, rname, sizeof(rname));
+        if (a < 0 || a + 10 > rlen)
+            break;
+        uint16_t rtype = get16(resp, a);
+        uint16_t rdlen = get16(resp, a + 8);
+        if (a + 10 + (int) rdlen > rlen)
+            break;
+        if (rtype == DNS_TYPE_DNSKEY && dnskey_rdlen == 0 && rdlen > 0 &&
+            rdlen <= (int) sizeof(dnskey_rd)) {
+            memcpy(dnskey_rd, resp + a + 10, rdlen);
+            dnskey_rdlen = (int) rdlen;
+        }
+        off = a + 10 + (int) rdlen;
+    }
+    if (!zone[0])
+        return DNSSEC_INSECURE; /* no SOA — not a well-formed denial proof */
+    int soa_secure = 0, saw_bogus = 0;
+    for (int i = 0; i < ns_n; i++) {
+        if (ns_types[i] != DNS_TYPE_RRSIG)
+            continue;
+        const char *rname = ns_names[i];
+        uint16_t rdlen = ns_rdlen[i];
+        uint8_t rrsig_rd[512];
+        if (rdlen < 18 || rdlen > (int) sizeof(rrsig_rd))
+            continue;
+        memcpy(rrsig_rd, resp + ns_rdoff[i], rdlen);
+        uint16_t covered = get16(rrsig_rd, 0);
+        if (covered != DNS_TYPE_SOA && covered != DNS_TYPE_NSEC && covered != DNS_TYPE_NSEC3)
+            continue;
+        int rr_offs[NEG_MAX_RRS];
+        int rr_n = 0;
+        int rdata_off = -1;
+        uint16_t rdata_len = 0;
+        for (int j = 0; j < ns_n; j++) {
+            if (ns_types[j] == covered && strcmp(ns_names[j], rname) == 0) {
+                rr_offs[rr_n++] = ns_start[j];
+                if (rdata_off < 0) {
+                    rdata_off = ns_rdoff[j];
+                    rdata_len = ns_rdlen[j];
+                }
+            }
+        }
+        if (rr_n == 0)
+            continue;
+        if (dnskey_rdlen == 0)
+            dnskey_rdlen = dnssec_fetch_dnskey(zone, dnskey_rd, (int) sizeof(dnskey_rd));
+        if (dnskey_rdlen == 0)
+            return DNSSEC_INSECURE;
+        int r = dnssec_verify_rrset(resp, rlen, rr_offs, rr_n, rrsig_rd, rdlen, dnskey_rd,
+                                    dnskey_rdlen);
+        if (r == 0) {
+            saw_bogus = 1;
+            continue;
+        }
+        if (r == 1 && dnskey_is_trusted(dnskey_rd, dnskey_rdlen)) {
+            if (covered == DNS_TYPE_SOA) {
+                soa_secure = 1;
+            } else if (*proof_count < max_proofs) {
+                nsec_proof_t *pr = &proofs[*proof_count];
+                if (nsec_parse_rdata(resp, rlen, rname, covered, rdata_off, rdata_len, pr)) {
+                    safe_strcpy(pr->zone, zone, sizeof(pr->zone));
+                    (*proof_count)++;
+                }
+            }
+        }
+        /* r == -1 (unsupported alg) or an untrusted key: neither bogus nor
+         * securely proven — just doesn't contribute to SECURE. */
+    }
+    if (saw_bogus)
+        return DNSSEC_BOGUS;
+    if (soa_secure && *proof_count > 0)
+        return DNSSEC_SECURE;
+    return DNSSEC_INSECURE;
+#undef NEG_MAX_RRS
 }
 
 /* =========================================================================
@@ -2559,6 +2863,125 @@ static void cache_entry_copy_free(cache_entry_t *e) {
     free(e);
 }
 
+/* =========================================================================
+ * RFC 8198 — aggressive NSEC/NSEC3 span store
+ *
+ * A bounded ring buffer of validated denial spans (see dnssec_validate_
+ * negative() above). Ring/FIFO eviction rather than LRU or expiry-aware
+ * bookkeeping: this is a best-effort accelerator layered on top of the real
+ * cache/upstream path, never the only source of an answer's correctness, so
+ * the O(1)-insert/O(n)-scan tradeoff is fine at this bound.
+ * ======================================================================= */
+#define MAX_AGG_NSEC 2048
+
+typedef struct {
+    nsec_proof_t proof;
+    time_t expiry;
+    int in_use;
+} agg_nsec_slot_t;
+
+static agg_nsec_slot_t g_agg_nsec[MAX_AGG_NSEC];
+static int g_agg_nsec_next = 0;
+static pthread_mutex_t g_agg_nsec_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ttl_secs is the entry's already-computed negative TTL (SOA minimum, capped
+ * by g_cfg.cache_neg_ttl) — the span never outlives the record it came from,
+ * satisfying the "do not exceed the original denial TTL" guardrail. */
+static void aggressive_nsec_insert(const nsec_proof_t *proof, uint32_t ttl_secs) {
+    if (ttl_secs == 0)
+        return;
+    pthread_mutex_lock(&g_agg_nsec_mutex);
+    agg_nsec_slot_t *slot = &g_agg_nsec[g_agg_nsec_next];
+    g_agg_nsec_next = (g_agg_nsec_next + 1) % MAX_AGG_NSEC;
+    slot->proof = *proof;
+    slot->expiry = time(NULL) + (time_t) ttl_secs;
+    slot->in_use = 1;
+    pthread_mutex_unlock(&g_agg_nsec_mutex);
+}
+
+/* True if `name` is inside (or equal to) `zone` (case-insensitive suffix
+ * match on whole labels only). Bounds aggressive spans to the zone they were
+ * proven in — a resolverd forwarding for many unrelated domains must never
+ * let one zone's NSEC chain answer for another. */
+static int name_in_zone(const char *name, const char *zone) {
+    if (!zone[0])
+        return 1; /* root zone covers everything */
+    size_t nlen = strlen(name), zlen = strlen(zone);
+    if (nlen < zlen)
+        return 0;
+    if (strcasecmp(name + (nlen - zlen), zone) != 0)
+        return 0;
+    return nlen == zlen || name[nlen - zlen - 1] == '.';
+}
+
+/*
+ * aggressive_nsec_answer — consult validated denial spans for a name that
+ * just missed the ordinary cache. On a match, populates *out and returns 1
+ * (NXDOMAIN for a gap match, NODATA for an owner-name/type-bitmap match);
+ * returns 0 if nothing covers it (caller falls through to upstream).
+ */
+typedef struct {
+    int is_nxdomain; /* 1 = name doesn't exist; 0 = name exists, type doesn't (NODATA) */
+} agg_nsec_result_t;
+
+static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_result_t *out) {
+    if (!g_cfg.aggressive_nsec_enabled)
+        return 0;
+    time_t now = time(NULL);
+    uint8_t qhash[20];
+    int qhash_valid_for_iters = -1, qhash_valid_for_saltlen = -1;
+    int found = 0;
+    pthread_mutex_lock(&g_agg_nsec_mutex);
+    for (int i = 0; i < MAX_AGG_NSEC && !found; i++) {
+        agg_nsec_slot_t *slot = &g_agg_nsec[i];
+        if (!slot->in_use || slot->expiry <= now)
+            continue;
+        nsec_proof_t *p = &slot->proof;
+        if (!name_in_zone(qname, p->zone))
+            continue;
+        if (p->is_nsec3) {
+            if (p->optout)
+                continue; /* RFC 8198 §5 / RFC 5155 §7.2.1: never synthesize
+                             across an opt-out span. */
+            /* Hash the candidate once per distinct (iterations, saltlen)
+             * pair seen — in practice every span in one zone shares params. */
+            if (qhash_valid_for_iters != p->nsec3_iters ||
+                qhash_valid_for_saltlen != p->nsec3_saltlen) {
+                nsec3_hash_raw(qname, p->nsec3_salt, p->nsec3_saltlen, p->nsec3_iters, qhash);
+                qhash_valid_for_iters = p->nsec3_iters;
+                qhash_valid_for_saltlen = p->nsec3_saltlen;
+            }
+            int cmp_owner = memcmp(qhash, p->owner_hash, 20);
+            int cmp_next = memcmp(qhash, p->next_hash, 20);
+            int wraps = memcmp(p->owner_hash, p->next_hash, 20) >= 0;
+            if (cmp_owner == 0) {
+                if (nsec_bitmap_has_type(p->bitmap, p->bitmap_len, qtype))
+                    continue; /* type actually exists here — can't help */
+                out->is_nxdomain = 0;
+                found = 1;
+            } else if (wraps ? (cmp_owner > 0 || cmp_next < 0) : (cmp_owner > 0 && cmp_next < 0)) {
+                out->is_nxdomain = 1;
+                found = 1;
+            }
+        } else {
+            int cmp_owner = canon_name_cmp(qname, p->owner);
+            int cmp_next = canon_name_cmp(qname, p->next);
+            int wraps = canon_name_cmp(p->owner, p->next) >= 0;
+            if (cmp_owner == 0) {
+                if (nsec_bitmap_has_type(p->bitmap, p->bitmap_len, qtype))
+                    continue;
+                out->is_nxdomain = 0;
+                found = 1;
+            } else if (wraps ? (cmp_owner > 0 || cmp_next < 0) : (cmp_owner > 0 && cmp_next < 0)) {
+                out->is_nxdomain = 1;
+                found = 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_agg_nsec_mutex);
+    return found;
+}
+
 /* Flush one specific entry (or all entries if qname is NULL) */
 static int cache_flush(const char *qname, uint16_t qtype) {
     int count = 0;
@@ -3093,6 +3516,21 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
     if (ce)
         return serve_cached_entry(ce, qname, result);
 
+    /* 2.5 RFC 8198: a validated NSEC/NSEC3 denial span from an earlier query
+     * may already prove this name/type doesn't exist — answer from it
+     * without going upstream at all. */
+    agg_nsec_result_t agg;
+    if (aggressive_nsec_answer(qname, qtype, &agg)) {
+        pthread_mutex_lock(&g_stat_mutex);
+        g_stat_hits++;
+        pthread_mutex_unlock(&g_stat_mutex);
+        result->from_cache = 1;
+        result->ancount = 0;
+        result->dnssec_status = (int) DNSSEC_SECURE;
+        result->rcode = agg.is_nxdomain ? 3 /* NXDOMAIN */ : 0 /* NOERROR/NODATA */;
+        return result->rcode;
+    }
+
     /* 3. Miss — query upstream */
     pthread_mutex_lock(&g_stat_mutex);
     g_stat_misses++;
@@ -3123,7 +3561,17 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
     /* 4. Parse response + DNSSEC validation */
     ce = parse_response_to_entry(resp, rlen, qname, qtype);
     if (ce) {
-        ce->dnssec_status = (int) dnssec_validate_response(resp, rlen, qname);
+        if (ce->negative) {
+            nsec_proof_t proofs[MAX_NEG_PROOFS];
+            int proof_n = 0;
+            ce->dnssec_status =
+                (int) dnssec_validate_negative(resp, rlen, qname, proofs, MAX_NEG_PROOFS, &proof_n);
+            if (ce->dnssec_status == (int) DNSSEC_SECURE)
+                for (int i = 0; i < proof_n; i++)
+                    aggressive_nsec_insert(&proofs[i], ce->neg_ttl);
+        } else {
+            ce->dnssec_status = (int) dnssec_validate_response(resp, rlen, qname);
+        }
         result->dnssec_status = ce->dnssec_status;
         if (ce->dnssec_status == 3 /*BOGUS*/) {
             fprintf(stderr, ";; DNSSEC BOGUS: signature verification FAILED for %s\n", qname);
@@ -3191,6 +3639,21 @@ static int dns_resolve(const char *qname_in, uint16_t qtype, resolve_result_t *r
         }
     }
     return 0;
+}
+
+/*
+ * Maps a dns_resolve() failure code to an RFC 8914 Extended DNS Error so a
+ * stub client that sent EDNS learns *why* an answer is SERVFAIL, rather than
+ * just that it is. Only meaningful for rc<0 (success codes never call this).
+ */
+static void ede_for_resolve_failure(int rc, int *ede_code, const char **ede_text) {
+    if (rc == -2) {
+        *ede_code = EDE_DNSSEC_BOGUS;
+        *ede_text = "DNSSEC validation failed";
+    } else {
+        *ede_code = EDE_NETWORK_ERROR;
+        *ede_text = "No response from upstream";
+    }
 }
 
 /* =========================================================================
@@ -3313,6 +3776,24 @@ static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct 
         }
     }
     rh->ancount = htons((uint16_t) ancount);
+    /* RFC 8914: tell an EDNS-speaking client why a failed resolution is
+     * SERVFAIL. Only attach an OPT record at all if the client sent one. */
+    edns_info_t req_ei;
+    edns_parse(pkt, plen, &req_ei);
+    int arcount = 0;
+    if (req_ei.present) {
+        int ede_code = -1;
+        const char *ede_text = NULL;
+        if (rc < 0)
+            ede_for_resolve_failure(rc, &ede_code, &ede_text);
+        int new_off = edns_append_opt(resp, off, (int) sizeof(resp), 0 /* is_tcp */, req_ei.do_bit,
+                                      0, &req_ei, NULL, NULL, ede_code, ede_text, -1, 0, NULL);
+        if (new_off > off) {
+            off = new_off;
+            arcount = 1;
+        }
+    }
+    rh->arcount = htons((uint16_t) arcount);
     sendto(srv_fd, resp, off, 0, src, srclen);
 }
 
@@ -3441,6 +3922,24 @@ static void proxy_handle_tcp(int cfd) {
         }
     }
     rh->ancount = htons((uint16_t) ancount);
+    /* RFC 8914: tell an EDNS-speaking client why a failed resolution is
+     * SERVFAIL. Only attach an OPT record at all if the client sent one. */
+    edns_info_t req_ei;
+    edns_parse(pkt, qlen, &req_ei);
+    int arcount = 0;
+    if (req_ei.present) {
+        int ede_code = -1;
+        const char *ede_text = NULL;
+        if (rc < 0)
+            ede_for_resolve_failure(rc, &ede_code, &ede_text);
+        int new_off = edns_append_opt(resp, off, (int) sizeof(resp), 1 /* is_tcp */, req_ei.do_bit,
+                                      0, &req_ei, NULL, NULL, ede_code, ede_text, -1, 0, NULL);
+        if (new_off > off) {
+            off = new_off;
+            arcount = 1;
+        }
+    }
+    rh->arcount = htons((uint16_t) arcount);
     /* Send with 2-byte length prefix */
     uint8_t hdr[2];
     hdr[0] = off >> 8;
@@ -3744,6 +4243,7 @@ static void config_load_env(void) {
     g_cfg.dns0x20_enabled = atoi(getenv_or("DNS0X20_ENABLED", "1"));
     safe_strcpy(g_cfg.dns0x20_disable, getenv_or("DNS0X20_DISABLE", ""),
                 sizeof(g_cfg.dns0x20_disable));
+    g_cfg.aggressive_nsec_enabled = atoi(getenv_or("AGGRESSIVE_NSEC", "1"));
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count = 0;
     const char *sdomains = getenv_or("SEARCH_DOMAINS", "");

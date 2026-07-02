@@ -2720,17 +2720,17 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
 finish_answer:
     rh->ancount = htons((uint16_t) answers);
+    /* NXDOMAIN/NODATA answered authoritatively are normal answers, not
+     * errors — RFC 8914 EDE is for surfacing failure causes (mirrors the
+     * identical fix in dns_server.c). */
     int ede_code = -1;
     const char *ede_text = NULL;
     if (answers == 0) {
         /* RFC 2308: add SOA in authority for NXDOMAIN / NODATA */
         if (!found) {
             rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NXDOMAIN);
-            ede_code = EDE_NXDOMAIN;
-            ede_text = "Name does not exist in zone";
         } else { /* NODATA — name exists, type doesn't */
             rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NOERROR);
-            ede_code = EDE_NOT_AUTH;
         }
         off = add_soa_authority(resp, off, resp_len, dnssec_ok, &auth_count);
         if (dnssec_ok)

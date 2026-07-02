@@ -4002,43 +4002,13 @@ static void catalog_scan_all(void) {
 
 /* RFC 5155 Sec 5: base32hex encoding */
 
-/* Compute NSEC3 owner name for a given qname */
+/* Compute NSEC3 owner name for a given qname. The SHA-1 iteration itself
+ * lives once in libdnswire's nsec3_hash_raw (shared with resolverd's RFC 8198
+ * aggressive-cache gap matching) so the two can never diverge. */
 static void nsec3_hash_name(const char *name, const uint8_t *salt, int saltlen, int iters,
                             char *out_b32hex, int out_len) {
-    /* Wire-encode the name (lowercase); RFC 1035 max wire length = 255 bytes */
-    char lname[256];
-    safe_strcpy(lname, name, sizeof(lname));
-    strlower(lname);
-    uint8_t wire[257];
-    int wlen = 0; /* 257 = 255 payload + 1 root + guard */
-    char tmp[256];
-    safe_strcpy(tmp, lname, sizeof(tmp));
-    char *sp3 = NULL;
-    char *lbl = strtok_r(tmp, ".", &sp3);
-    while (lbl) {
-        int ll = (int) strlen(lbl);
-        if (ll > 63 || wlen + ll + 1 > 255)
-            break; /* enforce label and total limits */
-        wire[wlen++] = (uint8_t) ll;
-        memcpy(wire + wlen, lbl, ll);
-        wlen += ll;
-        lbl = strtok_r(NULL, ".", &sp3);
-    }
-    if (wlen < 256)
-        wire[wlen++] = 0; /* root label */
-    /* Iterative SHA-1: H(x) = SHA-1(x || salt), repeated iters+1 times */
     uint8_t h[20];
-    uint8_t ibuf[256 + 64];
-    int iblen = wlen;
-    memcpy(ibuf, wire, wlen);
-    memcpy(ibuf + wlen, salt, saltlen);
-    iblen += saltlen;
-    sha1(ibuf, iblen, h);
-    for (int i = 0; i < iters; i++) {
-        memcpy(ibuf, h, 20);
-        memcpy(ibuf + 20, salt, saltlen);
-        sha1(ibuf, 20 + saltlen, h);
-    }
+    nsec3_hash_raw(name, salt, saltlen, iters, h);
     base32hex_enc(h, 20, out_b32hex, out_len);
 }
 
@@ -5858,7 +5828,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 off = 12 + qsec2;
             } else
                 off = 12;
-            off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, EDE_NOT_AUTH,
+            off = dnsd_edns_opt(resp, off, resp_len, is_tcp, 0, 0, &ei, cip, EDE_NOT_AUTHORITATIVE,
                                 "Not authoritative for this zone");
             dns_log(LOG_DEBUG, "[REFUSED] %s %s\n", type2str(qtype), qname);
             STAT_INC(g_stat_refused);
@@ -5898,8 +5868,11 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 off = add_nsec_denial(resp, off, resp_len, qname, dnssec_ok, &ac2);
             rh->nscount = htons(ntohs(rh->nscount) + (uint16_t) ac2);
         }
-        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, EDE_NXDOMAIN,
-                            "Locally served zone");
+        /* A locally-served RFC 6303 blackhole zone answering NXDOMAIN is a
+         * normal, correct authoritative answer, not an error — EDE isn't for
+         * this (see the identical reasoning at the ede_code assignment
+         * below). */
+        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip, -1, NULL);
         return off;
     }
     /* DNSSEC signing keys for the matched zone (NULL for locally-served zones). */
@@ -6500,18 +6473,20 @@ finish_answer:
             off = 12 + (after - 12) + 4; /* header + question only */
         }
     }
+    /* NXDOMAIN/NODATA answered authoritatively from a configured zone are
+     * normal, correct DNS answers, not errors — RFC 8914 EDE is for
+     * surfacing failure causes, so neither branch attaches one (an actual
+     * REFUSED/failure path still does, above and in the caller's SERVFAIL
+     * branches). */
     int ede_code = -1;
     const char *ede_text = NULL;
     if (answers == 0) {
         /* RFC 2308: add SOA in authority for NXDOMAIN / NODATA */
         if (!found) {
             rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NXDOMAIN);
-            ede_code = EDE_NXDOMAIN;
-            ede_text = "Name does not exist in zone";
             STAT_INC(g_stat_nxdomain);
         } else { /* NODATA — name exists, type doesn't */
             rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NOERROR);
-            ede_code = EDE_NOT_AUTH;
             STAT_INC(g_stat_noerror);
         }
         off = add_soa_authority(resp, off, resp_len, dnssec_ok, &auth_count);

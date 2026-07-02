@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -356,6 +356,16 @@ check-dnssec: tests/test_dnssec_verify.c tests/test_rollover.c resolverd.c $(WIR
 	      $(INCLUDES) -I. -o tests/test_rollover \
 	      tests/test_rollover.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
 	./tests/test_rollover
+
+# RFC 8198 aggressive NSEC/NSEC3 cache: rdata extraction, gap-covering
+# lookup, and end-to-end SOA+NSEC authority-section validation.
+check-aggressive-nsec: tests/test_aggressive_nsec.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_aggressive_nsec"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
+	      $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_aggressive_nsec \
+	      tests/test_aggressive_nsec.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_aggressive_nsec
 
 # name_from_wire compression-handling tests.
 # -Wno-unused-function: -DUNIT_TEST compiles out resolverd.c's main(), which
@@ -1901,6 +1911,35 @@ check-serve-stale: resolverd_debug
 	 test "$$NEVERCOUNT" = "1" || { echo "  FAIL  RFC 9520 SERVFAIL caching did not suppress the retry (upstream saw $$NEVERCOUNT queries, expected 1)"; cat /tmp/servfail_stub.log; exit 1; }; \
 	 echo "  OK  stale cache served on upstream SERVFAIL, and the repeat SERVFAIL was suppressed via the RFC 9520 cache"
 
+# RFC 8914 Extended DNS Errors: resolverd tells its own stub clients *why* an
+# answer is SERVFAIL. Two halves: a C known-answer test locking the rc->EDE
+# info-code mapping against a silently-wrong constant (tests/test_ede.c), and
+# a live dig-driven check that the OPT/EDE actually lands on the wire — gated
+# on the client having sent EDNS at all, and carrying the correct EDE code.
+check-ede: tests/test_ede.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h resolverd_debug | ossl-sanity
+	@echo "  CC [TEST]  tests/test_ede"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation -Wno-unused-function \
+	      $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_ede \
+	      tests/test_ede.c $(WIRE_SRC) $(SANDBOX_SRC) $(LIBS)
+	./tests/test_ede
+	@echo "  CHECK  RFC 8914 EDE on the wire (requires python3 + dig)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 python3 tests/servfail_upstream.py 127.0.0.1 5414 primed.ede.test 1 203.0.113.44 > /tmp/ede_stub.log 2>&1 & STUB=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5415 ./resolverd_debug --upstream 127.0.0.1:5414 \
+	     --no-dnssec --no-valkey > /tmp/resolverd_ede.log 2>&1 & RD=$$!;                       \
+	 sleep 1.5;                                                                                \
+	 WITH_EDNS=$$(dig @127.0.0.1 -p 5415 +dnssec +time=2 +tries=1 neverseen.ede.test A);       \
+	 NO_EDNS=$$(dig @127.0.0.1 -p 5415 +noedns +time=2 +tries=1 neverseen2.ede.test A);        \
+	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                           \
+	 EDECODE=$$(echo "$$WITH_EDNS" | grep -o "EDE: [0-9]*" | head -1);                         \
+	 ADDCOUNT=$$(echo "$$NO_EDNS" | grep -o "ADDITIONAL: [0-9]*" | head -1);                   \
+	 echo "  with-EDNS EDE=[$$EDECODE]   without-EDNS $$ADDCOUNT";                             \
+	 echo "$$WITH_EDNS" | grep -q "status: SERVFAIL" || { echo "  FAIL  never-cached name did not SERVFAIL"; cat /tmp/resolverd_ede.log; exit 1; }; \
+	 test "$$EDECODE" = "EDE: 23" || { echo "  FAIL  expected EDE: 23 (Network Error) on the wire, got [$$EDECODE]"; exit 1; }; \
+	 test "$$ADDCOUNT" = "ADDITIONAL: 0" || { echo "  FAIL  resolverd attached an OPT record to a client that never sent EDNS"; exit 1; }; \
+	 echo "  OK  EDE_NETWORK_ERROR (23) surfaced only to the EDNS-speaking client"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -1910,7 +1949,7 @@ clean:
 	      resolverd resolverd_debug \
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
-	      tests/test_zonemd tests/test_csync \
+	      tests/test_zonemd tests/test_csync tests/test_aggressive_nsec tests/test_ede \
 	      fuzz/fuzz_name_from_wire
 	@echo "  done"
 
@@ -1964,6 +2003,8 @@ help:
 	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"
 	@echo "  make check-dns0x20   resolverd RFC 5452 0x20 QNAME case randomization (needs dig + python3)"
 	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
+	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
+	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"
