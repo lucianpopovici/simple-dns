@@ -33,7 +33,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-eppd.md` | eppd | ADR-002, registry back-end (phased) |
 | `CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance — done except moving the libFuzzer harness into the lib's own test tree |
 | `CLAUDE-certd.md` | certd | PKI: ACME/EST extraction (done) + ARI (Add 1, done); Add 2/3 optional, TLSA/CAA integration + STAR roadmap still open |
-| `CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy (Add 1, done) + DSO/Push (Add 2, done); Add 3 (SRP) still open |
+| `CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy (Add 1) + DSO/Push (Add 2) + SRP (Add 3, registration handler lives in dnsd) — all done |
 | `specs/CLAUDE-resolverd.md` | resolverd | Forwarding/validating cache, Option A — **done** (Add 1 skipped, Adds 2–7 done), archived untracked |
 | `CLAUDE-rfc-skipped.md` | (triage) | Exclusion record with reasons |
 | `CLAUDE-roadmap.md` | all | Execution order (Phase 0 security → 1 ADRs → 2 features) |
@@ -130,7 +130,7 @@ Done: 6762 (mDNS), 6763 (DNS-SD).
 |----:|-----|---------|--------|
 | 1 | 8766 | Discovery Proxy (mDNS ↔ unicast DNS-SD) | **Done** 2026-07-02 (`make check-dp`) |
 | 2 | 8490 + 8765 | DSO + DNS Push Notifications | **Done** 2026-07-03 (`make check-dso`) |
-| 3 | 9665 + 9664 | SRP + UPDATE leases | Specced (larger) |
+| 3 | 9665 + 9664 | SRP + UPDATE leases | **Done** 2026-07-03 (`make check-srp`; registration handler lives in dnsd, not mdnsd) |
 
 References: 8882, 7558, 8552/8553.
 

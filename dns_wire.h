@@ -27,6 +27,8 @@
 #define DNS_TYPE_PTR 12
 #define DNS_TYPE_MX 15
 #define DNS_TYPE_TXT 16
+#define DNS_TYPE_SIG 24 /* RFC 2931 §3 — transaction signature (SIG(0)) when type-covered=0 */
+#define DNS_TYPE_KEY 25 /* RFC 2535 §3 — public key, reused unchanged by RFC 2931 SIG(0) */
 #define DNS_TYPE_AAAA 28
 #define DNS_TYPE_LOC 29
 #define DNS_TYPE_SRV 33
@@ -94,7 +96,8 @@
 
 /* ── EDNS(0) constants (RFC 6891) ────────────────────────────────────────── */
 
-#define EDNS_MAX_UDP 1232 /* current BCP 2020 recommendation */
+#define EDNS_MAX_UDP 1232       /* current BCP 2020 recommendation */
+#define EDNS_OPT_UPDATE_LEASE 2 /* RFC 9664 — "UL": DNS-SD SRP lease negotiation */
 #define EDNS_OPT_NSID 3
 #define EDNS_OPT_COOKIE 10
 #define EDNS_OPT_KEEPALIVE 11
@@ -172,7 +175,11 @@ typedef struct {
     int has_padding;
     uint16_t padding_req;
     int keepalive_req;
-    int zoneversion_req; /* RFC 9660: client sent OPTION-CODE 19, OPTION-LENGTH 0 */
+    int zoneversion_req;  /* RFC 9660: client sent OPTION-CODE 19, OPTION-LENGTH 0 */
+    int has_update_lease; /* RFC 9664: client sent OPTION-CODE 2 (4 or 8 bytes) */
+    uint32_t update_lease;
+    int has_update_key_lease; /* set iff the 8-byte variant was sent */
+    uint32_t update_key_lease;
 } edns_info_t;
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
@@ -208,6 +215,25 @@ int base32hex_dec(const char *in, uint8_t *out, int outlen);
  * (not base32hex-encoded). Shared by dnsd (signing) and resolverd (RFC 8198
  * aggressive-cache gap matching) so the two can never diverge. */
 void nsec3_hash_raw(const char *name, const uint8_t *salt, int saltlen, int iters, uint8_t out[20]);
+
+/* ── Generic DNSSEC-algorithm signature verification ─────────────────────────
+ * Shared by resolverd (RRSIG validation) and dnsd (RFC 2931 SIG(0) transaction
+ * signatures) — both verify the same two algorithms against the same raw
+ * (non-DER) 64-byte signature encoding DNSSEC uses; only what counts as
+ * "data" differs (canonical RRset vs. a DNS message), which the caller
+ * assembles before calling in. */
+
+/* Verify an ECDSA P-256 (alg 13) signature.
+ * sig_raw: 64-byte raw R||S (not DER). pubkey_xy: 64-byte X||Y (the DNSKEY/KEY
+ * rdata's public-key field, after its 4-byte flags/protocol/algorithm
+ * prefix). Returns 1 if valid, 0 otherwise (including on any internal error —
+ * fail closed). */
+int verify_ecdsa_p256(const uint8_t *sig_raw, const uint8_t *data, int dlen,
+                      const uint8_t pubkey_xy[64]);
+
+/* Verify an Ed25519 (alg 15) signature.
+ * sig_raw: 64-byte signature. pubkey: 32-byte raw Ed25519 public key. */
+int verify_ed25519(const uint8_t *sig_raw, const uint8_t *data, int dlen, const uint8_t pubkey[32]);
 
 /* ── Fixed-width big-endian accessors ────────────────────────────────────── */
 
@@ -303,13 +329,19 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei);
  *             this is unconditional (not gated on ede_code) — a resolver may
  *             validate a cached RRset, and thus discover an error, well after
  *             the response that carried this option.
+ *   has_ul / ul_lease / has_ul_key_lease / ul_key_lease - RFC 9664 §1: the
+ *             granted Update Lease option for an SRP registration response
+ *             (RFC 9665). has_ul=0 omits the option entirely; has_ul_key_lease
+ *             selects the 8-byte (LEASE+KEY-LEASE) vs 4-byte (LEASE only)
+ *             wire variant.
  *
  * The correct server cookie is IP-bound (RFC 9018 §4.2): callers must compute
  * it before calling this function and pass the result as scookie. */
 int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
                     const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
                     int ede_code, const char *ede_text, int zv_labels, uint32_t zv_serial,
-                    const char *report_agent);
+                    const char *report_agent, int has_ul, uint32_t ul_lease, int has_ul_key_lease,
+                    uint32_t ul_key_lease);
 
 /* ── RFC 4034 §6 canonical-form helpers ──────────────────────────────────── */
 

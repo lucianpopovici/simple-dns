@@ -297,8 +297,8 @@ static void test_edns_append(void) {
     uint8_t buf[512];
     memset(buf, 0, sizeof(buf));
     /* arcount starts at 0 */
-    int off =
-        edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL, -1, 0, NULL);
+    int off = edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL, -1, 0,
+                              NULL, 0, 0, 0, 0);
     check(off > 12, "edns_append_opt returns new offset > 12");
     check(get16(buf, 10) == 1, "arcount incremented to 1");
     /* Verify OPT type at wire position 12: 1 byte root name + 2 bytes type */
@@ -310,6 +310,145 @@ static void test_edns_append(void) {
     check((buf[opt_flags_hi] & 0x80) != 0, "DO bit set in response OPT");
 }
 
+/* ── RFC 9664: EDNS Update Lease option (SRP) ─────────────────────────────── */
+static void test_update_lease_option(void) {
+    printf("== RFC 9664 Update Lease option ==\n");
+
+    /* Parse: 8-byte variant (LEASE + KEY-LEASE) in a request. */
+    {
+        uint8_t pkt[128];
+        memset(pkt, 0, 12);
+        put16(pkt, 10, 1); /* arcount=1 */
+        int off = 12;
+        pkt[off++] = 0; /* OPT owner = root */
+        put16(pkt, off, DNS_TYPE_OPT);
+        off += 2;
+        put16(pkt, off, 1232);
+        off += 2;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        int rdlen_off = off;
+        off += 2;
+        int rdata_start = off;
+        put16(pkt, off, EDNS_OPT_UPDATE_LEASE);
+        off += 2;
+        put16(pkt, off, 8);
+        off += 2;
+        put32(pkt, off, 7200); /* LEASE = 2h */
+        off += 4;
+        put32(pkt, off, 1209600); /* KEY-LEASE = 14d */
+        off += 4;
+        put16(pkt, rdlen_off, (uint16_t) (off - rdata_start));
+
+        edns_info_t ei;
+        edns_parse(pkt, off, &ei);
+        check(ei.has_update_lease, "8-byte variant: has_update_lease set");
+        check(ei.update_lease == 7200, "8-byte variant: LEASE = 7200");
+        check(ei.has_update_key_lease, "8-byte variant: has_update_key_lease set");
+        check(ei.update_key_lease == 1209600, "8-byte variant: KEY-LEASE = 1209600");
+    }
+
+    /* Parse: 4-byte variant (LEASE only) — KEY-LEASE must NOT be set. */
+    {
+        uint8_t pkt[128];
+        memset(pkt, 0, 12);
+        put16(pkt, 10, 1);
+        int off = 12;
+        pkt[off++] = 0;
+        put16(pkt, off, DNS_TYPE_OPT);
+        off += 2;
+        put16(pkt, off, 1232);
+        off += 2;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        int rdlen_off = off;
+        off += 2;
+        int rdata_start = off;
+        put16(pkt, off, EDNS_OPT_UPDATE_LEASE);
+        off += 2;
+        put16(pkt, off, 4);
+        off += 2;
+        put32(pkt, off, 3600);
+        off += 4;
+        put16(pkt, rdlen_off, (uint16_t) (off - rdata_start));
+
+        edns_info_t ei;
+        edns_parse(pkt, off, &ei);
+        check(ei.has_update_lease, "4-byte variant: has_update_lease set");
+        check(ei.update_lease == 3600, "4-byte variant: LEASE = 3600");
+        check(!ei.has_update_key_lease, "4-byte variant: has_update_key_lease NOT set");
+    }
+
+    /* Append: round-trip through edns_append_opt then edns_parse. */
+    {
+        uint8_t buf[512];
+        memset(buf, 0, sizeof(buf));
+        int off = edns_append_opt(buf, 12, sizeof(buf), 0, 0, 0, NULL, NULL, NULL, -1, NULL, -1, 0,
+                                  NULL, 1, 5400, 1, 864000);
+        check(off > 12, "edns_append_opt with has_ul=1 returns new offset");
+
+        edns_info_t ei;
+        edns_parse(buf, off, &ei);
+        check(ei.has_update_lease && ei.update_lease == 5400, "round-trip: LEASE echoed correctly");
+        check(ei.has_update_key_lease && ei.update_key_lease == 864000,
+              "round-trip: KEY-LEASE echoed correctly");
+    }
+
+    /* Omitted when has_ul=0 — must not appear even if buffer has room. */
+    {
+        uint8_t buf[512];
+        memset(buf, 0, sizeof(buf));
+        int off = edns_append_opt(buf, 12, sizeof(buf), 0, 0, 0, NULL, NULL, NULL, -1, NULL, -1, 0,
+                                  NULL, 0, 5400, 1, 864000);
+        edns_info_t ei;
+        edns_parse(buf, off, &ei);
+        check(!ei.has_update_lease, "has_ul=0 omits the option entirely");
+    }
+}
+
+/* ── RFC 4648 §4: base64 padding must terminate decoding ──────────────────
+ * Regression for a real bug found via RFC 2931 SIG(0) KEY-lookup: the
+ * decode alphabet table mapped '=' to 0 (i.e. treated it as 'A') instead of
+ * -1 (padding/terminator), so any input whose true length wasn't a multiple
+ * of 3 bytes silently decoded 1-2 bytes too many. This is the "known-answer
+ * + negative" pattern CLAUDE.md asks for on a crypto-adjacent parser bug —
+ * every SIG(0)/TSIG-secret decode goes through this exact function. */
+static void test_base64_padding(void) {
+    printf("== RFC 4648 base64 padding ==\n");
+
+    uint8_t out[64];
+    /* No padding needed: 6 bytes -> 8 base64 chars, exact multiple of 3. */
+    int n = b64std_dec("Zm9vYmFy", out, sizeof(out));
+    check(n == 6 && memcmp(out, "foobar", 6) == 0, "unpadded input decodes exactly");
+
+    /* One '=' (2 padding bytes worth of zero-fill in the encoding): "fo" (2
+     * bytes) encodes as "Zm8=". */
+    n = b64std_dec("Zm8=", out, sizeof(out));
+    check(n == 2 && memcmp(out, "fo", 2) == 0, "single '=' padding decodes to 2 bytes, not 3");
+
+    /* Two '==': "f" (1 byte) encodes as "Zg==". This is the exact shape
+     * that triggered the bug (a 64-byte EC pubkey has the same 1-byte
+     * remainder, so its base64 also ends in "=="). */
+    n = b64std_dec("Zg==", out, sizeof(out));
+    check(n == 1 && out[0] == 'f', "double '==' padding decodes to 1 byte, not 3");
+
+    /* A realistic 64-byte payload round-tripped through openssl-style
+     * base64 (88 chars, trailing "=="): must decode to exactly 64 bytes. */
+    n = b64std_dec(
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0"
+        "+Pw==",
+        out, sizeof(out));
+    int seq_ok = (n == 64);
+    for (int i = 0; seq_ok && i < 64; i++)
+        seq_ok = (out[i] == i);
+    check(seq_ok, "64-byte 0x00-0x3F sequence with '==' padding decodes to exactly 64 bytes (was "
+                  "66), all bytes correct");
+}
+
 int main(void) {
     test_serial_arithmetic();
     test_ttl_max();
@@ -319,6 +458,8 @@ int main(void) {
     test_edns_parse_do_bit_position();
     test_edns_parse_nsid_cookie();
     test_edns_append();
+    test_update_lease_option();
+    test_base64_padding();
 
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;

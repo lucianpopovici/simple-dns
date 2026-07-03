@@ -10,7 +10,18 @@
  *   2181       Clarifications (QDCOUNT=1 enforced, TTL clamped to 2^31-1)
  *   2308       Negative caching – SOA in authority on NXDOMAIN/NODATA
  *   2782       SRV records
- *   2931       SIG(0) transaction signatures (stub – reject unsigned updates)
+ *   2931       SIG(0) transaction signatures – verification only (asymmetric
+ *              alternative to TSIG for UPDATE: a per-zone KEY RR store,
+ *              zone:<zone>:KEY:<signer>; dnsd does not sign its own SIG(0)
+ *              responses). Algs 13 (ECDSA P-256) and 15 (Ed25519) only.
+ *   9665/9664  SRP (Service Registration Protocol) + Update Leases – device
+ *              self-registration via a SIG(0)-authenticated, delete-all-
+ *              then-add profiled UPDATE (trust-on-first-use: verified
+ *              against a KEY RR embedded in the message, not a pre-
+ *              provisioned trust anchor), gated by an EDNS Update Lease
+ *              option (RFC 9664). Opt-in via config:srp_enabled; records +
+ *              FCFS ownership stored under srp:<zone>:*, reaped by a
+ *              lease-expiry sweeper (config:srp_sweep_secs).
  *   3007       Secure DNS Dynamic Update (TSIG prerequisite)
  *   3596       AAAA records
  *   3597       Unknown RR type pass-through (zone:TYPE:name keys are served as-is;
@@ -113,6 +124,30 @@
  *                              e.g. "e164.arpa" or "e164.example.local". Informational:
  *                              the serving path is the existing zone:NAPTR: store.
  *                              Used by: NAPTR Enumservice warning + provisioning helper.
+ *   zone:<zone>:KEY:<signer>   RFC 2931 SIG(0) trusted public key, KEY-rdata
+ *                              fields as "flags|protocol|algorithm|base64(pubkey)"
+ *                              (protocol MUST be 3; algorithm 13 or 15 — same
+ *                              raw pubkey encoding as DNSKEY). Not served over
+ *                              the wire; read only by sig0_verify to authenticate
+ *                              an RFC 2136 UPDATE signed with the matching
+ *                              private key, as an alternative to TSIG.
+ *   config:srp_enabled         "1" to accept RFC 9665 SRP registrations (opt-in;
+ *                              an SRP-shaped UPDATE — one carrying the RFC 9664
+ *                              Update Lease option — is REFUSED when unset,
+ *                              never silently processed as an ordinary UPDATE).
+ *   config:srp_max_lease_secs / config:srp_max_key_lease_secs
+ *                              Server-side ceiling on the negotiated LEASE /
+ *                              KEY-LEASE (default 24h / 30d). LEASE is always
+ *                              clamped <= KEY-LEASE (RFC 9664 §1).
+ *   config:srp_sweep_secs      Interval of the SRP lease-expiry sweeper
+ *                              (primary only, default 60; same silent-Valkey-
+ *                              TTL-expiry problem config:ddns_sweep_secs solves).
+ *   srp:<zone>:OWNER:<name>    FCFS ownership record ("flags|protocol|algorithm|
+ *                              hex(pubkey)") for a registered host or service
+ *                              instance name — ttl = granted KEY-LEASE.
+ *   srp:<zone>:{A,AAAA,SRV,TXT}:<name>   Registered records, ttl = granted LEASE.
+ *   srp:<zone>:PTR:<browse>:<instance>   One key per Service Discovery PTR
+ *                              instance under a shared browse name.
  *   config:rr_rotate           "1" to enable per-name round-robin rotation of
  *                              multi-address A/AAAA RRsets (RFC 1794). Distinct
  *                              from config:lb_mode — uses per-name counters keyed
@@ -299,6 +334,7 @@ static void notify_send(void);
 /* Wire + Valkey helpers used by early code (multi-zone, NSEC) */
 static int vk_set(const char *, const char *, uint32_t);
 static int vk_get(const char *, char *, int);
+static int vk_list_keys_strict(const char *, char ***);
 static int emit_rr(uint8_t *, int, int, const char *, uint16_t, uint32_t, const uint8_t *, uint16_t,
                    int, int *);
 
@@ -451,6 +487,11 @@ static int dkey(char *buf, size_t sz, const char *type, const char *name) {
     const char *zn = t_zone ? t_zone->name : "";
     return snprintf(buf, sz, "ddns:%s:%s:%s", zn, type, name);
 }
+/* Build "srp:<zone>:<type>:<name>" for the current request's zone (RFC 9665). */
+static int skey(char *buf, size_t sz, const char *type, const char *name) {
+    const char *zn = t_zone ? t_zone->name : "";
+    return snprintf(buf, sz, "srp:%s:%s:%s", zn, type, name);
+}
 
 /* Add or update a zone. Returns its index or -1 on error. */
 static int zone_upsert(const char *name, const char *mname, const char *rname, uint32_t serial,
@@ -550,6 +591,25 @@ static int g_ddns_auto_ptr = 0;
  * sweeper detects vanished leases and emits the missing replication events
  * (CLAUDE-discovery.md Gap 2). 0 disables it. */
 static int g_ddns_sweep_secs = 30;
+/* RFC 9665 SRP (Service Registration Protocol) — device self-registration via
+ * a SIG(0)-authenticated, delete-all-then-add profiled UPDATE. Opt-in
+ * (config:srp_enabled), matching the project's "never on by accident"
+ * posture for every other opt-in surface (Discovery Proxy, DSO, etc.) — an
+ * unconfigured server ignores SRP-shaped UPDATEs (REFUSED) rather than
+ * accepting registrations nobody asked for. */
+static int g_srp_enabled = 0;
+/* config:srp_max_lease_secs / config:srp_max_key_lease_secs — server-side
+ * ceiling on what a requester's EDNS Update Lease option can negotiate
+ * (RFC 9664 §1: "Servers MAY return lease durations different from those
+ * specified by the Requester"). Defaults: 24h record lease, 30d key lease —
+ * RFC 9665's own worked example uses 2h/14d as its own *requested* values,
+ * these are the *ceiling* on whatever a requester asks for, deliberately
+ * looser. */
+static uint32_t g_srp_max_lease = 86400;
+static uint32_t g_srp_max_key_lease = 2592000;
+/* config:srp_sweep_secs — interval of the SRP lease-expiry sweeper (primary
+ * only, same silent-Valkey-TTL-expiry problem ddns_sweep_secs solves). */
+static int g_srp_sweep_secs = 60;
 /* config:zone_role — "primary" (default) or "secondary". A secondary is a
  * read-only replica: it pulls the zone from a master and must refuse all local
  * writes (UPDATE → NOTAUTH) and never mint its own DNSSEC keys (it would publish
@@ -2108,6 +2168,11 @@ static void config_load_from_valkey(void) {
     g_ddns_auto_ptr = 0;
     GI("ddns_auto_ptr", g_ddns_auto_ptr);
     GI("ddns_sweep_secs", g_ddns_sweep_secs);
+    g_srp_enabled = 0;
+    GI("srp_enabled", g_srp_enabled);
+    GU("srp_max_lease_secs", g_srp_max_lease);
+    GU("srp_max_key_lease_secs", g_srp_max_key_lease);
+    GI("srp_sweep_secs", g_srp_sweep_secs);
     /* Role: a "secondary" is a read-only replica (hidden-master plan Gap 2). */
     g_zone_secondary = 0;
     {
@@ -4820,7 +4885,7 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
         report_agent = NULL; /* fail closed on the RFC 9567 §4 MUST NOT */
     return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei, g_nsid[0] ? g_nsid : NULL,
                            (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text, zv_labels,
-                           zv_serial, report_agent);
+                           zv_serial, report_agent, 0, 0, 0, 0);
 }
 
 /* ==========================================================================
@@ -6099,6 +6164,11 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             found = 1;
             off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, val, dnssec_ok, &answers);
         }
+        skey(k, sizeof(k), "A", qname); /* RFC 9665 SRP registration, "ttl|ip|ip|..." */
+        if (vk_get(k, val, sizeof(val))) {
+            found = 1;
+            off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, val, dnssec_ok, &answers);
+        }
     }
     /* Dynamic AAAA */
     if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
@@ -6118,6 +6188,12 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
         }
         zkey(k, sizeof(k), "AAAA", qname);
+        if (vk_get(k, val, sizeof(val))) {
+            found = 1;
+            off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, val, dnssec_ok,
+                                  &answers);
+        }
+        skey(k, sizeof(k), "AAAA", qname); /* RFC 9665 SRP registration */
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
             off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, val, dnssec_ok,
@@ -6158,6 +6234,80 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             int rl = name_to_wire(pipe, rd, sizeof(rd));
             if (rl > 0)
                 off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_PTR, ttl, rd, (uint16_t) rl,
+                              dnssec_ok, &answers);
+        }
+        /* RFC 9665 SRP Service Discovery: srp:<zone>:PTR:<browse>:<instance> —
+         * one key per instance (a shared browse name can have many), unlike
+         * every other type above which is one key per owner name. Enumerate
+         * via KEYS glob (vk_list_keys_strict, same helper the DDNS/SRP
+         * sweepers use) rather than a single vk_get. */
+        {
+            char pat[900];
+            snprintf(pat, sizeof(pat), "srp:%s:PTR:%s:*", t_zone ? t_zone->name : "", qname);
+            char **keys = NULL;
+            int nk = vk_list_keys_strict(pat, &keys);
+            for (int i = 0; i < nk; i++) {
+                const char *prefix = pat; /* "...:PTR:<qname>:" up to the trailing '*' */
+                size_t plen2 = strlen(prefix) - 1;
+                const char *target = (strlen(keys[i]) > plen2) ? keys[i] + plen2 : NULL;
+                if (target && target[0]) {
+                    found = 1;
+                    long tl = vk_ttl(keys[i]);
+                    if (tl < 1)
+                        tl = 1;
+                    uint8_t rd2[300];
+                    int rl2 = name_to_wire(target, rd2, sizeof(rd2));
+                    if (rl2 > 0)
+                        off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_PTR, (uint32_t) tl, rd2,
+                                      (uint16_t) rl2, dnssec_ok, &answers);
+                }
+                free(keys[i]);
+            }
+            free(keys);
+        }
+    }
+    /* RFC 9665 SRP: SRV + TXT at a registered service instance name. SRV
+     * shares zone:*'s "ttl|prio|weight|port|target" pipe format (reuses
+     * stored_rdata); TXT stores the raw rdata bytes hex-encoded (not
+     * zone:*'s presentation-text format — SRP TXT rdata can be multi-segment
+     * / binary, so it is replayed verbatim rather than lossily re-encoded). */
+    if (qtype == DNS_TYPE_SRV || qtype == DNS_TYPE_ANY) {
+        char val[600], k[768];
+        skey(k, sizeof(k), "SRV", qname);
+        if (vk_get(k, val, sizeof(val)) && val[0]) {
+            found = 1;
+            uint32_t ttl = DEFAULT_TTL;
+            char *pipe = strchr(val, '|');
+            if (pipe) {
+                ttl = (uint32_t) atoi(val);
+                pipe++;
+            } else {
+                pipe = val;
+            }
+            uint8_t rd[300];
+            int rl = stored_rdata(DNS_TYPE_SRV, pipe, rd, (int) sizeof(rd));
+            if (rl > 0)
+                off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_SRV, ttl, rd, (uint16_t) rl,
+                              dnssec_ok, &answers);
+        }
+    }
+    if (qtype == DNS_TYPE_TXT || qtype == DNS_TYPE_ANY) {
+        char val[950], k[768];
+        skey(k, sizeof(k), "TXT", qname);
+        if (vk_get(k, val, sizeof(val)) && val[0]) {
+            found = 1;
+            uint32_t ttl = DEFAULT_TTL;
+            char *pipe = strchr(val, '|');
+            if (pipe) {
+                ttl = (uint32_t) atoi(val);
+                pipe++;
+            } else {
+                pipe = val;
+            }
+            uint8_t rd[400];
+            int rl = hex_dec(pipe, rd, sizeof(rd));
+            if (rl > 0)
+                off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_TXT, ttl, rd, (uint16_t) rl,
                               dnssec_ok, &answers);
         }
     }
@@ -6561,6 +6711,730 @@ static void auto_ptr_apply(const char *fqdn, const char *ipstr, uint32_t ttl, in
 }
 
 /* ==========================================================================
+ * RFC 2931 SIG(0) transaction signatures
+ *
+ * An asymmetric alternative to TSIG for authenticating an UPDATE: instead of
+ * a shared secret, the client signs the message with its own private key and
+ * the server verifies against a KEY RR it already trusts. Trusted keys are
+ * provisioned per-zone as ordinary KEY (type 25) records —
+ * zone:<zone>:KEY:<signer-name> -> "flags|protocol|algorithm|base64(pubkey)"
+ * — the same zone:* store every other RR type already lives in (owned by the
+ * control plane per CLAUDE.md's ownership table; no new namespace). This is
+ * the verification half only: dnsd does not sign its own UPDATE responses
+ * (RFC 2931 doesn't require it, and doing so would need dnsd's own SIG(0)
+ * signing identity — a separate concern from DNSSEC zone-signing keys).
+ *
+ * Reuses the exact same "hash the message with the trailing RR's ARCOUNT
+ * patched out" technique as tsig_verify above, and the same
+ * verify_ecdsa_p256 / verify_ed25519 primitives (via libdnswire) that
+ * resolverd uses to validate RRSIGs — same algorithms (13, 15), same raw
+ * 64-byte signature encoding, just different "data" being verified.
+ * ======================================================================= */
+typedef struct {
+    uint8_t algorithm;
+    uint32_t sig_expiration;
+    uint32_t sig_inception;
+    uint16_t key_tag;
+    char signer_name[256];
+    const uint8_t *rdata_prefix; /* SIG rdata up to (not including) the signature, as received */
+    int rdata_prefix_len;
+    const uint8_t *signature;
+    int siglen;
+} sig0_rr_t;
+
+/* Find the trailing SIG(0) RR (type SIG=24, type-covered=0) in the
+ * additional section — mirrors tsig_find's structure exactly. Returns a
+ * pointer to the RR's start (owner name) in pkt, or NULL if absent/
+ * malformed/not actually a transaction signature (a genuine type-covered!=0
+ * SIG record is simply not ours to interpret here). Fills *out on success. */
+static const uint8_t *sig0_find(const uint8_t *pkt, int plen, sig0_rr_t *out) {
+    if (plen < 12)
+        return NULL;
+    const dns_hdr_t *h = (const dns_hdr_t *) pkt;
+    int ar = ntohs(h->arcount);
+    if (ar == 0)
+        return NULL;
+    int off = 12;
+    int skip = ntohs(h->qdcount) + ntohs(h->ancount) + ntohs(h->nscount);
+    for (int i = 0; i < skip; i++) {
+        int a = off;
+        for (;;) {
+            if (a >= plen)
+                return NULL;
+            uint8_t c = pkt[a];
+            if ((c & 0xC0) == 0xC0) {
+                a += 2;
+                break;
+            }
+            if (c == 0) {
+                a++;
+                break;
+            }
+            a += c + 1;
+        }
+        if (a + 4 > plen)
+            return NULL;
+        a += 4;
+        if (i >= ntohs(h->qdcount)) {
+            if (a + 6 > plen)
+                return NULL;
+            uint16_t rdlen = ((uint16_t) pkt[a + 4] << 8) | pkt[a + 5];
+            a += 6 + rdlen;
+        }
+        off = a;
+    }
+    for (int i = 0; i < ar; i++) {
+        int orig_off = off;
+        int a = off;
+        for (;;) {
+            if (a >= plen)
+                return NULL;
+            uint8_t c = pkt[a];
+            if ((c & 0xC0) == 0xC0) {
+                a += 2;
+                break;
+            }
+            if (c == 0) {
+                a++;
+                break;
+            }
+            a += c + 1;
+        }
+        if (a + 10 > plen)
+            return NULL;
+        uint16_t rtype = ((uint16_t) pkt[a] << 8) | pkt[a + 1];
+        uint16_t rdlen = ((uint16_t) pkt[a + 8] << 8) | pkt[a + 9];
+        int rd_off = a + 10;
+        if (rd_off + rdlen > plen)
+            return NULL;
+        if (rtype == DNS_TYPE_SIG) {
+            if (rdlen < 18)
+                return NULL; /* shorter than the fixed SIG rdata prefix */
+            uint16_t type_covered = get16(pkt, rd_off);
+            if (type_covered != 0) {
+                off = rd_off + rdlen;
+                continue; /* a real zone SIG record, not SIG(0) — skip it */
+            }
+            out->algorithm = pkt[rd_off + 2];
+            out->sig_expiration = get32(pkt, rd_off + 8);
+            out->sig_inception = get32(pkt, rd_off + 12);
+            out->key_tag = get16(pkt, rd_off + 16);
+            int name_end =
+                name_from_wire(pkt, plen, rd_off + 18, out->signer_name, sizeof(out->signer_name));
+            if (name_end < 0 || name_end > rd_off + rdlen)
+                return NULL;
+            strlower(out->signer_name);
+            out->rdata_prefix = pkt + rd_off;
+            out->rdata_prefix_len = name_end - rd_off;
+            out->signature = pkt + name_end;
+            out->siglen = (rd_off + rdlen) - name_end;
+            return pkt + orig_off;
+        }
+        off = rd_off + rdlen;
+    }
+    return NULL;
+}
+
+/* Cheap check: does this message carry a candidate SIG(0) RR at all? Lets
+ * handle_update decide, before t_zone is known, whether to defer to the
+ * SIG(0) gate below instead of the unconditional TSIG gate. */
+static int sig0_present(const uint8_t *pkt, int plen) {
+    sig0_rr_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    return sig0_find(pkt, plen, &tmp) != NULL;
+}
+
+/* Full verification: timing window, KEY RR lookup + keytag cross-check,
+ * signature verify. Requires t_zone (the UPDATE's Zone Section target) to
+ * already be resolved, since trusted keys are stored per-zone. Fail closed
+ * on every malformed/untrusted/unverifiable condition — returns 0. */
+/* Full SIG(0) verification against already-identified key material: siglen/
+ * timing-window checks on the SIG RR itself, then proto/alg/keytag
+ * cross-check, then the actual signature verify. Shared by the generic
+ * zone:*:KEY:* trust-anchor path (sig0_verify, below) and SRP's
+ * embedded-KEY-RR path (srp_verify_registration) — the two differ only in
+ * where (flags, proto, alg, pubkey) come from: a Valkey pipe-string for the
+ * former, a KEY RR's raw wire rdata for the latter. flags/proto/alg must
+ * already be decoded to ints and pubkey to raw bytes; no base64/pipe/wire
+ * parsing happens in here. */
+static int sig0_verify_with_key(const uint8_t *pkt, const uint8_t *sig_rr, const sig0_rr_t *s,
+                                int flags, int proto, int alg, const uint8_t *pubkey, int publen) {
+    if (s->siglen != 64) /* both supported algorithms use the raw 64-byte encoding */
+        return 0;
+    /* RFC 2931 §3.2: plain epoch-seconds window (unlike RRSIG's wraparound-
+     * aware comparison — a transaction signature's timestamps are always
+     * close to "now" by construction, no 136-year ambiguity to resolve). */
+    time_t now = time(NULL);
+    if (s->sig_expiration <= s->sig_inception)
+        return 0;
+    if ((uint32_t) now < s->sig_inception || (uint32_t) now > s->sig_expiration)
+        return 0;
+    if (flags < 0 || flags > 0xFFFF)
+        return 0;
+    if (proto != 3) /* RFC 2535 §3.1.2: the protocol octet MUST be 3 */
+        return 0;
+    if (alg != s->algorithm) /* the KEY's algorithm must match what the SIG claims */
+        return 0;
+    if ((alg == 13 && publen != 64) || (alg == 15 && publen != 32))
+        return 0;
+    if (alg != 13 && alg != 15) /* RSA etc: recognised by neither signer nor us */
+        return 0;
+
+    uint8_t keyrd[4 + 256];
+    keyrd[0] = (uint8_t) (flags >> 8);
+    keyrd[1] = (uint8_t) (flags & 0xFF);
+    keyrd[2] = (uint8_t) proto;
+    keyrd[3] = (uint8_t) alg;
+    memcpy(keyrd + 4, pubkey, (size_t) publen);
+    if (keytag(keyrd, 4 + publen) != s->key_tag)
+        return 0;
+
+    /* Covered data: the SIG rdata prefix (as received, minus the trailing
+     * signature) followed by the original message up to the SIG RR, with
+     * ARCOUNT patched -1 to exclude it — identical construction to
+     * tsig_verify's MAC input above, just a different final digest step. */
+    int msg_len = (int) (sig_rr - pkt);
+    if (msg_len <= 0)
+        return 0;
+    uint8_t *tmp = malloc((size_t) msg_len);
+    if (!tmp)
+        return 0;
+    memcpy(tmp, pkt, (size_t) msg_len);
+    uint16_t ar = get16(tmp, 10);
+    ar--;
+    put16(tmp, 10, ar);
+
+    uint8_t *data = malloc((size_t) (s->rdata_prefix_len + msg_len));
+    if (!data) {
+        free(tmp);
+        return 0;
+    }
+    memcpy(data, s->rdata_prefix, (size_t) s->rdata_prefix_len);
+    memcpy(data + s->rdata_prefix_len, tmp, (size_t) msg_len);
+    free(tmp);
+
+    int ok;
+    if (alg == 13)
+        ok = verify_ecdsa_p256(s->signature, data, s->rdata_prefix_len + msg_len, pubkey);
+    else
+        ok = verify_ed25519(s->signature, data, s->rdata_prefix_len + msg_len, pubkey);
+    free(data);
+    return ok;
+}
+
+static int sig0_verify(const uint8_t *pkt, int plen) {
+    sig0_rr_t s;
+    memset(&s, 0, sizeof(s));
+    const uint8_t *sig_rr = sig0_find(pkt, plen, &s);
+    if (!sig_rr || !t_zone)
+        return 0;
+
+    char k[768], val[512];
+    zkey(k, sizeof(k), "KEY", s.signer_name);
+    if (!vk_get(k, val, sizeof(val)) || !val[0])
+        return 0;
+    char *sp = NULL;
+    char *flags_s = strtok_r(val, "|", &sp);
+    char *proto_s = strtok_r(NULL, "|", &sp);
+    char *alg_s = strtok_r(NULL, "|", &sp);
+    char *pub_b64 = strtok_r(NULL, "|", &sp);
+    if (!flags_s || !proto_s || !alg_s || !pub_b64)
+        return 0;
+    uint8_t pubkey[256];
+    int publen = b64std_dec(pub_b64, pubkey, sizeof(pubkey));
+    if (publen <= 0)
+        return 0;
+    return sig0_verify_with_key(pkt, sig_rr, &s, atoi(flags_s), atoi(proto_s), atoi(alg_s), pubkey,
+                                publen);
+}
+
+/* ==========================================================================
+ * RFC 9665 SRP (Service Registration Protocol) + RFC 9664 (Update Leases)
+ *
+ * A device registers its own services with a constrained, profiled RFC 2136
+ * UPDATE: delete-all-then-add per name, SIG(0)-authenticated against a KEY
+ * RR embedded IN the message itself (trust-on-first-use — there is no
+ * pre-provisioned trust anchor the way generic SIG(0)/sig0_verify above
+ * needs; establishing that trust for a name IS what SRP does), carrying an
+ * EDNS Update Lease option (RFC 9664) that both signals "this is SRP" and
+ * negotiates how long the registration lives. This is why srp-shaped
+ * UPDATEs are routed here entirely separately from the generic RFC 2136
+ * path in handle_update below, before its TSIG/SIG(0)/prerequisite gates —
+ * those would reject a first-time registration outright.
+ *
+ * Storage (srp:<zone>:*, owned by dnsd — mdnsd may read it read-only in a
+ * future add, matching its existing read-only access to zone:* and mdns:*):
+ *   srp:<zone>:OWNER:<name>      "<flags>|<protocol>|<algorithm>|<hex pubkey>"
+ *                                 FCFS ownership record — the key that
+ *                                 authenticated this name (host or service
+ *                                 instance), ttl = granted KEY-LEASE.
+ *   srp:<zone>:A:<hostname>      "ttl|ip|ip|..."            (emit_addr_rrset format)
+ *   srp:<zone>:AAAA:<hostname>   "ttl|ip|ip|..."
+ *   srp:<zone>:SRV:<instance>    "ttl|prio|weight|port|target" (stored_rdata format)
+ *   srp:<zone>:TXT:<instance>    "ttl|hex(raw rdata)"        (verbatim replay, no
+ *                                 lossy re-encoding of multi-segment TXT rdata)
+ *   srp:<zone>:PTR:<browse>:<instance>  "ttl"  (target is the key suffix itself;
+ *                                 multiple instances at one browse name are
+ *                                 multiple keys — no existing multi-value
+ *                                 convention fit this shape, see CLAUDE-mdnsd.md)
+ * Record TTLs (A/AAAA/SRV/TXT/PTR) track the granted LEASE; OWNER tracks the
+ * granted KEY-LEASE (RFC 9665 §3.2.5.5.1: key retention outlives record
+ * retention, so a returning device keeps its name even after a period of
+ * being offline past the shorter record lease).
+ *
+ * Deliberately out of scope for this pass (documented, not silent gaps):
+ *   - RFC 9665 §3.3.4 service-subtype atomicity (treating a service type and
+ *     all its subtypes as one atomic unit) — subtypes are accepted as
+ *     ordinary Service Discovery PTR adds/deletes, not specially correlated.
+ *   - mdnsd re-announcing srp:*-registered services over link-local mDNS
+ *     (explicitly marked "Optional" in CLAUDE-mdnsd.md Add 3).
+ * ======================================================================= */
+
+#define SRP_MAX_BUCKETS 16
+#define SRP_MAX_RRS_PER_BUCKET 16
+/* Floor on a negotiated LEASE — not RFC-mandated, a deliberate anti-churn
+ * guardrail (RFC 9664 §1 leaves the server free to clamp in either
+ * direction). Low enough that a short-lease registration is still testable
+ * in real time (make check-srp), not just theoretically expirable. */
+#define SRP_MIN_LEASE 2
+
+typedef struct {
+    uint16_t type;
+    uint16_t class;
+    uint32_t ttl;
+    const uint8_t *rdata; /* pointer into the original pkt — never copied */
+    uint16_t rdlen;
+} srp_rr_t;
+
+typedef struct {
+    char name[256];
+    srp_rr_t rrs[SRP_MAX_RRS_PER_BUCKET];
+    int nrrs;
+} srp_bucket_t;
+
+typedef enum { SRP_HOST, SRP_SERVICE, SRP_DISCOVERY, SRP_UNKNOWN } srp_kind_t;
+
+/* Group the Update Section's RRs by owner name (case-insensitive), preserving
+ * first-seen order. Returns bucket count, or -1 on malformed input or a
+ * bound exceeded — SRP has no partial application, so any structural
+ * problem fails the whole message closed before any classification is even
+ * attempted. */
+static int srp_parse_buckets(const uint8_t *pkt, int plen, int off, int nscount,
+                             srp_bucket_t *buckets, int max_buckets) {
+    int nbuckets = 0;
+    for (int i = 0; i < nscount; i++) {
+        char nm[256];
+        int a = name_from_wire(pkt, plen, off, nm, sizeof(nm));
+        if (a < 0 || a + 10 > plen)
+            return -1;
+        uint16_t rtype = get16(pkt, a);
+        uint16_t rclass = get16(pkt, a + 2);
+        uint32_t rttl = get32(pkt, a + 4);
+        uint16_t rdlen = get16(pkt, a + 8);
+        int rdoff = a + 10;
+        if (rdoff + rdlen > plen)
+            return -1;
+        off = rdoff + rdlen;
+
+        srp_bucket_t *b = NULL;
+        for (int j = 0; j < nbuckets; j++)
+            if (strcasecmp(buckets[j].name, nm) == 0) {
+                b = &buckets[j];
+                break;
+            }
+        if (!b) {
+            if (nbuckets >= max_buckets)
+                return -1;
+            b = &buckets[nbuckets++];
+            memset(b, 0, sizeof(*b));
+            safe_strcpy(b->name, nm, sizeof(b->name));
+        }
+        if (b->nrrs >= SRP_MAX_RRS_PER_BUCKET)
+            return -1;
+        srp_rr_t *rr = &b->rrs[b->nrrs++];
+        rr->type = rtype;
+        rr->class = rclass;
+        rr->ttl = rttl;
+        rr->rdata = pkt + rdoff;
+        rr->rdlen = rdlen;
+    }
+    return nbuckets;
+}
+
+/* Classify one bucket by content shape (RFC 9665 §3.3): a Host Description
+ * has a KEY and optionally A/AAAA, never SRV/PTR; a Service Description has
+ * an SRV (and optionally KEY/TXT), never PTR; a Service Discovery
+ * (browse) bucket has only PTR adds/deletes. Any RR type outside that set,
+ * or a shape matching none of the three, is SRP_UNKNOWN (fail closed —
+ * REFUSED, not "best-effort apply what we understood"). Host/Service
+ * buckets must carry a "delete all RRsets from this name" pseudo-record
+ * (CLASS=ANY, TYPE=ANY, RDLENGTH=0); Discovery buckets don't need one — a
+ * shared browse name's PTR set is added/removed instance-by-instance, never
+ * wholesale-replaced. */
+static srp_kind_t srp_classify_bucket(const srp_bucket_t *b, int *has_key, int *has_addr) {
+    int has_delete_all = 0, has_srv = 0, has_txt = 0, has_ptr = 0;
+    *has_key = 0;
+    *has_addr = 0;
+    for (int i = 0; i < b->nrrs; i++) {
+        const srp_rr_t *rr = &b->rrs[i];
+        if (rr->class == DNS_CLASS_ANY && rr->type == DNS_TYPE_ANY && rr->rdlen == 0)
+            has_delete_all = 1;
+        else if (rr->class == DNS_CLASS_IN && rr->type == DNS_TYPE_KEY)
+            *has_key = 1;
+        else if (rr->class == DNS_CLASS_IN && rr->type == DNS_TYPE_SRV)
+            has_srv = 1;
+        else if (rr->class == DNS_CLASS_IN && rr->type == DNS_TYPE_TXT)
+            has_txt = 1;
+        else if (rr->class == DNS_CLASS_IN && (rr->type == DNS_TYPE_A || rr->type == DNS_TYPE_AAAA))
+            *has_addr = 1;
+        else if ((rr->class == DNS_CLASS_IN || rr->class == DNS_CLASS_NONE) &&
+                 rr->type == DNS_TYPE_PTR)
+            has_ptr = 1;
+        else
+            return SRP_UNKNOWN;
+    }
+    if (has_ptr && !*has_key && !has_srv && !has_txt && !*has_addr)
+        return SRP_DISCOVERY;
+    if (has_srv && !has_ptr && has_delete_all)
+        return SRP_SERVICE;
+    if (*has_key && !has_srv && !has_ptr && has_delete_all)
+        return SRP_HOST;
+    return SRP_UNKNOWN;
+}
+
+/* Find the first RR of `type`/`class` in a bucket, or NULL. */
+static const srp_rr_t *srp_bucket_find(const srp_bucket_t *b, uint16_t type, uint16_t class) {
+    for (int i = 0; i < b->nrrs; i++)
+        if (b->rrs[i].type == type && b->rrs[i].class == class)
+            return &b->rrs[i];
+    return NULL;
+}
+
+/* Compare presented key material against a stored "flags|proto|alg|hex(pub)"
+ * OWNER record. Returns 1 if they match (same owner), 0 otherwise —
+ * including on any parse failure of the stored value (fail closed: a
+ * corrupt OWNER record must never be treated as "no prior owner"). */
+static int srp_owner_matches(const char *stored, int flags, int proto, int alg,
+                             const uint8_t *pubkey, int publen) {
+    char tmp[512];
+    safe_strcpy(tmp, stored, sizeof(tmp));
+    char *sp = NULL;
+    char *flags_s = strtok_r(tmp, "|", &sp);
+    char *proto_s = strtok_r(NULL, "|", &sp);
+    char *alg_s = strtok_r(NULL, "|", &sp);
+    char *pub_hex = strtok_r(NULL, "|", &sp);
+    if (!flags_s || !proto_s || !alg_s || !pub_hex)
+        return 0;
+    if (atoi(flags_s) != flags || atoi(proto_s) != proto || atoi(alg_s) != alg)
+        return 0;
+    uint8_t stored_pub[256];
+    int stored_len = hex_dec(pub_hex, stored_pub, sizeof(stored_pub));
+    if (stored_len != publen)
+        return 0;
+    return CRYPTO_memcmp(stored_pub, pubkey, (size_t) publen) == 0;
+}
+
+static void srp_owner_write(char *out, size_t outsz, int flags, int proto, int alg,
+                            const uint8_t *pubkey, int publen) {
+    char hex[513];
+    hex_enc(pubkey, publen, hex);
+    snprintf(out, outsz, "%d|%d|%d|%s", flags, proto, alg, hex);
+}
+
+/* Bump the zone serial and journal one servable-record change. OWNER records
+ * are deliberately never journaled here — they're primary-only bookkeeping
+ * (a secondary never processes UPDATE, so it never needs to know who owns a
+ * name), not zone content a secondary must replicate. */
+static void srp_journal(zone_entry_t *z, char op, const char *name, const char *value) {
+    uint32_t prev = z->soa_serial;
+    uint32_t next = serial_bump(z);
+    ixfr_journal_append(z->name, prev, next, op, name, value);
+}
+
+/* The SRP registration handler: validates the whole message read-only first
+ * (RFC 2136 §3.8 — no partial application), then applies every write. Called
+ * from handle_update once an EDNS Update Lease option (RFC 9664) has been
+ * detected — see the module comment above for the full storage/scope
+ * writeup. `off`/`nscount` are the Update Section's start offset and RR
+ * count, already computed by handle_update's zone-section loop. */
+static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const dns_hdr_t *h,
+                             dns_hdr_t *rh, const edns_info_t *req_ei, int off, int nscount) {
+    if (!t_zone) {
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTZONE);
+        return 12;
+    }
+    /* RFC 9665 §3.3.2: an SRP Update MUST NOT contain any prerequisites. */
+    if (ntohs(h->ancount) != 0) {
+        dns_log(LOG_WARNING, "[SRP] Rejected: prerequisites present (not permitted in SRP)\n");
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
+        return 12;
+    }
+
+    sig0_rr_t sig;
+    memset(&sig, 0, sizeof(sig));
+    const uint8_t *sig_rr = sig0_find(pkt, plen, &sig);
+    if (!sig_rr) {
+        /* SRP is device self-auth only — no TSIG fallback makes sense for a
+         * "prove you own this new name" handshake. */
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
+        return 12;
+    }
+
+    static srp_bucket_t buckets[SRP_MAX_BUCKETS];
+    int nbuckets = srp_parse_buckets(pkt, plen, off, nscount, buckets, SRP_MAX_BUCKETS);
+    if (nbuckets < 0) {
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+        return 12;
+    }
+
+    srp_bucket_t *host = NULL;
+    srp_bucket_t *services[SRP_MAX_BUCKETS];
+    int nservices = 0;
+    srp_bucket_t *discovery[SRP_MAX_BUCKETS];
+    int ndiscovery = 0;
+    for (int i = 0; i < nbuckets; i++) {
+        int has_key, has_addr;
+        srp_kind_t kind = srp_classify_bucket(&buckets[i], &has_key, &has_addr);
+        if (kind == SRP_HOST) {
+            if (host) { /* RFC 9665 §3.3.2: exactly one Host Description Instruction */
+                rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+                return 12;
+            }
+            host = &buckets[i];
+        } else if (kind == SRP_SERVICE) {
+            services[nservices++] = &buckets[i];
+        } else if (kind == SRP_DISCOVERY) {
+            discovery[ndiscovery++] = &buckets[i];
+        } else {
+            dns_log(LOG_WARNING,
+                    "[SRP] Rejected: bucket '%s' doesn't match a recognised SRP "
+                    "instruction shape\n",
+                    buckets[i].name);
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+            return 12;
+        }
+    }
+    if (!host) {
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+        return 12;
+    }
+
+    /* Host KEY: required (RFC 9665 §3.3.3), flags MUST be all zero. */
+    const srp_rr_t *hkey = srp_bucket_find(host, DNS_TYPE_KEY, DNS_CLASS_IN);
+    if (!hkey || hkey->rdlen < 4) {
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+        return 12;
+    }
+    int h_flags = (int) get16(hkey->rdata, 0);
+    int h_proto = hkey->rdata[2];
+    int h_alg = hkey->rdata[3];
+    const uint8_t *h_pub = hkey->rdata + 4;
+    int h_publen = hkey->rdlen - 4;
+    if (h_flags != 0) {
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+        return 12;
+    }
+    for (int i = 0; i < nservices; i++) {
+        const srp_rr_t *srv = srp_bucket_find(services[i], DNS_TYPE_SRV, DNS_CLASS_IN);
+        if (srv && srv->rdlen < 7) { /* 2+2+2 fixed fields + at least a 1-byte target name */
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+            return 12;
+        }
+    }
+
+    /* SIG(0), verified against the KEY embedded IN this message — the
+     * trust-on-first-use moment; there is no pre-existing trust anchor. */
+    if (!sig0_verify_with_key(pkt, sig_rr, &sig, h_flags, h_proto, h_alg, h_pub, h_publen)) {
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
+        return 12;
+    }
+
+    /* FCFS (RFC 9665 §3.3.3): the host name's existing owner, if any, must
+     * be this same key. */
+    char ownerkey[768], ownerval[512];
+    skey(ownerkey, sizeof(ownerkey), "OWNER", host->name);
+    if (vk_get(ownerkey, ownerval, sizeof(ownerval)) &&
+        !srp_owner_matches(ownerval, h_flags, h_proto, h_alg, h_pub, h_publen)) {
+        dns_log(LOG_WARNING, "[SRP] YXDOMAIN: %s already owned by a different key\n", host->name);
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_YXDOMAIN);
+        return 12;
+    }
+    /* Each service's own KEY, if present, must equal the host key exactly
+     * (RFC 9665 §3.3.3) — a mismatch is malformed, not a conflict (conflicts
+     * are about *existing* registrations, checked next). Then FCFS for the
+     * service instance name itself. */
+    for (int i = 0; i < nservices; i++) {
+        const srp_rr_t *skeyrr = srp_bucket_find(services[i], DNS_TYPE_KEY, DNS_CLASS_IN);
+        if (skeyrr && (skeyrr->rdlen < 4 || (int) get16(skeyrr->rdata, 0) != h_flags ||
+                       skeyrr->rdata[2] != h_proto || skeyrr->rdata[3] != h_alg ||
+                       skeyrr->rdlen - 4 != h_publen ||
+                       memcmp(skeyrr->rdata + 4, h_pub, (size_t) h_publen) != 0)) {
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+            return 12;
+        }
+        char sownerkey[768], sownerval[512];
+        skey(sownerkey, sizeof(sownerkey), "OWNER", services[i]->name);
+        if (vk_get(sownerkey, sownerval, sizeof(sownerval)) &&
+            !srp_owner_matches(sownerval, h_flags, h_proto, h_alg, h_pub, h_publen)) {
+            dns_log(LOG_WARNING, "[SRP] YXDOMAIN: %s already owned by a different key\n",
+                    services[i]->name);
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_YXDOMAIN);
+            return 12;
+        }
+    }
+
+    /* --- Validation complete (everything above was read-only). Apply. --- */
+
+    uint32_t lease = req_ei->update_lease;
+    uint32_t key_lease = req_ei->has_update_key_lease ? req_ei->update_key_lease : lease;
+    if (lease < SRP_MIN_LEASE)
+        lease = SRP_MIN_LEASE;
+    if (lease > g_srp_max_lease)
+        lease = g_srp_max_lease;
+    if (key_lease < lease) /* RFC 9664 §1: LEASE MUST be <= KEY-LEASE */
+        key_lease = lease;
+    if (key_lease > g_srp_max_key_lease)
+        key_lease = g_srp_max_key_lease;
+
+    char ownerbuf[600];
+    srp_owner_write(ownerbuf, sizeof(ownerbuf), h_flags, h_proto, h_alg, h_pub, h_publen);
+
+    /* Host: delete-then-add addresses (possibly to nothing — a host update
+     * with zero A/AAAA just removes its addresses; the name itself is kept
+     * for KEY-LEASE so a returning device recovers the same identity). */
+    {
+        char k[768];
+        skey(k, sizeof(k), "A", host->name);
+        if (vk_get(k, ownerval, sizeof(ownerval))) {
+            vk_del(k);
+            srp_journal(t_zone, 'D', host->name, ownerval);
+        }
+        skey(k, sizeof(k), "AAAA", host->name);
+        if (vk_get(k, ownerval, sizeof(ownerval))) {
+            vk_del(k);
+            srp_journal(t_zone, 'D', host->name, ownerval);
+        }
+        char a_ips[512], aaaa_ips[512];
+        int a_len = 0, aaaa_len = 0;
+        for (int i = 0; i < host->nrrs; i++) {
+            const srp_rr_t *rr = &host->rrs[i];
+            if (rr->class != DNS_CLASS_IN)
+                continue;
+            if (rr->type == DNS_TYPE_A && rr->rdlen == 4) {
+                char ip[32];
+                snprintf(ip, sizeof(ip), "%d.%d.%d.%d", rr->rdata[0], rr->rdata[1], rr->rdata[2],
+                         rr->rdata[3]);
+                if (a_len == 0)
+                    a_len +=
+                        snprintf(a_ips + a_len, sizeof(a_ips) - (size_t) a_len, "%u|%s", lease, ip);
+                else
+                    a_len += snprintf(a_ips + a_len, sizeof(a_ips) - (size_t) a_len, "|%s", ip);
+            } else if (rr->type == DNS_TYPE_AAAA && rr->rdlen == 16) {
+                char ip[64];
+                inet_ntop(AF_INET6, rr->rdata, ip, sizeof(ip));
+                if (aaaa_len == 0)
+                    aaaa_len += snprintf(aaaa_ips + aaaa_len, sizeof(aaaa_ips) - (size_t) aaaa_len,
+                                         "%u|%s", lease, ip);
+                else
+                    aaaa_len += snprintf(aaaa_ips + aaaa_len, sizeof(aaaa_ips) - (size_t) aaaa_len,
+                                         "|%s", ip);
+            }
+        }
+        if (a_len > 0) {
+            skey(k, sizeof(k), "A", host->name);
+            vk_set(k, a_ips, lease);
+            srp_journal(t_zone, 'A', host->name, a_ips);
+        }
+        if (aaaa_len > 0) {
+            skey(k, sizeof(k), "AAAA", host->name);
+            vk_set(k, aaaa_ips, lease);
+            srp_journal(t_zone, 'A', host->name, aaaa_ips);
+        }
+        skey(k, sizeof(k), "OWNER", host->name);
+        vk_set(k, ownerbuf, key_lease);
+    }
+
+    /* Services: delete-then-add SRV/TXT, or (no SRV in the update) an
+     * explicit deregistration that also frees the name immediately — unlike
+     * the host, a deregistered service has no "coming back" concept, so
+     * there's no reason to hold its OWNER past this update. */
+    for (int i = 0; i < nservices; i++) {
+        srp_bucket_t *svc = services[i];
+        char k[768];
+        skey(k, sizeof(k), "SRV", svc->name);
+        if (vk_get(k, ownerval, sizeof(ownerval))) {
+            vk_del(k);
+            srp_journal(t_zone, 'D', svc->name, ownerval);
+        }
+        skey(k, sizeof(k), "TXT", svc->name);
+        vk_del(k); /* TXT is a companion of SRV; not independently journaled */
+
+        const srp_rr_t *srv = srp_bucket_find(svc, DNS_TYPE_SRV, DNS_CLASS_IN);
+        if (srv) {
+            uint16_t prio = get16(srv->rdata, 0);
+            uint16_t weight = get16(srv->rdata, 2);
+            uint16_t port = get16(srv->rdata, 4);
+            char target[256];
+            int abs_off = (int) (srv->rdata - pkt) + 6;
+            int tn = name_from_wire(pkt, plen, abs_off, target, sizeof(target));
+            if (tn < 0) {
+                rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_FORMERR);
+                return 12;
+            }
+            char srvval[600];
+            snprintf(srvval, sizeof(srvval), "%u|%u|%u|%u|%s", lease, prio, weight, port, target);
+            skey(k, sizeof(k), "SRV", svc->name);
+            vk_set(k, srvval, lease);
+            srp_journal(t_zone, 'A', svc->name, srvval);
+
+            const srp_rr_t *txt = srp_bucket_find(svc, DNS_TYPE_TXT, DNS_CLASS_IN);
+            if (txt && txt->rdlen <= 400) {
+                char hex[900];
+                hex_enc(txt->rdata, txt->rdlen, hex);
+                char txtval[950];
+                snprintf(txtval, sizeof(txtval), "%u|%s", lease, hex);
+                skey(k, sizeof(k), "TXT", svc->name);
+                vk_set(k, txtval, lease);
+            }
+            skey(k, sizeof(k), "OWNER", svc->name);
+            vk_set(k, ownerbuf, key_lease);
+        } else {
+            skey(k, sizeof(k), "OWNER", svc->name);
+            vk_del(k);
+        }
+    }
+
+    /* Discovery: per-instance PTR add/delete under a shared browse name —
+     * never wholesale-replaced, so no delete-all/re-add here, just apply
+     * each RR directly. */
+    for (int i = 0; i < ndiscovery; i++) {
+        srp_bucket_t *disc = discovery[i];
+        for (int j = 0; j < disc->nrrs; j++) {
+            const srp_rr_t *rr = &disc->rrs[j];
+            char target[256];
+            int abs_off = (int) (rr->rdata - pkt);
+            if (name_from_wire(pkt, plen, abs_off, target, sizeof(target)) < 0)
+                continue;
+            char k[900];
+            snprintf(k, sizeof(k), "srp:%s:PTR:%s:%s", t_zone->name, disc->name, target);
+            if (rr->class == DNS_CLASS_IN) {
+                vk_set(k, "1", lease); /* value unused — target lives in the key */
+                srp_journal(t_zone, 'A', disc->name, target);
+            } else if (rr->class == DNS_CLASS_NONE) {
+                vk_del(k);
+                srp_journal(t_zone, 'D', disc->name, target);
+            }
+        }
+    }
+
+    notify_send();
+
+    rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOERROR);
+    return edns_append_opt(resp, 12, BUF_SIZE, 0, 0, 0, req_ei, NULL, NULL, -1, NULL, -1, 0, NULL,
+                           1, lease, 1, key_lease);
+}
+
+/* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
 static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
@@ -6580,8 +7454,11 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
         return 12;
     }
-    /* TSIG verification */
-    if (g_tsig_secret_len > 0 && !tsig_verify(pkt, plen)) {
+    /* Authentication: RFC 2931 SIG(0) if the message carries one (verified
+     * below once the zone is known — trusted keys are per-zone), otherwise
+     * the existing global-secret TSIG gate, unchanged. */
+    int has_sig0 = sig0_present(pkt, plen);
+    if (!has_sig0 && g_tsig_secret_len > 0 && !tsig_verify(pkt, plen)) {
         rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_BADSIG);
         return 12;
     }
@@ -6606,6 +7483,33 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         off = za + 4;
         if (off > plen)
             goto formerr;
+    }
+    /* RFC 9665 SRP: an SRP-shaped UPDATE (carries the RFC 9664 Update Lease
+     * option) is a structurally different message from ordinary RFC 2136
+     * UPDATE and is routed to its own handler entirely, before the generic
+     * TSIG/SIG(0)/prerequisite logic below — that logic's sig0_verify()
+     * looks up a *pre-provisioned* zone:*:KEY:* trust anchor, which would
+     * reject a first-time SRP registration outright (establishing trust for
+     * a new name via its own embedded KEY is the whole point of SRP). */
+    edns_info_t srp_ei;
+    edns_parse(pkt, plen, &srp_ei);
+    if (srp_ei.has_update_lease) {
+        if (!g_srp_enabled) {
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
+            return 12;
+        }
+        return srp_handle_update(pkt, plen, resp, h, rh, &srp_ei, off, ntohs(h->nscount));
+    }
+    if (has_sig0 && !sig0_verify(pkt, plen)) {
+        dns_log(LOG_WARNING, "[UPDATE] SIG(0) verification failed for zone '%s'\n",
+                t_zone ? t_zone->name : "?");
+        /* NOTAUTH, not BADSIG(17): BADSIG needs an extended RCODE (RFC 6891
+         * §6.1.3), which requires an EDNS OPT record to carry the high byte —
+         * this is a bare header-only response with none. Setting BADSIG's
+         * raw value here would silently corrupt the low RCODE nibble *and*
+         * the adjacent CD flag bit instead of signaling anything meaningful. */
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
+        return 12;
     }
     /* RFC 2136 §2.4 prerequisites */
     for (int i = 0; i < ntohs(h->ancount); i++) {
@@ -6636,7 +7540,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         if (prereq_fail) {
             rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | prereq_fail);
             {
-                int o2 = tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+                int o2 = (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
                 return o2;
             }
         }
@@ -6661,7 +7565,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
             dns_log(LOG_WARNING, "[DDNS] REFUSED update of %s — outside ddns_allow_suffix [%s]\n",
                     un, g_ddns_allow_suffix);
             rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
-            return tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+            return (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
         }
         char k[768];
         if (uc == DNS_CLASS_IN && rdlen > 0) {
@@ -6822,7 +7726,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
     }
     /* Append TSIG to response */
     {
-        int off2 = tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+        int off2 = (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
         return off2;
     }
 formerr:
@@ -9213,6 +10117,166 @@ static void *ddns_sweeper_thread(void *arg) {
 }
 
 /* ==========================================================================
+ * RFC 9665 SRP / RFC 9664 lease-expiry sweeper
+ *
+ * Same silent-Valkey-TTL-expiry problem ddns_sweeper_thread solves above,
+ * applied to srp:* — a LEASE-driven A/AAAA/SRV/TXT/PTR key vanishing (or a
+ * KEY-LEASE-driven OWNER key vanishing) fires no event on its own. Tick-diff
+ * against the previous snapshot exactly like the DDNS sweeper; the one
+ * difference is OWNER keys are never journaled/notified — they are
+ * primary-only FCFS bookkeeping, not zone content a secondary replicates
+ * (a secondary never processes UPDATE, so it never needs to know who owns a
+ * name). A vanished OWNER just silently frees the name for a new claimant.
+ * ======================================================================= */
+typedef struct {
+    char *key;
+    char *val;
+} srp_lease_t;
+
+#define SRP_SWEEP_MAX 100000
+
+static int srp_lease_cmp(const void *a, const void *b) {
+    const srp_lease_t *la = a;
+    const srp_lease_t *lb = b;
+    return strcmp(la->key, lb->key);
+}
+
+/* Parse "srp:<zone>:<type>:<name>" (name may itself contain colons — true
+ * for a PTR key, "<browse>:<instance>" — the split only needs the first two
+ * colons to separate zone/type; everything after the second belongs to
+ * <name> verbatim). Returns 0 on success, -1 if malformed. */
+static int srp_key_split(const char *key, char *zone, size_t zcap, char *type, size_t tcap,
+                         char *name, size_t ncap) {
+    if (strncmp(key, "srp:", 4) != 0)
+        return -1;
+    const char *z = key + 4;
+    const char *c1 = strchr(z, ':');
+    if (!c1)
+        return -1;
+    const char *t = c1 + 1;
+    const char *c2 = strchr(t, ':');
+    if (!c2)
+        return -1;
+    const char *nm = c2 + 1;
+    if ((size_t) (c1 - z) >= zcap || (size_t) (c2 - t) >= tcap || strlen(nm) >= ncap)
+        return -1;
+    memcpy(zone, z, (size_t) (c1 - z));
+    zone[c1 - z] = 0;
+    memcpy(type, t, (size_t) (c2 - t));
+    type[c2 - t] = 0;
+    safe_strcpy(name, nm, ncap);
+    return 0;
+}
+
+/* Replay one vanished srp:* key. OWNER keys are bookkeeping-only (no
+ * replication); every other type is real zone content and gets the usual
+ * serial_bump + ixfr_journal_append('D'). Returns the owning zone name via
+ * zname_out (empty if nothing to notify — OWNER, or an unknown zone). */
+static void srp_replay_expiry(const srp_lease_t *l, char *zname_out, size_t zcap) {
+    zname_out[0] = 0;
+    char zone[256], type[16], name[256];
+    if (srp_key_split(l->key, zone, sizeof(zone), type, sizeof(type), name, sizeof(name)) != 0)
+        return;
+    if (strcmp(type, "OWNER") == 0) {
+        dns_log(LOG_NOTICE, "[SRP] key-lease expired, name freed: %s %s\n", zone, name);
+        return;
+    }
+    zone_entry_t *z = NULL;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        if (g_zones[i].active && strcasecmp(g_zones[i].name, zone) == 0) {
+            z = &g_zones[i];
+            break;
+        }
+    pthread_mutex_unlock(&g_zones_mutex);
+    if (!z)
+        return;
+    uint32_t prev = z->soa_serial;
+    uint32_t next = serial_bump(z);
+    ixfr_journal_append(z->name, prev, next, 'D', name, l->val ? l->val : "");
+    safe_strcpy(zname_out, z->name, zcap);
+    dns_log(LOG_NOTICE, "[SRP] lease expired: %s %s %s — serial %u->%u\n", zone, type, name, prev,
+            next);
+}
+
+static void *srp_sweeper_thread(void *arg) {
+    (void) arg;
+    srp_lease_t *prev = NULL;
+    int nprev = 0;
+    for (;;) {
+        int interval = g_srp_sweep_secs > 0 ? g_srp_sweep_secs : 60;
+        sleep((unsigned) interval);
+        if (!g_srp_enabled || g_srp_sweep_secs <= 0 || g_zone_secondary)
+            continue;
+
+        char **keys = NULL;
+        int nk = vk_list_keys_strict("srp:*", &keys);
+        if (nk < 0)
+            continue; /* Valkey error, not "empty" — keep the previous baseline */
+        if (nk > SRP_SWEEP_MAX) {
+            for (int i = 0; i < nk; i++)
+                free(keys[i]);
+            free(keys);
+            continue;
+        }
+        srp_lease_t *cur = NULL;
+        int ncur = 0;
+        if (nk > 0)
+            cur = calloc((size_t) nk, sizeof(srp_lease_t));
+        if (nk > 0 && !cur) {
+            for (int i = 0; i < nk; i++)
+                free(keys[i]);
+            free(keys);
+            continue;
+        }
+        for (int i = 0; i < nk; i++) {
+            char val[768] = "";
+            vk_get(keys[i], val, sizeof(val));
+            cur[ncur].key = strdup(keys[i]);
+            cur[ncur].val = strdup(val);
+            if (cur[ncur].key && cur[ncur].val)
+                ncur++;
+        }
+        if (cur)
+            qsort(cur, (size_t) ncur, sizeof(srp_lease_t), srp_lease_cmp);
+        for (int i = 0; i < nk; i++)
+            free(keys[i]);
+        free(keys);
+
+        char notified[MAX_ZONES][256];
+        int nnotified = 0;
+        for (int i = 0; i < nprev; i++) {
+            srp_lease_t want = {.key = prev[i].key, .val = NULL};
+            if (cur && bsearch(&want, cur, (size_t) ncur, sizeof(srp_lease_t), srp_lease_cmp))
+                continue;
+            char zn[256];
+            srp_replay_expiry(&prev[i], zn, sizeof(zn));
+            if (!zn[0])
+                continue;
+            int seen = 0;
+            for (int j = 0; j < nnotified; j++)
+                if (strcasecmp(notified[j], zn) == 0) {
+                    seen = 1;
+                    break;
+                }
+            if (!seen && nnotified < MAX_ZONES)
+                safe_strcpy(notified[nnotified++], zn, sizeof(notified[0]));
+        }
+        for (int j = 0; j < nnotified; j++)
+            notify_one_zone(notified[j]);
+
+        for (int i = 0; i < nprev; i++) {
+            free(prev[i].key);
+            free(prev[i].val);
+        }
+        free(prev);
+        prev = cur;
+        nprev = ncur;
+    }
+    return NULL;
+}
+
+/* ==========================================================================
  * DNS packet dispatch (shared by UDP / DoT / DoH)
  * ======================================================================= */
 static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len, int is_tcp,
@@ -9958,6 +11022,17 @@ int main(int argc, char **argv) {
             pthread_detach(stid);
         else
             dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
+    }
+
+    /* Primary: RFC 9665/9664 SRP lease-expiry sweeper — same role as the DDNS
+     * sweeper above, for srp:* registrations. Idle (just sleeps) unless
+     * config:srp_enabled is set. */
+    if (!g_zone_secondary) {
+        pthread_t srtid;
+        if (pthread_create(&srtid, NULL, srp_sweeper_thread, NULL) == 0)
+            pthread_detach(srtid);
+        else
+            dns_log(LOG_ERR, "[SRP] Failed to start lease-expiry sweeper\n");
     }
 
     /* Load-balancing health-check probe thread (CLAUDE-loadbalance.md Gap 2).
