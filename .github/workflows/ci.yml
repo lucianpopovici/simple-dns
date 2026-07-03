@@ -312,6 +312,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-role OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 2931 SIG(0) transaction signatures (KAT + negatives)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-sig0 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Zone transfer client (secondary AXFR pull)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

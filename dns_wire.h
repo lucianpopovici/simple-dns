@@ -27,6 +27,8 @@
 #define DNS_TYPE_PTR 12
 #define DNS_TYPE_MX 15
 #define DNS_TYPE_TXT 16
+#define DNS_TYPE_SIG 24 /* RFC 2931 §3 — transaction signature (SIG(0)) when type-covered=0 */
+#define DNS_TYPE_KEY 25 /* RFC 2535 §3 — public key, reused unchanged by RFC 2931 SIG(0) */
 #define DNS_TYPE_AAAA 28
 #define DNS_TYPE_LOC 29
 #define DNS_TYPE_SRV 33
@@ -208,6 +210,25 @@ int base32hex_dec(const char *in, uint8_t *out, int outlen);
  * (not base32hex-encoded). Shared by dnsd (signing) and resolverd (RFC 8198
  * aggressive-cache gap matching) so the two can never diverge. */
 void nsec3_hash_raw(const char *name, const uint8_t *salt, int saltlen, int iters, uint8_t out[20]);
+
+/* ── Generic DNSSEC-algorithm signature verification ─────────────────────────
+ * Shared by resolverd (RRSIG validation) and dnsd (RFC 2931 SIG(0) transaction
+ * signatures) — both verify the same two algorithms against the same raw
+ * (non-DER) 64-byte signature encoding DNSSEC uses; only what counts as
+ * "data" differs (canonical RRset vs. a DNS message), which the caller
+ * assembles before calling in. */
+
+/* Verify an ECDSA P-256 (alg 13) signature.
+ * sig_raw: 64-byte raw R||S (not DER). pubkey_xy: 64-byte X||Y (the DNSKEY/KEY
+ * rdata's public-key field, after its 4-byte flags/protocol/algorithm
+ * prefix). Returns 1 if valid, 0 otherwise (including on any internal error —
+ * fail closed). */
+int verify_ecdsa_p256(const uint8_t *sig_raw, const uint8_t *data, int dlen,
+                      const uint8_t pubkey_xy[64]);
+
+/* Verify an Ed25519 (alg 15) signature.
+ * sig_raw: 64-byte signature. pubkey: 32-byte raw Ed25519 public key. */
+int verify_ed25519(const uint8_t *sig_raw, const uint8_t *data, int dlen, const uint8_t pubkey[32]);
 
 /* ── Fixed-width big-endian accessors ────────────────────────────────────── */
 

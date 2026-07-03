@@ -754,10 +754,6 @@ static int upstream_query(const char *qname, uint16_t qtype, uint8_t *resp, int 
  *     re-verify.
  * ======================================================================= */
 
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/bn.h>
-
 typedef enum {
     DNSSEC_UNCHECKED = 0, /* not yet verified */
     DNSSEC_SECURE = 1,    /* signatures verified against trusted key */
@@ -807,71 +803,11 @@ static int dnskey_is_trusted(const uint8_t *dkrd, int dklen) {
     return 0;
 }
 
-/* Verify an ECDSA P-256 (alg 13) RRSIG.
- * sig_raw: 64-byte raw R||S (not DER).
- * data: the signing data (RRSIG header + canonical RR).
- * pubkey_xy: 64-byte X||Y from DNSKEY rdata (after 4-byte flags/proto/alg). */
-static int verify_ecdsa_p256(const uint8_t *sig_raw, const uint8_t *data, int dlen,
-                             const uint8_t pubkey_xy[64]) {
-    EVP_PKEY *pkey = NULL;
-    OSSL_PARAM params[3];
-    /* Convert 64-byte raw to DER ECDSA signature */
-    ECDSA_SIG *sig = ECDSA_SIG_new();
-    if (!sig)
-        return 0;
-    BIGNUM *r = BN_bin2bn(sig_raw, 32, NULL);
-    BIGNUM *s = BN_bin2bn(sig_raw + 32, 32, NULL);
-    ECDSA_SIG_set0(sig, r, s);
-    int derlen = i2d_ECDSA_SIG(sig, NULL);
-    uint8_t *der = malloc(derlen);
-    if (!der) {
-        ECDSA_SIG_free(sig);
-        return 0;
-    }
-    uint8_t *p = der;
-    i2d_ECDSA_SIG(sig, &p);
-    ECDSA_SIG_free(sig);
-    /* Build EVP_PKEY from raw X||Y */
-    uint8_t pub[65];
-    pub[0] = 0x04;
-    memcpy(pub + 1, pubkey_xy, 64);
-    params[0] = OSSL_PARAM_construct_utf8_string("group", "P-256", 0);
-    params[1] = OSSL_PARAM_construct_octet_string("pub", pub, 65);
-    params[2] = OSSL_PARAM_construct_end();
-    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
-    int ok = 0;
-    if (kctx && EVP_PKEY_fromdata_init(kctx) > 0 &&
-        EVP_PKEY_fromdata(kctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) > 0 && pkey) {
-        EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-        if (EVP_DigestVerifyInit(mctx, NULL, EVP_sha256(), NULL, pkey) > 0 &&
-            EVP_DigestVerifyUpdate(mctx, data, dlen) > 0 &&
-            EVP_DigestVerifyFinal(mctx, der, derlen) == 1)
-            ok = 1;
-        EVP_MD_CTX_free(mctx);
-    }
-    if (kctx)
-        EVP_PKEY_CTX_free(kctx);
-    if (pkey)
-        EVP_PKEY_free(pkey);
-    free(der);
-    return ok;
-}
-
-/* Verify an Ed25519 (alg 15) RRSIG.
- * sig_raw: 64-byte Ed25519 signature.
- * pubkey: 32-byte raw Ed25519 public key. */
-static int verify_ed25519(const uint8_t *sig_raw, const uint8_t *data, int dlen,
-                          const uint8_t pubkey[32]) {
-    EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pubkey, 32);
-    if (!pkey)
-        return 0;
-    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-    int ok = (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pkey) > 0 &&
-              EVP_DigestVerify(mctx, sig_raw, 64, data, dlen) == 1);
-    EVP_MD_CTX_free(mctx);
-    EVP_PKEY_free(pkey);
-    return ok;
-}
+/* verify_ecdsa_p256 / verify_ed25519 (RRSIG signature verification, algs 13
+ * and 15) live in libdnswire (dns_wire.c) — shared with dnsd's RFC 2931
+ * SIG(0) transaction-signature verification, which needs the identical
+ * raw-signature verify primitives over different "data" (a DNS message
+ * instead of a canonical RRset). */
 
 /* =========================================================================
  * DNSSEC signing-input construction (RFC 4034 §3.1.8.1)

@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1169,6 +1169,55 @@ check-role: $(BIN_DEBUG)
 	 test "$$PRI_DK" -ge 1 || { echo "  FAIL  primary did not generate DNSKEY (control)"; exit 1; }; \
 	 echo "  OK  secondary refuses UPDATE + serves unsigned (no keygen); primary signs"
 
+# RFC 2931 SIG(0) transaction signatures — the SRP prerequisite (CLAUDE-mdnsd.md
+# Add 3). An asymmetric alternative to TSIG: dnsd verifies a self-signed UPDATE
+# against a KEY RR it already trusts (zone:<zone>:KEY:<signer>). nsupdate can't
+# drive SIG(0) here (needs dnssec-keygen's on-disk key format, unavailable in
+# this env), so tests/sig0_client.py hand-builds+signs the UPDATE, delegating
+# the ECDSA math to `openssl dgst -sign` (no Python crypto dependency). KAT +
+# three negative cases (flipped signature byte, expired window, untrusted/
+# absent key) per CLAUDE.md's crypto-testing convention. Needs Valkey + dig +
+# openssl + python3.
+check-sig0: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 2931 SIG(0) transaction signatures (requires Valkey + dig + openssl + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v openssl >/dev/null 2>&1 || { echo "  SKIP  no openssl on PATH"; exit 0; }; \
+	 command -v python3 >/dev/null 2>&1 || { echo "  SKIP  no python3 on PATH"; exit 0; }; \
+	 D=$$(mktemp -d); SIGNER=sig0test.example.local; \
+	 openssl ecparam -name prime256v1 -genkey -noout -out $$D/sig0.key >/dev/null 2>&1; \
+	 PROV=$$(python3 tests/sig0_client.py provision $$D/sig0.key); \
+	 PUBB64=$$(echo "$$PROV" | cut -d' ' -f1); \
+	 SAVE_KEY=$$($$VC get zone:example.local:KEY:$$SIGNER); \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); \
+	 $$VC del config:tsig_secret_b64 >/dev/null; \
+	 $$VC set zone:example.local:KEY:$$SIGNER "0|3|13|$$PUBB64" >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_sig0.log 2>&1 & DNS=$$!; \
+	 sleep 1.5; \
+	 R_OK=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER good1.example.local none); \
+	 A_OK=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) good1.example.local A +time=2 +tries=1); \
+	 R_FLIP=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad1.example.local flipsig); \
+	 A_FLIP=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad1.example.local A +time=2 +tries=1); \
+	 R_EXP=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad2.example.local expired); \
+	 A_EXP=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad2.example.local A +time=2 +tries=1); \
+	 $$VC del zone:example.local:KEY:$$SIGNER >/dev/null; \
+	 R_NOKEY=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad3.example.local none); \
+	 A_NOKEY=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad3.example.local A +time=2 +tries=1); \
+	 kill $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
+	 if [ -n "$$SAVE_KEY" ]; then $$VC set zone:example.local:KEY:$$SIGNER "$$SAVE_KEY" >/dev/null; else $$VC del zone:example.local:KEY:$$SIGNER >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 rm -rf $$D; \
+	 echo "  good=[$$R_OK/$$A_OK]  flipsig=[$$R_FLIP/$$A_FLIP]  expired=[$$R_EXP/$$A_EXP]  no-key=[$$R_NOKEY/$$A_NOKEY]"; \
+	 test "$$R_OK" = "RCODE 0" || { echo "  FAIL  correctly-signed UPDATE was not accepted"; cat /tmp/dnsd_sig0.log; exit 1; }; \
+	 test "$$A_OK" = "10.9.9.9" || { echo "  FAIL  accepted UPDATE's record was not actually applied"; exit 1; }; \
+	 test "$$R_FLIP" = "RCODE 9" || { echo "  FAIL  flipped-signature-byte UPDATE was not rejected with NOTAUTH"; exit 1; }; \
+	 test -z "$$A_FLIP" || { echo "  FAIL  flipped-signature UPDATE was applied anyway"; exit 1; }; \
+	 test "$$R_EXP" = "RCODE 9" || { echo "  FAIL  expired-window UPDATE was not rejected with NOTAUTH"; exit 1; }; \
+	 test -z "$$A_EXP" || { echo "  FAIL  expired-window UPDATE was applied anyway"; exit 1; }; \
+	 test "$$R_NOKEY" = "RCODE 9" || { echo "  FAIL  UPDATE with no trusted KEY on file was not rejected with NOTAUTH"; exit 1; }; \
+	 test -z "$$A_NOKEY" || { echo "  FAIL  UPDATE with no trusted key was applied anyway"; exit 1; }; \
+	 echo "  OK  correctly-signed UPDATE applied; flipped-sig/expired/untrusted-key all rejected with NOTAUTH, none applied"
+
 # DDNS suffix ACL + serial-churn skip (CLAUDE-discovery.md Gap 3). With
 # config:ddns_allow_suffix set, RFC 2136 UPDATE may only touch names under that
 # suffix (others REFUSED); and a lease refresh that re-stores the same address
@@ -2199,6 +2248,7 @@ help:
 	@echo "  make check-dot-mtls  mTLS on the DoT/transfer listener (needs Valkey + openssl)"
 	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
 	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"
+	@echo "  make check-sig0      RFC 2931 SIG(0) transaction signatures: KAT + flipped-sig/expired/no-key negatives (needs Valkey + dig + openssl + python3)"
 	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"

@@ -10,7 +10,10 @@
  *   2181       Clarifications (QDCOUNT=1 enforced, TTL clamped to 2^31-1)
  *   2308       Negative caching – SOA in authority on NXDOMAIN/NODATA
  *   2782       SRV records
- *   2931       SIG(0) transaction signatures (stub – reject unsigned updates)
+ *   2931       SIG(0) transaction signatures – verification only (asymmetric
+ *              alternative to TSIG for UPDATE: a per-zone KEY RR store,
+ *              zone:<zone>:KEY:<signer>; dnsd does not sign its own SIG(0)
+ *              responses). Algs 13 (ECDSA P-256) and 15 (Ed25519) only.
  *   3007       Secure DNS Dynamic Update (TSIG prerequisite)
  *   3596       AAAA records
  *   3597       Unknown RR type pass-through (zone:TYPE:name keys are served as-is;
@@ -113,6 +116,13 @@
  *                              e.g. "e164.arpa" or "e164.example.local". Informational:
  *                              the serving path is the existing zone:NAPTR: store.
  *                              Used by: NAPTR Enumservice warning + provisioning helper.
+ *   zone:<zone>:KEY:<signer>   RFC 2931 SIG(0) trusted public key, KEY-rdata
+ *                              fields as "flags|protocol|algorithm|base64(pubkey)"
+ *                              (protocol MUST be 3; algorithm 13 or 15 — same
+ *                              raw pubkey encoding as DNSKEY). Not served over
+ *                              the wire; read only by sig0_verify to authenticate
+ *                              an RFC 2136 UPDATE signed with the matching
+ *                              private key, as an alternative to TSIG.
  *   config:rr_rotate           "1" to enable per-name round-robin rotation of
  *                              multi-address A/AAAA RRsets (RFC 1794). Distinct
  *                              from config:lb_mode — uses per-name counters keyed
@@ -6561,6 +6571,232 @@ static void auto_ptr_apply(const char *fqdn, const char *ipstr, uint32_t ttl, in
 }
 
 /* ==========================================================================
+ * RFC 2931 SIG(0) transaction signatures
+ *
+ * An asymmetric alternative to TSIG for authenticating an UPDATE: instead of
+ * a shared secret, the client signs the message with its own private key and
+ * the server verifies against a KEY RR it already trusts. Trusted keys are
+ * provisioned per-zone as ordinary KEY (type 25) records —
+ * zone:<zone>:KEY:<signer-name> -> "flags|protocol|algorithm|base64(pubkey)"
+ * — the same zone:* store every other RR type already lives in (owned by the
+ * control plane per CLAUDE.md's ownership table; no new namespace). This is
+ * the verification half only: dnsd does not sign its own UPDATE responses
+ * (RFC 2931 doesn't require it, and doing so would need dnsd's own SIG(0)
+ * signing identity — a separate concern from DNSSEC zone-signing keys).
+ *
+ * Reuses the exact same "hash the message with the trailing RR's ARCOUNT
+ * patched out" technique as tsig_verify above, and the same
+ * verify_ecdsa_p256 / verify_ed25519 primitives (via libdnswire) that
+ * resolverd uses to validate RRSIGs — same algorithms (13, 15), same raw
+ * 64-byte signature encoding, just different "data" being verified.
+ * ======================================================================= */
+typedef struct {
+    uint8_t algorithm;
+    uint32_t sig_expiration;
+    uint32_t sig_inception;
+    uint16_t key_tag;
+    char signer_name[256];
+    const uint8_t *rdata_prefix; /* SIG rdata up to (not including) the signature, as received */
+    int rdata_prefix_len;
+    const uint8_t *signature;
+    int siglen;
+} sig0_rr_t;
+
+/* Find the trailing SIG(0) RR (type SIG=24, type-covered=0) in the
+ * additional section — mirrors tsig_find's structure exactly. Returns a
+ * pointer to the RR's start (owner name) in pkt, or NULL if absent/
+ * malformed/not actually a transaction signature (a genuine type-covered!=0
+ * SIG record is simply not ours to interpret here). Fills *out on success. */
+static const uint8_t *sig0_find(const uint8_t *pkt, int plen, sig0_rr_t *out) {
+    if (plen < 12)
+        return NULL;
+    const dns_hdr_t *h = (const dns_hdr_t *) pkt;
+    int ar = ntohs(h->arcount);
+    if (ar == 0)
+        return NULL;
+    int off = 12;
+    int skip = ntohs(h->qdcount) + ntohs(h->ancount) + ntohs(h->nscount);
+    for (int i = 0; i < skip; i++) {
+        int a = off;
+        for (;;) {
+            if (a >= plen)
+                return NULL;
+            uint8_t c = pkt[a];
+            if ((c & 0xC0) == 0xC0) {
+                a += 2;
+                break;
+            }
+            if (c == 0) {
+                a++;
+                break;
+            }
+            a += c + 1;
+        }
+        if (a + 4 > plen)
+            return NULL;
+        a += 4;
+        if (i >= ntohs(h->qdcount)) {
+            if (a + 6 > plen)
+                return NULL;
+            uint16_t rdlen = ((uint16_t) pkt[a + 4] << 8) | pkt[a + 5];
+            a += 6 + rdlen;
+        }
+        off = a;
+    }
+    for (int i = 0; i < ar; i++) {
+        int orig_off = off;
+        int a = off;
+        for (;;) {
+            if (a >= plen)
+                return NULL;
+            uint8_t c = pkt[a];
+            if ((c & 0xC0) == 0xC0) {
+                a += 2;
+                break;
+            }
+            if (c == 0) {
+                a++;
+                break;
+            }
+            a += c + 1;
+        }
+        if (a + 10 > plen)
+            return NULL;
+        uint16_t rtype = ((uint16_t) pkt[a] << 8) | pkt[a + 1];
+        uint16_t rdlen = ((uint16_t) pkt[a + 8] << 8) | pkt[a + 9];
+        int rd_off = a + 10;
+        if (rd_off + rdlen > plen)
+            return NULL;
+        if (rtype == DNS_TYPE_SIG) {
+            if (rdlen < 18)
+                return NULL; /* shorter than the fixed SIG rdata prefix */
+            uint16_t type_covered = get16(pkt, rd_off);
+            if (type_covered != 0) {
+                off = rd_off + rdlen;
+                continue; /* a real zone SIG record, not SIG(0) — skip it */
+            }
+            out->algorithm = pkt[rd_off + 2];
+            out->sig_expiration = get32(pkt, rd_off + 8);
+            out->sig_inception = get32(pkt, rd_off + 12);
+            out->key_tag = get16(pkt, rd_off + 16);
+            int name_end =
+                name_from_wire(pkt, plen, rd_off + 18, out->signer_name, sizeof(out->signer_name));
+            if (name_end < 0 || name_end > rd_off + rdlen)
+                return NULL;
+            strlower(out->signer_name);
+            out->rdata_prefix = pkt + rd_off;
+            out->rdata_prefix_len = name_end - rd_off;
+            out->signature = pkt + name_end;
+            out->siglen = (rd_off + rdlen) - name_end;
+            return pkt + orig_off;
+        }
+        off = rd_off + rdlen;
+    }
+    return NULL;
+}
+
+/* Cheap check: does this message carry a candidate SIG(0) RR at all? Lets
+ * handle_update decide, before t_zone is known, whether to defer to the
+ * SIG(0) gate below instead of the unconditional TSIG gate. */
+static int sig0_present(const uint8_t *pkt, int plen) {
+    sig0_rr_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    return sig0_find(pkt, plen, &tmp) != NULL;
+}
+
+/* Full verification: timing window, KEY RR lookup + keytag cross-check,
+ * signature verify. Requires t_zone (the UPDATE's Zone Section target) to
+ * already be resolved, since trusted keys are stored per-zone. Fail closed
+ * on every malformed/untrusted/unverifiable condition — returns 0. */
+static int sig0_verify(const uint8_t *pkt, int plen) {
+    sig0_rr_t s;
+    memset(&s, 0, sizeof(s));
+    const uint8_t *sig_rr = sig0_find(pkt, plen, &s);
+    if (!sig_rr || !t_zone)
+        return 0;
+    if (s.siglen != 64) /* both supported algorithms use the raw 64-byte encoding */
+        return 0;
+    /* RFC 2931 §3.2: plain epoch-seconds window (unlike RRSIG's wraparound-
+     * aware comparison — a transaction signature's timestamps are always
+     * close to "now" by construction, no 136-year ambiguity to resolve). */
+    time_t now = time(NULL);
+    if (s.sig_expiration <= s.sig_inception)
+        return 0;
+    if ((uint32_t) now < s.sig_inception || (uint32_t) now > s.sig_expiration)
+        return 0;
+
+    char k[768], val[512];
+    zkey(k, sizeof(k), "KEY", s.signer_name);
+    if (!vk_get(k, val, sizeof(val)) || !val[0])
+        return 0;
+    char *sp = NULL;
+    char *flags_s = strtok_r(val, "|", &sp);
+    char *proto_s = strtok_r(NULL, "|", &sp);
+    char *alg_s = strtok_r(NULL, "|", &sp);
+    char *pub_b64 = strtok_r(NULL, "|", &sp);
+    if (!flags_s || !proto_s || !alg_s || !pub_b64)
+        return 0;
+    int flags = atoi(flags_s);
+    int proto = atoi(proto_s);
+    int alg = atoi(alg_s);
+    if (flags < 0 || flags > 0xFFFF)
+        return 0;
+    if (proto != 3) /* RFC 2535 §3.1.2: the protocol octet MUST be 3 */
+        return 0;
+    if (alg != s.algorithm) /* the KEY's algorithm must match what the SIG claims */
+        return 0;
+    uint8_t pubkey[256];
+    int publen = b64std_dec(pub_b64, pubkey, sizeof(pubkey));
+    if (publen <= 0)
+        return 0;
+    if ((alg == 13 && publen != 64) || (alg == 15 && publen != 32))
+        return 0;
+    if (alg != 13 && alg != 15) /* RSA etc: recognised by neither signer nor us */
+        return 0;
+
+    uint8_t keyrd[4 + 256];
+    keyrd[0] = (uint8_t) (flags >> 8);
+    keyrd[1] = (uint8_t) (flags & 0xFF);
+    keyrd[2] = (uint8_t) proto;
+    keyrd[3] = (uint8_t) alg;
+    memcpy(keyrd + 4, pubkey, (size_t) publen);
+    if (keytag(keyrd, 4 + publen) != s.key_tag)
+        return 0;
+
+    /* Covered data: the SIG rdata prefix (as received, minus the trailing
+     * signature) followed by the original message up to the SIG RR, with
+     * ARCOUNT patched -1 to exclude it — identical construction to
+     * tsig_verify's MAC input above, just a different final digest step. */
+    int msg_len = (int) (sig_rr - pkt);
+    if (msg_len <= 0)
+        return 0;
+    uint8_t *tmp = malloc((size_t) msg_len);
+    if (!tmp)
+        return 0;
+    memcpy(tmp, pkt, (size_t) msg_len);
+    uint16_t ar = get16(tmp, 10);
+    ar--;
+    put16(tmp, 10, ar);
+
+    uint8_t *data = malloc((size_t) (s.rdata_prefix_len + msg_len));
+    if (!data) {
+        free(tmp);
+        return 0;
+    }
+    memcpy(data, s.rdata_prefix, (size_t) s.rdata_prefix_len);
+    memcpy(data + s.rdata_prefix_len, tmp, (size_t) msg_len);
+    free(tmp);
+
+    int ok;
+    if (alg == 13)
+        ok = verify_ecdsa_p256(s.signature, data, s.rdata_prefix_len + msg_len, pubkey);
+    else
+        ok = verify_ed25519(s.signature, data, s.rdata_prefix_len + msg_len, pubkey);
+    free(data);
+    return ok;
+}
+
+/* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
 static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
@@ -6580,8 +6816,11 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
         return 12;
     }
-    /* TSIG verification */
-    if (g_tsig_secret_len > 0 && !tsig_verify(pkt, plen)) {
+    /* Authentication: RFC 2931 SIG(0) if the message carries one (verified
+     * below once the zone is known — trusted keys are per-zone), otherwise
+     * the existing global-secret TSIG gate, unchanged. */
+    int has_sig0 = sig0_present(pkt, plen);
+    if (!has_sig0 && g_tsig_secret_len > 0 && !tsig_verify(pkt, plen)) {
         rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_BADSIG);
         return 12;
     }
@@ -6606,6 +6845,17 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         off = za + 4;
         if (off > plen)
             goto formerr;
+    }
+    if (has_sig0 && !sig0_verify(pkt, plen)) {
+        dns_log(LOG_WARNING, "[UPDATE] SIG(0) verification failed for zone '%s'\n",
+                t_zone ? t_zone->name : "?");
+        /* NOTAUTH, not BADSIG(17): BADSIG needs an extended RCODE (RFC 6891
+         * §6.1.3), which requires an EDNS OPT record to carry the high byte —
+         * this is a bare header-only response with none. Setting BADSIG's
+         * raw value here would silently corrupt the low RCODE nibble *and*
+         * the adjacent CD flag bit instead of signaling anything meaningful. */
+        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
+        return 12;
     }
     /* RFC 2136 §2.4 prerequisites */
     for (int i = 0; i < ntohs(h->ancount); i++) {
@@ -6636,7 +6886,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         if (prereq_fail) {
             rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | prereq_fail);
             {
-                int o2 = tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+                int o2 = (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
                 return o2;
             }
         }
@@ -6661,7 +6911,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
             dns_log(LOG_WARNING, "[DDNS] REFUSED update of %s — outside ddns_allow_suffix [%s]\n",
                     un, g_ddns_allow_suffix);
             rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
-            return tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+            return (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
         }
         char k[768];
         if (uc == DNS_CLASS_IN && rdlen > 0) {
@@ -6822,7 +7072,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
     }
     /* Append TSIG to response */
     {
-        int off2 = tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0);
+        int off2 = (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
         return off2;
     }
 formerr:

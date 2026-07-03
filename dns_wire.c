@@ -15,6 +15,10 @@
 #include <openssl/x509.h> /* tls_server_ctx_from_pem */
 #include <openssl/pem.h>
 #include <openssl/bio.h>
+#include <openssl/ec.h> /* verify_ecdsa_p256 */
+#include <openssl/ecdsa.h>
+#include <openssl/bn.h>
+#include <openssl/core_names.h> /* OSSL_PARAM_construct_* */
 
 /* ── Small string helpers ────────────────────────────────────────────────── */
 
@@ -56,10 +60,16 @@ int hex_dec(const char *in, uint8_t *out, int maxlen) {
 
 int b64std_dec(const char *in, uint8_t *out, int olen) {
     int inlen = (int) strlen(in), o = 0;
+    /* index 61 ('=') is deliberately -1, NOT 0: it must be treated as
+     * padding/terminator (RFC 4648 §4), not decoded as if it were 'A'. A
+     * table that decodes '=' as 0 silently appends 1-2 bogus bytes to any
+     * input whose true length isn't a multiple of 3 (i.e. most real inputs —
+     * a 32-byte secret needs one '=', for example) — found via a SIG(0) KEY
+     * lookup that decoded a 64-byte pubkey as 66 bytes. */
     static const int8_t rev[256] = {
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62,
-        -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, 0,  -1, -1, -1, 0,
+        -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1, -1, 0,
         1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
         23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
         39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -69,7 +79,15 @@ int b64std_dec(const char *in, uint8_t *out, int olen) {
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-    for (int i = 0; i + 3 < inlen && o + 2 < olen; i += 4) {
+    /* The outer bound only needs `o < olen` (room for the one unconditional
+     * write below), not `o + 2 < olen`: that stricter bound assumed every
+     * group emits a full 3 bytes, which is false for the last group of a
+     * padded input (1-2 bytes) — with a destination sized exactly to the
+     * expected output, that over-conservative bound stopped the loop one
+     * group early and silently truncated the final byte(s). The two
+     * conditional writes below already carry their own `o < olen` guard, so
+     * this bound alone is still overflow-safe. */
+    for (int i = 0; i + 3 < inlen && o < olen; i += 4) {
 #ifdef __clang_analyzer__
         /* The clang static analyzer does not use strlen()'s guarantee that
            in[0..inlen) is initialized, so it false-positives
@@ -966,6 +984,10 @@ const char *type2str(uint16_t t) {
             return "MX";
         case DNS_TYPE_TXT:
             return "TXT";
+        case DNS_TYPE_SIG:
+            return "SIG";
+        case DNS_TYPE_KEY:
+            return "KEY";
         case DNS_TYPE_AAAA:
             return "AAAA";
         case DNS_TYPE_LOC:
@@ -1037,6 +1059,10 @@ uint16_t str2type(const char *s) {
         return DNS_TYPE_MX;
     if (!strcasecmp(s, "TXT"))
         return DNS_TYPE_TXT;
+    if (!strcasecmp(s, "SIG"))
+        return DNS_TYPE_SIG;
+    if (!strcasecmp(s, "KEY"))
+        return DNS_TYPE_KEY;
     if (!strcasecmp(s, "AAAA"))
         return DNS_TYPE_AAAA;
     if (!strcasecmp(s, "LOC"))
@@ -1471,6 +1497,67 @@ int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outle
                               inlen) != OPENSSL_NPN_NEGOTIATED)
         return SSL_TLSEXT_ERR_NOACK;
     return SSL_TLSEXT_ERR_OK;
+}
+
+/* ── Generic DNSSEC-algorithm signature verification ─────────────────────── */
+
+int verify_ecdsa_p256(const uint8_t *sig_raw, const uint8_t *data, int dlen,
+                      const uint8_t pubkey_xy[64]) {
+    EVP_PKEY *pkey = NULL;
+    OSSL_PARAM params[3];
+    /* Convert 64-byte raw to DER ECDSA signature */
+    ECDSA_SIG *sig = ECDSA_SIG_new();
+    if (!sig)
+        return 0;
+    BIGNUM *r = BN_bin2bn(sig_raw, 32, NULL);
+    BIGNUM *s = BN_bin2bn(sig_raw + 32, 32, NULL);
+    ECDSA_SIG_set0(sig, r, s);
+    int derlen = i2d_ECDSA_SIG(sig, NULL);
+    uint8_t *der = malloc(derlen);
+    if (!der) {
+        ECDSA_SIG_free(sig);
+        return 0;
+    }
+    uint8_t *p = der;
+    i2d_ECDSA_SIG(sig, &p);
+    ECDSA_SIG_free(sig);
+    /* Build EVP_PKEY from raw X||Y */
+    uint8_t pub[65];
+    pub[0] = 0x04;
+    memcpy(pub + 1, pubkey_xy, 64);
+    params[0] = OSSL_PARAM_construct_utf8_string("group", "P-256", 0);
+    params[1] = OSSL_PARAM_construct_octet_string("pub", pub, 65);
+    params[2] = OSSL_PARAM_construct_end();
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+    int ok = 0;
+    if (kctx && EVP_PKEY_fromdata_init(kctx) > 0 &&
+        EVP_PKEY_fromdata(kctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) > 0 && pkey) {
+        EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+        if (EVP_DigestVerifyInit(mctx, NULL, EVP_sha256(), NULL, pkey) > 0 &&
+            EVP_DigestVerifyUpdate(mctx, data, dlen) > 0 &&
+            EVP_DigestVerifyFinal(mctx, der, derlen) == 1)
+            ok = 1;
+        EVP_MD_CTX_free(mctx);
+    }
+    if (kctx)
+        EVP_PKEY_CTX_free(kctx);
+    if (pkey)
+        EVP_PKEY_free(pkey);
+    free(der);
+    return ok;
+}
+
+int verify_ed25519(const uint8_t *sig_raw, const uint8_t *data, int dlen,
+                   const uint8_t pubkey[32]) {
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pubkey, 32);
+    if (!pkey)
+        return 0;
+    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+    int ok = (EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pkey) > 0 &&
+              EVP_DigestVerify(mctx, sig_raw, 64, data, dlen) == 1);
+    EVP_MD_CTX_free(mctx);
+    EVP_PKEY_free(pkey);
+    return ok;
 }
 
 int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,

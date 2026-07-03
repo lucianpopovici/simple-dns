@@ -310,6 +310,45 @@ static void test_edns_append(void) {
     check((buf[opt_flags_hi] & 0x80) != 0, "DO bit set in response OPT");
 }
 
+/* ── RFC 4648 §4: base64 padding must terminate decoding ──────────────────
+ * Regression for a real bug found via RFC 2931 SIG(0) KEY-lookup: the
+ * decode alphabet table mapped '=' to 0 (i.e. treated it as 'A') instead of
+ * -1 (padding/terminator), so any input whose true length wasn't a multiple
+ * of 3 bytes silently decoded 1-2 bytes too many. This is the "known-answer
+ * + negative" pattern CLAUDE.md asks for on a crypto-adjacent parser bug —
+ * every SIG(0)/TSIG-secret decode goes through this exact function. */
+static void test_base64_padding(void) {
+    printf("== RFC 4648 base64 padding ==\n");
+
+    uint8_t out[64];
+    /* No padding needed: 6 bytes -> 8 base64 chars, exact multiple of 3. */
+    int n = b64std_dec("Zm9vYmFy", out, sizeof(out));
+    check(n == 6 && memcmp(out, "foobar", 6) == 0, "unpadded input decodes exactly");
+
+    /* One '=' (2 padding bytes worth of zero-fill in the encoding): "fo" (2
+     * bytes) encodes as "Zm8=". */
+    n = b64std_dec("Zm8=", out, sizeof(out));
+    check(n == 2 && memcmp(out, "fo", 2) == 0, "single '=' padding decodes to 2 bytes, not 3");
+
+    /* Two '==': "f" (1 byte) encodes as "Zg==". This is the exact shape
+     * that triggered the bug (a 64-byte EC pubkey has the same 1-byte
+     * remainder, so its base64 also ends in "=="). */
+    n = b64std_dec("Zg==", out, sizeof(out));
+    check(n == 1 && out[0] == 'f', "double '==' padding decodes to 1 byte, not 3");
+
+    /* A realistic 64-byte payload round-tripped through openssl-style
+     * base64 (88 chars, trailing "=="): must decode to exactly 64 bytes. */
+    n = b64std_dec(
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0"
+        "+Pw==",
+        out, sizeof(out));
+    int seq_ok = (n == 64);
+    for (int i = 0; seq_ok && i < 64; i++)
+        seq_ok = (out[i] == i);
+    check(seq_ok, "64-byte 0x00-0x3F sequence with '==' padding decodes to exactly 64 bytes (was "
+                  "66), all bytes correct");
+}
+
 int main(void) {
     test_serial_arithmetic();
     test_ttl_max();
@@ -319,6 +358,7 @@ int main(void) {
     test_edns_parse_do_bit_position();
     test_edns_parse_nsid_cookie();
     test_edns_append();
+    test_base64_padding();
 
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;
