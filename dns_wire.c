@@ -1226,6 +1226,14 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
                      * nonzero length here is malformed and ignored rather
                      * than honored. */
                     ei->zoneversion_req = 1;
+                } else if (oc == EDNS_OPT_UPDATE_LEASE && (ol == 4 || ol == 8) &&
+                           rp + (int) ol <= plen) {
+                    ei->has_update_lease = 1;
+                    ei->update_lease = get32(pkt, rp);
+                    if (ol == 8) {
+                        ei->has_update_key_lease = 1;
+                        ei->update_key_lease = get32(pkt, rp + 4);
+                    }
                 }
                 if (rp + (int) ol > plen)
                     break;
@@ -1243,7 +1251,8 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
 int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uint16_t rcode_ext,
                     const edns_info_t *req_ei, const char *nsid, const uint8_t *scookie,
                     int ede_code, const char *ede_text, int zv_labels, uint32_t zv_serial,
-                    const char *report_agent) {
+                    const char *report_agent, int has_ul, uint32_t ul_lease, int has_ul_key_lease,
+                    uint32_t ul_key_lease) {
     if (off + 11 > blen)
         return off;
     buf[off++] = 0; /* root name */
@@ -1338,6 +1347,21 @@ int edns_append_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit, uin
             memcpy(buf + rdata_off + 4, agent_wire, (size_t) al);
             rdata_off += 4 + al;
             rdata_len += 4 + al;
+        }
+    }
+    /* RFC 9664 §1 Update Lease option — SRP registration response. Wire
+     * variant (4 vs 8 bytes) mirrors what was granted: has_ul_key_lease
+     * selects LEASE+KEY-LEASE, otherwise LEASE only. */
+    if (has_ul) {
+        int ul_len = has_ul_key_lease ? 8 : 4;
+        if (rdata_off + 4 + ul_len < blen) {
+            put16(buf, rdata_off, EDNS_OPT_UPDATE_LEASE);
+            put16(buf, rdata_off + 2, (uint16_t) ul_len);
+            put32(buf, rdata_off + 4, ul_lease);
+            if (has_ul_key_lease)
+                put32(buf, rdata_off + 8, ul_key_lease);
+            rdata_off += 4 + ul_len;
+            rdata_len += 4 + ul_len;
         }
     }
     /* Padding (RFC 7830 / RFC 8467):

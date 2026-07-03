@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1218,6 +1218,68 @@ check-sig0: $(BIN_DEBUG)
 	 test -z "$$A_NOKEY" || { echo "  FAIL  UPDATE with no trusted key was applied anyway"; exit 1; }; \
 	 echo "  OK  correctly-signed UPDATE applied; flipped-sig/expired/untrusted-key all rejected with NOTAUTH, none applied"
 
+# RFC 9665 SRP (Service Registration Protocol) + RFC 9664 (Update Leases) —
+# device self-registration on top of SIG(0) (CLAUDE-mdnsd.md Add 3). No
+# standard tool speaks SRP, so tests/srp_client.py hand-builds and signs the
+# whole delete-all-then-add UPDATE (reusing sig0_client.py's crypto helpers).
+# Covers: register (host+service+PTR, verified via dig), refresh with the
+# same key (address change applies), conflict with a different key
+# (YXDOMAIN, original registration untouched), and lease expiry (a fast
+# sweep interval + short lease reaps the record). Needs Valkey + dig +
+# openssl + python3.
+check-srp: $(BIN_DEBUG)
+	@echo "  CHECK  RFC 9665 SRP + RFC 9664 Update Leases (requires Valkey + dig + openssl + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v openssl >/dev/null 2>&1 || { echo "  SKIP  no openssl on PATH"; exit 0; }; \
+	 command -v python3 >/dev/null 2>&1 || { echo "  SKIP  no python3 on PATH"; exit 0; }; \
+	 D=$$(mktemp -d); Z=example.local; HOST=srphost1.$$Z; \
+	 openssl ecparam -name prime256v1 -genkey -noout -out $$D/deviceA.key >/dev/null 2>&1; \
+	 openssl ecparam -name prime256v1 -genkey -noout -out $$D/deviceB.key >/dev/null 2>&1; \
+	 SAVE_SRP=$$($$VC get config:srp_enabled); SAVE_SWEEP=$$($$VC get config:srp_sweep_secs); \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); \
+	 $$VC del config:tsig_secret_b64 >/dev/null; \
+	 $$VC set config:srp_enabled 1 >/dev/null; \
+	 $$VC set config:srp_sweep_secs 2 >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_srp.log 2>&1 & DNS=$$!; \
+	 sleep 1.5; \
+	 R_REG=$$(python3 tests/srp_client.py register 127.0.0.1 $(TPORT) $$Z $$D/deviceA.key $$HOST 10.5.5.5 3600 86400 myprinter _ipp._tcp 631 path=/ | head -1); \
+	 A_HOST=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$HOST A +time=2 +tries=1); \
+	 A_SRV=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) myprinter._ipp._tcp.$$Z SRV +time=2 +tries=1); \
+	 A_TXT=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) myprinter._ipp._tcp.$$Z TXT +time=2 +tries=1); \
+	 A_PTR=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) _ipp._tcp.$$Z PTR +time=2 +tries=1); \
+	 R_REFRESH=$$(python3 tests/srp_client.py register 127.0.0.1 $(TPORT) $$Z $$D/deviceA.key $$HOST 10.5.5.6 3600 86400 | head -1); \
+	 A_REFRESHED=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$HOST A +time=2 +tries=1); \
+	 R_CONFLICT=$$(python3 tests/srp_client.py register 127.0.0.1 $(TPORT) $$Z $$D/deviceB.key $$HOST 10.9.9.9 3600 86400 | head -1); \
+	 A_AFTER_CONFLICT=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$HOST A +time=2 +tries=1); \
+	 R_EXP=$$(python3 tests/srp_client.py register 127.0.0.1 $(TPORT) $$Z $$D/deviceA.key srpexpire.$$Z 10.7.7.7 3 3 | head -1); \
+	 A_EXP_BEFORE=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) srpexpire.$$Z A +time=2 +tries=1); \
+	 sleep 8; \
+	 A_EXP_AFTER=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) srpexpire.$$Z A +time=2 +tries=1); \
+	 kill $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
+	 if [ -n "$$SAVE_SRP" ]; then $$VC set config:srp_enabled "$$SAVE_SRP" >/dev/null; else $$VC del config:srp_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_SWEEP" ]; then $$VC set config:srp_sweep_secs "$$SAVE_SWEEP" >/dev/null; else $$VC del config:srp_sweep_secs >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 for k in $$($$VC --scan --pattern "srp:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 rm -rf $$D; \
+	 echo "  register=[$$R_REG] host=[$$A_HOST] srv=[$$A_SRV] txt=[$$A_TXT] ptr=[$$A_PTR]"; \
+	 echo "  refresh=[$$R_REFRESH] refreshed=[$$A_REFRESHED]"; \
+	 echo "  conflict=[$$R_CONFLICT] after-conflict=[$$A_AFTER_CONFLICT]"; \
+	 echo "  expiry: reg=[$$R_EXP] before=[$$A_EXP_BEFORE] after=[$$A_EXP_AFTER]"; \
+	 test "$$R_REG" = "RCODE 0" || { echo "  FAIL  registration was not accepted"; cat /tmp/dnsd_srp.log; exit 1; }; \
+	 test "$$A_HOST" = "10.5.5.5" || { echo "  FAIL  host A record not servable after registration"; exit 1; }; \
+	 echo "$$A_SRV" | grep -q "631 $$HOST\.\?$$" || { echo "  FAIL  SRV record wrong/missing"; exit 1; }; \
+	 test "$$A_TXT" = '"path=/"' || { echo "  FAIL  TXT record wrong/missing (got [$$A_TXT])"; exit 1; }; \
+	 test "$$A_PTR" = "myprinter._ipp._tcp.$$Z." || { echo "  FAIL  PTR (service discovery) record wrong/missing"; exit 1; }; \
+	 test "$$R_REFRESH" = "RCODE 0" || { echo "  FAIL  same-key refresh was not accepted"; exit 1; }; \
+	 test "$$A_REFRESHED" = "10.5.5.6" || { echo "  FAIL  refresh did not update the address"; exit 1; }; \
+	 test "$$R_CONFLICT" = "RCODE 6" || { echo "  FAIL  different-key registration of an owned name was not rejected with YXDOMAIN"; exit 1; }; \
+	 test "$$A_AFTER_CONFLICT" = "10.5.5.6" || { echo "  FAIL  conflicting registration mutated the existing owner's record"; exit 1; }; \
+	 test "$$R_EXP" = "RCODE 0" || { echo "  FAIL  short-lease registration was not accepted"; exit 1; }; \
+	 test "$$A_EXP_BEFORE" = "10.7.7.7" || { echo "  FAIL  short-lease record was not initially servable"; exit 1; }; \
+	 test -z "$$A_EXP_AFTER" || { echo "  FAIL  record was not reaped after its lease expired"; exit 1; }; \
+	 echo "  OK  register+serve, same-key refresh, different-key YXDOMAIN conflict, and lease-expiry reaping all correct"
+
 # DDNS suffix ACL + serial-churn skip (CLAUDE-discovery.md Gap 3). With
 # config:ddns_allow_suffix set, RFC 2136 UPDATE may only touch names under that
 # suffix (others REFUSED); and a lease refresh that re-stores the same address
@@ -2249,6 +2311,7 @@ help:
 	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
 	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"
 	@echo "  make check-sig0      RFC 2931 SIG(0) transaction signatures: KAT + flipped-sig/expired/no-key negatives (needs Valkey + dig + openssl + python3)"
+	@echo "  make check-srp       RFC 9665 SRP + RFC 9664 Update Leases: register/refresh/conflict/expiry (needs Valkey + dig + openssl + python3)"
 	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"

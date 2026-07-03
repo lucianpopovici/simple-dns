@@ -297,8 +297,8 @@ static void test_edns_append(void) {
     uint8_t buf[512];
     memset(buf, 0, sizeof(buf));
     /* arcount starts at 0 */
-    int off =
-        edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL, -1, 0, NULL);
+    int off = edns_append_opt(buf, 12, sizeof(buf), 0, 1, 0, NULL, NULL, NULL, -1, NULL, -1, 0,
+                              NULL, 0, 0, 0, 0);
     check(off > 12, "edns_append_opt returns new offset > 12");
     check(get16(buf, 10) == 1, "arcount incremented to 1");
     /* Verify OPT type at wire position 12: 1 byte root name + 2 bytes type */
@@ -308,6 +308,106 @@ static void test_edns_append(void) {
     /* Owner(1)+type(2)+class(2)+rcode(1)+version(1)+flags_hi(1)+flags_lo(1) */
     int opt_flags_hi = 12 + 1 + 2 + 2 + 1 + 1; /* = 19 */
     check((buf[opt_flags_hi] & 0x80) != 0, "DO bit set in response OPT");
+}
+
+/* ── RFC 9664: EDNS Update Lease option (SRP) ─────────────────────────────── */
+static void test_update_lease_option(void) {
+    printf("== RFC 9664 Update Lease option ==\n");
+
+    /* Parse: 8-byte variant (LEASE + KEY-LEASE) in a request. */
+    {
+        uint8_t pkt[128];
+        memset(pkt, 0, 12);
+        put16(pkt, 10, 1); /* arcount=1 */
+        int off = 12;
+        pkt[off++] = 0; /* OPT owner = root */
+        put16(pkt, off, DNS_TYPE_OPT);
+        off += 2;
+        put16(pkt, off, 1232);
+        off += 2;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        int rdlen_off = off;
+        off += 2;
+        int rdata_start = off;
+        put16(pkt, off, EDNS_OPT_UPDATE_LEASE);
+        off += 2;
+        put16(pkt, off, 8);
+        off += 2;
+        put32(pkt, off, 7200); /* LEASE = 2h */
+        off += 4;
+        put32(pkt, off, 1209600); /* KEY-LEASE = 14d */
+        off += 4;
+        put16(pkt, rdlen_off, (uint16_t) (off - rdata_start));
+
+        edns_info_t ei;
+        edns_parse(pkt, off, &ei);
+        check(ei.has_update_lease, "8-byte variant: has_update_lease set");
+        check(ei.update_lease == 7200, "8-byte variant: LEASE = 7200");
+        check(ei.has_update_key_lease, "8-byte variant: has_update_key_lease set");
+        check(ei.update_key_lease == 1209600, "8-byte variant: KEY-LEASE = 1209600");
+    }
+
+    /* Parse: 4-byte variant (LEASE only) — KEY-LEASE must NOT be set. */
+    {
+        uint8_t pkt[128];
+        memset(pkt, 0, 12);
+        put16(pkt, 10, 1);
+        int off = 12;
+        pkt[off++] = 0;
+        put16(pkt, off, DNS_TYPE_OPT);
+        off += 2;
+        put16(pkt, off, 1232);
+        off += 2;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        pkt[off++] = 0;
+        int rdlen_off = off;
+        off += 2;
+        int rdata_start = off;
+        put16(pkt, off, EDNS_OPT_UPDATE_LEASE);
+        off += 2;
+        put16(pkt, off, 4);
+        off += 2;
+        put32(pkt, off, 3600);
+        off += 4;
+        put16(pkt, rdlen_off, (uint16_t) (off - rdata_start));
+
+        edns_info_t ei;
+        edns_parse(pkt, off, &ei);
+        check(ei.has_update_lease, "4-byte variant: has_update_lease set");
+        check(ei.update_lease == 3600, "4-byte variant: LEASE = 3600");
+        check(!ei.has_update_key_lease, "4-byte variant: has_update_key_lease NOT set");
+    }
+
+    /* Append: round-trip through edns_append_opt then edns_parse. */
+    {
+        uint8_t buf[512];
+        memset(buf, 0, sizeof(buf));
+        int off = edns_append_opt(buf, 12, sizeof(buf), 0, 0, 0, NULL, NULL, NULL, -1, NULL, -1, 0,
+                                  NULL, 1, 5400, 1, 864000);
+        check(off > 12, "edns_append_opt with has_ul=1 returns new offset");
+
+        edns_info_t ei;
+        edns_parse(buf, off, &ei);
+        check(ei.has_update_lease && ei.update_lease == 5400, "round-trip: LEASE echoed correctly");
+        check(ei.has_update_key_lease && ei.update_key_lease == 864000,
+              "round-trip: KEY-LEASE echoed correctly");
+    }
+
+    /* Omitted when has_ul=0 — must not appear even if buffer has room. */
+    {
+        uint8_t buf[512];
+        memset(buf, 0, sizeof(buf));
+        int off = edns_append_opt(buf, 12, sizeof(buf), 0, 0, 0, NULL, NULL, NULL, -1, NULL, -1, 0,
+                                  NULL, 0, 5400, 1, 864000);
+        edns_info_t ei;
+        edns_parse(buf, off, &ei);
+        check(!ei.has_update_lease, "has_ul=0 omits the option entirely");
+    }
 }
 
 /* ── RFC 4648 §4: base64 padding must terminate decoding ──────────────────
@@ -358,6 +458,7 @@ int main(void) {
     test_edns_parse_do_bit_position();
     test_edns_parse_nsid_cookie();
     test_edns_append();
+    test_update_lease_option();
     test_base64_padding();
 
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");

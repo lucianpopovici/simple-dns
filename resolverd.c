@@ -3903,7 +3903,7 @@ static int build_dns_response(const uint8_t *pkt, int plen, int is_tcp, uint8_t 
         if (rc < 0)
             ede_for_resolve_failure(rc, &ede_code, &ede_text);
         int new_off = edns_append_opt(resp, off, cap, is_tcp, req_ei.do_bit, 0, &req_ei, NULL, NULL,
-                                      ede_code, ede_text, -1, 0, NULL);
+                                      ede_code, ede_text, -1, 0, NULL, 0, 0, 0, 0);
         if (new_off > off) {
             off = new_off;
             arcount = 1;
