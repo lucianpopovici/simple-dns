@@ -501,43 +501,8 @@ static SSL_CTX *tls_ctx_from_pem(const char *cert_pem, const char *key_pem, cons
     return ctx;
 }
 
-/* Split cert:current into chain + key (same contract as dnsd/certd). */
-static int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
-                              size_t key_sz) {
-    static const char *kbegin_pat[] = {"-----BEGIN PRIVATE KEY-----",
-                                       "-----BEGIN EC PRIVATE KEY-----",
-                                       "-----BEGIN RSA PRIVATE KEY-----", NULL};
-    const char *kb = NULL;
-    for (int ki = 0; kbegin_pat[ki]; ki++) {
-        kb = strstr(blob, kbegin_pat[ki]);
-        if (kb)
-            break;
-    }
-    if (!kb)
-        return -1;
-    const char *ke = strstr(kb, "-----END ");
-    if (!ke)
-        return -1;
-    ke = strchr(ke, '\n');
-    if (!ke)
-        ke = kb + strlen(kb);
-    else
-        ke++;
-    size_t klen = (size_t) (ke - kb);
-    if (klen + 1 > key_sz)
-        return -1;
-    memcpy(key_out, kb, klen);
-    key_out[klen] = 0;
-    size_t pre = (size_t) (kb - blob), post = strlen(ke);
-    if (pre + post + 1 > cert_sz)
-        return -1;
-    memcpy(cert_out, blob, pre);
-    memcpy(cert_out + pre, ke, post);
-    cert_out[pre + post] = 0;
-    if (!strstr(cert_out, "-----BEGIN CERTIFICATE-----"))
-        return -1;
-    return 0;
-}
+/* cert_current_split lives in libdnswire (dns_wire.c) — shared with dnsd and
+ * mdnsd so the cert:current parsing exists once. */
 
 static void tls_reload(void) {
     pthread_mutex_lock(&g_tls_mutex);

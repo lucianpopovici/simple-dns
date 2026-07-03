@@ -29,6 +29,16 @@
  * (default 8530), config:dp_ttl_cap (default 30s — RFC 8766 §5.3, the
  * source mDNS TTL is never reused unchanged). Never proxies a link-scoped
  * (fe80::/10) AAAA to the unicast side.
+ *
+ * RFC 8490 DSO + RFC 8765 DNS Push Notifications (opt-in, requires the
+ * Discovery Proxy above): config:dso_enabled + config:dso_port (default
+ * 8531) run a DoT (TLS-only, cert:current-sourced) listener where clients
+ * SUBSCRIBE to a (name,type) under a proxied subdomain and get PUSHed the
+ * current answer set, then a PUSH whenever it changes (detected by polling
+ * every config:dso_poll_interval_secs, default 5). config:dso_max_subscriptions
+ * caps subscriptions per session; config:dso_inactivity_ms /
+ * config:dso_keepalive_ms tune the RFC 8490 session timers (defaults 15000
+ * each, matching the RFC's own defaults).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,6 +111,35 @@ static char g_dp_subdomains[DP_MAX_SUBDOMAINS][256];
 static int g_dp_subdomain_count = 0;
 static int g_dp_port = 8530;
 static uint32_t g_dp_ttl_cap = 30;
+
+/* RFC 8490 DSO + RFC 8765 DNS Push Notifications (Add 2) — the live-update
+ * companion to the Discovery Proxy above: a client SUBSCRIBEs to a
+ * (name,type) under a proxied subdomain over a long-lived DoT session and
+ * gets PUSHed the current answer set, then a PUSH whenever it changes.
+ * Off by default; RFC 8765 mandates TLS (the Strict Privacy DoT profile,
+ * RFC 8310 — no plaintext option), so the listener only comes up once
+ * cert:current has a usable certificate, same hot-reload contract as
+ * dnsd/apid. SUBSCRIBE only accepts names under a configured Discovery
+ * Proxy subdomain — Push rides on Add 1's existing trust boundary, it is
+ * not a general update channel. */
+#define DSO_MAX_SESSIONS 32
+#define DSO_MAX_SUBS_PER_SESSION 8
+#define DSO_MAX_MSG 16384 /* RFC 8765 §5.4: max PUSH message is 16382+2 bytes */
+/* RFC 8490 §7 generic TLV types */
+#define DSO_TLV_KEEPALIVE 1
+#define DSO_TLV_RETRY_DELAY 2
+#define DSO_TLV_ENCRYPTION_PADDING 3
+/* RFC 8765 §5 Push TLV types */
+#define DSO_TLV_SUBSCRIBE 0x40
+#define DSO_TLV_PUSH 0x41
+#define DSO_TLV_UNSUBSCRIBE 0x42
+#define DSO_TLV_RECONFIRM 0x43
+static int g_dso_enabled = 0;
+static int g_dso_port = 8531;
+static uint32_t g_dso_inactivity_ms = 15000; /* RFC 8490 §6.1 default */
+static uint32_t g_dso_keepalive_ms = 15000;  /* RFC 8490 §6.2 default */
+static int g_dso_max_subs = DSO_MAX_SUBS_PER_SESSION;
+static int g_dso_poll_secs = 5;
 
 static const char *cfgenv(const char *k, const char *def) {
     const char *v = getenv(k);
@@ -1088,6 +1127,17 @@ static int dp_from_mdns_name(const char *mdns_name, const char *suffix, char *ou
  * sidesteps the whole class of problem.
  */
 static pthread_mutex_t g_dp_collect_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Serializes whole collection rounds (arm -> send -> sleep -> read) against
+ * each other. dp_mdns_collect's collection window is process-wide (one
+ * armed/collected state shared via g_dp_collect_mutex above) and was
+ * originally only ever invoked serially from the single-threaded
+ * dp_listen_thread. DSO/Push (Add 2) added concurrent callers — a
+ * SUBSCRIBE handler on each session's own thread, plus a periodic poll
+ * thread — so without this, two overlapping collections would each see a
+ * mix of both callers' responses. This mutex is coarser than
+ * g_dp_collect_mutex on purpose: it must be held for the full round
+ * (including the DP_COLLECT_MS sleep), not just the bookkeeping updates. */
+static pthread_mutex_t g_dp_query_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_dp_armed = 0;
 static uint8_t g_dp_collected[DP_MAX_RESPONSES][MDNS_MAX_MSG];
 static int g_dp_collected_lens[DP_MAX_RESPONSES];
@@ -1124,14 +1174,17 @@ static void dp_maybe_collect(const uint8_t *pkt, int plen) {
  */
 static int dp_mdns_collect(const char *qname, uint16_t qtype, uint8_t out[][MDNS_MAX_MSG],
                            int *out_lens, int max_out) {
+    pthread_mutex_lock(&g_dp_query_mutex);
     uint8_t query[512];
     memset(query, 0, 12);
     put16(query, 4, 1); /* qdcount = 1 — a well-formed responder (and this
                          * codebase's own DNS-SD stub tests) reject qdcount
                          * != 1 outright, silently */
     int off = mdns_put_name(query, 12, sizeof(query), qname);
-    if (off < 0 || off + 4 > (int) sizeof(query))
+    if (off < 0 || off + 4 > (int) sizeof(query)) {
+        pthread_mutex_unlock(&g_dp_query_mutex);
         return 0;
+    }
     put16(query, off, qtype);
     off += 2;
     put16(query, off, DNS_CLASS_IN);
@@ -1154,6 +1207,7 @@ static int dp_mdns_collect(const char *qname, uint16_t qtype, uint8_t out[][MDNS
         out_lens[i] = g_dp_collected_lens[i];
     }
     pthread_mutex_unlock(&g_dp_collect_mutex);
+    pthread_mutex_unlock(&g_dp_query_mutex);
     return n;
 }
 
@@ -1290,6 +1344,17 @@ static void dp_collect_answers(const uint8_t *pkt, int plen, uint16_t qtype, con
     }
 }
 
+/* Find the configured proxied subdomain qname falls under, or NULL if none —
+ * shared by the Discovery Proxy query path and the DSO/Push SUBSCRIBE path
+ * (Add 2) below, since both gate on the exact same "never proxy/subscribe a
+ * subdomain we aren't explicitly configured for" guardrail. */
+static const char *dp_find_suffix(const char *qname) {
+    for (int i = 0; i < g_dp_subdomain_count; i++)
+        if (dp_suffix_match(qname, g_dp_subdomains[i]))
+            return g_dp_subdomains[i];
+    return NULL;
+}
+
 /* dp_handle_query — one Discovery Proxy request, start to finish: validate,
  * translate the qname, run the multicast collection window, translate the
  * answers back, and reply unicast. REFUSED for any name outside the
@@ -1323,12 +1388,7 @@ static void dp_handle_query(int srv_fd, const uint8_t *pkt, int plen, const stru
     }
     put16(resp, 4, 1); /* qdcount */
 
-    const char *suffix = NULL;
-    for (int i = 0; i < g_dp_subdomain_count; i++)
-        if (dp_suffix_match(qname, g_dp_subdomains[i])) {
-            suffix = g_dp_subdomains[i];
-            break;
-        }
+    const char *suffix = dp_find_suffix(qname);
     if (!suffix || qclass != DNS_CLASS_IN) {
         put16(resp, 2, 0x8000 | 5 /* REFUSED */);
         sendto(srv_fd, resp, off, 0, src, srclen);
@@ -1406,6 +1466,633 @@ static void *dp_listen_thread(void *arg) {
     return NULL;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * RFC 8490 DSO + RFC 8765 DNS Push Notifications (Add 2)
+ *
+ * "Change" detection is a bounded poll, not a passive full-link mDNS cache:
+ * every g_dso_poll_secs, every actively-subscribed (name,type) pair re-runs
+ * the same dp_mdns_collect() the Discovery Proxy uses for a one-shot lookup
+ * (de-duplicated across sessions — N sessions subscribed to the same name
+ * cost one collection round, not N) and diffs the result against what was
+ * last pushed to each session. This was chosen over building a continuous
+ * shadow cache of every advertisement seen on the link (a materially bigger,
+ * riskier piece of state to keep leak-free) because it reuses the
+ * already-audited Add 1 collection path and gives subscribers changes
+ * within one poll interval, which is adequate for the bounded subscription
+ * counts this daemon is designed for.
+ *
+ * dp_mdns_collect's collection window is process-wide (it arms/reads
+ * g_dp_collected under g_dp_collect_mutex and shares mdnsd's single
+ * link-local socket) and was previously only ever called from the
+ * single-threaded dp_listen_thread. DSO adds concurrent callers — SUBSCRIBE
+ * handlers on each session's own thread, plus this poll thread — so
+ * dp_mdns_collect itself now serializes whole collection rounds against
+ * each other via g_dp_query_mutex (see its definition), not just the
+ * bookkeeping variables.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    char name[256];
+    uint16_t type;
+    uint16_t msg_id; /* the SUBSCRIBE request's Message ID — what UNSUBSCRIBE references */
+    int nans;
+    dp_answer_t last[DP_MAX_ANSWERS]; /* last answer set pushed to this subscription */
+} dso_sub_t;
+
+typedef struct {
+    int fd;
+    SSL *ssl;
+    int active;
+    pthread_mutex_t mutex;  /* protects active/subs/nsubs/last[] below */
+    pthread_mutex_t wmutex; /* protects ssl/fd and serializes writes to them.
+                             * Lock order: mutex may be held while acquiring
+                             * wmutex (dso_poll_one); never the reverse. */
+    dso_sub_t subs[DSO_MAX_SUBS_PER_SESSION];
+    int nsubs;
+} dso_session_t;
+
+static dso_session_t g_dso_sessions[DSO_MAX_SESSIONS];
+static SSL_CTX *g_dso_ctx = NULL;
+static pthread_mutex_t g_dso_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Build (or rebuild, on cert:current hot-reload) the Push listener's TLS
+ * context. Builds the replacement before swapping so a transient bad/absent
+ * blob never tears down an already-working listener. Fails closed: leaves
+ * g_dso_ctx NULL (listener refuses every connection) until a valid cert
+ * exists — RFC 8765 has no plaintext fallback. */
+static void dso_tls_reload(void) {
+    if (!g_dso_enabled)
+        return;
+    char blob[24576], cert[16384], key[8192];
+    if (!vk_get("cert:current", blob, sizeof(blob)) || !blob[0] ||
+        cert_current_split(blob, cert, sizeof(cert), key, sizeof(key)) < 0) {
+        dns_log(LOG_WARNING, "[DSO] cert:current unavailable/unparseable — Push listener stays "
+                             "down until a cert is published (RFC 8765 requires TLS, never "
+                             "plaintext)\n");
+        return;
+    }
+    SSL_CTX *newctx = tls_server_ctx_from_pem(cert, key, NULL, 0);
+    if (!newctx) {
+        dns_log(LOG_ERR, "[DSO] TLS context build failed from cert:current\n");
+        return;
+    }
+    pthread_mutex_lock(&g_dso_tls_mutex);
+    SSL_CTX *old = g_dso_ctx;
+    g_dso_ctx = newctx;
+    pthread_mutex_unlock(&g_dso_tls_mutex);
+    if (old)
+        SSL_CTX_free(old);
+    dns_log(LOG_INFO, "[DSO] TLS context loaded\n");
+}
+
+/* Find a free session slot and claim it (active=1, subs cleared). Returns
+ * NULL if all DSO_MAX_SESSIONS slots are in use — a deliberate resource cap,
+ * not a soft limit. */
+static dso_session_t *dso_alloc_session(void) {
+    for (int i = 0; i < DSO_MAX_SESSIONS; i++) {
+        dso_session_t *s = &g_dso_sessions[i];
+        pthread_mutex_lock(&s->mutex);
+        if (!s->active) {
+            memset(s->subs, 0, sizeof(s->subs));
+            s->nsubs = 0;
+            s->active = 1;
+            pthread_mutex_unlock(&s->mutex);
+            return s;
+        }
+        pthread_mutex_unlock(&s->mutex);
+    }
+    return NULL;
+}
+
+/* Tear down a session: mark inactive first (so the poll thread's next
+ * active-check skips it), then close the TLS/socket under wmutex so a
+ * concurrent dso_send_raw() either completes before or safely no-ops after
+ * (it re-checks s->ssl != NULL under the same lock). */
+static void dso_teardown_session(dso_session_t *s) {
+    pthread_mutex_lock(&s->mutex);
+    s->active = 0;
+    s->nsubs = 0;
+    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_lock(&s->wmutex);
+    if (s->ssl) {
+        SSL_shutdown(s->ssl);
+        SSL_free(s->ssl);
+        s->ssl = NULL;
+    }
+    if (s->fd >= 0) {
+        close(s->fd);
+        s->fd = -1;
+    }
+    pthread_mutex_unlock(&s->wmutex);
+}
+
+/* Length-prefixed (RFC 1035 TCP framing, reused unchanged by RFC 8490 §5)
+ * send of one already-built DSO message. No-ops safely if the session's TLS
+ * has already been torn down. */
+static int dso_send_raw(dso_session_t *s, const uint8_t *msg, int len) {
+    pthread_mutex_lock(&s->wmutex);
+    int ok = -1;
+    if (s->ssl) {
+        uint8_t lb[2] = {(uint8_t) (len >> 8), (uint8_t) (len & 0xFF)};
+        if (SSL_write(s->ssl, lb, 2) == 2 && SSL_write(s->ssl, msg, len) == len)
+            ok = 0;
+    }
+    pthread_mutex_unlock(&s->wmutex);
+    return ok;
+}
+
+typedef struct {
+    uint16_t type;
+    int off;      /* absolute offset of DSO-DATA */
+    uint16_t len; /* DSO-DATA length */
+} dso_tlv_t;
+
+/* Read one TLV at pkt+off. Returns the offset just past it, or -1 on
+ * truncation — the caller must abort the session on -1 (fail closed), not
+ * skip bytes and guess. */
+static int dso_read_tlv(const uint8_t *pkt, int plen, int off, dso_tlv_t *out) {
+    if (off + 4 > plen)
+        return -1;
+    out->type = get16(pkt, off);
+    out->len = get16(pkt, off + 2);
+    out->off = off + 4;
+    if (out->off + (int) out->len > plen)
+        return -1;
+    return out->off + out->len;
+}
+
+/* A DSO response carrying only the 12-byte header (SUBSCRIBE success/failure,
+ * and generic error responses — FORMERR/DSOTYPENI/etc). */
+static int dso_build_simple_response(uint16_t msg_id, uint16_t rcode, uint8_t *out, int outsz) {
+    if (outsz < 12)
+        return -1;
+    memset(out, 0, 12);
+    put16(out, 0, msg_id);
+    put16(out, 2, DNS_QR | DNS_OPCODE_DSO | (rcode & DNS_RCODE_MASK));
+    return 12;
+}
+
+static int dso_build_keepalive_response(uint16_t msg_id, uint8_t *out, int outsz) {
+    if (outsz < 12 + 4 + 8)
+        return -1;
+    memset(out, 0, 12);
+    put16(out, 0, msg_id);
+    put16(out, 2, DNS_QR | DNS_OPCODE_DSO | DNS_RCODE_NOERROR);
+    int off = 12;
+    put16(out, off, DSO_TLV_KEEPALIVE);
+    off += 2;
+    put16(out, off, 8);
+    off += 2;
+    put32(out, off, g_dso_inactivity_ms);
+    off += 4;
+    put32(out, off, g_dso_keepalive_ms);
+    off += 4;
+    return off;
+}
+
+/* Build a unidirectional (Message ID 0) PUSH message: a single Push TLV
+ * (RFC 8765 §5.4) whose DATA is a sequence of RRs — TTL as collected for an
+ * add, TTL 0xFFFFFFFF (removes exactly this NAME/TYPE/CLASS/RDATA) for a
+ * removal. Names are uncompressed (append_rr_plain): the Push TLV's DATA is
+ * not the message's absolute offset 0, and libdnswire's compression context
+ * (name_to_wire_c) assumes owner names compress against the *whole
+ * message's* offsets — using it here would need the TLV's data offset
+ * threaded through, which isn't worth it for what are typically a handful
+ * of small RRs. Returns the message length, or -1 if nothing fit/was given. */
+static int dso_build_push(const dp_answer_t *adds, int nadds, const dp_answer_t *removes,
+                          int nremoves, uint8_t *out, int outsz) {
+    if (outsz < 16)
+        return -1;
+    memset(out, 0, 12);
+    put16(out, 2, DNS_OPCODE_DSO); /* ID=0, QR=0 -> unidirectional */
+    int tlv_hdr = 12;
+    int off = tlv_hdr + 4;
+    int data_start = off;
+    for (int i = 0; i < nadds; i++) {
+        int n = append_rr_plain(out, off, outsz, adds[i].name, adds[i].type, DNS_CLASS_IN,
+                                adds[i].ttl, adds[i].rdata, (uint16_t) adds[i].rdlen);
+        if (n < 0)
+            break; /* best-effort: stop rather than overflow the buffer */
+        off = n;
+    }
+    for (int i = 0; i < nremoves; i++) {
+        int n = append_rr_plain(out, off, outsz, removes[i].name, removes[i].type, DNS_CLASS_IN,
+                                0xFFFFFFFFu, removes[i].rdata, (uint16_t) removes[i].rdlen);
+        if (n < 0)
+            break;
+        off = n;
+    }
+    int data_len = off - data_start;
+    if (data_len == 0)
+        return -1;
+    put16(out, tlv_hdr, DSO_TLV_PUSH);
+    put16(out, tlv_hdr + 2, (uint16_t) data_len);
+    return off;
+}
+
+static void dso_push_answers(dso_session_t *s, const dp_answer_t *adds, int nadds,
+                             const dp_answer_t *removes, int nremoves) {
+    if (nadds == 0 && nremoves == 0)
+        return;
+    uint8_t msg[DSO_MAX_MSG];
+    int len = dso_build_push(adds, nadds, removes, nremoves, msg, sizeof(msg));
+    if (len < 0)
+        return;
+    dso_send_raw(s, msg, len);
+}
+
+/* Run the Add-1 collection path for (name,type) under suffix and return the
+ * translated answer set. Uses stack (not static) buffers because — unlike
+ * dp_handle_query, which is only ever called serially from the one
+ * dp_listen_thread — this is called concurrently from SUBSCRIBE handlers,
+ * the poll thread, and RECONFIRM handling, each on its own thread stack. */
+static int dso_collect_current(const char *name, uint16_t type, const char *suffix,
+                               dp_answer_t *out, int max_out) {
+    char mdns_qname[256];
+    if (dp_to_mdns_name(name, suffix, mdns_qname, sizeof(mdns_qname)) < 0)
+        return 0;
+    uint8_t collected[DP_MAX_RESPONSES][MDNS_MAX_MSG];
+    int collected_lens[DP_MAX_RESPONSES];
+    int nresp = dp_mdns_collect(mdns_qname, type, collected, collected_lens, DP_MAX_RESPONSES);
+    int n = 0;
+    for (int r = 0; r < nresp; r++)
+        dp_collect_answers(collected[r], collected_lens[r], type, suffix, g_dp_ttl_cap, out, &n,
+                           max_out);
+    return n;
+}
+
+/* Diff a freshly-collected answer set against every session subscribed to
+ * (name,type) and PUSH each session only what changed for it. Called both
+ * by the periodic poller (below) and by RECONFIRM (an on-demand re-check of
+ * one name/type). */
+static void dso_poll_one(const char *name, uint16_t type, const dp_answer_t *cur, int ncur) {
+    for (int i = 0; i < DSO_MAX_SESSIONS; i++) {
+        dso_session_t *s = &g_dso_sessions[i];
+        for (int j = 0; j < DSO_MAX_SUBS_PER_SESSION; j++) {
+            pthread_mutex_lock(&s->mutex);
+            if (!s->active || j >= s->nsubs) {
+                pthread_mutex_unlock(&s->mutex);
+                break;
+            }
+            dso_sub_t *sub = &s->subs[j];
+            if (sub->type != type || strcasecmp(sub->name, name) != 0) {
+                pthread_mutex_unlock(&s->mutex);
+                continue;
+            }
+            dp_answer_t adds[DP_MAX_ANSWERS], removes[DP_MAX_ANSWERS];
+            int nadds = 0, nremoves = 0;
+            for (int c = 0; c < ncur; c++)
+                if (!dp_answer_dup(sub->last, sub->nans, &cur[c]))
+                    adds[nadds++] = cur[c];
+            for (int p = 0; p < sub->nans; p++)
+                if (!dp_answer_dup(cur, ncur, &sub->last[p]))
+                    removes[nremoves++] = sub->last[p];
+            sub->nans = ncur;
+            memcpy(sub->last, cur, sizeof(dp_answer_t) * (size_t) ncur);
+            pthread_mutex_unlock(&s->mutex);
+            if (nadds || nremoves)
+                dso_push_answers(s, adds, nadds, removes, nremoves);
+        }
+    }
+}
+
+static void dso_handle_subscribe(dso_session_t *sess, uint16_t msg_id, const uint8_t *pkt, int mlen,
+                                 const dso_tlv_t *tlv) {
+    if (msg_id == 0) /* SUBSCRIBE must be a request, never unidirectional */
+        return;
+    char qname[256];
+    int a = name_from_wire(pkt, mlen, tlv->off, qname, sizeof(qname));
+    /* RFC 8765 §5.1: DSO-DATA MUST contain exactly one NAME, TYPE, CLASS —
+     * reject anything trailing or short as malformed, not "ignore the rest". */
+    if (a < 0 || a + 4 != tlv->off + (int) tlv->len) {
+        uint8_t resp[12];
+        int rl = dso_build_simple_response(msg_id, DNS_RCODE_FORMERR, resp, sizeof(resp));
+        dso_send_raw(sess, resp, rl);
+        return;
+    }
+    uint16_t qtype = get16(pkt, a);
+    uint16_t qclass = get16(pkt, a + 2);
+    const char *suffix = (qclass == DNS_CLASS_IN) ? dp_find_suffix(qname) : NULL;
+    if (!suffix) {
+        /* Guardrail: never subscribe a name we aren't explicitly configured
+         * to proxy — same posture as Add 1's REFUSED-on-unconfigured-subdomain. */
+        uint8_t resp[12];
+        int rl = dso_build_simple_response(msg_id, DNS_RCODE_REFUSED, resp, sizeof(resp));
+        dso_send_raw(sess, resp, rl);
+        return;
+    }
+
+    pthread_mutex_lock(&sess->mutex);
+    dso_sub_t *slot = NULL;
+    for (int i = 0; i < sess->nsubs; i++)
+        if (sess->subs[i].type == qtype && strcasecmp(sess->subs[i].name, qname) == 0) {
+            slot = &sess->subs[i];
+            break;
+        }
+    if (!slot && sess->nsubs >= g_dso_max_subs) {
+        pthread_mutex_unlock(&sess->mutex);
+        uint8_t resp[12]; /* per-session subscription cap guardrail */
+        int rl = dso_build_simple_response(msg_id, DNS_RCODE_REFUSED, resp, sizeof(resp));
+        dso_send_raw(sess, resp, rl);
+        return;
+    }
+    if (!slot)
+        slot = &sess->subs[sess->nsubs++];
+    memset(slot, 0, sizeof(*slot));
+    safe_strcpy(slot->name, qname, sizeof(slot->name));
+    slot->type = qtype;
+    slot->msg_id = msg_id;
+    pthread_mutex_unlock(&sess->mutex);
+
+    uint8_t resp[12];
+    int rl = dso_build_simple_response(msg_id, DNS_RCODE_NOERROR, resp, sizeof(resp));
+    dso_send_raw(sess, resp, rl);
+
+    /* RFC 8765 §5.1: "In the case that the answer set was already non-empty
+     * ... an initial PUSH message will be sent immediately following the
+     * SUBSCRIBE Response." */
+    dp_answer_t cur[DP_MAX_ANSWERS];
+    int ncur = dso_collect_current(qname, qtype, suffix, cur, DP_MAX_ANSWERS);
+    pthread_mutex_lock(&sess->mutex);
+    for (int i = 0; i < sess->nsubs; i++)
+        if (sess->subs[i].type == qtype && strcasecmp(sess->subs[i].name, qname) == 0) {
+            sess->subs[i].nans = ncur;
+            memcpy(sess->subs[i].last, cur, sizeof(dp_answer_t) * (size_t) ncur);
+            break;
+        }
+    pthread_mutex_unlock(&sess->mutex);
+    if (ncur > 0)
+        dso_push_answers(sess, cur, ncur, NULL, 0);
+    dns_log(LOG_INFO, "[DSO] SUBSCRIBE %s %s from session (id %u) -> %d initial answer(s)\n",
+            type2str(qtype), qname, msg_id, ncur);
+}
+
+static void dso_handle_unsubscribe(dso_session_t *sess, uint16_t sub_msg_id) {
+    pthread_mutex_lock(&sess->mutex);
+    for (int i = 0; i < sess->nsubs; i++) {
+        if (sess->subs[i].msg_id == sub_msg_id) {
+            sess->subs[i] = sess->subs[sess->nsubs - 1];
+            sess->nsubs--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&sess->mutex);
+}
+
+/* RFC 8765 §5.6: client asks the server to re-verify data it suspects is
+ * stale. DSO-DATA is one full RR (NAME/TYPE/CLASS/TTL/RDATA); we only need
+ * NAME+TYPE to decide what to re-check — re-running the collection early
+ * and pushing any resulting diff to whichever sessions are subscribed is a
+ * faithful implementation of "re-verify," just without a bespoke
+ * revalidation mechanism beyond what SUBSCRIBE already uses. */
+static void dso_handle_reconfirm(const uint8_t *pkt, int mlen, const dso_tlv_t *tlv) {
+    char qname[256];
+    int a = name_from_wire(pkt, mlen, tlv->off, qname, sizeof(qname));
+    if (a < 0 || a + 4 > tlv->off + (int) tlv->len)
+        return; /* malformed — unidirectional, nothing to error back */
+    uint16_t qtype = get16(pkt, a);
+    uint16_t qclass = get16(pkt, a + 2);
+    if (qclass == DNS_CLASS_ANY || qtype == DNS_TYPE_ANY)
+        return;
+    const char *suffix = dp_find_suffix(qname);
+    if (!suffix)
+        return;
+    dp_answer_t cur[DP_MAX_ANSWERS];
+    int ncur = dso_collect_current(qname, qtype, suffix, cur, DP_MAX_ANSWERS);
+    dso_poll_one(qname, qtype, cur, ncur);
+}
+
+/* Dispatch one parsed DSO message. Returns 0 to keep the session open, -1 to
+ * abort it (fail closed on anything that doesn't parse as a well-formed DSO
+ * message — this listener speaks DSO exclusively, there is no plaintext/
+ * classic-query fallback to degrade to). */
+static int dso_handle_message(dso_session_t *sess, const uint8_t *pkt, int mlen) {
+    if (mlen < 12)
+        return -1;
+    uint16_t msg_id = get16(pkt, 0);
+    uint16_t flags = get16(pkt, 2);
+    if ((flags & DNS_OPCODE_MASK) != DNS_OPCODE_DSO) {
+        if (msg_id != 0) {
+            uint8_t resp[12];
+            int rl = dso_build_simple_response(msg_id, DNS_RCODE_NOTIMP, resp, sizeof(resp));
+            dso_send_raw(sess, resp, rl);
+        }
+        return -1;
+    }
+    if (get16(pkt, 4) || get16(pkt, 6) || get16(pkt, 8) || get16(pkt, 10)) {
+        /* RFC 8490 §5.1: QD/AN/NS/ARCOUNT MUST be zero in a DSO message */
+        if (msg_id != 0) {
+            uint8_t resp[12];
+            int rl = dso_build_simple_response(msg_id, DNS_RCODE_FORMERR, resp, sizeof(resp));
+            dso_send_raw(sess, resp, rl);
+        }
+        return -1;
+    }
+    dso_tlv_t tlv;
+    if (dso_read_tlv(pkt, mlen, 12, &tlv) < 0) {
+        if (msg_id != 0) {
+            uint8_t resp[12];
+            int rl = dso_build_simple_response(msg_id, DNS_RCODE_FORMERR, resp, sizeof(resp));
+            dso_send_raw(sess, resp, rl);
+        }
+        return -1;
+    }
+    switch (tlv.type) {
+        case DSO_TLV_KEEPALIVE:
+            if (msg_id == 0 || tlv.len != 8)
+                return 0; /* malformed/unidirectional keepalive — silently ignore, not fatal */
+            {
+                uint8_t resp[24];
+                int rl = dso_build_keepalive_response(msg_id, resp, sizeof(resp));
+                dso_send_raw(sess, resp, rl);
+            }
+            return 0;
+        case DSO_TLV_SUBSCRIBE:
+            dso_handle_subscribe(sess, msg_id, pkt, mlen, &tlv);
+            return 0;
+        case DSO_TLV_UNSUBSCRIBE:
+            if (msg_id != 0 || tlv.len != 2)
+                return 0; /* UNSUBSCRIBE is unidirectional; malformed -> ignore */
+            dso_handle_unsubscribe(sess, get16(pkt, tlv.off));
+            return 0;
+        case DSO_TLV_RECONFIRM:
+            if (msg_id != 0)
+                return 0; /* RECONFIRM is unidirectional */
+            dso_handle_reconfirm(pkt, mlen, &tlv);
+            return 0;
+        default:
+            /* Unimplemented Primary TLV type. RFC 8490 §5.2: only a request
+             * gets a response; a unidirectional message with an unknown type
+             * is just ignored. */
+            if (msg_id != 0) {
+                uint8_t resp[12];
+                int rl = dso_build_simple_response(msg_id, DNS_RCODE_DSOTYPENI, resp, sizeof(resp));
+                dso_send_raw(sess, resp, rl);
+            }
+            return 0;
+    }
+}
+
+static void *dso_session_thread(void *arg) {
+    dso_session_t *sess = arg;
+    /* RFC 8490 §6.1/6.3: a session with no traffic for the inactivity
+     * timeout must be closed; the server side allows "5 seconds or twice
+     * the inactivity value, whichever is greater" beyond that before it
+     * forcibly aborts. Modeled here as one rolling SO_RCVTIMEO — any
+     * received message (not just Keepalive; that only resets the
+     * *keepalive* timer, not the inactivity timer per spec, but we don't
+     * distinguish the two clocks) restarts the wait by virtue of looping
+     * back into a fresh recv. */
+    uint32_t grace = g_dso_inactivity_ms * 2 > 5000 ? g_dso_inactivity_ms * 2 : 5000;
+    uint32_t total_ms = g_dso_inactivity_ms + grace;
+    struct timeval tv = {.tv_sec = total_ms / 1000, .tv_usec = (long) (total_ms % 1000) * 1000};
+    setsockopt(sess->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    for (;;) {
+        uint8_t lb[2];
+        int got = 0;
+        while (got < 2) {
+            int n = SSL_read(sess->ssl, lb + got, 2 - got);
+            if (n <= 0)
+                goto done;
+            got += n;
+        }
+        int mlen = (lb[0] << 8) | lb[1];
+        if (mlen < 12 || mlen > DSO_MAX_MSG)
+            break;
+        uint8_t pkt[DSO_MAX_MSG];
+        got = 0;
+        while (got < mlen) {
+            int n = SSL_read(sess->ssl, pkt + got, mlen - got);
+            if (n <= 0)
+                goto done;
+            got += n;
+        }
+        if (dso_handle_message(sess, pkt, mlen) < 0)
+            break;
+    }
+done:
+    dso_teardown_session(sess);
+    return NULL;
+}
+
+static void *dso_listen_thread(void *arg) {
+    (void) arg;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        dns_log(LOG_ERR, "[DSO] socket failed: %s\n", strerror(errno));
+        return NULL;
+    }
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in sa = {.sin_family = AF_INET,
+                             .sin_port = htons((uint16_t) g_dso_port),
+                             .sin_addr.s_addr = INADDR_ANY};
+    if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+        dns_log(LOG_ERR, "[DSO] bind :%d failed: %s\n", g_dso_port, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    if (listen(fd, 16) < 0) {
+        dns_log(LOG_ERR, "[DSO] listen failed: %s\n", strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    dns_log(LOG_NOTICE, "[DSO] Push listener on :%d (TLS)\n", g_dso_port);
+    for (;;) {
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int cfd = accept(fd, (struct sockaddr *) &caddr, &clen);
+        if (cfd < 0)
+            continue;
+        pthread_mutex_lock(&g_dso_tls_mutex);
+        SSL_CTX *ctx = g_dso_ctx;
+        SSL *ssl = ctx ? SSL_new(ctx) : NULL;
+        if (ssl)
+            SSL_set_fd(ssl, cfd);
+        pthread_mutex_unlock(&g_dso_tls_mutex);
+        if (!ssl) { /* no cert yet — fail closed, never plaintext */
+            close(cfd);
+            continue;
+        }
+        if (SSL_accept(ssl) <= 0) {
+            SSL_free(ssl);
+            close(cfd);
+            continue;
+        }
+        dso_session_t *sess = dso_alloc_session();
+        if (!sess) {
+            dns_log(LOG_WARNING, "[DSO] session cap (%d) reached — rejecting connection\n",
+                    DSO_MAX_SESSIONS);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(cfd);
+            continue;
+        }
+        pthread_mutex_lock(&sess->wmutex);
+        sess->fd = cfd;
+        sess->ssl = ssl;
+        pthread_mutex_unlock(&sess->wmutex);
+        pthread_t st;
+        if (pthread_create(&st, NULL, dso_session_thread, sess) == 0)
+            pthread_detach(st);
+        else
+            dso_teardown_session(sess);
+    }
+    return NULL;
+}
+
+static void *dso_poll_thread(void *arg) {
+    (void) arg;
+    for (;;) {
+        sleep(g_dso_poll_secs > 0 ? g_dso_poll_secs : 5);
+        if (!g_dso_enabled)
+            continue;
+        /* De-duplicate (name,type) across every session's subscriptions —
+         * dp_mdns_collect blocks for DP_COLLECT_MS per unique pair and only
+         * one collection round runs at a time (g_dp_query_mutex), so this
+         * keeps one poll cycle's cost proportional to unique subscriptions,
+         * not total sessions. static: dso_poll_thread has exactly one
+         * instance, so this isn't shared across concurrent callers. */
+        typedef struct {
+            char name[256];
+            uint16_t type;
+        } dso_key_t;
+        static dso_key_t keys[DSO_MAX_SESSIONS * DSO_MAX_SUBS_PER_SESSION];
+        int nkeys = 0;
+        for (int i = 0; i < DSO_MAX_SESSIONS; i++) {
+            dso_session_t *s = &g_dso_sessions[i];
+            pthread_mutex_lock(&s->mutex);
+            if (s->active) {
+                for (int j = 0; j < s->nsubs; j++) {
+                    int dup = 0;
+                    for (int k = 0; k < nkeys; k++)
+                        if (keys[k].type == s->subs[j].type &&
+                            strcasecmp(keys[k].name, s->subs[j].name) == 0) {
+                            dup = 1;
+                            break;
+                        }
+                    if (!dup && nkeys < (int) (sizeof(keys) / sizeof(keys[0]))) {
+                        safe_strcpy(keys[nkeys].name, s->subs[j].name, sizeof(keys[nkeys].name));
+                        keys[nkeys].type = s->subs[j].type;
+                        nkeys++;
+                    }
+                }
+            }
+            pthread_mutex_unlock(&s->mutex);
+        }
+        for (int k = 0; k < nkeys; k++) {
+            const char *suffix = dp_find_suffix(keys[k].name);
+            if (!suffix)
+                continue; /* config changed underneath an existing subscription */
+            dp_answer_t cur[DP_MAX_ANSWERS];
+            int ncur = dso_collect_current(keys[k].name, keys[k].type, suffix, cur, DP_MAX_ANSWERS);
+            dso_poll_one(keys[k].name, keys[k].type, cur, ncur);
+        }
+    }
+    return NULL;
+}
+
 /* ── Live reload via Valkey keyspace notifications (migration Step 6) ───────
  *
  * mdnsd serves mdns: and zone: records live per query already, so the value here
@@ -1415,6 +2102,28 @@ static void *dp_listen_thread(void *arg) {
  * edits trigger a re-announce, while interface/enable changes need a restart
  * (the multicast sockets are bound at startup). Reconnects use capped backoff. */
 #define KEYSPACE_DB 0
+
+/* config:dso_inactivity_ms / dso_keepalive_ms / dso_max_subscriptions /
+ * dso_poll_interval_secs are plain variables read fresh by each new
+ * SUBSCRIBE/poll cycle — no bound resource to rebind, so they reload live.
+ * dso_enabled/dso_port instead need a restart (listener socket is bound at
+ * startup), same posture as mdns_interfaces/mdns_enabled above. */
+static void dso_soft_config_reload(void) {
+    char val[512];
+    if (vk_get("config:dso_inactivity_ms", val, sizeof(val)) && val[0])
+        g_dso_inactivity_ms = (uint32_t) atoi(val);
+    if (vk_get("config:dso_keepalive_ms", val, sizeof(val)) && val[0])
+        g_dso_keepalive_ms = (uint32_t) atoi(val);
+    if (vk_get("config:dso_max_subscriptions", val, sizeof(val)) && val[0]) {
+        int v = atoi(val);
+        g_dso_max_subs = (v > 0 && v <= DSO_MAX_SUBS_PER_SESSION) ? v : DSO_MAX_SUBS_PER_SESSION;
+    }
+    if (vk_get("config:dso_poll_interval_secs", val, sizeof(val)) && val[0]) {
+        int v = atoi(val);
+        g_dso_poll_secs = (v >= 2) ? v : 2;
+    }
+}
+
 static void mdns_keyspace_apply(const char *key) {
     if (strncmp(key, "mdns:", 5) == 0) {
         mdns_announce();
@@ -1429,6 +2138,15 @@ static void mdns_keyspace_apply(const char *key) {
                 "[Reload] %s changed — restart mdnsd to apply "
                 "(multicast sockets are bound at startup)\n",
                 key);
+    } else if (strcmp(key, "cert:current") == 0) {
+        dso_tls_reload();
+    } else if (strcmp(key, "config:dso_enabled") == 0 || strcmp(key, "config:dso_port") == 0) {
+        dns_log(LOG_WARNING,
+                "[Reload] %s changed — restart mdnsd to apply (DSO listener socket is bound at "
+                "startup)\n",
+                key);
+    } else if (strncmp(key, "config:dso_", 11) == 0) {
+        dso_soft_config_reload();
     } else if (strncmp(key, "config:mdns_", 12) == 0) {
         mdns_announce();
     }
@@ -1454,7 +2172,8 @@ static void *keyspace_watch_thread(void *arg) {
             r.type == 1)
             dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications — "
                                  "announce-on-change disabled\n");
-        static const char *prefixes[] = {"mdns:*", "config:mdns_*", NULL};
+        static const char *prefixes[] = {"mdns:*", "config:mdns_*", "cert:current", "config:dso_*",
+                                         NULL};
         int subok = 1;
         for (int i = 0; prefixes[i]; i++) {
             char pat[160];
@@ -1646,6 +2365,34 @@ static int load_config(void) {
         if (vk_get("config:dp_ttl_cap", val, sizeof(val)) && val[0])
             g_dp_ttl_cap = (uint32_t) atoi(val);
     }
+    /* RFC 8490 DSO + RFC 8765 Push (Add 2) — opt-in, and only meaningful on
+     * top of an active Discovery Proxy (Push has nothing to subscribe to
+     * otherwise: SUBSCRIBE is gated on the same proxied-subdomain list). */
+    g_dso_enabled = (vk_get("config:dso_enabled", val, sizeof(val)) && atoi(val) == 1);
+    if (g_dso_enabled && !g_dp_enabled) {
+        dns_log(LOG_ERR, "[DSO] config:dso_enabled=1 but Discovery Proxy (config:dp_enabled) is "
+                         "off — Push has no subdomains to subscribe under. DSO stays OFF\n");
+        g_dso_enabled = 0;
+    }
+    if (g_dso_enabled) {
+        if (vk_get("config:dso_port", val, sizeof(val)) && val[0])
+            g_dso_port = atoi(val);
+        if (vk_get("config:dso_inactivity_ms", val, sizeof(val)) && val[0])
+            g_dso_inactivity_ms = (uint32_t) atoi(val);
+        if (vk_get("config:dso_keepalive_ms", val, sizeof(val)) && val[0])
+            g_dso_keepalive_ms = (uint32_t) atoi(val);
+        if (vk_get("config:dso_max_subscriptions", val, sizeof(val)) && val[0]) {
+            int v = atoi(val);
+            g_dso_max_subs =
+                (v > 0 && v <= DSO_MAX_SUBS_PER_SESSION) ? v : DSO_MAX_SUBS_PER_SESSION;
+        }
+        if (vk_get("config:dso_poll_interval_secs", val, sizeof(val)) && val[0]) {
+            int v = atoi(val);
+            /* Floor at 2s: DP_COLLECT_MS=600ms per unique subscribed name
+             * means a too-small interval just piles up backlogged cycles. */
+            g_dso_poll_secs = (v >= 2) ? v : 2;
+        }
+    }
     return 0;
 }
 
@@ -1710,6 +2457,25 @@ int main(int argc, char **argv) {
             pthread_detach(dpt);
         else
             dns_log(LOG_ERR, "[DP] Failed to start Discovery Proxy listener\n");
+    }
+    if (g_dso_enabled) {
+        for (int i = 0; i < DSO_MAX_SESSIONS; i++) {
+            pthread_mutex_init(&g_dso_sessions[i].mutex, NULL);
+            pthread_mutex_init(&g_dso_sessions[i].wmutex, NULL);
+            g_dso_sessions[i].fd = -1;
+            g_dso_sessions[i].ssl = NULL;
+            g_dso_sessions[i].active = 0;
+        }
+        dso_tls_reload();
+        pthread_t dsolt, dsopt;
+        if (pthread_create(&dsolt, NULL, dso_listen_thread, NULL) == 0)
+            pthread_detach(dsolt);
+        else
+            dns_log(LOG_ERR, "[DSO] Failed to start Push listener\n");
+        if (pthread_create(&dsopt, NULL, dso_poll_thread, NULL) == 0)
+            pthread_detach(dsopt);
+        else
+            dns_log(LOG_ERR, "[DSO] Failed to start Push poll thread\n");
     }
     mdns_recv_loop(g_mdns4_sock, g_mdns6_sock);
     return 0;

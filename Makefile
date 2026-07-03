@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -2071,6 +2071,78 @@ check-dp: mdnsd_debug
 	 test "$$REFUSED" = "1" || { echo "  FAIL  unconfigured subdomain was not REFUSED"; exit 1; }; \
 	 echo "  OK  PTR/SRV/TXT/A translate correctly, link-local AAAA dropped, unconfigured subdomain REFUSED"
 
+# RFC 8490 DSO + RFC 8765 DNS Push Notifications: SUBSCRIBE gets the current
+# answer set as an immediate PUSH, then a further PUSH (REMOVE, TTL
+# 0xFFFFFFFF) once the mDNS stub answering it disappears and a poll cycle
+# notices. Also checks SUBSCRIBE is REFUSED for a name outside the configured
+# Discovery Proxy subdomains — Push shares Add 1's trust boundary, not a
+# general update channel.
+check-dso: mdnsd_debug
+	@echo "  CHECK  RFC 8490 DSO + RFC 8765 Push Notifications (requires Valkey + openssl + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 command -v openssl >/dev/null 2>&1 || { echo "  SKIP  no openssl on PATH"; exit 0; }; \
+	 IFACE=""; \
+	 for i in $$(ip -o link show up 2>/dev/null | awk -F': ' '{print $$2}'); do \
+	   case "$$i" in lo|lo@*) continue ;; esac; \
+	   F=$$(ip link show "$$i" 2>/dev/null); \
+	   echo "$$F" | grep -q MULTICAST || continue; \
+	   echo "$$F" | grep -q LOWER_UP || continue; \
+	   IFACE="$$i"; break; \
+	 done; \
+	 test -n "$$IFACE" || { echo "  SKIP  no UP+MULTICAST+carrier non-loopback interface found"; exit 0; }; \
+	 D=$$(mktemp -d); \
+	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+	   -keyout $$D/srv.key -out $$D/srv.pem -days 2 -subj "/CN=mdnsd.test" \
+	   -addext "subjectAltName=DNS:mdnsd.test" >/dev/null 2>&1; \
+	 cat $$D/srv.pem $$D/srv.key > $$D/cert_current.pem; \
+	 SAVE_EN=$$($$VC get config:mdns_enabled); SAVE_IF=$$($$VC get config:mdns_interfaces); \
+	 SAVE_HN=$$($$VC get config:mdns_hostname); SAVE_DPE=$$($$VC get config:dp_enabled); \
+	 SAVE_DPS=$$($$VC get config:dp_subdomains); SAVE_DPP=$$($$VC get config:dp_port); \
+	 SAVE_DSE=$$($$VC get config:dso_enabled); SAVE_DSP=$$($$VC get config:dso_port); \
+	 SAVE_DSI=$$($$VC get config:dso_poll_interval_secs); SAVE_CUR=$$($$VC get cert:current); \
+	 $$VC set config:mdns_enabled 1 >/dev/null; \
+	 $$VC set config:mdns_interfaces "$$IFACE" >/dev/null; \
+	 $$VC set config:mdns_hostname dsotest.local >/dev/null; \
+	 $$VC set config:dp_enabled 1 >/dev/null; \
+	 $$VC set config:dp_subdomains lab.example.com >/dev/null; \
+	 $$VC set config:dp_port 8533 >/dev/null; \
+	 $$VC set config:dso_enabled 1 >/dev/null; \
+	 $$VC set config:dso_port 8534 >/dev/null; \
+	 $$VC set config:dso_poll_interval_secs 2 >/dev/null; \
+	 $$VC set cert:current "$$(cat $$D/cert_current.pem)" >/dev/null; \
+	 python3 tests/dp_mdns_responder.py > /tmp/dso_stub.log 2>&1 & STUB=$$!; \
+	 sleep 1; \
+	 ASAN_OPTIONS=detect_leaks=0 ./mdnsd_debug > /tmp/mdnsd_dso.log 2>&1 & MD=$$!; \
+	 sleep 2; \
+	 python3 tests/dso_push_client.py 127.0.0.1 8534 $$D/srv.pem mdnsd.test \
+	     _dpxtest9k2._tcp.lab.example.com 12 5 > /tmp/dso_client.log 2>&1 & CLIENT=$$!; \
+	 sleep 3; \
+	 kill $$STUB 2>/dev/null || true; \
+	 wait $$CLIENT 2>/dev/null || true; \
+	 REFUSED=$$(python3 tests/dso_push_client.py 127.0.0.1 8534 $$D/srv.pem mdnsd.test \
+	     foo.other.com 1 1 2>&1 | grep SUBSCRIBE_RCODE); \
+	 kill $$MD 2>/dev/null || true; wait 2>/dev/null || true; \
+	 if [ -n "$$SAVE_EN" ]; then $$VC set config:mdns_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:mdns_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_IF" ]; then $$VC set config:mdns_interfaces "$$SAVE_IF" >/dev/null; else $$VC del config:mdns_interfaces >/dev/null; fi; \
+	 if [ -n "$$SAVE_HN" ]; then $$VC set config:mdns_hostname "$$SAVE_HN" >/dev/null; else $$VC del config:mdns_hostname >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPE" ]; then $$VC set config:dp_enabled "$$SAVE_DPE" >/dev/null; else $$VC del config:dp_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPS" ]; then $$VC set config:dp_subdomains "$$SAVE_DPS" >/dev/null; else $$VC del config:dp_subdomains >/dev/null; fi; \
+	 if [ -n "$$SAVE_DPP" ]; then $$VC set config:dp_port "$$SAVE_DPP" >/dev/null; else $$VC del config:dp_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_DSE" ]; then $$VC set config:dso_enabled "$$SAVE_DSE" >/dev/null; else $$VC del config:dso_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_DSP" ]; then $$VC set config:dso_port "$$SAVE_DSP" >/dev/null; else $$VC del config:dso_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_DSI" ]; then $$VC set config:dso_poll_interval_secs "$$SAVE_DSI" >/dev/null; else $$VC del config:dso_poll_interval_secs >/dev/null; fi; \
+	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
+	 rm -rf $$D; \
+	 echo "  --- client log ---"; cat /tmp/dso_client.log; \
+	 echo "  refused=[$$REFUSED]"; \
+	 grep -q "^SUBSCRIBE_RCODE 0$$" /tmp/dso_client.log || { echo "  FAIL  SUBSCRIBE was not accepted"; cat /tmp/mdnsd_dso.log; exit 1; }; \
+	 grep -q "^RR INIT .*type=1 .*rdata=c0a80132$$" /tmp/dso_client.log || { echo "  FAIL  initial PUSH missing/wrong A record (192.168.1.50 = c0a80132)"; exit 1; }; \
+	 grep -q "^RR LATER .*ttl=4294967295" /tmp/dso_client.log || { echo "  FAIL  no REMOVE (ttl=0xFFFFFFFF) PUSH after the stub went away"; cat /tmp/mdnsd_dso.log; exit 1; }; \
+	 echo "$$REFUSED" | grep -q "SUBSCRIBE_RCODE 5" || { echo "  FAIL  SUBSCRIBE for an unconfigured subdomain was not REFUSED"; exit 1; }; \
+	 echo "  OK  SUBSCRIBE accepted + correct initial PUSH, REMOVE pushed on disappearance, unconfigured subdomain REFUSED"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -2140,6 +2212,7 @@ help:
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"
 	@echo "  make check-dns64     resolverd RFC 6147 DNS64 AAAA synthesis (KAT + live, needs dig + python3)"
 	@echo "  make check-dp        mdnsd RFC 8766 Discovery Proxy (needs Valkey + dig + python3)"
+	@echo "  make check-dso       mdnsd RFC 8490 DSO + RFC 8765 Push Notifications (needs Valkey + openssl + python3)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

@@ -2469,43 +2469,8 @@ static void tls_reload(void) {
  *
  * Step 6 drives this from Valkey keyspace notifications (see
  * keyspace_watch_thread) instead of polling. */
-static int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
-                              size_t key_sz) {
-    static const char *kbegin_pat[] = {"-----BEGIN PRIVATE KEY-----",
-                                       "-----BEGIN EC PRIVATE KEY-----",
-                                       "-----BEGIN RSA PRIVATE KEY-----", NULL};
-    const char *kb = NULL;
-    for (int ki = 0; kbegin_pat[ki]; ki++) {
-        kb = strstr(blob, kbegin_pat[ki]);
-        if (kb)
-            break;
-    }
-    if (!kb)
-        return -1;
-    const char *ke = strstr(kb, "-----END ");
-    if (!ke)
-        return -1;
-    ke = strchr(ke, '\n');
-    if (!ke)
-        ke = kb + strlen(kb);
-    else
-        ke++;
-    size_t klen = (size_t) (ke - kb);
-    if (klen + 1 > key_sz)
-        return -1;
-    memcpy(key_out, kb, klen);
-    key_out[klen] = 0;
-    /* cert = blob minus the key block (chain may precede and/or follow it) */
-    size_t pre = (size_t) (kb - blob), post = strlen(ke);
-    if (pre + post + 1 > cert_sz)
-        return -1;
-    memcpy(cert_out, blob, pre);
-    memcpy(cert_out + pre, ke, post);
-    cert_out[pre + post] = 0;
-    if (!strstr(cert_out, "-----BEGIN CERTIFICATE-----"))
-        return -1;
-    return 0;
-}
+/* cert_current_split lives in libdnswire (dns_wire.c) — shared with apid and
+ * mdnsd so the cert:current parsing exists once. */
 /* Publish TLSA 3 1 1 for _443._tcp.<name> and _853._tcp.<name>, bump the
  * SOA serial and NOTIFY secondaries. This is dnsd's half of issuance: certd
  * writes cert:current only; the zone is dnsd's to write (ownership table).

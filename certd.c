@@ -432,42 +432,8 @@ static int ecdsa_der_to_raw(const uint8_t *der, int dl, uint8_t raw[64]) {
 /* ── cert:current handling ───────────────────────────────────────────────── */
 /* Split one PEM blob into cert chain + private key (same logic as dnsd's
  * watcher; the blob is the cert:current contract format). */
-static int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
-                              size_t key_sz) {
-    static const char *kbegin_pat[] = {"-----BEGIN PRIVATE KEY-----",
-                                       "-----BEGIN EC PRIVATE KEY-----",
-                                       "-----BEGIN RSA PRIVATE KEY-----", NULL};
-    const char *kb = NULL;
-    for (int ki = 0; kbegin_pat[ki]; ki++) {
-        kb = strstr(blob, kbegin_pat[ki]);
-        if (kb)
-            break;
-    }
-    if (!kb)
-        return -1;
-    const char *ke = strstr(kb, "-----END ");
-    if (!ke)
-        return -1;
-    ke = strchr(ke, '\n');
-    if (!ke)
-        ke = kb + strlen(kb);
-    else
-        ke++;
-    size_t klen = (size_t) (ke - kb);
-    if (klen + 1 > key_sz)
-        return -1;
-    memcpy(key_out, kb, klen);
-    key_out[klen] = 0;
-    size_t pre = (size_t) (kb - blob), post = strlen(ke);
-    if (pre + post + 1 > cert_sz)
-        return -1;
-    memcpy(cert_out, blob, pre);
-    memcpy(cert_out + pre, ke, post);
-    cert_out[pre + post] = 0;
-    if (!strstr(cert_out, "-----BEGIN CERTIFICATE-----"))
-        return -1;
-    return 0;
-}
+/* cert_current_split lives in libdnswire (dns_wire.c) — shared with dnsd,
+ * apid, and mdnsd so the cert:current parsing exists once. */
 
 /* Refresh the local mirror of the active cert from cert:current. */
 static void cert_current_load(void) {

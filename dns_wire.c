@@ -1473,6 +1473,43 @@ int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outle
     return SSL_TLSEXT_ERR_OK;
 }
 
+int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
+                       size_t key_sz) {
+    static const char *kbegin_pat[] = {"-----BEGIN PRIVATE KEY-----",
+                                       "-----BEGIN EC PRIVATE KEY-----",
+                                       "-----BEGIN RSA PRIVATE KEY-----", NULL};
+    const char *kb = NULL;
+    for (int ki = 0; kbegin_pat[ki]; ki++) {
+        kb = strstr(blob, kbegin_pat[ki]);
+        if (kb)
+            break;
+    }
+    if (!kb)
+        return -1;
+    const char *ke = strstr(kb, "-----END ");
+    if (!ke)
+        return -1;
+    ke = strchr(ke, '\n');
+    if (!ke)
+        ke = kb + strlen(kb);
+    else
+        ke++;
+    size_t klen = (size_t) (ke - kb);
+    if (klen + 1 > key_sz)
+        return -1;
+    memcpy(key_out, kb, klen);
+    key_out[klen] = 0;
+    size_t pre = (size_t) (kb - blob), post = strlen(ke);
+    if (pre + post + 1 > cert_sz)
+        return -1;
+    memcpy(cert_out, blob, pre);
+    memcpy(cert_out + pre, ke, post);
+    cert_out[pre + post] = 0;
+    if (!strstr(cert_out, "-----BEGIN CERTIFICATE-----"))
+        return -1;
+    return 0;
+}
+
 /* ── Schema version contract (ADR-003) ───────────────────────────────────────
  * Pure comparator: no I/O. The daemon reads `schema:version` from Valkey and
  * passes it here; the SCHEMA_* return code drives its startup policy. */

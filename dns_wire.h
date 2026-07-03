@@ -73,6 +73,7 @@
 #define DNS_OPCODE_QUERY 0x0000
 #define DNS_OPCODE_NOTIFY 0x2000
 #define DNS_OPCODE_UPDATE 0x2800
+#define DNS_OPCODE_DSO 0x3000 /* RFC 8490 §5.1 — DNS Stateful Operations */
 #define DNS_OPCODE_MASK 0x7800
 
 #define DNS_RCODE_NOERROR 0
@@ -86,6 +87,7 @@
 #define DNS_RCODE_NXRRSET 8 /* RFC 2136: RRset should exist but does not */
 #define DNS_RCODE_NOTAUTH 9 /* RFC 2136 §2.2: not authoritative / not authorized */
 #define DNS_RCODE_NOTZONE 10
+#define DNS_RCODE_DSOTYPENI 11 /* RFC 8490 §5.2 — DSO TLV Type Not Implemented */
 #define DNS_RCODE_BADVERS 16
 #define DNS_RCODE_BADSIG 17
 #define DNS_RCODE_BADCOOKIE 23
@@ -458,6 +460,15 @@ SSL_CTX *tls_server_ctx_from_pem(const char *cert_pem, const char *key_pem, cons
  * *client* offers, and is a no-op on a server SSL_CTX. */
 int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                        const unsigned char *in, unsigned int inlen, void *arg);
+
+/* Split a cert:current blob (certd's output: cert chain + private key PEM,
+ * concatenated in either order) into separate cert-chain and key buffers.
+ * Shared by dnsd, apid, and mdnsd (each hot-reloads its own TLS listener off
+ * cert:current) so the parsing exists once. Returns -1 on malformed input
+ * (no key block, no "BEGIN CERTIFICATE", or either output buffer too small);
+ * caller must treat that as "no valid cert yet", not partial success. */
+int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
+                       size_t key_sz);
 
 /* ── Schema version contract (ADR-003) ────────────────────────────────────────
  * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the

@@ -31,10 +31,10 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `specs/CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317, Done) + 3258 anycast note (Done) — archived untracked |
 | `CLAUDE-ENUM.md` | dnsd | ADR-001, Add 6 (ENUM), bind config, ENUM roadmap |
 | `CLAUDE-eppd.md` | eppd | ADR-002, registry back-end (phased) |
-| `CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance |
-| `CLAUDE-certd.md` | certd | PKI: ACME/EST extraction + ARI |
-| `CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy |
-| `CLAUDE-resolverd.md` | resolverd | Forwarding/validating cache + Option A |
+| `CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance — done except moving the libFuzzer harness into the lib's own test tree |
+| `CLAUDE-certd.md` | certd | PKI: ACME/EST extraction (done) + ARI (Add 1, done); Add 2/3 optional, TLSA/CAA integration + STAR roadmap still open |
+| `CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy (Add 1, done) + DSO/Push (Add 2, done); Add 3 (SRP) still open |
+| `specs/CLAUDE-resolverd.md` | resolverd | Forwarding/validating cache, Option A — **done** (Add 1 skipped, Adds 2–7 done), archived untracked |
 | `CLAUDE-rfc-skipped.md` | (triage) | Exclusion record with reasons |
 | `CLAUDE-roadmap.md` | all | Execution order (Phase 0 security → 1 ADRs → 2 features) |
 | `CLAUDE-index.md` | (this file) | The map |
@@ -89,20 +89,21 @@ coverage matrix, 8499/9499, **NAPTR = 3403** (header mislabels it 9250).
 
 ---
 
-## resolverd — forwarding/validating cache (Option A)
+## resolverd — forwarding/validating cache (Option A) — **fully closed 2026-07-02**
 
 | Add | RFC | Feature | Status |
 |----:|-----|---------|--------|
-| 1 | 9156 | QNAME minimisation | Specced |
-| 2 | 8198 | Aggressive use of DNSSEC-validated cache | Specced |
-| 3 | 8767 + 9520 | Serve-stale + failure caching | Specced |
+| 1 | 9156 | QNAME minimisation | **Skipped** 2026-07-01 — inapplicable to a single-hop forwarder (no delegation chain to hide labels from); would require pulling forward Option B's iterative resolver, so deferred rather than forced |
+| 2 | 8198 | Aggressive use of DNSSEC-validated cache | **Done** (`make check-aggressive-nsec`) |
+| 3 | 8767 + 9520 | Serve-stale + failure caching | **Done** (`make check-serve-stale`) |
 | 4 | 5452 | Resilience to forged answers (port + 0x20) | **Done** (port + transaction ID were already CSPRNG from the Phase-0 security pass; 0x20 QNAME case randomization added — `dns0x20_mix`/`dns0x20_active_for` in resolverd, case-sensitive verification via a case-preserving question decode, per-upstream opt-out; `make check-dns0x20`) |
-| 5 | 8914 | Extended DNS Errors (generation) | Specced |
-| 6 | 9462 / 9463 | DDR / DNR | Specced (lighter) |
-| 7 | 6147 | DNS64 (NAT64 AAAA synthesis) | Specced |
+| 5 | 8914 | Extended DNS Errors (generation) | **Done** (`make check-ede`) |
+| 6 | 9462 / 9463 | DDR / DNR | **Done** (`make check-ddr`); RFC 9463 DNR explicitly out of scope (host-side, not resolver-side) |
+| 7 | 6147 | DNS64 (NAT64 AAAA synthesis) | **Done** (`make check-dns64`; DNSSEC guardrail: synthesis skipped whenever the AAAA NODATA validated SECURE — this also surfaced and fixed a `serve_cached_entry` bug that was losing `dnssec_status` on cache hits) |
 
 Roadmap (Option B — iterative): 8109 priming, 8806 root-on-loopback, full
-delegation following, 5011 trust-anchor rollover.
+delegation following, 5011 trust-anchor rollover. Full detail archived at
+`specs/CLAUDE-resolverd.md`.
 
 ---
 
@@ -127,8 +128,8 @@ Done: 6762 (mDNS), 6763 (DNS-SD).
 
 | Add | RFC | Feature | Status |
 |----:|-----|---------|--------|
-| 1 | 8766 | Discovery Proxy (mDNS ↔ unicast DNS-SD) | Specced |
-| 2 | 8490 + 8765 | DSO + DNS Push Notifications | Specced (larger) |
+| 1 | 8766 | Discovery Proxy (mDNS ↔ unicast DNS-SD) | **Done** 2026-07-02 (`make check-dp`) |
+| 2 | 8490 + 8765 | DSO + DNS Push Notifications | **Done** 2026-07-03 (`make check-dso`) |
 | 3 | 9665 + 9664 | SRP + UPDATE leases | Specced (larger) |
 
 References: 8882, 7558, 8552/8553.
