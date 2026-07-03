@@ -126,8 +126,8 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
-        certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq fuzz-wire fuzz-response fuzz-tlv fuzz-doq gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
 # instead of a wall of confusing compiler/linker errors.
@@ -140,6 +140,26 @@ ossl-sanity:
 	@ls "$(OSSL_LIB)"/libcrypto.* >/dev/null 2>&1 || { \
 	    echo "error: OpenSSL libraries not found in $(OSSL_LIB)."; \
 	    echo "       Install the OpenSSL 3.x dev package or pass OSSL_LIB=<lib-dir>."; \
+	    exit 1; }
+
+# doqd needs the *server-side* QUIC API (SSL_new_listener/SSL_accept_connection/
+# SSL_accept_stream), which shipped in OpenSSL 3.5 — a higher floor than every
+# other binary here (3.0+). Scoped to doqd's own build targets only; do NOT
+# fold this into the base ossl-sanity check above.
+doqd-ossl-sanity: ossl-sanity
+	@test -f "$(OSSL_INC)/openssl/quic.h" || { \
+	    echo "error: doqd needs OpenSSL >= 3.5 for server-side QUIC (openssl/quic.h"; \
+	    echo "       not found at $(OSSL_INC)). dnsd/apid/certd/resolverd still build"; \
+	    echo "       against OpenSSL 3.0+ — only doqd needs the newer version."; \
+	    exit 1; }
+	@T=$$(mktemp); printf '#include <openssl/opensslv.h>\n#include <stdio.h>\nint main(void){printf("%%ld\\n",(long)OPENSSL_VERSION_NUMBER);return 0;}\n' > $$T.c; \
+	 $(CC) -I"$(OSSL_INC)" $$T.c -o $$T 2>/dev/null && V=$$($$T) || V=0; \
+	 rm -f $$T $$T.c; \
+	 [ "$$V" -ge 810549248 ] 2>/dev/null || { \
+	    echo "error: doqd needs OpenSSL >= 3.5 (0x30500000) for server-side QUIC;"; \
+	    echo "       found OPENSSL_VERSION_NUMBER=$$V at $(OSSL_INC). doqd is skipped on"; \
+	    echo "       older OpenSSL — the rest of the build (dnsd/apid/certd/resolverd/mdnsd)"; \
+	    echo "       is unaffected."; \
 	    exit 1; }
 
 # Default → production
@@ -214,6 +234,24 @@ apid: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	strip --strip-unneeded $@
 
 apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [DEBUG] $@"
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	@echo ""
+	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
+	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
+
+# =============================================================================
+# doqd — DNS-over-QUIC (RFC 9250) sidecar. Needs OpenSSL >= 3.5 (server-side
+# QUIC API) — a higher floor than every other binary; see doqd-ossl-sanity.
+# =============================================================================
+doqd: doqd.c $(WIRE_SRC) dns_wire.h | doqd-ossl-sanity
+	@echo "  CC [PROD]  $@"
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	strip --strip-unneeded $@
+
+doqd_debug: doqd.c $(WIRE_SRC) dns_wire.h | doqd-ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
 	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
@@ -954,6 +992,21 @@ fuzz-tlv: fuzz/fuzz_tlv.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 	      -L$(OSSL_LIB) -lssl -lcrypto -Wl,-rpath,$(OSSL_LIB)
 	mkdir -p fuzz/corpus_tlv
 	./fuzz/fuzz_tlv -max_total_time=60 fuzz/corpus_tlv
+
+# libFuzzer over doqd's RFC 9250 §4.3 stream-framing parser (doq_frame_next),
+# the only structured parsing doqd does on client bytes — everything past a
+# valid frame is opaque and forwarded to dnsd untouched. #includes doqd.c
+# (same pattern as fuzz-response/resolverd.c) so -DUNIT_TEST drops doqd's own
+# main(). Needs the same OpenSSL >= 3.5 floor as doqd itself.
+fuzz-doq: fuzz/fuzz_doq.c doqd.c $(WIRE_SRC) dns_wire.h | doqd-ossl-sanity
+	@echo "  CC [FUZZ]  fuzz_doq (doqd stream framing; clang, ASan+UBSan+libFuzzer)"
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -DUNIT_TEST -I. -I$(OSSL_INC) \
+	      -Wno-unused-function \
+	      -o fuzz/fuzz_doq \
+	      fuzz/fuzz_doq.c $(WIRE_SRC) \
+	      -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)
+	mkdir -p fuzz/corpus_doq
+	./fuzz/fuzz_doq -max_total_time=60 fuzz/corpus_doq
 
 # =============================================================================
 # Smoke test
@@ -2297,6 +2350,72 @@ check-dso: mdnsd_debug
 	 echo "$$REFUSED" | grep -q "SUBSCRIBE_RCODE 5" || { echo "  FAIL  SUBSCRIBE for an unconfigured subdomain was not REFUSED"; exit 1; }; \
 	 echo "  OK  SUBSCRIBE accepted + correct initial PUSH, REMOVE pushed on disappearance, unconfigured subdomain REFUSED"
 
+# RFC 9250 DNS-over-QUIC: doqd sidecar. Three parts:
+#   (1) KAT for doq_frame_next's accept/reject boundary (no network — see
+#       tests/test_doq.c; memory-safety of the same function is covered
+#       separately by fuzz-doq).
+#   (2) Live positive: dnsd + doqd + a real kdig +quic query resolves
+#       correctly and dnsd's _853._udp TLSA (Gap 3) is published on the same
+#       cert.
+#   (3) Live negative: config:doq_enabled unset — doqd must refuse to start
+#       and must never bind the QUIC port (never advertise a transport it
+#       isn't serving, same posture as check-ddr for resolverd's DoT+DDR).
+check-doq: $(BIN_DEBUG) doqd_debug
+	@echo "  CC [TEST]  tests/test_doq"
+	@clang -std=c99 -D_GNU_SOURCE -g -fsanitize=address,undefined -DUNIT_TEST -I. \
+	      -Wno-unused-function -o tests/test_doq tests/test_doq.c dns_wire.c \
+	      -lssl -lcrypto -lpthread
+	./tests/test_doq
+	@echo "  CHECK  RFC 9250 DNS-over-QUIC (requires Valkey + kdig +quic + openssl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v kdig >/dev/null 2>&1 || { echo "  SKIP  no kdig on PATH"; exit 0; };   \
+	 kdig -h 2>&1 | grep -q -- '+\[no\]quic ' || { echo "  SKIP  kdig has no +quic support"; exit 0; }; \
+	 command -v openssl >/dev/null 2>&1 || { echo "  SKIP  no openssl on PATH"; exit 0; }; \
+	 D=$$(mktemp -d); \
+	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+	   -keyout $$D/srv.key -out $$D/srv.pem -days 2 -subj "/CN=doq.test" \
+	   -addext "subjectAltName=DNS:doq.test" >/dev/null 2>&1; \
+	 cat $$D/srv.pem $$D/srv.key > $$D/cert_current.pem; \
+	 SAVE_ZN=$$($$VC get config:zone_name); SAVE_A=$$($$VC get "zone:doq.test:A:doq.test"); \
+	 SAVE_CUR=$$($$VC get cert:current); \
+	 SAVE_DE=$$($$VC get config:doq_enabled); SAVE_DP=$$($$VC get config:doq_port); \
+	 SAVE_DD=$$($$VC get config:doq_dns_port); \
+	 $$VC set config:zone_name doq.test >/dev/null; \
+	 $$VC set "zone:doq.test:A:doq.test" "300|192.168.9.9" >/dev/null; \
+	 $$VC set cert:current "$$(cat $$D/cert_current.pem)" >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_doq.log 2>&1 & DNS=$$!; \
+	 sleep 1.5; \
+	 $$VC set config:doq_enabled 1 >/dev/null; \
+	 $$VC set config:doq_port 18853 >/dev/null; \
+	 $$VC set config:doq_dns_port $(TPORT) >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 ./doqd_debug > /tmp/doqd_check.log 2>&1 & DOQ=$$!; \
+	 sleep 1.5; \
+	 ANSWER=$$(kdig +quic +short @127.0.0.1 -p 18853 +tls-ca=$$D/srv.pem +tls-hostname=doq.test \
+	     +timeout=3 +retry=0 doq.test A 2>/dev/null | head -1); \
+	 TLSA=$$(dig @127.0.0.1 -p $(TPORT) +short TLSA _853._udp.doq.test); \
+	 kill $$DOQ 2>/dev/null || true; wait $$DOQ 2>/dev/null || true; \
+	 $$VC set config:doq_enabled 0 >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 timeout 3 ./doqd_debug > /tmp/doqd_check_off.log 2>&1; DOQRC=$$?; \
+	 NOTBOUND=$$(ss -uln 2>/dev/null | grep -c ":18853 " || true); \
+	 kill $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_A" ]; then $$VC set "zone:doq.test:A:doq.test" "$$SAVE_A" >/dev/null; else $$VC del "zone:doq.test:A:doq.test" >/dev/null; fi; \
+	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
+	 if [ -n "$$SAVE_DE" ]; then $$VC set config:doq_enabled "$$SAVE_DE" >/dev/null; else $$VC del config:doq_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_DP" ]; then $$VC set config:doq_port "$$SAVE_DP" >/dev/null; else $$VC del config:doq_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_DD" ]; then $$VC set config:doq_dns_port "$$SAVE_DD" >/dev/null; else $$VC del config:doq_dns_port >/dev/null; fi; \
+	 $$VC del "zone:doq.test:TLSA:_443._tcp.doq.test" "zone:doq.test:TLSA:_853._tcp.doq.test" \
+	     "zone:doq.test:TLSA:_853._udp.doq.test" >/dev/null; \
+	 for k in $$($$VC --scan --pattern "dnssec:doq.test:*"); do $$VC del "$$k" >/dev/null; done; \
+	 rm -rf $$D; \
+	 echo "  DoQ answer=[$$ANSWER]  TLSA(_853._udp)=[$$TLSA]  doqd-disabled-exit=[$$DOQRC]  port-still-bound=[$$NOTBOUND]"; \
+	 test "$$ANSWER" = "192.168.9.9" || { echo "  FAIL  DoQ query did not resolve"; cat /tmp/doqd_check.log; cat /tmp/dnsd_doq.log; exit 1; }; \
+	 echo "$$TLSA" | grep -q "^3 1 1 " || { echo "  FAIL  _853._udp TLSA not published on cert change"; exit 1; }; \
+	 test "$$DOQRC" -ne 0 || { echo "  FAIL  doqd started despite config:doq_enabled=0"; exit 1; }; \
+	 test "$$NOTBOUND" = "0" || { echo "  FAIL  doqd bound :18853/udp while disabled"; exit 1; }; \
+	 echo "  OK  DoQ resolves correctly, _853._udp TLSA published, doqd refuses to start/bind when disabled"
+
 # =============================================================================
 # Clean
 # =============================================================================
@@ -2369,6 +2488,8 @@ help:
 	@echo "  make check-dns64     resolverd RFC 6147 DNS64 AAAA synthesis (KAT + live, needs dig + python3)"
 	@echo "  make check-dp        mdnsd RFC 8766 Discovery Proxy (needs Valkey + dig + python3)"
 	@echo "  make check-dso       mdnsd RFC 8490 DSO + RFC 8765 Push Notifications (needs Valkey + openssl + python3)"
+	@echo "  make check-doq       doqd RFC 9250 DNS-over-QUIC: framing KAT + live query + TLSA + disabled-negative (needs Valkey + kdig +quic + openssl)"
+	@echo "  make fuzz-doq        libFuzzer 60s smoke on doqd's stream-framing parser (needs clang)"
 	@echo "  make clean        Remove build artefacts"
 	@echo "  make gen-signing-key  Generate OpenSSL Ed25519 code-signing key pair"
 	@echo "  make help         This message"

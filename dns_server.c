@@ -59,6 +59,11 @@
  *   7828       edns-tcp-keepalive EDNS option (DoT)
  *   7830/8467  EDNS Padding
  *   7858       DNS-over-TLS (DoT)
+ *   9250       DNS-over-QUIC (DoQ) – terminated by the separate `doqd` sidecar
+ *              (not in this binary; see CLAUDE.md), which forwards to dnsd's
+ *              loopback DNS port exactly like apid's DoH. dnsd's only DoQ-
+ *              related duty is publishing TLSA 3 1 1 for _853._udp.<name> on
+ *              cert change (cert_publish_tlsa), alongside DoT's _853._tcp.
  *   8080       EdDSA/Ed25519 DNSSEC algorithm 15 (alongside Alg 13)
  *   8482       Minimal responses to QTYPE=ANY
  *   8484       DNS-over-HTTPS (DoH) – /dns-query endpoint on HTTPS port
@@ -2536,8 +2541,9 @@ static void tls_reload(void) {
  * keyspace_watch_thread) instead of polling. */
 /* cert_current_split lives in libdnswire (dns_wire.c) — shared with apid and
  * mdnsd so the cert:current parsing exists once. */
-/* Publish TLSA 3 1 1 for _443._tcp.<name> and _853._tcp.<name>, bump the
- * SOA serial and NOTIFY secondaries. This is dnsd's half of issuance: certd
+/* Publish TLSA 3 1 1 for _443._tcp.<name>, _853._tcp.<name> (DoT) and
+ * _853._udp.<name> (DoQ, RFC 9250 — doqd terminates the same cert:current),
+ * bump the SOA serial and NOTIFY secondaries. This is dnsd's half of issuance: certd
  * writes cert:current only; the zone is dnsd's to write (ownership table).
  * The name comes from the certificate itself (first SAN dNSName, else CN),
  * so dnsd needs no knowledge of the ACME/EST configuration. */
@@ -2586,6 +2592,11 @@ static void cert_publish_tlsa(const char *cert_pem) {
         snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_443._tcp.%s", zn, domain);
         vk_set(tkey, tval, 0);
         snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_853._tcp.%s", zn, domain);
+        vk_set(tkey, tval, 0);
+        /* DoQ (RFC 9250) is UDP-transported; _853._udp is its TLSA owner
+         * name by analogy to DoT's _853._tcp — doqd terminates the same
+         * cert:current material, so the SPKI hash is identical. */
+        snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_853._udp.%s", zn, domain);
         vk_set(tkey, tval, 0);
         dns_log(LOG_NOTICE, "[PKI] TLSA 3 1 1 published for %s (zone %s)\n", domain, zn);
         serial_bump(z);

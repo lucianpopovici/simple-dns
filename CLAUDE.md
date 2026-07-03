@@ -180,10 +180,21 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
    │  └──────────────────── apid ──────────────────────┘
    │ DNS / DoT (53, 853)         (HTTP/HTTPS front; writes Valkey,
  clients                          forwards DoH to dnsd's DNS port)
+
+   ▲
+   │ DNS-over-QUIC (853/udp, opt-in)
+   └──────────────────── doqd ──── reads config:*/cert:current from Valkey;
+ clients                           forwards the framed message to dnsd's
+                                    loopback DNS port, same relay pattern
+                                    apid uses for DoH. Writes nothing.
 ```
 
 Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) linked by `dnsd`,
-`mdnsd`, and `resolverd`.
+`mdnsd`, and `resolverd`. `doqd` also links it but does **not** share
+`dns_wire.c`'s TLS helper (`tls_server_ctx_from_pem`) — that would force an
+unconditional `#include <openssl/quic.h>` into a file every other daemon
+compiles against the lower OpenSSL 3.0+ floor, so `doqd` carries its own
+small QUIC-specific context constructor instead (documented in `doqd.c`).
 
 ---
 
@@ -320,6 +331,43 @@ authoritative zone.
   `apid`'s `/metrics` proxy. All write operations go through Valkey, not an
   embedded API.
 
+### `doqd` — DNS-over-QUIC sidecar (RFC 9250)
+
+**Done.** `doqd.c`. A separate sidecar terminates QUIC/UDP 853 and relays the
+framed DNS message to `dnsd`'s loopback DNS port (UDP, TCP retry on
+truncation) — the exact pattern `apid` already uses for DoH. `doqd` never
+parses the DNS payload; it only understands RFC 9250 §4.3's stream framing (a
+2-octet length prefix, identical to DoT/TCP framing) via the pure,
+fuzz-tested `doq_frame_next` (`make fuzz-doq`).
+
+Rationale for a sidecar rather than folding QUIC into `dnsd`: `dnsd` holds
+DNSSEC signing keys and the TSIG secret and must stay the small trusted core;
+a QUIC/TLS state machine is a large untrusted-input surface that must not be
+able to touch those keys even if it has a bug. Also a build-floor concern:
+server-side QUIC (`SSL_new_listener`/`SSL_accept_connection`/
+`SSL_accept_stream`) needs OpenSSL ≥ 3.5, which the rest of the fleet
+(`dnsd`/`apid`/`certd`/`resolverd`, OpenSSL 3.0+) should not be forced onto —
+isolating the newer floor to one binary (`doqd-ossl-sanity` in the Makefile)
+keeps the others building on older distros.
+
+Config (Valkey, **read-only** — `doqd` writes nothing):
+`config:doq_enabled` (must be `"1"`, default off — never on by accident),
+`config:doq_port` (default 8853), `config:doq_dns_port` (dnsd's loopback DNS
+port), `config:doq_max_conns`. TLS material: `cert:current` (written by
+`certd`), falling back to `config:tls_cert_pem`/`config:tls_key_pem` — same
+contract as `dnsd`/`apid`. Live-reloads on a `cert:current`/`config:doq_*`
+keyspace-notification watcher, mirroring `apid`'s; certificate rotation
+mutates the one long-lived QUIC `SSL_CTX` in place (`SSL_CTX_use_certificate`)
+rather than swapping the pointer, because `SSL_new_listener` takes its own
+reference to the ctx at listener-creation time and never re-reads a global —
+swapping which object a variable points to would not reach the running
+listener.
+
+`dnsd`'s only DoQ-related duty: it publishes TLSA `3 1 1` for
+`_853._udp.<name>` on cert change (`cert_publish_tlsa`), alongside DoT's
+`_853._tcp` — `dnsd` still owns TLSA-on-cert-change per the ownership table,
+`doqd` publishes nothing.
+
 ### `libdnswire` — shared wire-format library
 
 Factor the duplicated primitives (`name_from_wire`, `name_to_wire`,
@@ -343,18 +391,18 @@ HTTP front-ends. Define and enforce this.
 
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
-| `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid | Runtime configuration |
+| `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid, doqd | Runtime configuration |
 | `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
 | `ddns:*` | dnsd (RFC 2136 UPDATE), apid (HTTP `/update`, `ddns_secret`-gated) | dnsd | Dynamic records |
 | `srp:*` | dnsd (RFC 9665 SRP UPDATE, SIG(0)-authenticated, `config:srp_enabled`-gated) | dnsd (mdnsd read-only in a future add) | Service-registration records + FCFS ownership + lease/key-lease expiry (RFC 9664) |
 | `ixfr:*` | dnsd (records each A/AAAA change) | dnsd | RFC 1995 IXFR journal (incremental diff; gap → AXFR fallback) |
 | `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |
 | `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |
-| `cert:current` | certd | dnsd (hot-reload) | Active TLS cert + key |
+| `cert:current` | certd | dnsd, apid, doqd (hot-reload) | Active TLS cert + key |
 | `acme:*` | certd | certd | ACME account key, order state |
 | `cache:*` | resolverd | resolverd | Persisted resolver cache. ADR-008 pilot: with `RESOLVERD_CACHE_BACKEND=objectdb` this namespace moves out of Valkey into resolverd's embedded objectdb store (`object_graph.{c,h}`, vendored+pinned) — same single-owner contract, no bus change |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
-| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid | ADR-003 schema-version contract (`major.minor`) |
+| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid, doqd | ADR-003 schema-version contract (`major.minor`) |
 
 **Live reload (done — migration Step 6):** each daemon runs a subscriber on a
 dedicated Valkey connection, enables keyspace notifications
@@ -504,7 +552,10 @@ and the `resolverd` split (`dns_client.c` → `resolverd.c`, now a first-class
 hardened daemon — see the `resolverd` section above) are **all complete**. The
 monolith is fully decomposed and every box in `specs/CLAUDE-migration.md` is ticked.
 Remaining work is feature/quality, not migration: the optional plans
-(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,DoQ,sec}.md`). The
+(`CLAUDE-{hidden-master,loadbalance,forwarder,discovery,sec}.md`). DoQ
+(`specs/CLAUDE-DoQ.md`) is also **done** — the `doqd` sidecar (RFC 9250),
+archived untracked; only its own explicitly-deferred Gap 4 (resolverd
+outbound DoQ client) remains, tracked as a roadmap item. The
 performance work (baseline + SO_REUSEPORT workers, in-process record cache,
 stale-shadow throttle, recvmmsg/sendmmsg batching) is done and archived at
 `specs/CLAUDE-performance.md`.

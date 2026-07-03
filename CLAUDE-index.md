@@ -35,6 +35,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-certd.md` | certd | PKI: ACME/EST extraction (done) + ARI (Add 1, done); Add 2/3 optional, TLSA/CAA integration + STAR roadmap still open |
 | `CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy (Add 1) + DSO/Push (Add 2) + SRP (Add 3, registration handler lives in dnsd) — all done |
 | `specs/CLAUDE-resolverd.md` | resolverd | Forwarding/validating cache, Option A — **done** (Add 1 skipped, Adds 2–7 done), archived untracked |
+| `specs/CLAUDE-DoQ.md` | doqd | RFC 9250 DNS-over-QUIC sidecar — **done** (Gaps 1–3; Gap 4, resolverd outbound DoQ client, deferred by the plan itself), archived untracked |
 | `CLAUDE-rfc-skipped.md` | (triage) | Exclusion record with reasons |
 | `CLAUDE-roadmap.md` | all | Execution order (Phase 0 security → 1 ADRs → 2 features) |
 | `CLAUDE-index.md` | (this file) | The map |
@@ -136,6 +137,21 @@ References: 8882, 7558, 8552/8553.
 
 ---
 
+## doqd — DNS-over-QUIC sidecar
+
+| Gap | RFC | Feature | Status |
+|----:|-----|---------|--------|
+| 1 + 2 | 9250 | `doqd` binary + QUIC↔loopback bridge (relays framed messages to dnsd's loopback DNS port, same pattern as apid's DoH) | **Done** (`make check-doq`; framing parser fuzzed via `make fuzz-doq`) |
+| 3 | 9250 | `_853._udp` TLSA on dnsd's side (cert_publish_tlsa sibling to DoT's `_853._tcp`) | **Done** |
+| 4 | 9250 | resolverd outbound DoQ client | Roadmap (ship when an actual DoQ upstream is needed) |
+
+Needs OpenSSL ≥ 3.5 for the server-side QUIC API (`SSL_new_listener` /
+`SSL_accept_connection` / `SSL_accept_stream`) — isolated to this one binary
+via the `doqd-ossl-sanity` Makefile gate; the rest of the fleet stays on the
+3.0+ floor.
+
+---
+
 ## eppd — registry back-end (phased)
 
 | Phase | RFCs | Status |
@@ -164,6 +180,7 @@ validation never diverge.
 | ENUM number portability | 4769 | ENUM |
 | ENUM EPP federation | 4114, 5076 | ENUM / eppd |
 | resolverd iterative (Option B) | 8109, 8806, 5011 | resolverd |
+| resolverd outbound DoQ client | 9250 | resolverd / doqd |
 | certd STAR certs | 8739 | certd |
 | dnsd compact denial | 9824, 4470 | batch3 (follow-on) |
 | eppd public-registry obligations | 9082/9083, 8909/9022 | eppd |

@@ -23,16 +23,20 @@ keyspace notifications; no restarts.
                        │           Valkey            │
                        │   source of truth + bus     │
                        └─────────────────────────────┘
-     ▲      ▲        ▲             ▲              ▲          ▲
-     │      │        │             │              │          │
- ┌───┴──┐ ┌─┴────┐ ┌─┴────┐   ┌────┴─────┐   ┌────┴─────┐  (reads/writes)
- │ dnsd │ │mdnsd │ │certd │   │   apid   │   │dashboard │
- │auth. │ │ mDNS │ │ PKI  │   │HTTP/DoH/ │   │ Flask UI │
- │      │ │      │ │      │   │   mgmt   │   │          │
- └──┬───┘ └──────┘ └──────┘   └────┬─────┘   └──────────┘
-    │ DNS 53 / DoT 853                │ DoH + mgmt (8053/8443)
-  clients                          clients
+     ▲      ▲        ▲             ▲              ▲          ▲       ▲
+     │      │        │             │              │          │       │
+ ┌───┴──┐ ┌─┴────┐ ┌─┴────┐   ┌────┴─────┐   ┌────┴─────┐  ┌─┴────┐ (reads/writes)
+ │ dnsd │ │mdnsd │ │certd │   │   apid   │   │dashboard │  │ doqd │
+ │auth. │ │ mDNS │ │ PKI  │   │HTTP/DoH/ │   │ Flask UI │  │ DoQ  │
+ │      │ │      │ │      │   │   mgmt   │   │          │  │      │
+ └──┬───┘ └──────┘ └──────┘   └────┬─────┘   └──────────┘  └──┬───┘
+    │ DNS 53 / DoT 853                │ DoH + mgmt (8053/8443)    │ DoQ 853/udp
+  clients                          clients                    clients
 ```
+
+`doqd` forwards to `dnsd`'s loopback DNS port (UDP, TCP retry on truncation) —
+the same relay pattern `apid` uses for DoH — so it never parses DNS payloads,
+only RFC 9250's 2-octet stream-length framing.
 
 | Daemon | Role | Listens on | Talks to |
 |---|---|---|---|
@@ -40,6 +44,7 @@ keyspace notifications; no restarts.
 | **`certd`** (`certd.c`) | ACME (RFC 8555, DNS-01) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA) | Valkey + CA |
 | **`mdnsd`** (`mdnsd.c`) | mDNS (RFC 6762) + DNS-SD (RFC 6763) responder, link-local | `5353` multicast on explicitly-configured interfaces | Valkey (read) |
 | **`apid`** (`apid.c`) | HTTP/HTTPS front: DoH + management API | `8053` (HTTP), `8443` (HTTPS/mTLS) | Valkey + dnsd (DoH forward) |
+| **`doqd`** (`doqd.c`) | DNS-over-QUIC (RFC 9250) sidecar | `8853/udp` (opt-in via `config:doq_enabled`) | Valkey (read) + dnsd (loopback forward) |
 | **`dashboard`** (`dashboard/app.py`) | Authenticated control-plane UI | `127.0.0.1:5000` (configurable) | Valkey |
 
 Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) — the single
@@ -54,6 +59,7 @@ linked by every binary.
 | `certd.c` | `certd`, the ACME/EST certificate sidecar. |
 | `mdnsd.c` | `mdnsd`, the mDNS/DNS-SD responder. |
 | `apid.c` | `apid`, the HTTP/HTTPS front for DoH + management. |
+| `doqd.c` | `doqd`, the DNS-over-QUIC (RFC 9250) sidecar. Needs OpenSSL ≥ 3.5 (server-side QUIC API) — only this one binary; the rest of the build stays on the 3.0+ floor. |
 | `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library. |
 | `sandbox.{c,h}` | `libsandbox`, the shared privilege-drop / chroot+mountns / seccomp sandbox, linked by `dnsd` and `resolverd`. |
 | `resolverd.c` | `resolverd`, the recursive/forwarding resolver + cache + DNSSEC validation (the recursive role; formerly `dns_client.c`). |
@@ -81,6 +87,7 @@ valkey-server &
 ./apid                               # DoH + management on 8053/8443
 ./certd --once                       # one ACME/EST renewal check (or run as a daemon)
 ./mdnsd                              # needs config:mdns_enabled=1 + config:mdns_interfaces
+./doqd                               # needs config:doq_enabled=1; OpenSSL >= 3.5 to build
 ```
 
 If Valkey is unreachable at startup, `dnsd` retries (≈1 min) and then exits with
@@ -142,6 +149,16 @@ glance:
   client retries over TCP rather than emitting a fragmentable datagram.
 - **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
 - **PKI bootstrap** (`certd`): ACME (8555, DNS-01) and EST (7030) over mTLS.
+- **DNS-over-QUIC** (`doqd`, RFC 9250): a separate sidecar terminating
+  QUIC/UDP 853 and relaying framed messages to `dnsd`'s loopback DNS port —
+  the same pattern `apid` uses for DoH. Needs OpenSSL ≥ 3.5 to build (only
+  this binary; the rest of the fleet stays on 3.0+). `dnsd` publishes TLSA
+  `3 1 1` for `_853._udp.<name>` on cert change, alongside DoT's `_853._tcp`.
+- **SIG(0) + SRP**: RFC 2931 transaction-signature verification for UPDATE
+  (an asymmetric alternative to TSIG, per-zone `KEY` RR trust store) and RFC
+  9665 SRP + RFC 9664 Update Leases — opt-in (`config:srp_enabled`) device
+  self-registration via a SIG(0)-authenticated, delete-all-then-add UPDATE
+  with trust-on-first-use and a lease-expiry sweeper.
 
 ## Configuration
 
