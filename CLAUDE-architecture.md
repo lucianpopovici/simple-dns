@@ -19,6 +19,10 @@ ADR-006 key custody ──────┘                                       
         └──────────────> ADR-007 HA / persistence / DR <────────────┘
                  (in-process cache doubles as Valkey-outage survival;
                   key backup must be encrypted; snapshots need durability)
+
+ADR-008 embedded store (objectdb) ──> candidate *implementation* of ADR-005's
+                 in-process cache and ADR-007's degraded mode; never replaces
+                 the Valkey bus (ADR-003 contract stays authoritative)
 ```
 
 ---
@@ -275,6 +279,93 @@ Specify HA, durability, and DR as three explicit dimensions.
 
 ---
 
+# ADR-008: Role of the embedded object store (objectdb) relative to Valkey
+
+**Status:** Proposed — recommended option **C now** (per-daemon embedded store
+for single-owner namespaces, pilot: `resolverd`'s `cache:*`), **D later**
+(dnsd's in-process zone store, co-designed with ADR-005/ADR-007). Option A
+(full Valkey replacement) is **rejected**. Feasibility study 2026-07-03.
+
+## Context
+
+`objectdb` (`lucianpopovici/objectdb`, `object_graph.{c,h}`) is an embedded,
+WAL-backed persistent object-graph engine that has been deliberately evolved
+toward DNS workloads: an ordered index in RFC 4034 §6.1 canonical DNS-name
+order (`index_succ`/`index_pred`/`index_range` — the NSEC-chain primitive), a
+durable per-transaction change log (`store_changes_since`, IXFR-style
+diffing), `dns.ancestors`/`dns.wildcards` virtual lists (the zone-match and
+wildcard-synthesis ladders), `OBJ_BYTES` blobs, crash recovery, and a
+thread-safe rwlock. Its test suite passes clean (1308/1308) under this
+project's hardening flags.
+
+The question is whether it can replace Valkey. It cannot, wholesale, for
+structural reasons:
+
+1. **It is single-process by design.** `store_open()` takes an exclusive
+   `flock(LOCK_EX|LOCK_NB)`; there is no server, wire protocol, or shared
+   read-only mode. Valkey's role here is precisely the thing an embedded
+   library cannot do: the integration bus between six processes (design
+   principle 2), which exists for privilege separation.
+2. **No pub/sub.** `dnsd`/`apid`/`mdnsd` live-reload via keyspace
+   notifications; objectdb's change log is poll-based and in-process only.
+3. **No Python access.** The dashboard talks to Valkey directly.
+4. **No TTL.** `ddns:*` leases and `stale:*` shadows use `SET … EX`.
+5. **Data remodel, not rename.** Field keys and root names cap at 64 bytes
+   (< a 255-byte DNS name); the flat `zone:<zone>:<type>:<name>` keyspace
+   would become class-tagged objects with indexed `name` fields.
+
+## Decision
+
+Define what role, if any, objectdb plays relative to Valkey.
+
+## Options
+
+- **A — full replacement.** Requires building a network daemon around
+  objectdb (protocol, auth, notifications, HA) — re-implementing Valkey and
+  placing new, unproven code in the most trusted position. Rejected.
+- **B — status quo.** Valkey everywhere; objectdb unused. Foregoes a
+  DNS-tailored engine for the hot path and leaves ADR-005 B / ADR-007
+  degraded mode as bespoke cache code.
+- **C — per-daemon embedded store for single-owner namespaces.** Adopt
+  objectdb only where the ownership table shows one writer *and* one reader,
+  both the same process: `resolverd`'s `cache:*` (and potentially `certd`'s
+  `acme:*`, though certd still needs Valkey for `zone:`/`cert:`). Removes
+  resolverd's Valkey dependency and a network round-trip per cache op; the
+  inter-daemon contract is untouched.
+- **D — dnsd materialized zone store, alongside Valkey.** Valkey remains the
+  control-plane bus and source of truth; objectdb becomes dnsd's durable
+  in-process copy, fed by the existing keyspace notifications. The ordered
+  index serves NSEC denial, the change log maps onto the `ixfr:*` journal,
+  and durability turns ADR-005's cache into ADR-007's "serve
+  last-known-good" degraded mode (superseding the `stale:` shadow hack).
+
+## Recommendation
+
+**C now, D later, never A.** Pilot with `resolverd`'s cache: self-contained,
+one owner, measurable win, and it exercises the sandbox interplay cheaply.
+Take up D only together with ADR-005's invalidation design and ADR-004's
+snapshot pinning (a pinned store snapshot is a natural AXFR anchor).
+
+## Consequences
+
+- **Sandbox:** the store's snapshot/WAL/vlog files must live inside the
+  daemon's chroot, writable by the privdrop user; `fsync`/`rename`-class
+  syscalls join the seccomp whitelist (re-harvest via the documented
+  audit-then-enforce procedure). The trusted core gains a durable-file
+  write path it currently does not have.
+- **Ownership table / ADR-003:** any namespace moved into an embedded store
+  leaves the Valkey schema contract; the ownership table and format registry
+  must record that move in the same change. Embedded-store layout gets its
+  own version discipline (objectdb snapshots carry a format version).
+- **TTL semantics** must be replaced by explicit sweeps wherever an adopted
+  namespace relied on `EX` expiry.
+- **Dependency:** objectdb is vendored/pinned and held to this repo's bar —
+  its parser/loader surface (snapshot + WAL replay) is untrusted-input-adjacent
+  and needs fuzz coverage before it backs the trusted core (security-sensitive
+  change gate applies to D).
+
+---
+
 ## Open architectural issues (named, not yet decided)
 
 Lower-tier than the ADRs above but real; track and decide before GA.
@@ -310,4 +401,6 @@ Lower-tier than the ADRs above but real; track and decide before GA.
 3. **ADR-007** (HA/DR) — before depending on a single Valkey in production.
 4. **ADR-005** (caching/QPS) — when you hit the throughput ceiling; co-design
    with ADR-004's snapshot and ADR-007's degraded mode.
-5. Open issues 1–6 — before GA.
+5. **ADR-008** (embedded store) — pilot (option C, resolverd cache) any time;
+   the dnsd zone-store role (option D) only together with ADR-005/004.
+6. Open issues 1–6 — before GA.

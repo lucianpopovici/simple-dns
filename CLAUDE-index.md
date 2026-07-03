@@ -25,7 +25,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `specs/CLAUDE-loadbalance.md` | dnsd | A/AAAA rotation + health checks — **done**, archived untracked |
 | `specs/CLAUDE-forwarder.md` | dnsd | Out-of-zone forwarding — **done**, archived untracked |
 | `specs/CLAUDE-discovery.md` | dnsd | Automatic FQDN registration — **done**, archived untracked |
-| `CLAUDE-architecture.md` | all | System-level ADRs (schema, atomicity, data access, keys, HA/DR) |
+| `CLAUDE-architecture.md` | all | System-level ADRs (schema, atomicity, data access, keys, HA/DR, embedded store/objectdb) |
 | `specs/CLAUDE-rfc-additions.md` | dnsd | Batch 1–2: Adds 1–5 + doc reconciliations — **done**, archived untracked |
 | `CLAUDE-rfc-additions-batch3.md` | dnsd (+libdnswire) | Batch 3: Adds 7–11 + complementary + reference |
 | `specs/CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317, Done) + 3258 anycast note (Done) — archived untracked |
