@@ -65,6 +65,9 @@
  *   DNS64_ENABLED     RFC 6147 DNS64 AAAA synthesis    (default: 0)
  *   DNS64_PREFIX      NAT64 prefix, /96 only           (default: 64:ff9b::/96)
  *   DNS64_EXCLUDE     Comma-separated suffixes never synthesized for
+ *   RESOLVERD_UDP_WORKERS  UDP worker-pool size, 1-64   (default: 8) —
+ *                     queries resolve off the select() loop so one slow
+ *                     upstream miss cannot stall other clients
  *
  * Sandbox (Valkey config:* keys, env override in parens; applied after the
  * listeners bind, before the proxy loop — no-op unless started as root):
@@ -97,8 +100,10 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <time.h>
@@ -259,6 +264,9 @@ typedef struct {
     uint8_t dns64_prefix[16]; /* well-known 64:ff9b::/96 by default */
     int dns64_prefix_len;     /* only /96 is supported (see dns64_init) */
     char dns64_exclude[512];  /* comma-separated suffixes never synthesized for */
+    /* Size of the UDP worker pool (RESOLVERD_UDP_WORKERS); resolves queries
+     * off the select() loop so one slow miss cannot stall other clients. */
+    int udp_workers;
 } config_t;
 
 /* =========================================================================
@@ -297,13 +305,18 @@ static pthread_mutex_t g_cache_count_mutex = PTHREAD_MUTEX_INITIALIZER;
 static cache_entry_t *g_lru_head = NULL, *g_lru_tail = NULL;
 static pthread_mutex_t g_lru_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Statistics */
-static uint64_t g_stat_queries = 0;
-static uint64_t g_stat_hits = 0;
-static uint64_t g_stat_misses = 0;
-static uint64_t g_stat_expired = 0;
-static uint64_t g_stat_negcache = 0;
-static uint64_t g_stat_stale = 0; /* stale-while-revalidate serves */
-static pthread_mutex_t g_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Counters are relaxed atomics: they are monotonic tallies with no
+ * cross-counter invariant to protect, so a mutex around each ++ bought
+ * nothing but contention on the query path. */
+static _Atomic uint64_t g_stat_queries = 0;
+static _Atomic uint64_t g_stat_hits = 0;
+static _Atomic uint64_t g_stat_misses = 0;
+static _Atomic uint64_t g_stat_expired = 0;
+static _Atomic uint64_t g_stat_negcache = 0;
+static _Atomic uint64_t g_stat_stale = 0; /* stale-while-revalidate serves */
+static _Atomic uint64_t g_stat_udp_dropped = 0; /* UDP jobs dropped: queue full */
+static _Atomic uint64_t g_stat_vkw_dropped = 0; /* Valkey writes dropped: queue full */
+#define STAT_INC(c) atomic_fetch_add_explicit(&(c), 1, memory_order_relaxed)
 /* Valkey client (for persistent cache) */
 static resp_conn_t g_vk;
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -523,11 +536,21 @@ static int resp_send_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
     return resp_parse(c, r);
 }
 
+/* After a failed connect, skip Valkey entirely until this time. Without it, a
+ * black-holed (packet-drop, not RST) Valkey costs a blocking connect() — up
+ * to the 3s socket timeout — on every cache operation, on whatever thread is
+ * resolving. */
+#define VK_DOWN_BACKOFF_SECS 3
+static _Atomic long g_vk_down_until = 0;
+
 static int vk_connect(resp_conn_t *c) {
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
     }
+    long down_until = atomic_load_explicit(&g_vk_down_until, memory_order_relaxed);
+    if (down_until != 0 && (long) time(NULL) < down_until)
+        return -1;
     c->rlen = c->rpos = 0;
     c->fd = socket(AF_INET, SOCK_STREAM, 0);
     if (c->fd < 0)
@@ -553,6 +576,8 @@ static int vk_connect(resp_conn_t *c) {
     if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
         close(c->fd);
         c->fd = -1;
+        atomic_store_explicit(&g_vk_down_until, (long) time(NULL) + VK_DOWN_BACKOFF_SECS,
+                              memory_order_relaxed);
         return -1;
     }
     if (g_cfg.valkey_pass[0]) {
@@ -560,82 +585,98 @@ static int vk_connect(resp_conn_t *c) {
         if (resp_send_cmd(c, &r, 2, "AUTH", g_cfg.valkey_pass) < 0 || r.type == RESP_ERR) {
             close(c->fd);
             c->fd = -1;
+            atomic_store_explicit(&g_vk_down_until, (long) time(NULL) + VK_DOWN_BACKOFF_SECS,
+                                  memory_order_relaxed);
             return -1;
         }
     }
+    atomic_store_explicit(&g_vk_down_until, 0, memory_order_relaxed);
     return 0;
 }
+/* Connect only when there is no live fd. No PING probe: the old
+ * PING-before-every-command doubled the round-trips of every cache
+ * operation; a connection gone stale (Valkey restart) is detected by the
+ * command itself failing, which the callers below handle by reconnecting
+ * and retrying once. */
 static int vk_ensure(resp_conn_t *c) {
-    if (c->fd < 0)
-        return vk_connect(c);
-    resp_reply_t r;
-    if (resp_send_cmd(c, &r, 1, "PING") < 0) {
-        return vk_connect(c);
-    }
-    return 0;
+    if (c->fd >= 0)
+        return 0;
+    return vk_connect(c);
 }
 
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
+    int good = 0;
     resp_reply_t r;
-    int ok;
-    if (ttl > 0) {
-        char ts[16];
-        snprintf(ts, sizeof(ts), "%u", ttl);
-        ok = resp_send_cmd(&g_vk, &r, 5, "SET", key, val, "EX", ts);
-    } else
-        ok = resp_send_cmd(&g_vk, &r, 3, "SET", key, val);
-    if (ok < 0) {
-        g_vk.fd = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
+            break;
+        int ok;
+        if (ttl > 0) {
+            char ts[16];
+            snprintf(ts, sizeof(ts), "%u", ttl);
+            ok = resp_send_cmd(&g_vk, &r, 5, "SET", key, val, "EX", ts);
+        } else
+            ok = resp_send_cmd(&g_vk, &r, 3, "SET", key, val);
+        if (ok >= 0) {
+            good = (r.type == RESP_STR);
+            break;
+        }
+        g_vk.fd = -1; /* stale/broken — reconnect and retry once */
     }
     pthread_mutex_unlock(&g_vk_mutex);
-    return ok >= 0 && r.type == RESP_STR;
+    return good;
 }
 static int vk_get(const char *key, char *out, int olen) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
+    int good = 0;
     resp_reply_t r;
-    if (resp_send_cmd(&g_vk, &r, 2, "GET", key) < 0) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
+            break;
+        if (resp_send_cmd(&g_vk, &r, 2, "GET", key) >= 0) {
+            good = 1; /* command succeeded; nil reply is a valid miss */
+            break;
+        }
         g_vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
     }
     pthread_mutex_unlock(&g_vk_mutex);
-    if (r.type != RESP_BULK)
+    if (!good || r.type != RESP_BULK)
         return 0;
     safe_strcpy(out, r.str, olen);
     return 1;
 }
 static int vk_del(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
+    int good = 0;
     resp_reply_t r;
-    resp_send_cmd(&g_vk, &r, 2, "DEL", key);
-    if (r.type < 0)
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
+            break;
+        if (resp_send_cmd(&g_vk, &r, 2, "DEL", key) >= 0) {
+            good = 1;
+            break;
+        }
         g_vk.fd = -1;
+    }
     pthread_mutex_unlock(&g_vk_mutex);
-    return r.type == RESP_INT ? (int) r.integer : 0;
+    return good && r.type == RESP_INT ? (int) r.integer : 0;
 }
 static int vk_keys_scan(const char *pattern, char keys[][512], int maxkeys) {
     pthread_mutex_lock(&g_vk_mutex);
     int n = 0;
-    if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
+    int good = 0;
     resp_reply_t r;
-    if (resp_send_cmd(&g_vk, &r, 2, "KEYS", pattern) < 0 || r.type != RESP_ARR) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
+            break;
+        if (resp_send_cmd(&g_vk, &r, 2, "KEYS", pattern) >= 0) {
+            good = 1;
+            break;
+        }
         g_vk.fd = -1;
+    }
+    if (!good || r.type != RESP_ARR) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
@@ -650,6 +691,103 @@ static int vk_keys_scan(const char *pattern, char keys[][512], int maxkeys) {
     }
     pthread_mutex_unlock(&g_vk_mutex);
     return n;
+}
+
+/* =========================================================================
+ * Async Valkey cache writer
+ *
+ * cache_store_valkey used to run its SET synchronously inside dns_resolve,
+ * adding the Valkey round-trip(s) to every miss's answer latency. The store
+ * is a persistence side effect the client answer never depends on, so it now
+ * goes through this bounded queue to a dedicated writer thread. Queue-full
+ * drops the write (best effort — it's a cache) and counts it.
+ * ======================================================================= */
+#define VKW_QUEUE_LEN 256
+typedef struct {
+    char key[600];
+    char *val; /* malloc'd serialized entry; NULL = DEL the key */
+    uint32_t ttl;
+} vkw_job_t;
+static vkw_job_t g_vkw_queue[VKW_QUEUE_LEN];
+static int g_vkw_head = 0;
+static int g_vkw_count = 0;
+static int g_vkw_inflight = 0; /* job popped but its SET/DEL not finished */
+static pthread_mutex_t g_vkw_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_vkw_cond = PTHREAD_COND_INITIALIZER;
+
+static void *vkw_worker(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&g_vkw_mutex);
+        while (g_vkw_count == 0)
+            pthread_cond_wait(&g_vkw_cond, &g_vkw_mutex);
+        vkw_job_t job = g_vkw_queue[g_vkw_head];
+        g_vkw_queue[g_vkw_head].val = NULL;
+        g_vkw_head = (g_vkw_head + 1) % VKW_QUEUE_LEN;
+        g_vkw_count--;
+        g_vkw_inflight = 1;
+        pthread_mutex_unlock(&g_vkw_mutex);
+        if (job.val) {
+            vk_set(job.key, job.val, job.ttl);
+            free(job.val);
+        } else {
+            vk_del(job.key);
+        }
+        pthread_mutex_lock(&g_vkw_mutex);
+        g_vkw_inflight = 0;
+        pthread_mutex_unlock(&g_vkw_mutex);
+    }
+    return NULL;
+}
+
+/* Wait (bounded) for queued cache writes to land. Only the one-shot CLI
+ * modes need this — the daemon never exits; without it a one-shot resolve
+ * could exit before its cache entry reached Valkey. */
+static void vkw_drain(int max_ms) {
+    for (int waited = 0; waited < max_ms; waited += 5) {
+        pthread_mutex_lock(&g_vkw_mutex);
+        int busy = g_vkw_count > 0 || g_vkw_inflight;
+        pthread_mutex_unlock(&g_vkw_mutex);
+        if (!busy)
+            return;
+        usleep(5000);
+    }
+}
+
+/* Enqueue a SET (val != NULL, copied) or DEL (val == NULL). Drops on a full
+ * queue or alloc failure rather than blocking the resolve path. */
+static void vkw_enqueue(const char *key, const char *val, uint32_t ttl) {
+    char *dup = NULL;
+    if (val) {
+        dup = strdup(val);
+        if (!dup) {
+            STAT_INC(g_stat_vkw_dropped);
+            return;
+        }
+    }
+    pthread_mutex_lock(&g_vkw_mutex);
+    if (g_vkw_count == VKW_QUEUE_LEN) {
+        pthread_mutex_unlock(&g_vkw_mutex);
+        free(dup);
+        STAT_INC(g_stat_vkw_dropped);
+        return;
+    }
+    int slot = (g_vkw_head + g_vkw_count) % VKW_QUEUE_LEN;
+    safe_strcpy(g_vkw_queue[slot].key, key, sizeof(g_vkw_queue[slot].key));
+    g_vkw_queue[slot].val = dup;
+    g_vkw_queue[slot].ttl = ttl;
+    g_vkw_count++;
+    pthread_cond_signal(&g_vkw_cond);
+    pthread_mutex_unlock(&g_vkw_mutex);
+}
+
+static void vkw_start(void) {
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, vkw_worker, NULL);
+    pthread_attr_destroy(&attr);
 }
 
 /* Format one rdata value as a human-readable string */
@@ -981,7 +1119,73 @@ out:
  * dnskey_rd (capacity cap). Returns the rdata length, or 0 if none
  * found/unreachable. Shared by the positive- and negative-response
  * validators so the DNSKEY-fetch parse exists in exactly one place. */
+/* DNSKEY cache: validating a response used to refetch the zone's DNSKEY
+ * upstream on every miss (responses rarely carry it), doubling the upstream
+ * RTT of each validated resolution. Cache the fetched rdata for its response
+ * TTL (clamped). Trust is unchanged: the cached rdata goes through exactly
+ * the same dnskey_is_trusted / RRSIG verification as a fresh fetch — this
+ * caches bytes, not a verification verdict. */
+#define DNSKEY_CACHE_SLOTS 64
+#define DNSKEY_CACHE_TTL_CAP 3600
+#define DNSKEY_CACHE_TTL_MIN 30
+#define DNSKEY_RD_MAX 512
+typedef struct {
+    char name[256];
+    uint8_t rd[DNSKEY_RD_MAX];
+    int rdlen; /* 0 = slot unused */
+    time_t expires;
+} dnskey_cache_slot_t;
+static dnskey_cache_slot_t g_dnskey_cache[DNSKEY_CACHE_SLOTS];
+static int g_dnskey_cache_next = 0; /* round-robin replacement cursor */
+static pthread_mutex_t g_dnskey_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int dnskey_cache_get(const char *name, uint8_t *out, int cap) {
+    int n = 0;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_dnskey_cache_mutex);
+    for (int i = 0; i < DNSKEY_CACHE_SLOTS; i++) {
+        dnskey_cache_slot_t *s = &g_dnskey_cache[i];
+        if (s->rdlen > 0 && s->expires > now && s->rdlen <= cap &&
+            strcasecmp(s->name, name) == 0) {
+            memcpy(out, s->rd, (size_t) s->rdlen);
+            n = s->rdlen;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dnskey_cache_mutex);
+    return n;
+}
+
+static void dnskey_cache_put(const char *name, const uint8_t *rd, int rdlen, uint32_t ttl) {
+    if (rdlen <= 0 || rdlen > DNSKEY_RD_MAX || ttl == 0)
+        return;
+    if (ttl < DNSKEY_CACHE_TTL_MIN)
+        ttl = DNSKEY_CACHE_TTL_MIN;
+    if (ttl > DNSKEY_CACHE_TTL_CAP)
+        ttl = DNSKEY_CACHE_TTL_CAP;
+    pthread_mutex_lock(&g_dnskey_cache_mutex);
+    int slot = -1;
+    for (int i = 0; i < DNSKEY_CACHE_SLOTS; i++) {
+        if (g_dnskey_cache[i].rdlen > 0 && strcasecmp(g_dnskey_cache[i].name, name) == 0) {
+            slot = i; /* refresh in place */
+            break;
+        }
+    }
+    if (slot < 0) {
+        slot = g_dnskey_cache_next;
+        g_dnskey_cache_next = (g_dnskey_cache_next + 1) % DNSKEY_CACHE_SLOTS;
+    }
+    safe_strcpy(g_dnskey_cache[slot].name, name, sizeof(g_dnskey_cache[slot].name));
+    memcpy(g_dnskey_cache[slot].rd, rd, (size_t) rdlen);
+    g_dnskey_cache[slot].rdlen = rdlen;
+    g_dnskey_cache[slot].expires = time(NULL) + (time_t) ttl;
+    pthread_mutex_unlock(&g_dnskey_cache_mutex);
+}
+
 static int dnssec_fetch_dnskey(const char *name, uint8_t *dnskey_rd, int cap) {
+    int cached = dnskey_cache_get(name, dnskey_rd, cap);
+    if (cached > 0)
+        return cached;
     uint8_t dkresp[DNS_BUF * 2];
     long rtt = 0;
     int dkrlen = upstream_query(name, 48 /*DNSKEY*/, dkresp, sizeof(dkresp), &rtt);
@@ -1002,9 +1206,13 @@ static int dnssec_fetch_dnskey(const char *name, uint8_t *dnskey_rd, int cap) {
         if (a < 0 || a + 10 > dkrlen)
             break;
         uint16_t rt = get16(dkresp, a);
+        uint32_t rttl = get32(dkresp, a + 4);
         uint16_t rdl = get16(dkresp, a + 8);
+        if (a + 10 + (int) rdl > dkrlen)
+            break; /* rdlength runs past the packet — fail closed */
         if (rt == 48 && rdl > 0 && rdl <= (uint16_t) cap) {
             memcpy(dnskey_rd, dkresp + a + 10, rdl);
+            dnskey_cache_put(name, dnskey_rd, (int) rdl, rttl);
             return (int) rdl;
         }
         dkoff = a + 10 + (int) rdl;
@@ -1978,13 +2186,19 @@ static void tls_verify_peer_name(SSL *ssl, const char *host) {
 }
 
 /* Open a DoT connection to the upstream server */
-static SSL *dot_connect(int *fd_out) {
+/* The whole dispatch chain (dot_connect / tcp_query / upstream_dispatch)
+ * takes the upstream host/port explicitly. It used to read
+ * g_cfg.upstream_host[0], forcing upstream_query_one to temporarily rewrite
+ * slot 0 and restore it — an unlocked data race once two threads resolve
+ * concurrently (TCP client threads and prefetch already did; the UDP worker
+ * pool makes it constant). g_cfg is read-only after startup now. */
+static SSL *dot_connect(int *fd_out, const char *host, int port) {
     struct addrinfo hints = {0}, *res;
     char ps[8];
-    snprintf(ps, sizeof(ps), "%d", g_cfg.upstream_port[0]);
+    snprintf(ps, sizeof(ps), "%d", port);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(g_cfg.upstream_host[0], ps, &hints, &res) != 0)
+    if (getaddrinfo(host, ps, &hints, &res) != 0)
         return NULL;
     int fd = socket(res->ai_family, res->ai_socktype, 0);
     if (fd < 0) {
@@ -2002,8 +2216,8 @@ static SSL *dot_connect(int *fd_out) {
     freeaddrinfo(res);
     SSL *ssl = SSL_new(g_dot_ctx);
     SSL_set_fd(ssl, fd);
-    SSL_set_tlsext_host_name(ssl, g_cfg.upstream_host[0]);
-    tls_verify_peer_name(ssl, g_cfg.upstream_host[0]);
+    SSL_set_tlsext_host_name(ssl, host);
+    tls_verify_peer_name(ssl, host);
     if (SSL_connect(ssl) <= 0) {
         SSL_free(ssl);
         close(fd);
@@ -2014,20 +2228,21 @@ static SSL *dot_connect(int *fd_out) {
 }
 
 /* Send a query over TCP or DoT (with 2-byte length prefix) */
-static int tcp_query(const uint8_t *query, int qlen, uint8_t *resp, int resp_sz, int use_dot) {
+static int tcp_query(const uint8_t *query, int qlen, uint8_t *resp, int resp_sz, int use_dot,
+                     const char *host, int port) {
     int fd = -1;
     SSL *ssl = NULL;
     if (use_dot) {
-        ssl = dot_connect(&fd);
+        ssl = dot_connect(&fd, host, port);
         if (!ssl)
             return -1;
     } else {
         struct addrinfo hints = {0}, *res;
         char ps[8];
-        snprintf(ps, sizeof(ps), "%d", g_cfg.upstream_port[0]);
+        snprintf(ps, sizeof(ps), "%d", port);
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(g_cfg.upstream_host[0], ps, &hints, &res) != 0)
+        if (getaddrinfo(host, ps, &hints, &res) != 0)
             return -1;
         fd = socket(res->ai_family, res->ai_socktype, 0);
         if (fd < 0) {
@@ -2382,23 +2597,24 @@ static int parse_server_arg(const char *arg) {
  * + slot 0, set by the caller). Returns response length or -1. Factored out so
  * the RFC 7873 BADCOOKIE retry can resend without duplicating the transport
  * fan-out. */
-static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int resp_sz) {
+static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int resp_sz,
+                             const char *host, int port, upstream_proto_t proto) {
     int rlen = -1;
-    if (g_cfg.proto == PROTO_DOT)
-        rlen = tcp_query(query, qlen, resp, resp_sz, 1);
-    else if (g_cfg.proto == PROTO_TCP)
-        rlen = tcp_query(query, qlen, resp, resp_sz, 0);
-    else if (g_cfg.proto == PROTO_DOH) {
+    if (proto == PROTO_DOT)
+        rlen = tcp_query(query, qlen, resp, resp_sz, 1, host, port);
+    else if (proto == PROTO_TCP)
+        rlen = tcp_query(query, qlen, resp, resp_sz, 0, host, port);
+    else if (proto == PROTO_DOH) {
         const char *doh_path = g_cfg.doh_path[0] ? g_cfg.doh_path : "/dns-query";
-        rlen = doh_query_on(g_cfg.upstream_host[0], g_cfg.doh_port ? g_cfg.doh_port : 443, doh_path,
-                            query, qlen, resp, resp_sz);
+        rlen = doh_query_on(host, g_cfg.doh_port ? g_cfg.doh_port : 443, doh_path, query, qlen,
+                            resp, resp_sz);
     } else {
         struct addrinfo hints = {0}, *res;
         char ps[8];
-        snprintf(ps, sizeof(ps), "%d", g_cfg.upstream_port[0]);
+        snprintf(ps, sizeof(ps), "%d", port);
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
-        if (getaddrinfo(g_cfg.upstream_host[0], ps, &hints, &res) == 0) {
+        if (getaddrinfo(host, ps, &hints, &res) == 0) {
             int fd = socket(res->ai_family, res->ai_socktype, 0);
             if (fd >= 0) {
                 /* Random source port */
@@ -2425,7 +2641,7 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
                     rlen = (int) recv(fd, resp, resp_sz, 0);
                 close(fd);
                 if (rlen >= 2 && (get16(resp, 2) & DNS_TC))
-                    rlen = tcp_query(query, qlen, resp, resp_sz, 0);
+                    rlen = tcp_query(query, qlen, resp, resp_sz, 0, host, port);
             }
             freeaddrinfo(res);
         }
@@ -2438,23 +2654,12 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
                               int upstream_idx, long *rtt_us_out) {
     uint16_t id = csprng_u16();
     uint8_t query[DNS_BUF];
-    /* Temporarily point g_cfg to this upstream for build_query/tcp_query */
-    /* (they read g_cfg.upstream_host/port/proto) */
-    char saved_host[256];
-    int saved_port;
-    upstream_proto_t saved_proto;
-    safe_strcpy(saved_host, g_cfg.upstream_host[0], sizeof(saved_host));
-    saved_port = g_cfg.upstream_port[0];
-    saved_proto = g_cfg.proto;
-    /* Point slot 0 at the chosen upstream. Skip the copy when it IS slot 0:
-     * safe_strcpy() is strncpy-based, and strncpy with src==dst is undefined
-     * behaviour (ASan: strncpy-param-overlap) — querying the primary upstream
-     * would otherwise abort. */
-    if (upstream_idx != 0)
-        safe_strcpy(g_cfg.upstream_host[0], g_cfg.upstream_host[upstream_idx],
-                    sizeof(g_cfg.upstream_host[0]));
-    g_cfg.upstream_port[0] = g_cfg.upstream_port[upstream_idx];
-    g_cfg.proto = g_cfg.upstream_proto[upstream_idx];
+    /* The chosen upstream is passed straight down the dispatch chain — no
+     * more rewriting g_cfg slot 0 (an unlocked data race under concurrent
+     * resolves). */
+    const char *up_host = g_cfg.upstream_host[upstream_idx];
+    int up_port = g_cfg.upstream_port[upstream_idx];
+    upstream_proto_t up_proto = g_cfg.upstream_proto[upstream_idx];
     /* RFC 5452 §2.2 0x20: wire-encode (and later verify) a case-mixed QNAME
      * instead of the plain one when this upstream hasn't opted out. qname
      * itself is left untouched — callers outside this function (cache keys,
@@ -2469,7 +2674,7 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
     int rlen = -1;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    rlen = upstream_dispatch(query, qlen, resp, resp_sz);
+    rlen = upstream_dispatch(query, qlen, resp, resp_sz, up_host, up_port, up_proto);
     /* RFC 5452: drop any reply whose ID/question does not match what we asked —
      * fail closed so a spoofed or stray packet is never cached or trusted. */
     if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname_sent, qtype, use_0x20))
@@ -2489,7 +2694,7 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
             if (use_0x20)
                 dns0x20_mix(qname, qname_sent, sizeof(qname_sent));
             qlen = build_query(query, sizeof(query), qname_sent, qtype, id, 1, upstream_idx);
-            rlen = upstream_dispatch(query, qlen, resp, resp_sz);
+            rlen = upstream_dispatch(query, qlen, resp, resp_sz, up_host, up_port, up_proto);
             if (rlen >= 12 && !response_matches_query(resp, rlen, id, qname_sent, qtype, use_0x20))
                 rlen = -1;
             if (rlen >= 12) {
@@ -2501,10 +2706,6 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    /* Restore */
-    safe_strcpy(g_cfg.upstream_host[0], saved_host, sizeof(g_cfg.upstream_host[0]));
-    g_cfg.upstream_port[0] = saved_port;
-    g_cfg.proto = saved_proto;
     long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
     if (rtt_us_out)
         *rtt_us_out = rtt;
@@ -2781,16 +2982,12 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         if (!allow_stale || entry_expired_for(e) > g_cfg.serve_stale_max) {
             pthread_rwlock_unlock(&g_cache[bkt].lock);
             if (allow_stale) {
-                pthread_mutex_lock(&g_stat_mutex);
-                g_stat_expired++;
-                pthread_mutex_unlock(&g_stat_mutex);
+                STAT_INC(g_stat_expired);
             }
             return NULL;
         }
         is_stale = 1;
-        pthread_mutex_lock(&g_stat_mutex);
-        g_stat_expired++;
-        pthread_mutex_unlock(&g_stat_mutex);
+        STAT_INC(g_stat_expired);
     }
     /* Deep copy */
     cache_entry_t *copy = malloc(sizeof(cache_entry_t));
@@ -3047,10 +3244,11 @@ static void cache_store_valkey(const cache_entry_t *e) {
         if (e->rrs[i].ttl_original > max_ttl)
             max_ttl = e->rrs[i].ttl_original;
     if (max_ttl == 0) {
-        vk_del(vk_key);
+        vkw_enqueue(vk_key, NULL, 0); /* async DEL */
         return;
     }
     /* Serialise */
+    static const char hexdig[] = "0123456789abcdef";
     char buf[RESP_BUF];
     int pos = 0;
     pos += snprintf(buf + pos, RESP_BUF - pos, "%d|%u|%d|%u|%ld|", e->nrr, (uint32_t) e->rcode,
@@ -3058,13 +3256,15 @@ static void cache_store_valkey(const cache_entry_t *e) {
     for (int i = 0; i < e->nrr && pos < RESP_BUF - 256; i++) {
         pos += snprintf(buf + pos, RESP_BUF - pos, "%u:%u:%u:", e->rrs[i].type,
                         e->rrs[i].ttl_original, e->rrs[i].rdlen);
-        for (int j = 0; j < (int) e->rrs[i].rdlen && pos + 3 < RESP_BUF; j++)
-            pos += snprintf(buf + pos, RESP_BUF - pos, "%02x", e->rrs[i].rdata[j]);
+        for (int j = 0; j < (int) e->rrs[i].rdlen && pos + 3 < RESP_BUF; j++) {
+            buf[pos++] = hexdig[e->rrs[i].rdata[j] >> 4];
+            buf[pos++] = hexdig[e->rrs[i].rdata[j] & 0x0f];
+        }
         if (pos < RESP_BUF - 1)
             buf[pos++] = '|';
     }
     buf[pos] = 0;
-    vk_set(vk_key, buf, max_ttl);
+    vkw_enqueue(vk_key, buf, max_ttl); /* async SET — off the resolve path */
 }
 
 static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype, int allow_stale) {
@@ -3211,9 +3411,7 @@ static cache_entry_t *parse_response_to_entry(const uint8_t *resp, int rlen, con
             aoff = a + 10 + (int) rdl;
         }
         e->neg_ttl = (soa_min > g_cfg.cache_neg_ttl) ? g_cfg.cache_neg_ttl : soa_min;
-        pthread_mutex_lock(&g_stat_mutex);
-        g_stat_negcache++;
-        pthread_mutex_unlock(&g_stat_mutex);
+        STAT_INC(g_stat_negcache);
         return e;
     }
     /* Parse answer RRs */
@@ -3296,8 +3494,18 @@ typedef struct {
     uint16_t qtype;
 } prefetch_job_t;
 
-static void *prefetch_worker(void *arg) {
-    prefetch_job_t *j = (prefetch_job_t *) arg;
+/* Bounded prefetch queue + one long-lived worker. The old code spawned a
+ * detached thread per prefetch; a burst of serve-stale hits (exactly when
+ * upstream is slow) became a thread-creation storm. Queue-full or duplicate
+ * jobs are dropped — prefetch is opportunistic by definition. */
+#define PREFETCH_QUEUE_LEN 64
+static prefetch_job_t g_prefetch_queue[PREFETCH_QUEUE_LEN];
+static int g_prefetch_head = 0;
+static int g_prefetch_count = 0;
+static pthread_mutex_t g_prefetch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_prefetch_cond = PTHREAD_COND_INITIALIZER;
+
+static void prefetch_do(const prefetch_job_t *j) {
     uint8_t resp[DNS_BUF];
     long rtt = 0;
     int rlen = upstream_query(j->qname, j->qtype, resp, sizeof(resp), &rtt);
@@ -3311,21 +3519,50 @@ static void *prefetch_worker(void *arg) {
             cache_store_valkey(e);
         }
     }
-    free(j);
+}
+
+static void *prefetch_worker(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&g_prefetch_mutex);
+        while (g_prefetch_count == 0)
+            pthread_cond_wait(&g_prefetch_cond, &g_prefetch_mutex);
+        prefetch_job_t job = g_prefetch_queue[g_prefetch_head];
+        g_prefetch_head = (g_prefetch_head + 1) % PREFETCH_QUEUE_LEN;
+        g_prefetch_count--;
+        pthread_mutex_unlock(&g_prefetch_mutex);
+        prefetch_do(&job);
+    }
     return NULL;
 }
 
 static void prefetch_async(const char *qname, uint16_t qtype) {
-    prefetch_job_t *j = malloc(sizeof(prefetch_job_t));
-    if (!j)
-        return;
-    safe_strcpy(j->qname, qname, sizeof(j->qname));
-    j->qtype = qtype;
+    pthread_mutex_lock(&g_prefetch_mutex);
+    if (g_prefetch_count == PREFETCH_QUEUE_LEN) {
+        pthread_mutex_unlock(&g_prefetch_mutex);
+        return; /* full — drop, it's opportunistic */
+    }
+    for (int i = 0; i < g_prefetch_count; i++) {
+        prefetch_job_t *q = &g_prefetch_queue[(g_prefetch_head + i) % PREFETCH_QUEUE_LEN];
+        if (q->qtype == qtype && strcasecmp(q->qname, qname) == 0) {
+            pthread_mutex_unlock(&g_prefetch_mutex);
+            return; /* already queued */
+        }
+    }
+    int slot = (g_prefetch_head + g_prefetch_count) % PREFETCH_QUEUE_LEN;
+    safe_strcpy(g_prefetch_queue[slot].qname, qname, sizeof(g_prefetch_queue[slot].qname));
+    g_prefetch_queue[slot].qtype = qtype;
+    g_prefetch_count++;
+    pthread_cond_signal(&g_prefetch_cond);
+    pthread_mutex_unlock(&g_prefetch_mutex);
+}
+
+static void prefetch_start(void) {
     pthread_t tid;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &attr, prefetch_worker, j);
+    pthread_create(&tid, &attr, prefetch_worker, NULL);
     pthread_attr_destroy(&attr);
 }
 
@@ -3345,6 +3582,16 @@ typedef struct {
     uint32_t answer_ttls[32];
 } resolve_result_t;
 
+/* Zero only the scalar header of a resolve_result_t (~24 KB of answer
+ * arrays follow `answers`). Every consumer reads the arrays strictly up to
+ * ancount, and every producer fully writes each element it counts, so
+ * zeroing the arrays bought nothing but a 25 KB memset per resolution
+ * (recursed per CNAME hop / search-domain attempt). The arrays MUST stay
+ * the trailing members for this offsetof to cover every scalar. */
+static void result_init(resolve_result_t *r) {
+    memset(r, 0, offsetof(resolve_result_t, answers));
+}
+
 /*
  * Populate `result` from a cache entry obtained via cache_lookup/
  * cache_load_valkey (which have already applied the stale-window check) and
@@ -3354,9 +3601,7 @@ typedef struct {
  * one.
  */
 static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_result_t *result) {
-    pthread_mutex_lock(&g_stat_mutex);
-    g_stat_hits++;
-    pthread_mutex_unlock(&g_stat_mutex);
+    STAT_INC(g_stat_hits);
     result->from_cache = 1;
     result->cache_ttl_remaining = entry_remaining_ttl(ce);
     result->rcode = ce->rcode;
@@ -3364,9 +3609,7 @@ static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_resu
     if (ce->served_stale) {
         prefetch_async(qname, ce->qtype);
         result->from_cache = 2;
-        pthread_mutex_lock(&g_stat_mutex);
-        g_stat_stale++;
-        pthread_mutex_unlock(&g_stat_mutex);
+        STAT_INC(g_stat_stale);
     } else if (!ce->negative && ce->prefetch_ttl > 0 &&
                result->cache_ttl_remaining <= ce->prefetch_ttl) {
         prefetch_async(qname, ce->qtype);
@@ -3400,13 +3643,11 @@ static int serve_cached_entry(cache_entry_t *ce, const char *qname, resolve_resu
 }
 
 static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result_t *result) {
-    memset(result, 0, sizeof(*result));
+    result_init(result);
     char qname[256];
     safe_strcpy(qname, qname_in, sizeof(qname));
     strlower(qname);
-    pthread_mutex_lock(&g_stat_mutex);
-    g_stat_queries++;
-    pthread_mutex_unlock(&g_stat_mutex);
+    STAT_INC(g_stat_queries);
 
     /* -1. mDNS for .local names (RFC 6762) — try multicast before unicast */
     if (is_local_name(qname)) {
@@ -3419,9 +3660,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
                 mce->dnssec_status = (int) DNSSEC_INSECURE; /* mDNS is not DNSSEC-signed */
                 cache_insert(mce);
                 cache_store_valkey(mce);
-                pthread_mutex_lock(&g_stat_mutex);
-                g_stat_hits++;
-                pthread_mutex_unlock(&g_stat_mutex);
+                STAT_INC(g_stat_hits);
                 result->from_cache = 0;
                 result->rtt_us = MDNS_COLLECT_MS * 1000;
                 result->dnssec_status = (int) DNSSEC_INSECURE;
@@ -3471,7 +3710,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
             char expanded[256];
             snprintf(expanded, sizeof(expanded), "%s.%s", qname, g_cfg.search_domains[sdi]);
             resolve_result_t sub;
-            memset(&sub, 0, sizeof(sub));
+            result_init(&sub);
             if (dns_resolve_core(expanded, qtype, &sub) == 0 && sub.rcode != 3 /*NXDOMAIN*/) {
                 *result = sub;
                 return 0;
@@ -3493,9 +3732,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
      * without going upstream at all. */
     agg_nsec_result_t agg;
     if (aggressive_nsec_answer(qname, qtype, &agg)) {
-        pthread_mutex_lock(&g_stat_mutex);
-        g_stat_hits++;
-        pthread_mutex_unlock(&g_stat_mutex);
+        STAT_INC(g_stat_hits);
         result->from_cache = 1;
         result->ancount = 0;
         result->dnssec_status = (int) DNSSEC_SECURE;
@@ -3504,9 +3741,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
     }
 
     /* 3. Miss — query upstream */
-    pthread_mutex_lock(&g_stat_mutex);
-    g_stat_misses++;
-    pthread_mutex_unlock(&g_stat_mutex);
+    STAT_INC(g_stat_misses);
     uint8_t resp[DNS_BUF * 2];
     int rlen = upstream_query(qname, qtype, resp, sizeof(resp), &result->rtt_us);
     int upstream_failed = (rlen < 12);
@@ -3590,7 +3825,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
         safe_strcpy(cname_target, result->answers[0], sizeof(cname_target));
         for (int hop = 0; hop < MAX_CNAME_HOPS && cname_target[0]; hop++) {
             resolve_result_t sub;
-            memset(&sub, 0, sizeof(sub));
+            result_init(&sub);
             if (dns_resolve_core(cname_target, qtype, &sub) < 0)
                 break;
             /* Append sub-results */
@@ -3925,6 +4160,90 @@ static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct 
     sendto(srv_fd, resp, off, 0, src, srclen);
 }
 
+/* =========================================================================
+ * UDP worker pool
+ *
+ * UDP queries used to be resolved inline in proxy_run's select() loop: one
+ * slow upstream lookup stalled EVERY client — including pure cache hits —
+ * for its full round-trip (measured as a perfect per-query staircase under
+ * concurrent misses). The loop now only receives and enqueues; a fixed pool
+ * of workers (RESOLVERD_UDP_WORKERS, default 8) resolves and replies.
+ * Concurrent sendto() on the shared listener fd is safe: UDP datagrams are
+ * atomic. Queue-full drops the packet (the client retries, as with any lost
+ * UDP datagram) and counts it in g_stat_udp_dropped.
+ * ======================================================================= */
+#define UDP_WORKERS_DEFAULT 8
+#define UDP_WORKERS_MAX 64
+#define UDP_QUEUE_LEN 256
+typedef struct {
+    int srv_fd;
+    int plen;
+    socklen_t srclen;
+    struct sockaddr_storage src;
+    uint8_t pkt[DNS_BUF];
+} udp_job_t;
+static udp_job_t g_udp_queue[UDP_QUEUE_LEN];
+static int g_udp_head = 0;
+static int g_udp_count = 0;
+static pthread_mutex_t g_udp_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_udp_cond = PTHREAD_COND_INITIALIZER;
+
+static void *udp_worker(void *arg) {
+    (void) arg;
+    /* Per-worker job copy: the queue slot is released before the (long)
+     * resolve so the ring never blocks on a slow worker. */
+    udp_job_t job;
+    for (;;) {
+        pthread_mutex_lock(&g_udp_mutex);
+        while (g_udp_count == 0)
+            pthread_cond_wait(&g_udp_cond, &g_udp_mutex);
+        job = g_udp_queue[g_udp_head];
+        g_udp_head = (g_udp_head + 1) % UDP_QUEUE_LEN;
+        g_udp_count--;
+        pthread_mutex_unlock(&g_udp_mutex);
+        proxy_handle(job.srv_fd, job.pkt, job.plen, (struct sockaddr *) &job.src, job.srclen);
+    }
+    return NULL;
+}
+
+static void udp_enqueue(int srv_fd, const uint8_t *pkt, int plen, const struct sockaddr *src,
+                        socklen_t srclen) {
+    if (plen <= 0 || plen > (int) sizeof(g_udp_queue[0].pkt))
+        return;
+    if (srclen > (socklen_t) sizeof(struct sockaddr_storage))
+        return;
+    pthread_mutex_lock(&g_udp_mutex);
+    if (g_udp_count == UDP_QUEUE_LEN) {
+        pthread_mutex_unlock(&g_udp_mutex);
+        STAT_INC(g_stat_udp_dropped);
+        return;
+    }
+    udp_job_t *slot = &g_udp_queue[(g_udp_head + g_udp_count) % UDP_QUEUE_LEN];
+    slot->srv_fd = srv_fd;
+    slot->plen = plen;
+    slot->srclen = srclen;
+    memcpy(&slot->src, src, srclen);
+    memcpy(slot->pkt, pkt, (size_t) plen);
+    g_udp_count++;
+    pthread_cond_signal(&g_udp_cond);
+    pthread_mutex_unlock(&g_udp_mutex);
+}
+
+static void udp_workers_start(int n) {
+    if (n < 1)
+        n = 1;
+    if (n > UDP_WORKERS_MAX)
+        n = UDP_WORKERS_MAX;
+    for (int i = 0; i < n; i++) {
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&tid, &attr, udp_worker, NULL);
+        pthread_attr_destroy(&attr);
+    }
+}
+
 /* proxy_handle_tcp — serve one DNS-over-TCP session (2-byte length-framing) */
 static void proxy_handle_tcp(int cfd) {
     uint8_t lb[2];
@@ -4161,6 +4480,10 @@ static void *proxy_run(void *arg) {
      * syscall filter before the loop touches untrusted query/response bytes. */
     apply_sandbox();
 
+    /* Workers start after the sandbox so they inherit the dropped
+     * privileges (and, with a TSYNC seccomp filter, the syscall policy). */
+    udp_workers_start(g_cfg.udp_workers);
+
     uint8_t buf[DNS_BUF];
     for (;;) {
         fd_set fds;
@@ -4215,7 +4538,7 @@ static void *proxy_run(void *arg) {
             socklen_t sl = sizeof(src4);
             ssize_t n = recvfrom(fd4, buf, sizeof(buf), 0, (struct sockaddr *) &src4, &sl);
             if (n > 0)
-                proxy_handle(fd4, buf, (int) n, (struct sockaddr *) &src4, sl);
+                udp_enqueue(fd4, buf, (int) n, (struct sockaddr *) &src4, sl);
         }
 
         /* IPv6 UDP */
@@ -4224,7 +4547,7 @@ static void *proxy_run(void *arg) {
             socklen_t sl = sizeof(src6);
             ssize_t n = recvfrom(fd6, buf, sizeof(buf), 0, (struct sockaddr *) &src6, &sl);
             if (n > 0)
-                proxy_handle(fd6, buf, (int) n, (struct sockaddr *) &src6, sl);
+                udp_enqueue(fd6, buf, (int) n, (struct sockaddr *) &src6, sl);
         }
 
         /* IPv4 TCP — spawn thread per connection */
@@ -4430,6 +4753,11 @@ static void config_load_env(void) {
         g_cfg.dns64_prefix_len = plen;
     }
     safe_strcpy(g_cfg.dns64_exclude, getenv_or("DNS64_EXCLUDE", ""), sizeof(g_cfg.dns64_exclude));
+    g_cfg.udp_workers = atoi(getenv_or("RESOLVERD_UDP_WORKERS", "8"));
+    if (g_cfg.udp_workers < 1)
+        g_cfg.udp_workers = 1;
+    if (g_cfg.udp_workers > UDP_WORKERS_MAX)
+        g_cfg.udp_workers = UDP_WORKERS_MAX;
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count = 0;
     const char *sdomains = getenv_or("SEARCH_DOMAINS", "");
@@ -4672,6 +5000,8 @@ static void print_stats(void) {
     printf("  Expired entries:      %llu\n", (unsigned long long) g_stat_expired);
     printf("  Negative cached:      %llu\n", (unsigned long long) g_stat_negcache);
     printf("  Stale served:         %llu\n", (unsigned long long) g_stat_stale);
+    printf("  UDP jobs dropped:     %llu\n", (unsigned long long) g_stat_udp_dropped);
+    printf("  Valkey writes dropped:%llu\n", (unsigned long long) g_stat_vkw_dropped);
     if (g_stat_queries > 0)
         printf("  Hit rate:             %.1f%%\n", 100.0 * g_stat_hits / g_stat_queries);
     for (int ui = 0; ui < g_cfg.upstream_count; ui++) {
@@ -4994,6 +5324,8 @@ int main(int argc, char **argv) {
         }
     }
     cache_init();
+    vkw_start();      /* async Valkey cache writer */
+    prefetch_start(); /* single prefetch worker (replaces thread-per-job) */
     if (g_cfg.proto == PROTO_DOT || g_cfg.proto == PROTO_DOH)
         dot_init();
     dot_server_init(); /* no-op unless DOT_SERVER_ENABLED=1; must run before apply_sandbox() */
@@ -5027,6 +5359,7 @@ int main(int argc, char **argv) {
         }
         print_result(query_name, qtype, &result, result.rtt_us);
         print_stats();
+        vkw_drain(2000); /* let the async cache write land before exiting */
         return result.rcode;
     }
     /* Default: proxy mode */
