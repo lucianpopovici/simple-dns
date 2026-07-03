@@ -313,7 +313,7 @@ static _Atomic uint64_t g_stat_hits = 0;
 static _Atomic uint64_t g_stat_misses = 0;
 static _Atomic uint64_t g_stat_expired = 0;
 static _Atomic uint64_t g_stat_negcache = 0;
-static _Atomic uint64_t g_stat_stale = 0; /* stale-while-revalidate serves */
+static _Atomic uint64_t g_stat_stale = 0;       /* stale-while-revalidate serves */
 static _Atomic uint64_t g_stat_udp_dropped = 0; /* UDP jobs dropped: queue full */
 static _Atomic uint64_t g_stat_vkw_dropped = 0; /* Valkey writes dropped: queue full */
 #define STAT_INC(c) atomic_fetch_add_explicit(&(c), 1, memory_order_relaxed)
@@ -1145,8 +1145,7 @@ static int dnskey_cache_get(const char *name, uint8_t *out, int cap) {
     pthread_mutex_lock(&g_dnskey_cache_mutex);
     for (int i = 0; i < DNSKEY_CACHE_SLOTS; i++) {
         dnskey_cache_slot_t *s = &g_dnskey_cache[i];
-        if (s->rdlen > 0 && s->expires > now && s->rdlen <= cap &&
-            strcasecmp(s->name, name) == 0) {
+        if (s->rdlen > 0 && s->expires > now && s->rdlen <= cap && strcasecmp(s->name, name) == 0) {
             memcpy(out, s->rd, (size_t) s->rdlen);
             n = s->rdlen;
             break;
