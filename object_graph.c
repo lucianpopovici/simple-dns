@@ -1,4 +1,4 @@
-/* VENDORED from lucianpopovici/objectdb @ fece251 (ADR-008 pilot).
+/* VENDORED from lucianpopovici/objectdb @ 2ad8607 (ADR-008 pilot).
  * Do not edit here — fix upstream, re-run its test suite, then re-copy
  * object_graph.{c,h} together and update this pin. Local divergence is the
  * bug class the libdnswire extraction exists to prevent. These two files

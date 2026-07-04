@@ -1,4 +1,4 @@
-/* VENDORED from lucianpopovici/objectdb @ fece251 (ADR-008 pilot).
+/* VENDORED from lucianpopovici/objectdb @ 2ad8607 (ADR-008 pilot).
  * Do not edit here — fix upstream, re-run its test suite, then re-copy
  * object_graph.{c,h} together and update this pin. Local divergence is the
  * bug class the libdnswire extraction exists to prevent. These two files
@@ -302,19 +302,15 @@ extern const VListOps pog_dns_wildcards; /* type_name = "dns.wildcards" */
 void pog_register_builtins(void);
 
 /* --- Named roots ---
- * Canonical names are pog_-prefixed: the original bare `bind` collided with
- * the POSIX socket bind(2) declaration the moment a host program included
- * both <sys/socket.h> and this header (simple-dns resolverd did). Existing
- * callers can opt into the short spellings with
- * #define POG_ENABLE_SHORT_ROOT_NAMES before including this header. */
+ * pog_-prefixed: the original bare `bind` collided with the POSIX socket
+ * bind(2) declaration the moment a host program included both
+ * <sys/socket.h> and this header (simple-dns resolverd did). No short-name
+ * compatibility macros: a function-like `bind()` macro rewrites the host's
+ * socket bind(2) calls too, which static analyzers explore even when the
+ * guard is off. */
 bool    pog_bind  (Store *s, const char *name, Object *o);
 Object *pog_get   (Store *s, const char *name);
 bool    pog_unbind(Store *s, const char *name);
-#ifdef POG_ENABLE_SHORT_ROOT_NAMES
-#define bind(s, name, o) pog_bind((s), (name), (o))
-#define get(s, name) pog_get((s), (name))
-#define unbind(s, name) pog_unbind((s), (name))
-#endif
 
 /* --- Debug --- */
 void dump(Object *o);
