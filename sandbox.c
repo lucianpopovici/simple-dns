@@ -358,6 +358,16 @@ static void seccomp_install(const sandbox_config_t *cfg) {
         SCMP_SYS(recvmmsg),
         SCMP_SYS(sendmmsg),
     };
+    /* Durable embedded file store (objectdb: WAL append + fsync, checkpoint's
+     * atomic save/rename, torn-tail ftruncate, .lock flock). Only requested by
+     * a daemon that actually opens such a store (resolverd's objectdb cache
+     * backend); after adding a group, re-validate with seccomp_mode=audit
+     * before trusting enforce — same procedure as any whitelist change. */
+    const int filewrite_extra[] = {
+        SCMP_SYS(fsync),    SCMP_SYS(fdatasync), SCMP_SYS(ftruncate), SCMP_SYS(rename),
+        SCMP_SYS(renameat), SCMP_SYS(renameat2), SCMP_SYS(unlink),    SCMP_SYS(unlinkat),
+        SCMP_SYS(flock),    SCMP_SYS(lseek),
+    };
 
     int allowed = 0;
     int skipped = 0;
@@ -370,6 +380,14 @@ static void seccomp_install(const sandbox_config_t *cfg) {
     if (cfg->extra_syscall_groups & SANDBOX_SYS_GETADDRINFO) {
         for (int i = 0; i < (int) (sizeof(getaddrinfo_extra) / sizeof(getaddrinfo_extra[0])); i++) {
             if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, getaddrinfo_extra[i], 0) == 0)
+                allowed++;
+            else
+                skipped++;
+        }
+    }
+    if (cfg->extra_syscall_groups & SANDBOX_SYS_FILEWRITE) {
+        for (int i = 0; i < (int) (sizeof(filewrite_extra) / sizeof(filewrite_extra[0])); i++) {
+            if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, filewrite_extra[i], 0) == 0)
                 allowed++;
             else
                 skipped++;

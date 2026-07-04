@@ -38,6 +38,9 @@ typedef enum {
  * actual SCMP_SYS() numbers inside sandbox.c means callers never need to include
  * <seccomp.h>. */
 #define SANDBOX_SYS_GETADDRINFO 0x1u /* recvmmsg/sendmmsg — glibc stub resolver */
+#define SANDBOX_SYS_FILEWRITE                                                                      \
+    0x2u /* durable file-store I/O (fsync/rename/…) —                                          \
+          * resolverd's embedded objectdb cache */
 
 typedef struct {
     /* All resolved by the caller before sandbox_apply(). Empty string = unset. */

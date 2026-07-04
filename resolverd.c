@@ -68,6 +68,14 @@
  *   RESOLVERD_UDP_WORKERS  UDP worker-pool size, 1-64   (default: 8) —
  *                     queries resolve off the select() loop so one slow
  *                     upstream miss cannot stall other clients
+ *   RESOLVERD_CACHE_BACKEND  Persistent cache tier (ADR-008 pilot):
+ *                     valkey (default) | objectdb (embedded WAL-backed
+ *                     store — no Valkey on the cache path) | none
+ *   RESOLVERD_CACHE_DB  objectdb store path (default:
+ *                     /var/lib/resolverd/cache.pog). Interpreted AFTER the
+ *                     chroot in daemon mode; the directory must exist and
+ *                     be writable by the privdrop user.
+ *   RESOLVERD_CACHE_DB_MAX  objectdb max persisted entries (default: 32768)
  *
  * Sandbox (Valkey config:* keys, env override in parens; applied after the
  * listeners bind, before the proxy loop — no-op unless started as root):
@@ -126,6 +134,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include "sandbox.h"
+#include "object_graph.h"
 
 /* =========================================================================
  * Constants
@@ -267,7 +276,20 @@ typedef struct {
     /* Size of the UDP worker pool (RESOLVERD_UDP_WORKERS); resolves queries
      * off the select() loop so one slow miss cannot stall other clients. */
     int udp_workers;
+    /* Persistent cache tier backend (ADR-008 pilot). `valkey` keeps the
+     * network cache tier; `objectdb` embeds a WAL-backed object store
+     * (removes resolverd's Valkey dependency from the cache path);
+     * `none` disables cache persistence entirely. */
+    int cache_backend; /* CACHE_BACKEND_* */
+    char cache_db_path[512];
+    int cache_db_max; /* objectdb: max persisted entries before purge/refuse */
 } config_t;
+
+enum {
+    CACHE_BACKEND_VALKEY = 0,
+    CACHE_BACKEND_OBJECTDB = 1,
+    CACHE_BACKEND_NONE = 2,
+};
 
 /* =========================================================================
  * Per-domain upstream routing table
@@ -694,20 +716,293 @@ static int vk_keys_scan(const char *pattern, char keys[][512], int maxkeys) {
 }
 
 /* =========================================================================
- * Async Valkey cache writer
+ * Embedded objectdb persistent cache tier (ADR-008 pilot, option C)
  *
- * cache_store_valkey used to run its SET synchronously inside dns_resolve,
- * adding the Valkey round-trip(s) to every miss's answer latency. The store
- * is a persistence side effect the client answer never depends on, so it now
- * goes through this bounded queue to a dedicated writer thread. Queue-full
- * drops the write (best effort — it's a cache) and counts it.
+ * `cache:*` is the one Valkey namespace with a single writer AND a single
+ * reader — resolverd itself — so it is the contract-preserving place to
+ * swap the network cache tier for an embedded store. Selected with
+ * RESOLVERD_CACHE_BACKEND=objectdb; the entry VALUE format is byte-for-byte
+ * the same pipe serialization the Valkey tier uses, so the parse/TTL/
+ * stale-window logic is shared and backends stay interchangeable.
+ *
+ * Data model: root OBJ_LIST "entries" (GC anchor) of class-"centry"
+ * composites {k: cache key, v: serialized entry ("" = tombstone),
+ * exp: absolute expiry incl. the RFC 8767 stale window}; hash index on
+ * (centry, k) for O(1) lookup. Opened with POG_OPEN_NO_VLOG — a cache
+ * needs no IXFR-style change history and the .vlog is never pruned.
+ *
+ * Concurrency: every objectdb call sits under g_pog_mutex. Reads are ~0.4µs
+ * so a single mutex is not a bottleneck, and it sidesteps the engine's
+ * pointer-return/read-back races entirely. Writes arrive only via the
+ * persist-writer thread, batched into ONE transaction per queue drain:
+ * objectdb fsyncs the WAL per commit (~1.4ms), so per-entry autocommit on
+ * the miss path would be ~75x slower than Valkey — measured in the ADR-008
+ * feasibility study. Batching amortizes that to ~0.04ms/entry off-path.
  * ======================================================================= */
-#define VKW_QUEUE_LEN 256
+#define POG_CHECKPOINT_EVERY 512 /* writer batches between WAL checkpoints */
+
+/* One persist-writer job (shared by both backends; defined here because the
+ * objectdb batch-apply consumes a drained array of them). */
 typedef struct {
     char key[600];
     char *val; /* malloc'd serialized entry; NULL = DEL the key */
     uint32_t ttl;
 } vkw_job_t;
+
+static Store *g_pog = NULL;
+static Object *g_pog_entries = NULL; /* root list — keeps entries GC-reachable */
+static pthread_mutex_t g_pog_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_pog_batches = 0;
+static _Atomic uint64_t g_stat_pog_full = 0; /* inserts refused: store at cap */
+
+/* Open (idempotent) the embedded store. Daemon mode calls this AFTER
+ * apply_sandbox() so the path is interpreted post-chroot and files are
+ * created as the privdrop user; CLI one-shot modes call it from main().
+ * Failure (lock held, unwritable dir) disables the tier with a log line —
+ * resolverd still serves, matching Valkey-down semantics. */
+static void pog_cache_open(void) {
+    if (g_cfg.cache_backend != CACHE_BACKEND_OBJECTDB)
+        return;
+    pthread_mutex_lock(&g_pog_mutex);
+    if (g_pog) {
+        pthread_mutex_unlock(&g_pog_mutex);
+        return;
+    }
+    Store *s = store_open_flags(g_cfg.cache_db_path, POG_OPEN_NO_VLOG);
+    if (!s) {
+        fprintf(stderr, "[pog] cannot open cache db %s (%s) — persistent cache tier disabled\n",
+                g_cfg.cache_db_path, strerror(errno));
+        pthread_mutex_unlock(&g_pog_mutex);
+        return;
+    }
+    if (!index_create(s, "centry", "k")) {
+        fprintf(stderr, "[pog] index_create failed — persistent cache tier disabled\n");
+        store_close(s);
+        pthread_mutex_unlock(&g_pog_mutex);
+        return;
+    }
+    Object *l = pog_get(s, "entries");
+    if (!l || l->kind != OBJ_LIST) {
+        l = new_list(s);
+        if (!l || !pog_bind(s, "entries", l)) {
+            fprintf(stderr, "[pog] root init failed — persistent cache tier disabled\n");
+            store_close(s);
+            pthread_mutex_unlock(&g_pog_mutex);
+            return;
+        }
+    }
+    g_pog = s;
+    g_pog_entries = l;
+    printf("[pog] persistent cache tier: %s (%zu entries, cap %d)\n", g_cfg.cache_db_path,
+           class_size(s, "centry"), g_cfg.cache_db_max);
+    pthread_mutex_unlock(&g_pog_mutex);
+}
+
+/* Point lookup by cache key; copies the serialized value out. Expiry is NOT
+ * checked here — the shared parse path applies the same TTL/stale-window
+ * rules as the Valkey tier. Tombstones ("" value) are misses. */
+static int pog_cache_get(const char *key, char *out, int olen) {
+    int ok = 0;
+    pthread_mutex_lock(&g_pog_mutex);
+    if (g_pog) {
+        Object *o = index_lookup_one(g_pog, "centry", "k", key);
+        if (o) {
+            Object *v = get_field(o, "v");
+            if (v && v->kind == OBJ_STRING && v->str_value && v->str_value[0]) {
+                safe_strcpy(out, v->str_value, olen);
+                ok = 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_pog_mutex);
+    return ok;
+}
+
+/* query_class collector for purge/flush: pointers only (the callback must
+ * not mutate the store); fields are read afterwards under g_pog_mutex. */
+typedef struct {
+    Object **objs;
+    size_t count;
+    size_t cap;
+} pog_collect_t;
+
+static bool pog_collect_cb(Object *o, void *ud) {
+    pog_collect_t *c = (pog_collect_t *) ud;
+    if (c->count < c->cap)
+        c->objs[c->count++] = o;
+    return c->count < c->cap;
+}
+
+/* Drop expired entries and tombstones: rebuild the root list with the
+ * survivors, untag the dead (the old list becomes unreachable and GC
+ * reclaims it and them). Caller holds g_pog_mutex; no txn active. */
+static void pog_purge_unlocked(void) {
+    size_t n = class_size(g_pog, "centry");
+    if (n == 0)
+        return;
+    pog_collect_t c = {.objs = calloc(n, sizeof(Object *)), .count = 0, .cap = n};
+    if (!c.objs)
+        return;
+    query_class(g_pog, "centry", pog_collect_cb, &c);
+    time_t now = time(NULL);
+    if (!txn_begin(g_pog)) {
+        free(c.objs);
+        return;
+    }
+    Object *nl = new_list(g_pog);
+    if (!nl) {
+        txn_abort(g_pog);
+        free(c.objs);
+        return;
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < c.count; i++) {
+        Object *o = c.objs[i];
+        Object *v = get_field(o, "v");
+        Object *exp = get_field(o, "exp");
+        int live = v && v->kind == OBJ_STRING && v->str_value && v->str_value[0] && exp &&
+                   exp->kind == OBJ_INT && exp->int_value > (int64_t) now;
+        if (live) {
+            list_append(nl, o);
+            kept++;
+        } else {
+            unset_class(o);
+        }
+    }
+    pog_bind(g_pog, "entries", nl);
+    g_pog_entries = nl;
+    if (!txn_commit(g_pog)) {
+        txn_abort(g_pog);
+        free(c.objs);
+        return;
+    }
+    gc(g_pog);
+    printf("[pog] purge: kept %zu of %zu entries\n", kept, c.count);
+    free(c.objs);
+}
+
+/* Apply a drained batch of persist-writer jobs in one WAL-fsync'd
+ * transaction. val==NULL jobs are DELs (tombstoned in place — physical
+ * removal happens at purge). New entries are refused at cap AFTER a purge
+ * attempt fails to make room (counted, resolver unaffected). */
+static void pog_cache_apply_batch(vkw_job_t *jobs, int n) {
+    pthread_mutex_lock(&g_pog_mutex);
+    if (!g_pog) {
+        pthread_mutex_unlock(&g_pog_mutex);
+        return;
+    }
+    if (!txn_begin(g_pog)) {
+        pthread_mutex_unlock(&g_pog_mutex);
+        return;
+    }
+    time_t now = time(NULL);
+    int want_purge = 0;
+    for (int i = 0; i < n; i++) {
+        Object *o = index_lookup_one(g_pog, "centry", "k", jobs[i].key);
+        if (!jobs[i].val) { /* DEL -> tombstone */
+            if (o) {
+                set_str(get_field(o, "v"), "");
+                set_int(get_field(o, "exp"), 0);
+            }
+            continue;
+        }
+        int64_t exp = (int64_t) now + jobs[i].ttl + g_cfg.serve_stale_max;
+        if (o) {
+            set_str(get_field(o, "v"), jobs[i].val);
+            set_int(get_field(o, "exp"), exp);
+            continue;
+        }
+        if (class_size(g_pog, "centry") >= (size_t) g_cfg.cache_db_max) {
+            STAT_INC(g_stat_pog_full);
+            want_purge = 1;
+            continue;
+        }
+        o = new_object(g_pog);
+        if (!o)
+            continue;
+        set_field(o, "k", new_string(g_pog, jobs[i].key));
+        set_field(o, "v", new_string(g_pog, jobs[i].val));
+        set_field(o, "exp", new_int(g_pog, exp));
+        set_class(o, "centry");
+        list_append(g_pog_entries, o);
+    }
+    if (!txn_commit(g_pog))
+        txn_abort(g_pog);
+    if (want_purge)
+        pog_purge_unlocked();
+    g_pog_batches++;
+    if (g_pog_batches % POG_CHECKPOINT_EVERY == 0) {
+        if (!store_checkpoint(g_pog))
+            fprintf(stderr, "[pog] checkpoint failed (WAL keeps growing until one succeeds)\n");
+    }
+    pthread_mutex_unlock(&g_pog_mutex);
+}
+
+/* Flush support. qname==NULL clears everything; else tombstones one key.
+ * Returns entries physically removed (full flush) or tombstoned (per-key). */
+static int pog_cache_flush(const char *key) {
+    int count = 0;
+    pthread_mutex_lock(&g_pog_mutex);
+    if (!g_pog) {
+        pthread_mutex_unlock(&g_pog_mutex);
+        return 0;
+    }
+    if (key) {
+        Object *o = index_lookup_one(g_pog, "centry", "k", key);
+        if (o) {
+            if (txn_begin(g_pog)) {
+                set_str(get_field(o, "v"), "");
+                set_int(get_field(o, "exp"), 0);
+                if (!txn_commit(g_pog))
+                    txn_abort(g_pog);
+                else
+                    count = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_pog_mutex);
+        return count;
+    }
+    size_t n = class_size(g_pog, "centry");
+    pog_collect_t c = {.objs = n ? calloc(n, sizeof(Object *)) : NULL, .count = 0, .cap = n};
+    if (n && !c.objs) {
+        pthread_mutex_unlock(&g_pog_mutex);
+        return 0;
+    }
+    query_class(g_pog, "centry", pog_collect_cb, &c);
+    if (txn_begin(g_pog)) {
+        Object *nl = new_list(g_pog);
+        if (nl) {
+            for (size_t i = 0; i < c.count; i++)
+                unset_class(c.objs[i]);
+            pog_bind(g_pog, "entries", nl);
+            g_pog_entries = nl;
+            if (txn_commit(g_pog)) {
+                count = (int) c.count;
+                gc(g_pog);
+            } else
+                txn_abort(g_pog);
+        } else
+            txn_abort(g_pog);
+    }
+    free(c.objs);
+    pthread_mutex_unlock(&g_pog_mutex);
+    return count;
+}
+
+/* =========================================================================
+ * Async persistent-cache writer
+ *
+ * cache stores used to run synchronously inside dns_resolve, adding the
+ * persistence round-trip(s) to every miss's answer latency. The store is a
+ * persistence side effect the client answer never depends on, so it goes
+ * through this bounded queue to a dedicated writer thread: per-job SET/DEL
+ * for the Valkey backend, one batched transaction per queue drain for the
+ * objectdb backend (see pog_cache_apply_batch). Queue-full drops the write
+ * (best effort — it's a cache) and counts it.
+ * ======================================================================= */
+#define VKW_QUEUE_LEN 256
+#define VKW_BATCH_MAX 64             /* objectdb: jobs folded into one transaction */
+#define POG_BATCH_ACCUMULATE_US 3000 /* objectdb: nap to gather a fuller batch */
 static vkw_job_t g_vkw_queue[VKW_QUEUE_LEN];
 static int g_vkw_head = 0;
 static int g_vkw_count = 0;
@@ -717,21 +1012,48 @@ static pthread_cond_t g_vkw_cond = PTHREAD_COND_INITIALIZER;
 
 static void *vkw_worker(void *arg) {
     (void) arg;
+    vkw_job_t batch[VKW_BATCH_MAX];
     for (;;) {
         pthread_mutex_lock(&g_vkw_mutex);
         while (g_vkw_count == 0)
             pthread_cond_wait(&g_vkw_cond, &g_vkw_mutex);
-        vkw_job_t job = g_vkw_queue[g_vkw_head];
-        g_vkw_queue[g_vkw_head].val = NULL;
-        g_vkw_head = (g_vkw_head + 1) % VKW_QUEUE_LEN;
-        g_vkw_count--;
+        /* objectdb amortizes its per-commit WAL fsync across the whole
+         * drain; for Valkey a batch of 1 keeps the old per-job behavior.
+         * The short accumulation nap matters under a sequential miss
+         * stream: without it every miss becomes a batch of 1 = one fsync,
+         * and the NEXT miss's store read queues behind that commit. A few
+         * ms of extra write latency is free (it's a cache), and it turns
+         * ~1 fsync/entry into ~1 fsync/VKW_BATCH_MAX entries under load. */
+        int max_take = 1;
+        if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
+            max_take = VKW_BATCH_MAX;
+            pthread_mutex_unlock(&g_vkw_mutex);
+            usleep(POG_BATCH_ACCUMULATE_US);
+            pthread_mutex_lock(&g_vkw_mutex);
+        }
+        int taken = 0;
+        while (taken < max_take && g_vkw_count > 0) {
+            batch[taken] = g_vkw_queue[g_vkw_head];
+            g_vkw_queue[g_vkw_head].val = NULL;
+            g_vkw_head = (g_vkw_head + 1) % VKW_QUEUE_LEN;
+            g_vkw_count--;
+            taken++;
+        }
         g_vkw_inflight = 1;
         pthread_mutex_unlock(&g_vkw_mutex);
-        if (job.val) {
-            vk_set(job.key, job.val, job.ttl);
-            free(job.val);
+        if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
+            pog_cache_apply_batch(batch, taken);
+            for (int i = 0; i < taken; i++)
+                free(batch[i].val);
         } else {
-            vk_del(job.key);
+            for (int i = 0; i < taken; i++) {
+                if (batch[i].val) {
+                    vk_set(batch[i].key, batch[i].val, batch[i].ttl);
+                    free(batch[i].val);
+                } else {
+                    vk_del(batch[i].key);
+                }
+            }
         }
         pthread_mutex_lock(&g_vkw_mutex);
         g_vkw_inflight = 0;
@@ -3180,8 +3502,10 @@ static int cache_flush(const char *qname, uint16_t qtype) {
         pthread_mutex_lock(&g_cache_count_mutex);
         g_cache_total = 0;
         pthread_mutex_unlock(&g_cache_count_mutex);
-        /* Also flush Valkey cache namespace */
-        if (g_cfg.valkey_enabled) {
+        /* Also flush the persistent tier */
+        if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
+            pog_cache_flush(NULL);
+        } else if (g_cfg.cache_backend == CACHE_BACKEND_VALKEY && g_cfg.valkey_enabled) {
             char keys[256][512];
             int n = vk_keys_scan("dnscache:*", keys, 256);
             for (int i = 0; i < n; i++)
@@ -3217,10 +3541,13 @@ static int cache_flush(const char *qname, uint16_t qtype) {
         pp = &(*pp)->hash_next;
     }
     pthread_rwlock_unlock(&g_cache[bkt].lock);
-    if (g_cfg.valkey_enabled) {
+    if (g_cfg.cache_backend != CACHE_BACKEND_NONE) {
         char vk_key[600];
         snprintf(vk_key, sizeof(vk_key), "dnscache:%s:%s", qname, type2str(qtype));
-        vk_del(vk_key);
+        if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB)
+            pog_cache_flush(vk_key);
+        else if (g_cfg.valkey_enabled)
+            vk_del(vk_key);
     }
     return count;
 }
@@ -3232,8 +3559,10 @@ static int cache_flush(const char *qname, uint16_t qtype) {
  *   <nrr>|<rcode>|<negative>|<neg_ttl>|<inserted_at>|
  *   <type>:<ttl_orig>:<rdlen_hex>:<rdata_hex>|...
  * ======================================================================= */
-static void cache_store_valkey(const cache_entry_t *e) {
-    if (!g_cfg.valkey_enabled)
+static void cache_store_persist(const cache_entry_t *e) {
+    if (g_cfg.cache_backend == CACHE_BACKEND_NONE)
+        return;
+    if (g_cfg.cache_backend == CACHE_BACKEND_VALKEY && !g_cfg.valkey_enabled)
         return;
     char vk_key[600];
     snprintf(vk_key, sizeof(vk_key), "dnscache:%s:%s", e->qname, type2str(e->qtype));
@@ -3266,14 +3595,21 @@ static void cache_store_valkey(const cache_entry_t *e) {
     vkw_enqueue(vk_key, buf, max_ttl); /* async SET — off the resolve path */
 }
 
-static cache_entry_t *cache_load_valkey(const char *qname, uint16_t qtype, int allow_stale) {
-    if (!g_cfg.valkey_enabled)
+static cache_entry_t *cache_load_persist(const char *qname, uint16_t qtype, int allow_stale) {
+    if (g_cfg.cache_backend == CACHE_BACKEND_NONE)
         return NULL;
     char vk_key[600];
     snprintf(vk_key, sizeof(vk_key), "dnscache:%s:%s", qname, type2str(qtype));
     char buf[RESP_BUF];
-    if (!vk_get(vk_key, buf, sizeof(buf)))
-        return NULL;
+    if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
+        if (!pog_cache_get(vk_key, buf, sizeof(buf)))
+            return NULL;
+    } else {
+        if (!g_cfg.valkey_enabled)
+            return NULL;
+        if (!vk_get(vk_key, buf, sizeof(buf)))
+            return NULL;
+    }
     cache_entry_t *e = calloc(1, sizeof(cache_entry_t));
     if (!e)
         return NULL;
@@ -3482,7 +3818,7 @@ static void cache_servfail(const char *qname, uint16_t qtype) {
     e->neg_ttl = g_cfg.servfail_cache_ttl;
     e->inserted_at = time(NULL);
     cache_insert(e);
-    cache_store_valkey(e);
+    cache_store_persist(e);
 }
 
 /* =========================================================================
@@ -3515,7 +3851,7 @@ static void prefetch_do(const prefetch_job_t *j) {
         cache_entry_t *e = parse_response_to_entry(resp, rlen, j->qname, j->qtype);
         if (e) {
             cache_insert(e);
-            cache_store_valkey(e);
+            cache_store_persist(e);
         }
     }
 }
@@ -3593,7 +3929,7 @@ static void result_init(resolve_result_t *r) {
 
 /*
  * Populate `result` from a cache entry obtained via cache_lookup/
- * cache_load_valkey (which have already applied the stale-window check) and
+ * cache_load_persist (which have already applied the stale-window check) and
  * free it. Handles negative answers, prefetch triggering, and RFC 8767
  * stale-serve accounting. Returns what dns_resolve should return: 0 for a
  * positive answer (already filled in), or the cached rcode for a negative
@@ -3658,7 +3994,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
             if (mce && mce->nrr > 0) {
                 mce->dnssec_status = (int) DNSSEC_INSECURE; /* mDNS is not DNSSEC-signed */
                 cache_insert(mce);
-                cache_store_valkey(mce);
+                cache_store_persist(mce);
                 STAT_INC(g_stat_hits);
                 result->from_cache = 0;
                 result->rtt_us = MDNS_COLLECT_MS * 1000;
@@ -3722,7 +4058,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
     cache_entry_t *ce = cache_lookup(qname, qtype, 0);
     /* 2. Valkey persistent cache fallback */
     if (!ce)
-        ce = cache_load_valkey(qname, qtype, 0);
+        ce = cache_load_persist(qname, qtype, 0);
     if (ce)
         return serve_cached_entry(ce, qname, result);
 
@@ -3756,7 +4092,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
          * query outright. */
         cache_entry_t *sce = cache_lookup(qname, qtype, 1);
         if (!sce)
-            sce = cache_load_valkey(qname, qtype, 1);
+            sce = cache_load_persist(qname, qtype, 1);
         if (sce)
             return serve_cached_entry(sce, qname, result);
         /* RFC 9520: nothing to serve — cache the failure briefly so repeated
@@ -3785,7 +4121,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
             return -2; /* caller gets SERVFAIL */
         }
         cache_insert(ce);
-        cache_store_valkey(ce);
+        cache_store_persist(ce);
     }
     /* 5. Populate result from raw response */
     int ancount = ntohs(((dns_hdr_t *) resp)->ancount);
@@ -4479,6 +4815,11 @@ static void *proxy_run(void *arg) {
      * syscall filter before the loop touches untrusted query/response bytes. */
     apply_sandbox();
 
+    /* The embedded cache store opens after the sandbox: the path is
+     * interpreted post-chroot and its files are created as the privdrop
+     * user, so checkpoint's rename/reopen keeps working confined. */
+    pog_cache_open();
+
     /* Workers start after the sandbox so they inherit the dropped
      * privileges (and, with a TSYNC seccomp filter, the syscall policy). */
     udp_workers_start(g_cfg.udp_workers);
@@ -4757,6 +5098,22 @@ static void config_load_env(void) {
         g_cfg.udp_workers = 1;
     if (g_cfg.udp_workers > UDP_WORKERS_MAX)
         g_cfg.udp_workers = UDP_WORKERS_MAX;
+    /* Persistent cache tier (ADR-008): valkey (default) | objectdb | none */
+    {
+        const char *cb = getenv_or("RESOLVERD_CACHE_BACKEND", "valkey");
+        if (!strcasecmp(cb, "objectdb"))
+            g_cfg.cache_backend = CACHE_BACKEND_OBJECTDB;
+        else if (!strcasecmp(cb, "none"))
+            g_cfg.cache_backend = CACHE_BACKEND_NONE;
+        else
+            g_cfg.cache_backend = CACHE_BACKEND_VALKEY;
+    }
+    safe_strcpy(g_cfg.cache_db_path,
+                getenv_or("RESOLVERD_CACHE_DB", "/var/lib/resolverd/cache.pog"),
+                sizeof(g_cfg.cache_db_path));
+    g_cfg.cache_db_max = atoi(getenv_or("RESOLVERD_CACHE_DB_MAX", "32768"));
+    if (g_cfg.cache_db_max < 64)
+        g_cfg.cache_db_max = 64;
     /* Search domains: SEARCH_DOMAINS=domain1,domain2,... */
     g_cfg.search_domain_count = 0;
     const char *sdomains = getenv_or("SEARCH_DOMAINS", "");
@@ -5013,7 +5370,18 @@ static void print_stats(void) {
     }
     printf("  TSIG:                 %s\n",
            g_cfg.tsig_key_name[0] ? g_cfg.tsig_key_name : "disabled");
-    printf("  Valkey cache:         %s\n", g_cfg.valkey_enabled ? "enabled" : "disabled");
+    if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
+        pthread_mutex_lock(&g_pog_mutex);
+        size_t pn = g_pog ? class_size(g_pog, "centry") : 0;
+        pthread_mutex_unlock(&g_pog_mutex);
+        printf("  Persistent cache:     objectdb %s (%zu entries%s)\n", g_cfg.cache_db_path, pn,
+               g_pog ? "" : ", NOT OPEN");
+        printf("  Store refusals (cap): %llu\n", (unsigned long long) g_stat_pog_full);
+    } else if (g_cfg.cache_backend == CACHE_BACKEND_NONE) {
+        printf("  Persistent cache:     disabled\n");
+    } else {
+        printf("  Valkey cache:         %s\n", g_cfg.valkey_enabled ? "enabled" : "disabled");
+    }
     if (g_route_count > 0) {
         printf("\n── Domain Routes ────────────────────────────────\n");
         printf("  %-40s → %s\n", "Suffix", "Upstream");
@@ -5146,6 +5514,11 @@ static void apply_sandbox(void) {
     /* enforce by default — whitelist harvest-validated across all transports (see above) */
     sb.seccomp_default = SANDBOX_SECCOMP_ENFORCE;
     sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* glibc resolver for upstream hostnames */
+    if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
+        /* objectdb WAL fsync + checkpoint rename + lock flock. New group =>
+         * re-validate with seccomp_mode=audit before trusting enforce. */
+        sb.extra_syscall_groups |= SANDBOX_SYS_FILEWRITE;
+    }
     sb.log = resolverd_log;
     sb.tag = "resolverd";
     sandbox_apply(&sb);
@@ -5328,6 +5701,10 @@ int main(int argc, char **argv) {
     if (g_cfg.proto == PROTO_DOT || g_cfg.proto == PROTO_DOH)
         dot_init();
     dot_server_init(); /* no-op unless DOT_SERVER_ENABLED=1; must run before apply_sandbox() */
+    /* One-shot modes never sandbox, so the embedded cache store can open
+     * here; the daemon path opens it in proxy_run after apply_sandbox(). */
+    if (mode_stats || mode_flush || mode_dump || query_name[0])
+        pog_cache_open();
     /* One-shot modes that don't need proxy */
     if (mode_stats) {
         print_stats();

@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso fuzz-wire fuzz-response fuzz-tlv gen-signing-key help ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -229,13 +229,17 @@ apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 # suppress just that one warning here (as the unit-test targets already do) to
 # keep the -Werror build green. The rest of the curated WARN set still applies.
 # =============================================================================
-resolverd: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+# POG_SRC: the vendored objectdb engine (lucianpopovici/objectdb, pinned —
+# see the header of object_graph.h) backing RESOLVERD_CACHE_BACKEND=objectdb.
+POG_SRC = object_graph.c
+
+resolverd: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.h object_graph.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(PROD_FLAGS) $(VERSION_FLAGS) \
 	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
-resolverd_debug: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+resolverd_debug: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.h object_graph.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) $(VERSION_FLAGS) \
 	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
@@ -1913,6 +1917,45 @@ check-resolverd-cache: resolverd_debug
 	 test "$$ALIVE" = 1 || { echo "  FAIL  resolverd crashed serving a Valkey cache hit"; cat /tmp/resolverd_cache.log; exit 1; }; \
 	 test "$$A" = "93.184.216.34" || { echo "  FAIL  cache-load path returned wrong/empty answer"; exit 1; }; \
 	 echo "  OK  served cached A from Valkey without crashing"
+
+# ADR-008 pilot: the embedded objectdb persistent cache tier
+# (RESOLVERD_CACHE_BACKEND=objectdb). Prime one name through a live upstream,
+# restart resolverd against a dead upstream with Valkey disabled, and require
+# the answer to come back from the objectdb store — the process's memory
+# cache died with it and the store is the only possible source. Also asserts
+# a never-cached name still SERVFAILs (no accidental wildcard serving) and
+# that POG_OPEN_NO_VLOG kept the .vlog off disk.
+check-resolverd-pog: resolverd_debug
+	@echo "  CHECK  resolverd embedded objectdb cache tier (ADR-008; requires python3 + dig)"
+	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 rm -rf /tmp/pogcache; mkdir -p /tmp/pogcache; chmod 777 /tmp/pogcache;             \
+	 python3 tests/servfail_upstream.py 127.0.0.1 5420 pog.test 300 203.0.113.99        \
+	     > /tmp/pog_stub.log 2>&1 & STUB=$$!;                                           \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5421 RESOLVERD_CACHE_BACKEND=objectdb      \
+	     RESOLVERD_CACHE_DB=/tmp/pogcache/cache.pog                                     \
+	     ./resolverd_debug --upstream 127.0.0.1:5420 --no-dnssec --no-valkey            \
+	     > /tmp/resolverd_pog1.log 2>&1 & RD=$$!;                                       \
+	 sleep 1.5;                                                                          \
+	 A1=$$(dig @127.0.0.1 -p 5421 pog.test A +short +time=2 +tries=1);                  \
+	 sleep 1;                                                                            \
+	 kill $$RD 2>/dev/null || true; sleep 1;                                            \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5421 RESOLVERD_CACHE_BACKEND=objectdb      \
+	     RESOLVERD_CACHE_DB=/tmp/pogcache/cache.pog                                     \
+	     ./resolverd_debug --upstream 127.0.0.1:1 --no-dnssec --no-valkey               \
+	     > /tmp/resolverd_pog2.log 2>&1 & RD2=$$!;                                      \
+	 sleep 1.5;                                                                          \
+	 A2=$$(dig @127.0.0.1 -p 5421 pog.test A +short +time=2 +tries=1);                  \
+	 S1=$$(dig @127.0.0.1 -p 5421 neverseen.pog.test A +time=2 +tries=1 | grep -o "status: [A-Z]*"); \
+	 ALIVE=0; kill -0 $$RD2 2>/dev/null && ALIVE=1;                                     \
+	 VLOG=0; test -e /tmp/pogcache/cache.pog.vlog && VLOG=1;                            \
+	 kill $$RD2 $$STUB 2>/dev/null || true; wait 2>/dev/null || true;                   \
+	 echo "  primed A1=[$$A1] objectdb-tier A2=[$$A2] neverseen=[$$S1] daemon_alive=$$ALIVE vlog_present=$$VLOG"; \
+	 test "$$ALIVE" = 1 || { echo "  FAIL  resolverd crashed serving from the objectdb tier"; cat /tmp/resolverd_pog2.log; exit 1; }; \
+	 test "$$A1" = "203.0.113.99" || { echo "  FAIL  priming query did not get the upstream answer"; cat /tmp/resolverd_pog1.log; exit 1; }; \
+	 test "$$A2" = "203.0.113.99" || { echo "  FAIL  restart did not serve the entry from the objectdb store"; cat /tmp/resolverd_pog2.log; exit 1; }; \
+	 test "$$S1" = "status: SERVFAIL" || { echo "  FAIL  never-cached name did not SERVFAIL (unexpected data source)"; exit 1; }; \
+	 test "$$VLOG" = 0 || { echo "  FAIL  POG_OPEN_NO_VLOG did not suppress the .vlog change log"; exit 1; }; \
+	 echo "  OK  objectdb tier persisted across restart, served with upstream+Valkey both dead, no .vlog"
 
 # RFC 7873 client-side DNS Cookies. A stub upstream refuses to answer until the
 # client proves it holds a valid Server Cookie (first query → BADCOOKIE carrying
