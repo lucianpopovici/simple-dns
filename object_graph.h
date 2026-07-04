@@ -1,7 +1,9 @@
 /* VENDORED from lucianpopovici/objectdb @ fece251 (ADR-008 pilot).
  * Do not edit here — fix upstream, re-run its test suite, then re-copy
  * object_graph.{c,h} together and update this pin. Local divergence is the
- * bug class the libdnswire extraction exists to prevent.
+ * bug class the libdnswire extraction exists to prevent. These two files
+ * keep UPSTREAM's formatting (CI's clang-format job excludes them) so the
+ * pin stays byte-verifiable: upstream file + this header == this file.
  */
 /* object_graph.h — Persistent Object Graph Engine (v2: OODB)
  *
