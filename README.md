@@ -57,6 +57,7 @@ linked by every binary.
 | `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library. |
 | `sandbox.{c,h}` | `libsandbox`, the shared privilege-drop / chroot+mountns / seccomp sandbox, linked by `dnsd` and `resolverd`. |
 | `resolverd.c` | `resolverd`, the recursive/forwarding resolver + cache + DNSSEC validation (the recursive role; formerly `dns_client.c`). |
+| `object_graph.{c,h}` | Vendored [objectdb](https://github.com/lucianpopovici/objectdb) engine (pinned; see the file headers) backing `resolverd`'s optional embedded cache tier (`RESOLVERD_CACHE_BACKEND=objectdb`, ADR-008 pilot). |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire`. |
 | `dashboard/` | Flask control-plane UI (see [Dashboard](#dashboard)). |
 | `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`) and a libFuzzer harness (`make fuzz-wire`). |
@@ -299,6 +300,7 @@ make debug           # dnsd under ASan/UBSan, full symbols
 make check           # smoke test (needs Valkey + dig)
 make check-resolverd # resolverd caching proxy → dnsd (needs Valkey + dig)
 make check-resolverd-cache  # resolverd Valkey cache-load regression (needs Valkey + dig)
+make check-resolverd-pog    # resolverd embedded objectdb cache tier, ADR-008 (needs python3 + dig)
 make check-resolverd-cookie # resolverd RFC 7873 cookie exchange (needs dig + python3)
 make check-catalog   # RFC 9432 catalog provision/deprovision (needs Valkey + dig)
 make check-dnssec    # DNSSEC known-answer + negative (flipped-byte) tests

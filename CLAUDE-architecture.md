@@ -281,10 +281,19 @@ Specify HA, durability, and DR as three explicit dimensions.
 
 # ADR-008: Role of the embedded object store (objectdb) relative to Valkey
 
-**Status:** Proposed — recommended option **C now** (per-daemon embedded store
-for single-owner namespaces, pilot: `resolverd`'s `cache:*`), **D later**
-(dnsd's in-process zone store, co-designed with ADR-005/ADR-007). Option A
-(full Valkey replacement) is **rejected**. Feasibility study 2026-07-03.
+**Status:** **Accepted — option C pilot implemented (2026-07-04)**:
+`resolverd`'s cache tier is selectable via `RESOLVERD_CACHE_BACKEND`
+(`valkey` default | `objectdb` | `none`). The objectdb backend embeds the
+vendored engine (`object_graph.{c,h}`, pinned) behind the existing async
+persist-writer: batched single-fsync transactions off the resolve path,
+capped entry count with expired/tombstone purge + GC, periodic WAL
+checkpoint, opened with `POG_OPEN_NO_VLOG` (upstream flag added for this —
+the never-pruned change log would otherwise grow without bound under cache
+churn), post-chroot open as the privdrop user, and a `SANDBOX_SYS_FILEWRITE`
+seccomp group (re-harvest with `seccomp_mode=audit` before enforce).
+Guarded by `make check-resolverd-pog`. **D later** (dnsd's in-process zone
+store, co-designed with ADR-005/ADR-007) remains open; option A (full
+Valkey replacement) is **rejected**. Feasibility study 2026-07-03.
 
 ## Context
 

@@ -80,6 +80,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | Path | What it is |
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
+| `object_graph.{c,h}` | Vendored **objectdb** engine (pinned — see file headers; fix upstream, never here) backing `resolverd`'s optional embedded cache tier (ADR-008 pilot, `RESOLVERD_CACHE_BACKEND=objectdb`). |
 | `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd` and `resolverd`. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
 | `dns_server.c` | **`dnsd`** — the authoritative core (~3600 lines). ACME/EST extracted in Step 2, mDNS in Step 3, the HTTP/DoH/portal surface in Step 4. Now: DNS/DoT + localhost `/health`+`/metrics` only. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
@@ -351,7 +352,7 @@ HTTP front-ends. Define and enforce this.
 | `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |
 | `cert:current` | certd | dnsd (hot-reload) | Active TLS cert + key |
 | `acme:*` | certd | certd | ACME account key, order state |
-| `cache:*` | resolverd | resolverd | Persisted resolver cache |
+| `cache:*` | resolverd | resolverd | Persisted resolver cache. ADR-008 pilot: with `RESOLVERD_CACHE_BACKEND=objectdb` this namespace moves out of Valkey into resolverd's embedded objectdb store (`object_graph.{c,h}`, vendored+pinned) — same single-owner contract, no bus change |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
 | `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid | ADR-003 schema-version contract (`major.minor`) |
 

@@ -405,9 +405,13 @@ jobs:
       - name: Install clang-format (pinned — see comment above)
         run: pipx install "clang-format==20.1.8"
       - name: Check formatting
+        # object_graph.{c,h} are VENDORED (pinned upstream objectdb — see their
+        # file headers) and keep upstream's formatting so the pin stays
+        # byte-verifiable against the upstream commit. Everything else is
+        # repo-style and blocking.
         run: |
           clang-format --version
-          files=$(git ls-files '*.c' '*.h')
+          files=$(git ls-files '*.c' '*.h' | grep -v '^object_graph\.')
           [ -z "$files" ] || clang-format --dry-run --Werror $files
 
   fuzz-smoke:
