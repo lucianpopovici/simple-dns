@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -707,6 +707,63 @@ check-enum: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$OUT2" | grep -q "a|b@x.com"            || { echo "  FAIL  '|' in regexp not preserved";   exit 1; }; \
 	 test "$$SIGS" -ge 1                            || { echo "  FAIL  +dnssec returned no RRSIG";      exit 1; }; \
 	 echo "  OK  ENUM NAPTR ordered rules serve correctly; '|' in regexp preserved; RRSIG present"
+
+# CLAUDE-ENUM.md's "Provisioning" gap: no REST/dashboard writer existed to turn
+# an E.164 number into the reversed-digit zone:<zone>:NAPTR:<revname> key dnsd
+# already serves (operators wrote the raw Valkey key by hand). Drives apid's
+# real HTTPS mTLS management listener with curl (as an operator would), so
+# this exercises apid's digit-reversal/defaulting/'|'-in-replacement guardrail
+# — code check-enum above never touches, since that test writes the Valkey key
+# directly. Needs Valkey + openssl + curl.
+check-enum-provision: apid_debug | ossl-sanity
+	@echo "  CHECK  RFC 6116 ENUM provisioning: apid /enum/provision -> zone:*:NAPTR:* (requires Valkey + openssl + curl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v curl >/dev/null    || { echo "  SKIP  no curl on PATH"; exit 0; };                 \
+	 D=$$(mktemp -d); PORT=18443; EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes";    \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=enum-test-ca" >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1;   \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=mgmt-client" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 Z=example.local; APEX=e164.$$Z; NAME=4.3.2.1.5.5.5.0.0.8.1.$$APEX;                            \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);              \
+	 SAVE_A=$$($$VC get config:mtls_ca_pem); SAVE_HP=$$($$VC get config:https_port);                \
+	 SAVE_EA=$$($$VC get config:enum_apex); SAVE_ZN=$$($$VC get config:zone_name);                  \
+	 $$VC set config:tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null;                                 \
+	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                                  \
+	 $$VC set config:mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                                   \
+	 $$VC set config:https_port "$$PORT" >/dev/null;                                                \
+	 $$VC set config:enum_apex "$$APEX" >/dev/null;                                                 \
+	 $$VC set config:zone_name "$$Z" >/dev/null;                                                     \
+	 $$VC del "zone:$$Z:NAPTR:$$NAME" >/dev/null 2>&1;                                              \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug >/tmp/apid_enum.log 2>&1 & API=$$!;                   \
+	 sleep 1.5;                                                                                      \
+	 CURL="curl -sk --cacert $$D/ca.pem --cert $$D/cli.pem --key $$D/cli.key";                      \
+	 R1=$$($$CURL -o /tmp/enum_r1.txt -w '%{http_code}' -X POST "https://127.0.0.1:$$PORT/enum/provision" \
+	   --data-urlencode "number=+18005551234" --data-urlencode "service=E2U+sip" \
+	   --data-urlencode "regexp=!^.*\$$!sip:info@example.com!");                                     \
+	 R2=$$($$CURL -o /tmp/enum_r2.txt -w '%{http_code}' -X POST "https://127.0.0.1:$$PORT/enum/provision" \
+	   --data-urlencode "number=+18005551234" --data-urlencode "service=E2U+sip" \
+	   --data-urlencode "regexp=!^.*\$$!x!" --data-urlencode "replacement=a|b");                     \
+	 kill $$API 2>/dev/null; wait $$API 2>/dev/null || true;                                        \
+	 VAL=$$($$VC get "zone:$$Z:NAPTR:$$NAME");                                                       \
+	 $$VC del "zone:$$Z:NAPTR:$$NAME" >/dev/null 2>&1;                                              \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_A" ]; then $$VC set config:mtls_ca_pem "$$SAVE_A" >/dev/null; else $$VC del config:mtls_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_HP" ]; then $$VC set config:https_port "$$SAVE_HP" >/dev/null; else $$VC del config:https_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_EA" ]; then $$VC set config:enum_apex "$$SAVE_EA" >/dev/null; else $$VC del config:enum_apex >/dev/null; fi; \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 rm -rf $$D;                                                                                     \
+	 echo "  POST /enum/provision: http=$$R1  written: $$VAL";                                       \
+	 echo "  POST with '|' in replacement: http=$$R2 (expect 400)";                                  \
+	 test "$$R1" = "201"                              || { echo "  FAIL  provisioning did not return 201"; exit 1; }; \
+	 echo "$$VAL" | grep -q "^3600|100|10|u|E2U+sip|" || { echo "  FAIL  written NAPTR value wrong"; exit 1; }; \
+	 echo "$$VAL" | grep -q "sip:info@example.com"    || { echo "  FAIL  regexp missing from written value"; exit 1; }; \
+	 test "$$R2" = "400"                               || { echo "  FAIL  '|' in replacement was not rejected"; exit 1; }; \
+	 echo "  OK  E.164 number -> reversed-digit zone:*:NAPTR:* key; defaults and '|'-in-replacement guardrail correct"
 
 # RFC 2317 classless in-addr.arpa delegation. Writes a /24 zone + /27 subzone
 # directly to Valkey (as the apid /reverse/classless endpoint would), then
@@ -2751,6 +2808,7 @@ help:
 	@echo "  make check-dnsxl     RFC 5782 DNSxL synthesis listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN (needs Valkey + dig)"
 	@echo "  make check-rr-rotate RFC 1794 per-name round-robin rotation; DNSSEC still valid (needs Valkey + dig)"
 	@echo "  make check-enum      RFC 6116 ENUM NAPTR: ordered rules, '|' in regexp, RRSIG (needs Valkey + dig)"
+	@echo "  make check-enum-provision  RFC 6116 ENUM provisioning via apid's real mTLS endpoint (needs Valkey + openssl + curl)"
 	@echo "  make check-2317      RFC 2317 classless /24 sub-block delegation CNAME→PTR + RRSIG (needs Valkey + dig)"
 	@echo "  make check-zoneversion RFC 9660 ZONEVERSION EDNS option echoes zone SOA serial (needs Valkey + dig)"
 	@echo "  make check-xot       RFC 9103 XoT: 'dot' ALPN actually selected on DoT/XFR listener (needs Valkey + openssl + dig)"

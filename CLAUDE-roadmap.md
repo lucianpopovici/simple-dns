@@ -19,8 +19,8 @@ The backlog files are not all the same kind of work. Sort before sequencing:
 |------|-------|---------------|
 | **Live code vulnerabilities** | `SECURITY_AUDIT.md` | Phase 0 — first |
 | **System decisions (no/low code)** | `CLAUDE-architecture.md` (ADR-003…007) | Phase 1 — before new record types |
-| **Feature specs** | `CLAUDE-rfc-additions-batch3.md`, `CLAUDE-ENUM.md`, `CLAUDE-libdnswire.md`, `CLAUDE-certd.md`, `CLAUDE-mdnsd.md`, `CLAUDE-resolverd*.md`, `CLAUDE-DoQ.md`, `CLAUDE-eppd.md` | Phase 2 |
-| **Feature specs — done, archived untracked** | `specs/CLAUDE-rfc-additions.md`, `specs/CLAUDE-rfc-additions-batch4.md`, `specs/CLAUDE-discovery.md`, `specs/CLAUDE-hidden-master.md`, `specs/CLAUDE-loadbalance.md` | Done — see below |
+| **Feature specs** | `CLAUDE-rfc-additions-batch3.md`, `CLAUDE-ENUM.md`, `CLAUDE-libdnswire.md`, `CLAUDE-eppd.md` | Phase 2 |
+| **Feature specs — done, archived untracked** | `specs/CLAUDE-rfc-additions.md`, `specs/CLAUDE-rfc-additions-batch4.md`, `specs/CLAUDE-discovery.md`, `specs/CLAUDE-hidden-master.md`, `specs/CLAUDE-loadbalance.md`, `specs/CLAUDE-mdnsd.md`, `specs/CLAUDE-resolverd.md`, `specs/CLAUDE-DoQ.md`, `specs/CLAUDE-certd.md` | Done — see below |
 | **Skill edits (not codebase)** | `c-security-audit-improvements.md`, `c-security-audit.patch.md` | Out-of-band — Settings → Capabilities |
 | **Research playbook (not code)** | `CLAUDE-sec.md` | Background, parallel |
 | **Triage / exclusion record** | `CLAUDE-rfc-skipped.md` | Read-and-track only (no code) |
@@ -39,14 +39,21 @@ these three, plus `specs/CLAUDE-rfc-additions.md` (batch 1–2) and
 `specs/CLAUDE-rfc-additions-batch4.md`, were moved from repo root into `specs/`
 (already gitignored) and untracked from git, matching the existing
 `specs/CLAUDE-{fixes,migration}.md` archival convention for fully-done specs.
-`CLAUDE-certd.md`, `CLAUDE-libdnswire.md`, `CLAUDE-ENUM.md`, and
-`CLAUDE-rfc-additions-batch3.md` were considered for the same move but kept at
-root on purpose — each has a real remaining item (certd: RFC 8659 CAA-before-
-issuance, unimplemented; libdnswire: the libFuzzer harness never moved into the
-lib's own test tree; ENUM: the `+E.164`→reversed-name provisioning writer
-doesn't exist, operators write the raw Valkey key by hand; batch3: Add 8 glue-
-in-referrals and Add 11 compact denial are intentionally-deferred forward
-items, not done work) — not just a stale checkbox like the five that moved.
+`CLAUDE-libdnswire.md`, `CLAUDE-ENUM.md`, and `CLAUDE-rfc-additions-batch3.md`
+were considered for the same move but kept at root on purpose — each has a
+real remaining item (libdnswire: the libFuzzer harness never moved into the
+lib's own test tree; ENUM: two-instance topology, ops (systemd unit/dashboard
+backend/parent DS), a two-instance CI job, and the number-portability/EPP-
+federation roadmap items are all still open — the one item that *was* closed,
+the `+E.164`→reversed-name provisioning writer, landed 2026-07-06 as `POST
+/enum/provision` in `apid.c`, `make check-enum-provision`; batch3: Add 11
+compact denial is an intentionally-deferred forward item — Add 8 glue-in-
+referrals has since landed, 2026-07-06) — not just a stale checkbox like the
+five that moved. `CLAUDE-mdnsd.md`, `CLAUDE-resolverd.md`, and `CLAUDE-DoQ.md`
+were each moved on their own completion dates (all "done" per
+`CLAUDE-index.md`). **2026-07-06:** `CLAUDE-certd.md` moved too — its last
+open item, RFC 8659 CAA pre-flight, landed the same day, followed immediately
+by RFC 8739 STAR; its entire checklist is now closed.
 `CLAUDE-rfc-skipped.md` also stays at root: it's a permanent decision record
 (why things were *not* built), not a spec of something implemented, so
 "archived" doesn't apply to it.

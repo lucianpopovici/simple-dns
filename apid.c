@@ -1104,6 +1104,97 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         return;
     }
 
+    /* RFC 6116 ENUM provisioning (mgmt only). Turns an E.164 number + one
+     * NAPTR rule into the reversed-digit zone:<zone>:NAPTR:<revname> key dnsd
+     * already serves (CLAUDE-ENUM.md's "Provisioning" section) — one rule per
+     * call, the same one-record-per-POST convention /zone already uses.
+     * Params: number, service, regexp (required); order (100), pref (10),
+     * flags ("u"), replacement ("."), ttl (3600) all optional. */
+    if (is_mgmt && !strcasecmp(method, "POST") && !strcmp(path, "/enum/provision")) {
+        char *bdy = strstr(buf, "\r\n\r\n");
+        if (!bdy) {
+            api_send(fd, ssl, 400, "no body\n");
+            return;
+        }
+        bdy += 4;
+        char apex[256] = {0};
+        vk_get("config:enum_apex", apex, sizeof(apex));
+        if (!apex[0]) {
+            api_send(fd, ssl, 400, "config:enum_apex is not set\n");
+            return;
+        }
+        char number[64] = {0}, order_s[16] = {0}, pref_s[16] = {0}, flags[16] = {0},
+             service[64] = {0}, regexp[256] = {0}, repl[256] = {0}, ttl_s[16] = {0};
+        qs_get(bdy, "number", number, sizeof(number));
+        qs_get(bdy, "order", order_s, sizeof(order_s));
+        qs_get(bdy, "pref", pref_s, sizeof(pref_s));
+        qs_get(bdy, "flags", flags, sizeof(flags));
+        qs_get(bdy, "service", service, sizeof(service));
+        qs_get(bdy, "regexp", regexp, sizeof(regexp));
+        qs_get(bdy, "replacement", repl, sizeof(repl));
+        qs_get(bdy, "ttl", ttl_s, sizeof(ttl_s));
+        if (!number[0] || !service[0] || !regexp[0]) {
+            api_send(fd, ssl, 400, "missing number/service/regexp\n");
+            return;
+        }
+        /* RFC 6116 §2.4: strip everything but digits before reversing. */
+        char digits[32];
+        int nd = 0;
+        for (const char *p = number; *p && nd < (int) sizeof(digits) - 1; p++)
+            if (isdigit((unsigned char) *p))
+                digits[nd++] = *p;
+        digits[nd] = 0;
+        if (nd < 1 || nd > 15) {
+            api_send(fd, ssl, 400, "number must have 1-15 digits (E.164)\n");
+            return;
+        }
+        /* dnsd's NAPTR parser splits regexp|replacement at the LAST '|', so
+         * regexp may contain '|' but replacement (a bare DNS name) must not. */
+        if (repl[0] && strchr(repl, '|')) {
+            api_send(fd, ssl, 400, "replacement must not contain '|'\n");
+            return;
+        }
+        if (!flags[0])
+            safe_strcpy(flags, "u", sizeof(flags));
+        if (!repl[0])
+            safe_strcpy(repl, ".", sizeof(repl));
+        uint32_t ttl = ttl_s[0] ? (uint32_t) atoi(ttl_s) : 3600;
+        int order = order_s[0] ? atoi(order_s) : 100;
+        int pref = pref_s[0] ? atoi(pref_s) : 10;
+        /* RFC 6116 §3: advisory only, same as dnsd's own check — still serve. */
+        if (strncasecmp(service, "E2U+", 4) != 0)
+            dns_log(LOG_WARNING,
+                    "[ENUM] provisioning %s with service '%s' is not an Enumservice "
+                    "(E2U+...) — verify RFC 6117 registration\n",
+                    number, service);
+        char revname[256];
+        int rp = 0;
+        for (int i = nd - 1; i >= 0 && rp < (int) sizeof(revname) - 2; i--) {
+            revname[rp++] = digits[i];
+            revname[rp++] = '.';
+        }
+        revname[rp] = 0;
+        safe_strcpy(revname + rp, apex, sizeof(revname) - (size_t) rp);
+        char zn[256];
+        resolve_zone(revname, zn, sizeof(zn));
+        if (!zn[0]) {
+            api_send(fd, ssl, 400,
+                     "no authoritative zone for the ENUM apex — add it with /zone/add first\n");
+            return;
+        }
+        char vkey[600], vval[768];
+        snprintf(vkey, sizeof(vkey), "zone:%s:NAPTR:%s", zn, revname);
+        snprintf(vval, sizeof(vval), "%u|%d|%d|%s|%s|%s|%s", ttl, order, pref, flags, service,
+                 regexp, repl);
+        vk_set(vkey, vval, 0);
+        serial_bump_zone(zn);
+        dns_log(LOG_NOTICE, "[ENUM] provisioned %s -> %s = %s\n", number, vkey, vval);
+        char rb[700];
+        snprintf(rb, sizeof(rb), "ok: %s\n", vkey);
+        api_send(fd, ssl, 201, rb);
+        return;
+    }
+
     api_send(fd, ssl, 404, "unknown endpoint\n");
 }
 

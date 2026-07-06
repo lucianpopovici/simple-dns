@@ -115,7 +115,12 @@ glance:
 - **Record types**: A, AAAA, NS (multi-value, `"ttl|ns1|ns2|…"` — a delegation
   can carry more than one nameserver), CNAME, SOA, PTR, MX, TXT, SRV (2782),
   CAA (8659), SSHFP (4255), TLSA/DANE (6698/7671), LOC (1876), URI (7553),
-  NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078), SVCB + HTTPS (9460).
+  NAPTR (3403), DNAME (6672), CDS/CDNSKEY (7344/8078), SVCB + HTTPS (9460).
+- **ENUM** (6116/6117/6118): E.164-to-URI mapping over NAPTR under a configured
+  `config:enum_apex` tree root (e.g. `e164.arpa`); Enumservice (`E2U+...`)
+  validated on serve (advisory warning, not a refusal). Provisioning helper:
+  `POST /enum/provision` on `apid`'s mgmt listener turns an E.164 number + one
+  NAPTR rule into the reversed-digit `zone:<zone>:NAPTR:<revname>` key.
 - **Delegation / referrals** (RFC 9471): a qname at or below a configured NS
   delegation point gets a non-authoritative referral — AA=0, unsigned NS in
   Authority, in-bailiwick glue in Additional, TC=1 if the glue doesn't fit a
