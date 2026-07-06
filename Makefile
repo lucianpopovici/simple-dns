@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -981,6 +981,122 @@ check-acme-challenges: tests/test_certd_challenges.c certd.c dns_wire.c dns_wire
 	      $(INCLUDES) -I. -o tests/test_certd_challenges \
 	      tests/test_certd_challenges.c dns_wire.c $(LIBS)
 	./tests/test_certd_challenges
+
+# CLAUDE-certd.md Integration item: honor CAA (8659) before requesting
+# issuance. certd reads zone:<zone>:CAA:<name> directly off Valkey (dnsd
+# already owns/serves it) rather than making a real DNS query. No stub ACME
+# server needed: the CAA check runs before certd ever contacts the CA, so a
+# denial is provable purely from the log; the two "should proceed" cases
+# point config:acme_ca at 127.0.0.1:1 (an essentially-guaranteed-closed
+# port) so the subsequent directory fetch fails fast and distinctly
+# ("Directory failed") instead of hanging on a real network call.
+check-caa: certd_debug | ossl-sanity
+	@echo "  CHECK  RFC 8659 CAA pre-flight gates certd's cert request (requires Valkey)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 SAVE_ZN=$$($$VC get config:zone_name); SAVE_D=$$($$VC get config:acme_domain);                \
+	 SAVE_CA=$$($$VC get config:acme_ca); SAVE_CAA=$$($$VC get zone:caatest.local:CAA:caatest.local); \
+	 $$VC set config:zone_name "caatest.local" >/dev/null;                                          \
+	 $$VC set config:acme_domain "www.caatest.local" >/dev/null;                                    \
+	 $$VC set config:acme_ca "https://127.0.0.1:1/dir" >/dev/null;                                  \
+	 $$VC set zone:caatest.local:CAA:caatest.local "3600|0|issue|someother.example" >/dev/null;      \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_caa_deny.log 2>&1; DENY_RC=$$?;    \
+	 $$VC set zone:caatest.local:CAA:caatest.local "3600|0|issue|127.0.0.1" >/dev/null;              \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_caa_allow.log 2>&1;                \
+	 $$VC del zone:caatest.local:CAA:caatest.local >/dev/null;                                       \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_caa_none.log 2>&1;                 \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_D" ]; then $$VC set config:acme_domain "$$SAVE_D" >/dev/null; else $$VC del config:acme_domain >/dev/null; fi; \
+	 if [ -n "$$SAVE_CA" ]; then $$VC set config:acme_ca "$$SAVE_CA" >/dev/null; else $$VC del config:acme_ca >/dev/null; fi; \
+	 if [ -n "$$SAVE_CAA" ]; then $$VC set zone:caatest.local:CAA:caatest.local "$$SAVE_CAA" >/dev/null; else $$VC del zone:caatest.local:CAA:caatest.local >/dev/null; fi; \
+	 $$VC del acme:account_key acme:account_url >/dev/null 2>&1;                                    \
+	 grep -q "does not authorize" /tmp/certd_caa_deny.log || { echo "  FAIL  mismatched CAA issue value did not refuse"; cat /tmp/certd_caa_deny.log; exit 1; }; \
+	 test "$$DENY_RC" -ne 0 || { echo "  FAIL  certd --once exited 0 despite CAA refusal"; exit 1; }; \
+	 grep -q "does not authorize" /tmp/certd_caa_allow.log && { echo "  FAIL  matching CAA issue value was refused"; cat /tmp/certd_caa_allow.log; exit 1; }; \
+	 grep -q "Directory failed" /tmp/certd_caa_allow.log || { echo "  FAIL  matching CAA case did not proceed to attempt the CA"; cat /tmp/certd_caa_allow.log; exit 1; }; \
+	 grep -q "does not authorize" /tmp/certd_caa_none.log && { echo "  FAIL  absent CAA was refused (should default-allow)"; cat /tmp/certd_caa_none.log; exit 1; }; \
+	 grep -q "Directory failed" /tmp/certd_caa_none.log || { echo "  FAIL  no-CAA case did not proceed to attempt the CA"; cat /tmp/certd_caa_none.log; exit 1; }; \
+	 echo "  OK  mismatched CAA issue refuses (climbed to the zone apex); matching issue and absent CAA both proceed"
+
+# CLAUDE-certd.md Roadmap item: RFC 8739 STAR (short-term, automatically
+# renewed certs). tests/star_stub.py implements just enough ACME (dns-01
+# order/authz/challenge/finalize, plus the STAR directory meta + the
+# star-certificate order field/fetch endpoint) to drive certd's full
+# acme_issue() once, then proves the SECOND `certd --once` run refreshes the
+# cert by hitting ONLY the star-certificate endpoint — new-order/authz/chal/
+# finalize hit-counts must stay unchanged — before a third run (feature
+# disabled) exercises order cancellation.
+check-star: certd_debug | ossl-sanity
+	@echo "  CHECK  RFC 8739 STAR: one recurrent order yields many short-lived certs (requires Valkey + openssl + python3 + curl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };              \
+	 command -v curl >/dev/null || { echo "  SKIP  no curl on PATH"; exit 0; };                    \
+	 D=$$(mktemp -d); PORT=5399; EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes";     \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=star-test-ca" \
+	   -addext "subjectKeyIdentifier=hash" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1; \
+	 printf 'subjectAltName=IP:127.0.0.1\nauthorityKeyIdentifier=keyid,issuer\nbasicConstraints=CA:FALSE\n' > $$D/srv.ext; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1;   \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial \
+	   -out $$D/srv.pem -days 2 -extfile $$D/srv.ext >/dev/null 2>&1;                              \
+	 openssl req $$EC -x509 -keyout $$D/a.key -out $$D/a.pem -days 1 -subj "/CN=star-cert-a" >/dev/null 2>&1; \
+	 openssl req $$EC -x509 -keyout $$D/b.key -out $$D/b.pem -days 2 -subj "/CN=star-cert-b" >/dev/null 2>&1; \
+	 SAVE_ZN=$$($$VC get config:zone_name); SAVE_D=$$($$VC get config:acme_domain);                \
+	 SAVE_CA=$$($$VC get config:acme_ca); SAVE_CAP=$$($$VC get config:acme_ca_pem);                 \
+	 SAVE_EN=$$($$VC get config:acme_star_enabled); SAVE_LT=$$($$VC get config:acme_star_lifetime_secs); \
+	 SAVE_RB=$$($$VC get config:acme_star_renew_before_secs); SAVE_CUR=$$($$VC get cert:current);   \
+	 $$VC set config:zone_name "star-test.example" >/dev/null;                                      \
+	 $$VC set config:acme_domain "star-test.example" >/dev/null;                                    \
+	 $$VC set config:acme_ca "https://127.0.0.1:$$PORT/dir" >/dev/null;                             \
+	 $$VC set config:acme_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                                    \
+	 $$VC set config:acme_star_enabled "1" >/dev/null;                                               \
+	 $$VC set config:acme_star_lifetime_secs "3600" >/dev/null;                                      \
+	 $$VC set config:acme_star_renew_before_secs "90000" >/dev/null;                                 \
+	 $$VC del acme:star_order_url acme:star_cert_url acme:star_end_epoch acme:star_allow_get acme:star_key_pem >/dev/null 2>&1; \
+	 python3 tests/star_stub.py 127.0.0.1 $$PORT $$D/srv.pem $$D/srv.key $$D/a.pem $$D/b.pem 45 >/tmp/star_stub.log 2>&1 & STUB=$$!; \
+	 sleep 1;                                                                                        \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_star_1.log 2>&1;                   \
+	 $$VC get cert:current > /tmp/star_cur1.pem;                                                     \
+	 SUBJ1=$$(openssl x509 -in /tmp/star_cur1.pem -noout -subject 2>/dev/null);                      \
+	 STATS1=$$(curl -sk https://127.0.0.1:$$PORT/__stats);                                           \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_star_2.log 2>&1;                   \
+	 $$VC get cert:current > /tmp/star_cur2.pem;                                                     \
+	 SUBJ2=$$(openssl x509 -in /tmp/star_cur2.pem -noout -subject 2>/dev/null);                      \
+	 STATS2=$$(curl -sk https://127.0.0.1:$$PORT/__stats);                                           \
+	 $$VC set config:acme_star_enabled "0" >/dev/null;                                                \
+	 ASAN_OPTIONS=detect_leaks=0 ./certd_debug --once >/tmp/certd_star_3.log 2>&1;                   \
+	 STATS3=$$(curl -sk https://127.0.0.1:$$PORT/__stats);                                           \
+	 LEFTOVER=$$($$VC get acme:star_order_url);                                                      \
+	 kill $$STUB 2>/dev/null; wait $$STUB 2>/dev/null || true;                                       \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_D" ]; then $$VC set config:acme_domain "$$SAVE_D" >/dev/null; else $$VC del config:acme_domain >/dev/null; fi; \
+	 if [ -n "$$SAVE_CA" ]; then $$VC set config:acme_ca "$$SAVE_CA" >/dev/null; else $$VC del config:acme_ca >/dev/null; fi; \
+	 if [ -n "$$SAVE_CAP" ]; then $$VC set config:acme_ca_pem "$$SAVE_CAP" >/dev/null; else $$VC del config:acme_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_EN" ]; then $$VC set config:acme_star_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:acme_star_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_LT" ]; then $$VC set config:acme_star_lifetime_secs "$$SAVE_LT" >/dev/null; else $$VC del config:acme_star_lifetime_secs >/dev/null; fi; \
+	 if [ -n "$$SAVE_RB" ]; then $$VC set config:acme_star_renew_before_secs "$$SAVE_RB" >/dev/null; else $$VC del config:acme_star_renew_before_secs >/dev/null; fi; \
+	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
+	 $$VC del acme:account_key acme:account_url acme:star_order_url acme:star_cert_url acme:star_end_epoch acme:star_allow_get acme:star_key_pem >/dev/null 2>&1; \
+	 rm -rf $$D /tmp/star_cur1.pem /tmp/star_cur2.pem;                                                \
+	 echo "  phase 1 (establish): $$SUBJ1";                                                           \
+	 echo "  phase 2 (refresh):   $$SUBJ2";                                                           \
+	 echo "  hits after phase 1: $$STATS1";                                                           \
+	 echo "  hits after phase 2: $$STATS2";                                                           \
+	 echo "  hits after phase 3 (cancel): $$STATS3";                                                  \
+	 echo "$$SUBJ1" | grep -q "star-cert-a" || { echo "  FAIL  phase 1 did not install cert A"; cat /tmp/certd_star_1.log; exit 1; }; \
+	 echo "$$SUBJ2" | grep -q "star-cert-b" || { echo "  FAIL  phase 2 did not install cert B"; cat /tmp/certd_star_2.log; exit 1; }; \
+	 N1=$$(echo "$$STATS1" | python3 -c "import json,sys; print(json.load(sys.stdin).get('/new-order',0))"); \
+	 N2=$$(echo "$$STATS2" | python3 -c "import json,sys; print(json.load(sys.stdin).get('/new-order',0))"); \
+	 test "$$N1" = "1" || { echo "  FAIL  expected exactly 1 new-order call after phase 1, got $$N1"; exit 1; }; \
+	 test "$$N2" = "$$N1" || { echo "  FAIL  phase 2 (refresh) re-hit new-order — reauthorized instead of just refreshing"; exit 1; }; \
+	 SC2=$$(echo "$$STATS2" | python3 -c "import json,sys; print(json.load(sys.stdin).get('/star-cert/1',0))"); \
+	 test "$$SC2" = "2" || { echo "  FAIL  expected star-cert/1 hit exactly twice after phase 2, got $$SC2"; exit 1; }; \
+	 O3=$$(echo "$$STATS3" | python3 -c "import json,sys; print(json.load(sys.stdin).get('/order/1',0))"); \
+	 O2=$$(echo "$$STATS2" | python3 -c "import json,sys; print(json.load(sys.stdin).get('/order/1',0))"); \
+	 test "$$O3" -gt "$$O2" || { echo "  FAIL  phase 3 (disabled) did not POST a cancellation to the order"; exit 1; }; \
+	 test -z "$$LEFTOVER" || { echo "  FAIL  acme:star_order_url still set after disabling with an active order"; exit 1; }; \
+	 echo "  OK  recurrent order established once, refreshed via star-certificate only (no reauthorization), and canceled on disable"
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"

@@ -142,6 +142,18 @@ jobs:
       - name: RFC 8737 TLS-ALPN-01 + RFC 8738 IP identifiers (certd optional Add 2/Add 3)
         run: make check-acme-challenges OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: RFC 8659 CAA pre-flight gates certd's cert request
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-caa OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: RFC 8739 STAR recurrent-order renewal
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-star OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Smoke test against Valkey
         env:
           DNS_VALKEY_HOST: 127.0.0.1

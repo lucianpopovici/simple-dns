@@ -284,9 +284,20 @@ tls-alpn-01 for an RFC 8738 IP identifier since dns-01 has no defined meaning
 for the "ip" type), EST mTLS enrollment, CSR generation (DNS **or** IP
 identifiers, RFC 8738), renewal scheduling (daemon mode checks daily; `certd
 --once` for cron/manual runs; RFC 9773 ARI lets the CA drive the renewal
-window instead of a fixed threshold).
+window instead of a fixed threshold). Per-domain opt-in RFC 8739 STAR
+(`config:acme_star_enabled`, 2026-07-06): one recurrent order/authorization
+yields a stream of short-lived certs fetched from a fixed URL — a genuinely
+different renewal model from the fixed-cadence path above, not a variant of
+it, so `renewal_check` branches to a dedicated `acme_star_tick` (establish /
+lightweight refresh with no reauthorization / cancel-on-disable) for any
+domain that's STAR-enabled or still has a recorded recurrent order.
 
 Integration is entirely through Valkey:
+- Before requesting any cert: a CAA (RFC 8659, 2026-07-06) pre-flight —
+  `zone:<zone>:CAA:<name>` read directly off Valkey (tree-climbing to the
+  zone apex per RFC 8659 §5.3), refusing to even contact the CA if a found
+  CAA RRset doesn't authorize it. Read-only; `certd`'s only zone-namespace
+  *write* is still the dns-01 challenge TXT below.
 - For ACME dns-01: writes the challenge as a normal zone record
   (`zone:TXT:_acme-challenge.<domain>`), waits, then deletes it.
 - For ACME tls-alpn-01: no Valkey write at all — instead a short-lived
@@ -546,7 +557,7 @@ HTTP front-ends. Define and enforce this.
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
 | `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | Runtime configuration |
-| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976), eppd (NS/A/AAAA/DS delegation only, from its own `epp:*` object store — DS per RFC 5910, Phase 2) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
+| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976), eppd (NS/A/AAAA/DS delegation only, from its own `epp:*` object store — DS per RFC 5910, Phase 2) | dnsd, mdnsd (shared records, read-only), certd (CAA only, read-only pre-flight before requesting a cert, RFC 8659) | Authoritative records |
 | `ddns:*` | dnsd (RFC 2136 UPDATE), apid (HTTP `/update`, `ddns_secret`-gated) | dnsd | Dynamic records |
 | `srp:*` | dnsd (RFC 9665 SRP UPDATE, SIG(0)-authenticated, `config:srp_enabled`-gated) | dnsd (mdnsd read-only in a future add) | Service-registration records + FCFS ownership + lease/key-lease expiry (RFC 9664) |
 | `ixfr:*` | dnsd (records each A/AAAA change) | dnsd | RFC 1995 IXFR journal (incremental diff; gap → AXFR fallback) |

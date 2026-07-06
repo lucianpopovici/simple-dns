@@ -45,7 +45,7 @@ authoritative answer at the delegation cut.
 | Daemon | Role | Listens on | Talks to |
 |---|---|---|---|
 | **`dnsd`** (`dns_server.c`) | Authoritative core: query resolution, DNSSEC signing, UPDATE/TSIG, AXFR/IXFR/NOTIFY, EDNS/cookies, RFC 9471 delegation referrals | `5353/udp+tcp` (DNS), `8853` (DoT), `127.0.0.1:8054` (read-only `/health`+`/metrics`) | Valkey only |
-| **`certd`** (`certd.c`) | ACME (RFC 8555, dns-01/tls-alpn-01, RFC 8737/8738, RFC 9773 ARI) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA; briefly inbound on `config:acme_tls_alpn_port` during a tls-alpn-01 validation) | Valkey + CA |
+| **`certd`** (`certd.c`) | ACME (RFC 8555, dns-01/tls-alpn-01, RFC 8737/8738, RFC 9773 ARI, RFC 8739 STAR) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA; briefly inbound on `config:acme_tls_alpn_port` during a tls-alpn-01 validation) | Valkey + CA |
 | **`mdnsd`** (`mdnsd.c`) | mDNS (RFC 6762) + DNS-SD (RFC 6763) responder, link-local | `5353` multicast on explicitly-configured interfaces | Valkey (read) |
 | **`apid`** (`apid.c`) | HTTP/HTTPS front: DoH + management API | `8053` (HTTP), `8443` (HTTPS/mTLS) | Valkey + dnsd (DoH forward) |
 | **`doqd`** (`doqd.c`) | DNS-over-QUIC (RFC 9250) sidecar | `8853/udp` (opt-in via `config:doq_enabled`) | Valkey (read) + dnsd (loopback forward) |
@@ -166,7 +166,9 @@ glance:
   client retries over TCP rather than emitting a fragmentable datagram.
 - **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
 - **PKI bootstrap** (`certd`): ACME (8555, dns-01 and tls-alpn-01/8737, DNS
-  and IP identifiers/8738, renewal-info/9773) and EST (7030) over mTLS.
+  and IP identifiers/8738, renewal-info/9773, STAR recurrent orders/8739)
+  and EST (7030) over mTLS. A CAA (8659) pre-flight refuses to even contact
+  the CA if the zone's CAA policy doesn't authorize it.
 - **DNS-over-QUIC** (`doqd`, RFC 9250): a separate sidecar terminating
   QUIC/UDP 853 and relaying framed messages to `dnsd`'s loopback DNS port —
   the same pattern `apid` uses for DoH. Needs OpenSSL ≥ 3.5 to build (only
@@ -321,7 +323,11 @@ AXFR over DoT works on `:8853` for encrypted transfers.
 
 ### Certificates
 
-`certd` performs ACME dns-01 (it writes the challenge to
+Before requesting any cert, `certd` checks the zone's CAA (RFC 8659) policy —
+reading `zone:<zone>:CAA:<name>` straight off Valkey and climbing to the zone
+apex if the exact name has no CAA RRset — and refuses to contact the CA at
+all if a found record doesn't authorize it (no CAA anywhere defaults to
+allow, per the RFC). Then it performs ACME dns-01 (it writes the challenge to
 `zone:TXT:_acme-challenge.<domain>` and deletes it after validation),
 tls-alpn-01 (`config:acme_challenge_type=tls-alpn-01` — no zone write at all;
 a short-lived in-process TLS listener on `config:acme_tls_alpn_port`, default
@@ -332,6 +338,14 @@ dns-01 has no defined meaning for an IP identifier. `dnsd` and `apid` watch
 `cert:current` and hot-reload TLS within seconds; `dnsd` also publishes the
 matching TLSA records. Run `certd` as a daemon (daily renewal check) or
 `certd --once` from cron.
+
+`config:acme_star_enabled=1` opts a domain into RFC 8739 STAR instead: one
+authorization/order yields a stream of short-lived certs fetched from a
+fixed URL, with no per-refresh reauthorization — a different renewal model
+from the daily check above, not a variant of it. `certd` establishes the
+recurrent order once, then refreshes purely by fetching from the CA's
+`star-certificate` URL as each cert nears its own (short) expiry; disabling
+the flag while an order is active cancels it at the CA.
 
 ### Live reload
 

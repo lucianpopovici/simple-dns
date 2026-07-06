@@ -88,6 +88,22 @@ static char g_acme_ca[512] = ACME_CA_PROD;
 static char g_acme_challenge_type[16] = "dns-01";
 static int g_acme_tls_alpn_port =
     443; /* RFC 8737 fixes 443; overridable for a private CA/NAT setup */
+/* RFC 8739 STAR: opt-in (default off, never on by accident — same convention
+ * as doqd/eppd's own enabled flags). When on, a domain gets ONE recurrent
+ * order that yields many short-lived certs over its lifetime instead of a
+ * full reissuance every renewal cycle; see acme_star_tick(). */
+static int g_acme_star_enabled = 0;
+static int g_acme_star_lifetime_secs = 345600;     /* 4 days, the RFC's own example */
+static int g_acme_star_lifetime_adjust_secs = 0;   /* RFC 8739 s4.1 "left pad"; 0 = none */
+static int g_acme_star_duration_secs = 30 * 86400; /* how long ONE recurrent order spans */
+static long g_acme_star_renew_before_secs = 0;     /* 0 => default to lifetime/2 at use time */
+/* Populated from the CA directory's meta.auto-renewal object each time
+ * acme_directory() runs; g_acme_star_supported gates whether the
+ * auto-renewal order extension is even attempted. */
+static long g_acme_star_min_lifetime = 0;
+static long g_acme_star_max_duration = 0;
+static int g_acme_star_ca_allow_get = 0;
+static int g_acme_star_supported = 0;
 static char g_acme_client_cert_pem[MAX_PEM] = "";
 static char g_acme_client_key_pem[MAX_PEM] = "";
 static char g_acme_ca_pem[MAX_PEM] = "";
@@ -146,6 +162,39 @@ static int json_str(const char *j, const char *key, char *out, int olen) {
     }
     out[i] = 0;
     return 1;
+}
+
+/* json_str only reads quoted-string values. RFC 8739's directory meta
+ * fields (min-lifetime, max-duration) are bare JSON integers/booleans, so
+ * they need their own tiny scanners rather than stretching json_str's
+ * quote-based contract. */
+static long json_int(const char *j, const char *key, long defval) {
+    char nd[256];
+    snprintf(nd, sizeof(nd), "\"%s\"", key);
+    const char *p = strstr(j, nd);
+    if (!p)
+        return defval;
+    p += strlen(nd);
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
+        p++;
+    char *end;
+    long v = strtol(p, &end, 10);
+    return end != p ? v : defval;
+}
+static int json_bool(const char *j, const char *key, int defval) {
+    char nd[256];
+    snprintf(nd, sizeof(nd), "\"%s\"", key);
+    const char *p = strstr(j, nd);
+    if (!p)
+        return defval;
+    p += strlen(nd);
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
+        p++;
+    if (!strncmp(p, "true", 4))
+        return 1;
+    if (!strncmp(p, "false", 5))
+        return 0;
+    return defval;
 }
 
 /* ── Valkey — thin wrappers over the shared libdnswire RESP client (see
@@ -210,6 +259,30 @@ static int vk_del(const char *key) {
     }
     pthread_mutex_unlock(&g_vk_mutex);
     return r.type == 3 ? (int) r.integer : 0;
+}
+/* Only needed for the CAA pre-flight check's zone_table:* scan — mirrors
+ * eppd's own vk_list_keys exactly (same shared vkc_ client, same shape). */
+static int vk_list_keys(const char *pattern, char out[][256], int maxkeys) {
+    pthread_mutex_lock(&g_vk_mutex);
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return -1;
+    }
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < r.count; i++) {
+        vkc_reply_t kr;
+        if (vkc_parse(&vk, &kr) < 0)
+            break;
+        if (kr.type == 2 && n < maxkeys)
+            safe_strcpy(out[n++], kr.str, 256);
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    return n;
 }
 
 /* ── EC helpers (P-256 JWK + ECDSA raw signatures for JWS) ───────────────── */
@@ -595,6 +668,14 @@ static int acme_directory(const char *host, int port) {
     json_str(body, "newOrder", g_acme_dir_neworder, sizeof(g_acme_dir_neworder));
     g_acme_dir_renewalinfo[0] = 0;
     json_str(body, "renewalInfo", g_acme_dir_renewalinfo, sizeof(g_acme_dir_renewalinfo));
+    /* RFC 8739 STAR capability discovery: meta.auto-renewal.{min-lifetime,
+     * max-duration} are both required if the CA supports it at all;
+     * allow-certificate-get is optional (defaults to authenticated
+     * POST-as-GET only). */
+    g_acme_star_min_lifetime = json_int(body, "min-lifetime", 0);
+    g_acme_star_max_duration = json_int(body, "max-duration", 0);
+    g_acme_star_ca_allow_get = json_bool(body, "allow-certificate-get", 0);
+    g_acme_star_supported = g_acme_star_min_lifetime > 0 && g_acme_star_max_duration > 0;
     free(body);
     dns_log(LOG_NOTICE, "[ACME] Directory OK\n");
     (void) host;
@@ -915,6 +996,133 @@ static void tlsalpn01_stop(tlsalpn01_listener_t *l, pthread_t tid) {
     free(l);
 }
 
+/* ── RFC 8659: CAA pre-flight check ──────────────────────────────────────
+ * Before requesting a cert, certd checks whether the zone's CAA policy
+ * even authorizes the configured CA — reading zone:<zone>:CAA:<name>
+ * directly off the Valkey bus rather than making a real DNS query, since
+ * Valkey is the integration bus between daemons (CLAUDE.md design
+ * principle #2) and dnsd already owns/serves this data. Read-only: certd
+ * writes nothing new here. Failing fast avoids wasting an ACME order (and
+ * the CA's rate limit) on a request the CA would reject anyway once it
+ * does its own CAA check. */
+
+/* Longest-suffix match against configured zone_table:<zone> entries —
+ * mirrors dnsd's own zone_for_qname and eppd's find_parent_zone. */
+static int name_in_zone(const char *name, const char *zone) {
+    size_t nl = strlen(name), zl = strlen(zone);
+    if (zl == 0 || zl > nl)
+        return 0;
+    if (zl == nl)
+        return strcasecmp(name, zone) == 0;
+    return nl > zl + 1 && name[nl - zl - 1] == '.' && strcasecmp(name + nl - zl, zone) == 0;
+}
+
+static int find_owning_zone(const char *name, char *zone_out, int cap) {
+    char keys[64][256];
+    int n = vk_list_keys("zone_table:*", keys, 64);
+    size_t best = 0;
+    zone_out[0] = 0;
+    for (int i = 0; i < n; i++) {
+        const char *zn = keys[i] + strlen("zone_table:");
+        if (name_in_zone(name, zn)) {
+            size_t zl = strlen(zn);
+            if (zl > best) {
+                best = zl;
+                safe_strcpy(zone_out, zn, cap);
+            }
+        }
+    }
+    /* The primary zone has no zone_table:<name> key of its own (seeded from
+     * config:zone_name/config:soa_* at boot) — same fallback apid/eppd use. */
+    if (!zone_out[0])
+        vk_get("config:zone_name", zone_out, cap);
+    return zone_out[0] ? 0 : -1;
+}
+
+/* RFC 8659 §5.3 tree-climbing: starting at `name`, walk up one label at a
+ * time (stopping at the zone apex) until a CAA RRset is found or the apex
+ * is reached with none. Returns 1 if `ca_host` (the configured ACME
+ * endpoint's hostname) is authorized — including the RFC 8659 default of
+ * "no CAA RRset anywhere in the chain" — 0 if a CAA RRset was found and
+ * none of its issue properties match, or -1 if the check could not be
+ * performed at all (no owning zone found). A -1 is treated as "proceed" by
+ * the caller: this is a fast, best-effort pre-flight, not a substitute for
+ * the CA's own mandatory CAA check, so an infra hiccup here must not block
+ * every renewal the way an ARI-fetch failure doesn't either. Only an
+ * explicit, successfully-read CAA denial refuses issuance. */
+static int caa_authorizes(const char *name, const char *ca_host) {
+    char zone[256];
+    if (find_owning_zone(name, zone, sizeof(zone)) < 0)
+        return -1;
+    char cur[256];
+    safe_strcpy(cur, name, sizeof(cur));
+    for (;;) {
+        char key[560], val[512];
+        snprintf(key, sizeof(key), "zone:%s:CAA:%s", zone, cur);
+        if (vk_get(key, val, sizeof(val)) && val[0]) {
+            char *sp = NULL;
+            strtok_r(val, "|", &sp);  /* ttl — unused here */
+            strtok_r(NULL, "|", &sp); /* flags — unused: we only ever check the
+                                       * "issue" tag, so an unrecognized
+                                       * critical tag doesn't change anything */
+            char *tag = strtok_r(NULL, "|", &sp);
+            char *caaval = strtok_r(NULL, "|", &sp);
+            if (tag && caaval && !strcasecmp(tag, "issue")) {
+                size_t hl = strlen(ca_host), vl = strlen(caaval);
+                if (vl > 0 && (strcasecmp(ca_host, caaval) == 0 ||
+                               (hl > vl && ca_host[hl - vl - 1] == '.' &&
+                                strcasecmp(ca_host + hl - vl, caaval) == 0)))
+                    return 1;
+            }
+            return 0; /* a CAA RRset exists here and does not authorize ca_host */
+        }
+        if (!strcasecmp(cur, zone))
+            break; /* reached the apex with nothing found */
+        char *dot = strchr(cur, '.');
+        if (!dot)
+            break;
+        memmove(cur, dot + 1, strlen(dot + 1) + 1);
+    }
+    return 1; /* no CAA RRset anywhere in the chain: default allow */
+}
+
+/* ── RFC 8739 STAR: order cancellation + recurrent-cert fetch ───────────── */
+
+/* RFC 8739 §5: cancel a recurrent order by POSTing {"status":"canceled"} to
+ * the order URL — only valid while the order is still "valid" per the RFC;
+ * a late/duplicate cancel just draws a 4xx from the CA, logged and ignored
+ * since the local acme:star_* state is cleared by the caller either way. */
+static void acme_star_cancel(const char *order_url) {
+    char h[256];
+    int p = 443;
+    char path[512];
+    parse_url(order_url, h, &p, path, sizeof(path));
+    char hdrs[4096] = {0};
+    int code = 0;
+    char *body = acme_post(order_url, "{\"status\":\"canceled\"}", h, p, &code, hdrs, sizeof(hdrs));
+    free(body);
+    if (code < 200 || code >= 300)
+        dns_log(LOG_WARNING,
+                "[ACME-STAR] cancel request returned %d (order may already be inactive)\n", code);
+}
+
+/* Fetch the current cert chain from a star-certificate URL: an
+ * unauthenticated GET if the CA granted allow-certificate-get, else an
+ * authenticated POST-as-GET (acme_post with a NULL payload — the same
+ * primitive already used to poll authz/order status). */
+static char *acme_star_fetch_cert(const char *url, int allow_get, int *code) {
+    char h[256];
+    int p = 443;
+    char path[512];
+    parse_url(url, h, &p, path, sizeof(path));
+    char hdrs[4096] = {0};
+    if (allow_get)
+        return https_req_mtls(h, p, "GET", path, NULL, NULL, NULL,
+                              g_acme_ca_pem[0] ? g_acme_ca_pem : NULL, NULL, code, hdrs,
+                              sizeof(hdrs));
+    return acme_post(url, NULL, h, p, code, hdrs, sizeof(hdrs));
+}
+
 static int acme_issue(void) {
     if (!g_acme_domain[0])
         return 0;
@@ -923,6 +1131,19 @@ static int acme_issue(void) {
     int acport = 443;
     char acpath[512];
     parse_url(g_acme_ca, achost, &acport, acpath, sizeof(acpath));
+    int is_ip = is_ip_literal(g_acme_domain);
+    if (!is_ip) {
+        int caa = caa_authorizes(g_acme_domain, achost);
+        if (caa == 0) {
+            dns_log(LOG_ERR,
+                    "[ACME] CAA policy for %s does not authorize %s — refusing to request "
+                    "(RFC 8659)\n",
+                    g_acme_domain, achost);
+            return -1;
+        }
+        if (caa < 0)
+            dns_log(LOG_DEBUG, "[ACME] CAA pre-flight check skipped (no owning zone found)\n");
+    }
     if (!g_acme_key) {
         char pem[MAX_PEM] = {0};
         if (vk_get("acme:account_key", pem, sizeof(pem)) && strlen(pem) > 10) {
@@ -966,16 +1187,46 @@ static int acme_issue(void) {
             dns_log(LOG_NOTICE, "[ACME] Account: %s\n", g_acme_account_url);
         }
     }
-    int is_ip = is_ip_literal(g_acme_domain);
     const char *chal_type = is_ip ? "tls-alpn-01" : g_acme_challenge_type;
     if (is_ip && strcmp(g_acme_challenge_type, "tls-alpn-01") != 0)
         dns_log(LOG_NOTICE,
                 "[ACME] %s is an IP identifier — dns-01 has no defined meaning for it "
                 "(RFC 8555 §8.4); forcing tls-alpn-01\n",
                 g_acme_domain);
-    char pay[512];
-    snprintf(pay, sizeof(pay), "{\"identifiers\":[{\"type\":\"%s\",\"value\":\"%s\"}]}",
-             is_ip ? "ip" : "dns", g_acme_domain);
+    /* RFC 8739 STAR: request a recurrent order — one authorization yields
+     * many short-lived certs over [now, star_end_epoch] instead of the
+     * normal one-cert-per-order model. Skipped for an IP identifier (RFC
+     * 8739 doesn't address "ip" identifiers) and if the CA doesn't
+     * advertise support. star_end_epoch stays in scope for the whole
+     * function — used later to persist acme:star_end_epoch on success. */
+    char extra[300] = "";
+    time_t star_end_epoch = 0;
+    if (g_acme_star_enabled && !is_ip) {
+        if (!g_acme_star_supported)
+            dns_log(LOG_WARNING, "[ACME-STAR] CA directory has no meta.auto-renewal — issuing a "
+                                 "normal certificate instead\n");
+        else {
+            time_t now_t = time(NULL);
+            int duration = g_acme_star_duration_secs > 0 ? g_acme_star_duration_secs : 30 * 86400;
+            if (g_acme_star_max_duration > 0 && duration > g_acme_star_max_duration)
+                duration = (int) g_acme_star_max_duration;
+            star_end_epoch = now_t + duration;
+            int lifetime = g_acme_star_lifetime_secs > 0 ? g_acme_star_lifetime_secs : 345600;
+            if (g_acme_star_min_lifetime > 0 && lifetime < g_acme_star_min_lifetime)
+                lifetime = (int) g_acme_star_min_lifetime;
+            char end_iso[32];
+            struct tm tmv;
+            gmtime_r(&star_end_epoch, &tmv);
+            strftime(end_iso, sizeof(end_iso), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+            snprintf(
+                extra, sizeof(extra),
+                ",\"auto-renewal\":{\"end-date\":\"%s\",\"lifetime\":%d,\"lifetime-adjust\":%d}",
+                end_iso, lifetime, g_acme_star_lifetime_adjust_secs);
+        }
+    }
+    char pay[1024];
+    snprintf(pay, sizeof(pay), "{\"identifiers\":[{\"type\":\"%s\",\"value\":\"%s\"}]%s}",
+             is_ip ? "ip" : "dns", g_acme_domain, extra);
     char ord_hdrs[4096] = {0};
     int code = 0;
     char *ord_body =
@@ -1148,6 +1399,7 @@ static int acme_issue(void) {
     char *fb = acme_post(finalize_url, fin_pay, fh, fp, &code, fin_hdrs, sizeof(fin_hdrs));
     free(fb);
     char cert_url[512] = {0};
+    char star_cert_url[512] = {0};
     dns_log(LOG_NOTICE, "[ACME] Polling order (up to 3min)\n");
     for (int i = 0; i < 30; i++) {
         sleep(6);
@@ -1160,24 +1412,14 @@ static int acme_issue(void) {
         char status[64] = {0};
         json_str(ob, "status", status, sizeof(status));
         json_str(ob, "certificate", cert_url, sizeof(cert_url));
+        json_str(ob, "star-certificate", star_cert_url, sizeof(star_cert_url));
         free(ob);
         dns_log(LOG_INFO, "[ACME] order status: %s\n", status);
-        if (!strcmp(status, "valid") && cert_url[0])
+        if (!strcmp(status, "valid") && (cert_url[0] || star_cert_url[0]))
             break;
     }
     dns_log(LOG_NOTICE, "[ACME] Order poll done\n");
-    if (!cert_url[0]) {
-        EVP_PKEY_free(dkey);
-        return -1;
-    }
-    char ch2[256];
-    int cp = 443;
-    char cpath[512];
-    parse_url(cert_url, ch2, &cp, cpath, sizeof(cpath));
-    char cdh[4096] = {0};
-    char *cert_pem = acme_post(cert_url, NULL, ch2, cp, &code, cdh, sizeof(cdh));
-    if (!cert_pem || code < 200 || code >= 300) {
-        free(cert_pem);
+    if (!cert_url[0] && !star_cert_url[0]) {
         EVP_PKEY_free(dkey);
         return -1;
     }
@@ -1191,8 +1433,127 @@ static int acme_issue(void) {
     key_pem[kn] = 0;
     BIO_free(kb);
     EVP_PKEY_free(dkey);
+
+    if (star_cert_url[0]) {
+        /* RFC 8739: this order recurs — there is no new CSR/finalize per
+         * refresh, so the CSR key generated above must be persisted and
+         * reused for every future star-certificate fetch (acme_star_tick).
+         * Persist state, then do the first fetch to populate cert:current
+         * right away rather than waiting for the next renewal tick. */
+        vk_set("acme:star_order_url", order_url, 0);
+        vk_set("acme:star_cert_url", star_cert_url, 0);
+        char end_s[32];
+        snprintf(end_s, sizeof(end_s), "%lld", (long long) star_end_epoch);
+        vk_set("acme:star_end_epoch", end_s, 0);
+        vk_set("acme:star_allow_get", g_acme_star_ca_allow_get ? "1" : "0", 0);
+        vk_set("acme:star_key_pem", key_pem, 0);
+        dns_log(LOG_NOTICE, "[ACME-STAR] recurrent order established for %s: %s\n", g_acme_domain,
+                star_cert_url);
+        int code2 = 0;
+        char *pem = acme_star_fetch_cert(star_cert_url, g_acme_star_ca_allow_get, &code2);
+        if (!pem || code2 < 200 || code2 >= 300) {
+            dns_log(LOG_ERR, "[ACME-STAR] initial star-certificate fetch failed (%d)\n", code2);
+            free(pem);
+            return -1;
+        }
+        cert_post_issue(g_acme_domain, pem, key_pem);
+        free(pem);
+        return 0;
+    }
+
+    char ch2[256];
+    int cp = 443;
+    char cpath[512];
+    parse_url(cert_url, ch2, &cp, cpath, sizeof(cpath));
+    char cdh[4096] = {0};
+    char *cert_pem = acme_post(cert_url, NULL, ch2, cp, &code, cdh, sizeof(cdh));
+    if (!cert_pem || code < 200 || code >= 300) {
+        free(cert_pem);
+        return -1;
+    }
     cert_post_issue(g_acme_domain, cert_pem, key_pem);
     free(cert_pem);
+    return 0;
+}
+
+/* RFC 8739 STAR: is the currently-active cert (from cert:current, mirrored
+ * into g_tls_cert_pem by cert_current_load) close enough to its own expiry
+ * to need a fresh star-certificate fetch? Absent/unparseable cert => yes.
+ * config:acme_star_renew_before_secs overrides the default of half the
+ * configured per-cert lifetime. */
+static int acme_star_needs_refresh(void) {
+    if (!g_tls_cert_pem[0])
+        return 1;
+    BIO *b = BIO_new_mem_buf(g_tls_cert_pem, -1);
+    X509 *cert = PEM_read_bio_X509(b, NULL, NULL, NULL);
+    BIO_free(b);
+    if (!cert)
+        return 1;
+    int days = 0, secs = 0;
+    ASN1_TIME_diff(&days, &secs, NULL, X509_get0_notAfter(cert));
+    X509_free(cert);
+    long remaining = (long) days * 86400 + secs;
+    long threshold = g_acme_star_renew_before_secs > 0 ? g_acme_star_renew_before_secs
+                                                       : g_acme_star_lifetime_secs / 2;
+    return remaining <= threshold;
+}
+
+/* RFC 8739 STAR tick, called from renewal_check() in place of the normal
+ * acme_needs_renewal()/acme_issue() pair whenever config:acme_star_enabled
+ * is set OR a previously-established recurrent order is still on record
+ * (so turning the feature off cleanly cancels rather than orphaning it at
+ * the CA). Three outcomes: cancel-and-clear (disabled but state exists),
+ * establish a new recurrent order (enabled but no active/unexpired order —
+ * this reuses acme_issue()'s entire challenge/CSR machinery, CAA pre-flight
+ * included), or a lightweight cert-only refresh (active order, current
+ * cert nearing its own expiry) that never touches the authorization/
+ * challenge flow at all — the whole point of STAR. */
+static int acme_star_tick(void) {
+    char order_url[512] = "";
+    vk_get("acme:star_order_url", order_url, sizeof(order_url));
+    if (!g_acme_star_enabled) {
+        if (order_url[0]) {
+            dns_log(LOG_NOTICE,
+                    "[ACME-STAR] feature disabled with an active recurrent order — canceling\n");
+            acme_star_cancel(order_url);
+            vk_del("acme:star_order_url");
+            vk_del("acme:star_cert_url");
+            vk_del("acme:star_end_epoch");
+            vk_del("acme:star_allow_get");
+            vk_del("acme:star_key_pem");
+        }
+        return 0;
+    }
+    if (!g_acme_domain[0])
+        return 0;
+    char cert_url[512] = "", end_s[32] = "";
+    vk_get("acme:star_cert_url", cert_url, sizeof(cert_url));
+    vk_get("acme:star_end_epoch", end_s, sizeof(end_s));
+    time_t end_epoch = end_s[0] ? (time_t) atoll(end_s) : 0;
+    time_t now = time(NULL);
+    if (!order_url[0] || !cert_url[0] || end_epoch <= now) {
+        dns_log(LOG_NOTICE, "[ACME-STAR] establishing a new recurrent order for %s\n",
+                g_acme_domain);
+        return acme_issue();
+    }
+    if (!acme_star_needs_refresh())
+        return 0;
+    char allow_get_s[8] = "", key_pem[MAX_PEM] = "";
+    vk_get("acme:star_allow_get", allow_get_s, sizeof(allow_get_s));
+    if (!vk_get("acme:star_key_pem", key_pem, sizeof(key_pem)) || !key_pem[0]) {
+        dns_log(LOG_ERR, "[ACME-STAR] missing persisted key for the active recurrent order\n");
+        return -1;
+    }
+    int code = 0;
+    char *pem = acme_star_fetch_cert(cert_url, allow_get_s[0] == '1', &code);
+    if (!pem || code < 200 || code >= 300) {
+        dns_log(LOG_ERR, "[ACME-STAR] star-certificate refresh failed (%d)\n", code);
+        free(pem);
+        return -1;
+    }
+    dns_log(LOG_NOTICE, "[ACME-STAR] refreshed cert for %s\n", g_acme_domain);
+    cert_post_issue(g_acme_domain, pem, key_pem);
+    free(pem);
     return 0;
 }
 
@@ -1566,6 +1927,15 @@ static void load_config(void) {
     }
     if (vk_get("config:acme_tls_alpn_port", val, sizeof(val)) && val[0])
         g_acme_tls_alpn_port = atoi(val);
+    g_acme_star_enabled = vk_get("config:acme_star_enabled", val, sizeof(val)) && !strcmp(val, "1");
+    if (vk_get("config:acme_star_lifetime_secs", val, sizeof(val)) && val[0])
+        g_acme_star_lifetime_secs = atoi(val);
+    if (vk_get("config:acme_star_lifetime_adjust_secs", val, sizeof(val)) && val[0])
+        g_acme_star_lifetime_adjust_secs = atoi(val);
+    if (vk_get("config:acme_star_duration_secs", val, sizeof(val)) && val[0])
+        g_acme_star_duration_secs = atoi(val);
+    if (vk_get("config:acme_star_renew_before_secs", val, sizeof(val)) && val[0])
+        g_acme_star_renew_before_secs = atol(val);
     vk_get("config:acme_client_cert_pem", g_acme_client_cert_pem, sizeof(g_acme_client_cert_pem));
     vk_get("config:acme_client_key_pem", g_acme_client_key_pem, sizeof(g_acme_client_key_pem));
     vk_get("config:acme_ca_pem", g_acme_ca_pem, sizeof(g_acme_ca_pem));
@@ -1586,6 +1956,20 @@ static int renewal_check(void) {
         dns_log(LOG_INFO,
                 "[PKI] Nothing configured (config:acme_domain / config:est_server empty)\n");
         return 0;
+    }
+    if (g_acme_domain[0]) {
+        char leftover[512] = "";
+        vk_get("acme:star_order_url", leftover, sizeof(leftover));
+        /* STAR (enabled, or disabled-but-still-has-an-order-to-cancel) owns
+         * the whole renewal decision for this domain — it is a different
+         * cadence (short-lived certs, no per-renewal reauthorization) from
+         * the fixed-threshold model below, not a variant of it. */
+        if (g_acme_star_enabled || leftover[0]) {
+            int ok = acme_star_tick();
+            if (ok < 0)
+                dns_log(LOG_ERR, "[ACME-STAR] recurrent renewal failed\n");
+            return ok;
+        }
     }
     if (!est_needs_renewal() && !acme_needs_renewal())
         return 0;
