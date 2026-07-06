@@ -852,6 +852,13 @@ static int epp_build_greeting(char *out, int outcap) {
                     "<objURI>urn:ietf:params:xml:ns:domain-1.0</objURI>"
                     "<objURI>urn:ietf:params:xml:ns:host-1.0</objURI>"
                     "<objURI>urn:ietf:params:xml:ns:contact-1.0</objURI>"
+                    "<objURI>urn:ietf:params:xml:ns:org-1.0</objURI>"
+                    "<svcExtension>"
+                    "<extURI>urn:ietf:params:xml:ns:secDNS-1.1</extURI>"
+                    "<extURI>urn:ietf:params:xml:ns:rgp-1.0</extURI>"
+                    "<extURI>urn:ietf:params:xml:ns:fee-0.11</extURI>"
+                    "<extURI>urn:ietf:params:xml:ns:changePoll-1.0</extURI>"
+                    "</svcExtension>"
                     "</svcMenu>"
                     "<dcp>"
                     "<access><all/></access>"
@@ -949,7 +956,26 @@ static int epp_handle_login(epp_session_t *sess, const char *xml, int len, int c
 #define EPP_TAG_TRANSFER_REDATE 18  /* u32 unix time, domain only */
 #define EPP_TAG_TRANSFER_STATUS 19  /* domain only — "", "pending", "clientApproved", ... */
 
-#define EPP_MAX_ARR 16 /* status/ns/addr/ds entries per object — ample for Phase 1/2 */
+/* Phase 3 additions (RFC 5730 poll queue, RFC 8590 changePoll, RFC 8543 org
+ * mapping — see CLAUDE-eppd.md). Poll-message tags (20-28) and org tags
+ * (29-31) are disjoint ranges purely for this file's own readability; TLV
+ * tag numbers are scoped per encode/decode function, not global, so reuse
+ * across object types (e.g. EPP_TAG_EMAIL for both contact and org) is
+ * already established practice above and still safe. */
+#define EPP_TAG_MSG 20          /* poll message only — human-readable text */
+#define EPP_TAG_QDATE 21        /* poll message only — u32 unix time enqueued */
+#define EPP_TAG_OBJTYPE 22      /* poll message only — "domain"/"host"/"contact" */
+#define EPP_TAG_OBJID 23        /* poll message only — the object's name/id */
+#define EPP_TAG_CP_STATE 24     /* poll message only — RFC 8590 changePoll state ("before"/"after") */
+#define EPP_TAG_CP_OPERATION 25 /* poll message only — RFC 8590 changePoll operation */
+#define EPP_TAG_CP_WHO 26       /* poll message only — RFC 8590 changePoll who (clID or "eppd") */
+#define EPP_TAG_CP_REASON 27    /* poll message only — RFC 8590 changePoll reason */
+#define EPP_TAG_RESDATA 28      /* poll message only — raw <resData> child XML, e.g. domain:trnData */
+#define EPP_TAG_PARENTID 29     /* org only — optional parent org id */
+#define EPP_TAG_ROLE 30         /* repeated, org only — RFC 8543 role token */
+#define EPP_TAG_ORGID 31        /* org only — the org's own id (also the Valkey key) */
+
+#define EPP_MAX_ARR 16 /* status/ns/addr/ds/role entries per object — ample for Phase 1/2/3 */
 #define EPP_DS_MAX_DIGEST 68 /* SHA-512 (64) + headroom; covers every registered digest type */
 
 /* RFC 3915 RGP grace-period state a domain can be in. NONE covers ordinary
@@ -1058,6 +1084,28 @@ typedef struct {
     char authinfo[256];
     uint32_t crdate;
 } epp_contact_t;
+
+/* RFC 8543 organization mapping (Phase 3), simplified for a private/
+ * internal registry the same way contact is: id/role(s)/parentId/email/
+ * voice, no postalInfo block. Not transferable (no authInfo — orgs aren't
+ * registrant-owned domain-like objects, per the base spec). Deliberately
+ * NOT cross-linked into domain/host/contact's own create/update (no
+ * <org:roid> extension support there) — this lands the org object type
+ * itself, which is RFC 8543's core; wiring other objects to reference an
+ * org is a separate, smaller follow-up if ever needed. */
+typedef struct {
+    char id[64];
+    char roid[32];
+    char clid[64];
+    char status[EPP_MAX_ARR][32];
+    int nstatus;
+    char parentid[64];
+    char roles[EPP_MAX_ARR][32];
+    int nroles;
+    char email[128];
+    char voice[32];
+    uint32_t crdate;
+} epp_org_t;
 
 static int epp_domain_encode(const epp_domain_t *d, uint8_t *buf, int cap) {
     int off = tlv_begin(buf, cap, 1);
@@ -1360,6 +1408,105 @@ static int epp_contact_decode(const uint8_t *buf, int len, epp_contact_t *c) {
     return r < 0 ? -1 : 0;
 }
 
+static int epp_org_encode(const epp_org_t *o, uint8_t *buf, int cap) {
+    int off = tlv_begin(buf, cap, 1);
+    if (off < 0)
+        return -1;
+    off = tlv_put(buf, cap, off, EPP_TAG_ORGID, (const uint8_t *) o->id, (int) strlen(o->id));
+    if (off >= 0)
+        off = tlv_put(buf, cap, off, EPP_TAG_ROID, (const uint8_t *) o->roid, (int) strlen(o->roid));
+    if (off >= 0 && o->clid[0])
+        off =
+            tlv_put(buf, cap, off, EPP_TAG_CLID, (const uint8_t *) o->clid, (int) strlen(o->clid));
+    for (int i = 0; off >= 0 && i < o->nstatus; i++)
+        off = tlv_put(buf, cap, off, EPP_TAG_STATUS, (const uint8_t *) o->status[i],
+                      (int) strlen(o->status[i]));
+    if (off >= 0 && o->parentid[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_PARENTID, (const uint8_t *) o->parentid,
+                      (int) strlen(o->parentid));
+    for (int i = 0; off >= 0 && i < o->nroles; i++)
+        off = tlv_put(buf, cap, off, EPP_TAG_ROLE, (const uint8_t *) o->roles[i],
+                      (int) strlen(o->roles[i]));
+    if (off >= 0 && o->email[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_EMAIL, (const uint8_t *) o->email,
+                      (int) strlen(o->email));
+    if (off >= 0 && o->voice[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_VOICE, (const uint8_t *) o->voice,
+                      (int) strlen(o->voice));
+    if (off >= 0)
+        off = tlv_put_u32(buf, cap, off, EPP_TAG_CRDATE, o->crdate);
+    return off;
+}
+
+static int epp_org_decode(const uint8_t *buf, int len, epp_org_t *o) {
+    memset(o, 0, sizeof(*o));
+    int off = 1;
+    uint8_t tag;
+    const uint8_t *val;
+    uint16_t vlen;
+    int r;
+    while ((r = tlv_next(buf, len, &off, &tag, &val, &vlen)) == 1) {
+        switch (tag) {
+            case EPP_TAG_ORGID:
+                if (vlen < sizeof(o->id)) {
+                    memcpy(o->id, val, vlen);
+                    o->id[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_ROID:
+                if (vlen < sizeof(o->roid)) {
+                    memcpy(o->roid, val, vlen);
+                    o->roid[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_CLID:
+                if (vlen < sizeof(o->clid)) {
+                    memcpy(o->clid, val, vlen);
+                    o->clid[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_STATUS:
+                if (o->nstatus < EPP_MAX_ARR && vlen < sizeof(o->status[0])) {
+                    memcpy(o->status[o->nstatus], val, vlen);
+                    o->status[o->nstatus][vlen] = 0;
+                    o->nstatus++;
+                }
+                break;
+            case EPP_TAG_PARENTID:
+                if (vlen < sizeof(o->parentid)) {
+                    memcpy(o->parentid, val, vlen);
+                    o->parentid[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_ROLE:
+                if (o->nroles < EPP_MAX_ARR && vlen < sizeof(o->roles[0])) {
+                    memcpy(o->roles[o->nroles], val, vlen);
+                    o->roles[o->nroles][vlen] = 0;
+                    o->nroles++;
+                }
+                break;
+            case EPP_TAG_EMAIL:
+                if (vlen < sizeof(o->email)) {
+                    memcpy(o->email, val, vlen);
+                    o->email[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_VOICE:
+                if (vlen < sizeof(o->voice)) {
+                    memcpy(o->voice, val, vlen);
+                    o->voice[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_CRDATE:
+                o->crdate = tlv_u32_of(val, vlen);
+                break;
+            default:
+                break;
+        }
+    }
+    return r < 0 ? -1 : 0;
+}
+
 static void epp_iso_date(uint32_t unixtime, char *out, int cap) {
     time_t t = (time_t) unixtime;
     struct tm tmv;
@@ -1540,6 +1687,41 @@ static long epp_cfg_secs(const char *key, long defval) {
 #define EPPD_TRANSFER_GRACE_SECS() epp_cfg_secs("config:eppd_transfer_grace_secs", 5L * 86400)
 #define EPPD_TRANSFER_PENDING_SECS() epp_cfg_secs("config:eppd_transfer_pending_secs", 5L * 86400)
 #define EPPD_RGP_TICK_SECS() epp_cfg_secs("config:eppd_rgp_tick_secs", 3600L)
+
+/* RFC 8748 fee extension (Phase 3) — flat, informational quoting only, per
+ * the scoping decision in CLAUDE-eppd.md: this is a private/internal
+ * registry with no billing/payment system to enforce a balance against, so
+ * `eppd` always reports the configured flat fee for the requested command
+ * and never declines an operation over it. `config:eppd_fee_<command>`
+ * (command in create/renew/transfer) defaults to "0.00" — a deployment
+ * that wants real numbers configures them; unconfigured means "free",
+ * not "unavailable" (a fee-aware client must still get a well-formed
+ * quote, not an error, from a registry that simply hasn't set prices). */
+static void epp_fee_currency(char *out, int cap) {
+    if (!vk_get("config:eppd_fee_currency", out, cap) || !out[0])
+        safe_strcpy(out, "USD", (size_t) cap);
+}
+static void epp_fee_amount(const char *command, char *out, int cap) {
+    char key[64];
+    snprintf(key, sizeof(key), "config:eppd_fee_%s", command);
+    if (!vk_get(key, out, cap) || !out[0])
+        safe_strcpy(out, "0.00", (size_t) cap);
+}
+/* Builds the RFC 8748 response fragment for `command` ("create"/"renew"/
+ * "transfer"), wrapped in its own <extension> — used only when the
+ * matching request extension (<fee:create>/<fee:renew>/<fee:transfer>) was
+ * present. `wraptag` is the per-command response element name
+ * ("fee:creData"/"fee:renData"/"fee:trnData" per RFC 8748). */
+static void epp_fee_response_extension(const char *command, const char *wraptag, char *out,
+                                       int cap) {
+    char currency[8], fee[16];
+    epp_fee_currency(currency, sizeof(currency));
+    epp_fee_amount(command, fee, sizeof(fee));
+    snprintf(out, (size_t) cap,
+            "<extension><%s xmlns:fee=\"urn:ietf:params:xml:ns:fee-0.11\">"
+            "<fee:currency>%s</fee:currency><fee:fee>%s</fee:fee></%s></extension>",
+            wraptag, currency, fee, wraptag);
+}
 
 /* Does d->status[] contain `name` (one of the client-settable prohibition/
  * hold flags — clientUpdateProhibited, clientDeleteProhibited,
@@ -1819,12 +2001,149 @@ static int epp_contact_info(epp_session_t *sess, const char *xml, int cmd_s, int
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
+/* ── org:* command handlers (RFC 8543, Phase 3) ───────────────────────── */
+static int epp_org_check(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs, int qe,
+                         const char *cltrid, char *resp, int rcap) {
+    (void) sess;
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "org:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: org:id", NULL,
+                                cltrid);
+    char key[300], blob[16];
+    snprintf(key, sizeof(key), "epp:org:%s", id);
+    int exists = vk_get(key, blob, sizeof(blob));
+    char extra[400];
+    snprintf(extra, sizeof(extra),
+             "<chkData xmlns=\"urn:ietf:params:xml:ns:org-1.0\">"
+             "<cd><id avail=\"%d\">%s</id></cd></chkData>",
+             exists ? 0 : 1, id);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+}
+
+static int epp_org_create(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs, int qe,
+                          const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "org:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: org:id", NULL,
+                                cltrid);
+    char key[300], existing[16];
+    snprintf(key, sizeof(key), "epp:org:%s", id);
+    if (vk_get(key, existing, sizeof(existing)))
+        return epp_build_result(resp, rcap, 2302, "Object exists", NULL, cltrid);
+
+    epp_org_t o;
+    memset(&o, 0, sizeof(o));
+    safe_strcpy(o.id, id, sizeof(o.id));
+    safe_strcpy(o.clid, sess->clid, sizeof(o.clid));
+    int pos = qs, rs, re, rnp;
+    while (o.nroles < EPP_MAX_ARR &&
+           xml_find_child(xml, pos, qe, "org:role", &rs, &re, &rnp) == 1) {
+        char role[32] = "";
+        if (xml_text_decode(xml, rs, re, role, sizeof(role)) >= 0 && role[0])
+            safe_strcpy(o.roles[o.nroles++], role, sizeof(o.roles[0]));
+        pos = rnp;
+    }
+    int pids, pide, pidnp;
+    if (xml_find_child(xml, qs, qe, "org:parentId", &pids, &pide, &pidnp) == 1)
+        xml_text_decode(xml, pids, pide, o.parentid, sizeof(o.parentid));
+    int es_, ee_, enp;
+    if (xml_find_child(xml, qs, qe, "org:email", &es_, &ee_, &enp) == 1)
+        xml_text_decode(xml, es_, ee_, o.email, sizeof(o.email));
+    int vs_, ve_, vnp;
+    if (xml_find_child(xml, qs, qe, "org:voice", &vs_, &ve_, &vnp) == 1)
+        xml_text_decode(xml, vs_, ve_, o.voice, sizeof(o.voice));
+    epp_gen_roid(o.roid, sizeof(o.roid), "EPPD-O");
+    o.crdate = (uint32_t) time(NULL);
+    safe_strcpy(o.status[0], "ok", sizeof(o.status[0]));
+    o.nstatus = 1;
+
+    uint8_t tlv[2048];
+    int tlen = epp_org_encode(&o, tlv, sizeof(tlv));
+    if (tlen < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[4096];
+    hex_enc(tlv, tlen, hexbuf);
+    vk_set(key, hexbuf);
+
+    char crdatestr[32];
+    epp_iso_date(o.crdate, crdatestr, sizeof(crdatestr));
+    char extra[400];
+    snprintf(extra, sizeof(extra),
+             "<creData xmlns=\"urn:ietf:params:xml:ns:org-1.0\">"
+             "<id>%s</id><crDate>%s</crDate></creData>",
+             id, crdatestr);
+    dns_log(LOG_NOTICE, "[eppd] org created: %s (%d role(s))\n", id, o.nroles);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+}
+
+static int epp_org_info(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs, int qe,
+                        const char *cltrid, char *resp, int rcap) {
+    (void) sess;
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "org:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: org:id", NULL,
+                                cltrid);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:org:%s", id);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[2048];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_org_t o;
+    if (tlen < 0 || epp_org_decode(tlv, tlen, &o) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    char rolesxml[600] = "";
+    int roff = 0;
+    for (int i = 0; i < o.nroles && roff < (int) sizeof(rolesxml) - 1; i++)
+        roff += snprintf(rolesxml + roff, sizeof(rolesxml) - roff, "<role>%s</role>", o.roles[i]);
+    char statusxml[300] = "";
+    int soff = 0;
+    for (int i = 0; i < o.nstatus && soff < (int) sizeof(statusxml) - 1; i++)
+        soff +=
+            snprintf(statusxml + soff, sizeof(statusxml) - soff, "<status s=\"%s\"/>", o.status[i]);
+    char crdatestr[32];
+    epp_iso_date(o.crdate, crdatestr, sizeof(crdatestr));
+    char extra[1300];
+    snprintf(extra, sizeof(extra),
+             "<infData xmlns=\"urn:ietf:params:xml:ns:org-1.0\">"
+             "<id>%s</id><roid>%s</roid>%s%s%s%s%s"
+             "<clID>%s</clID><crDate>%s</crDate></infData>",
+             id, o.roid, statusxml, rolesxml, o.parentid[0] ? "<parentId>" : "",
+             o.parentid[0] ? o.parentid : "", o.parentid[0] ? "</parentId>" : "", o.clid, crdatestr);
+    (void) o.email;
+    (void) o.voice; /* not echoed in infData yet, mirrors contact's own simplification */
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+}
+
+/* Finds a named child of <command>'s <extension> sibling (e.g. RFC 5910's
+ * secDNS:create/update, or RFC 8748's fee:check/create/renew/transfer) —
+ * every EPP extension rides in <command>'s <extension> sibling, not inside
+ * the base command element itself, so callers need the whole command range
+ * (cmd_s/cmd_e), not just their own object-command range. */
+static int epp_find_secdns_block(const char *xml, int cmd_s, int cmd_e, const char *secdns_tag,
+                                 int *bs, int *be) {
+    int es, ee, enp;
+    if (xml_find_child(xml, cmd_s, cmd_e, "extension", &es, &ee, &enp) != 1)
+        return 0;
+    return xml_find_child(xml, es, ee, secdns_tag, bs, be, &enp);
+}
+
 /* ── domain:* command handlers (RFC 5731) ─────────────────────────────── */
 static int epp_domain_check(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
                             int qe, const char *cltrid, char *resp, int rcap) {
     (void) sess;
-    (void) cmd_s;
-    (void) cmd_e;
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "domain:name", &ns, &ne, &np) != 1 ||
@@ -1835,11 +2154,45 @@ static int epp_domain_check(epp_session_t *sess, const char *xml, int cmd_s, int
     char key[300], blob[16];
     snprintf(key, sizeof(key), "epp:domain:%s", name);
     int exists = vk_get(key, blob, sizeof(blob));
-    char extra[600];
-    snprintf(extra, sizeof(extra),
+    char chkdata[600];
+    snprintf(chkdata, sizeof(chkdata),
              "<chkData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
              "<cd><name avail=\"%d\">%s</name></cd></chkData>",
              exists ? 0 : 1, name);
+
+    /* RFC 8748 fee extension: <extension><fee:check><fee:command
+     * name="create"><fee:period unit="y">N</fee:period></fee:command>
+     * </fee:check></extension> requests a fee quote alongside the
+     * availability check (single-name only — this domain:check has never
+     * supported multiple <domain:name>s, a pre-existing Phase 1 scope
+     * limit, not something this extension changes). */
+    char extra[1300];
+    int fcs, fce;
+    if (epp_find_secdns_block(xml, cmd_s, cmd_e, "fee:check", &fcs, &fce) == 1) {
+        char command[32] = "create";
+        char cattr[32] = "";
+        int ccs, cce, ccnp;
+        if (xml_find_child_attr(xml, fcs, fce, "fee:command", "name", cattr, sizeof(cattr), &ccs,
+                                &cce, &ccnp) == 1 &&
+            cattr[0])
+            safe_strcpy(command, cattr, sizeof(command));
+        char period[16] = "1";
+        int pes, pee, penp;
+        if (xml_find_child(xml, fcs, fce, "fee:period", &pes, &pee, &penp) == 1)
+            xml_text_decode(xml, pes, pee, period, sizeof(period));
+        char currency[8], fee[16];
+        epp_fee_currency(currency, sizeof(currency));
+        epp_fee_amount(command, fee, sizeof(fee));
+        snprintf(extra, sizeof(extra),
+                "%s<extension><fee:chkData xmlns:fee=\"urn:ietf:params:xml:ns:fee-0.11\">"
+                "<fee:cd><fee:objID>%s</fee:objID><fee:class>standard</fee:class>"
+                "<fee:command name=\"%s\"><fee:period unit=\"y\">%s</fee:period>"
+                "<fee:currency>%s</fee:currency><fee:fee>%s</fee:fee></fee:command>"
+                "</fee:cd></fee:chkData></extension>",
+                chkdata, name, command, period, currency, fee);
+    } else {
+        safe_strcpy(extra, chkdata, sizeof(extra));
+    }
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
@@ -1920,18 +2273,6 @@ static int epp_domain_parse_ns(const char *xml, int qs, int qe, char ns_out[][25
         break;
     }
     return nns;
-}
-
-/* ── RFC 5910 secDNS extension (DS mapping) ───────────────────────────────
- * RFC 5910's DS data always rides in <command>'s <extension> sibling, not
- * inside <create>/<update> itself, so these need the whole command range
- * (cmd_s/cmd_e), not just the domain:create/domain:update object range. */
-static int epp_find_secdns_block(const char *xml, int cmd_s, int cmd_e, const char *secdns_tag,
-                                 int *bs, int *be) {
-    int es, ee, enp;
-    if (xml_find_child(xml, cmd_s, cmd_e, "extension", &es, &ee, &enp) != 1)
-        return 0;
-    return xml_find_child(xml, es, ee, secdns_tag, bs, be, &enp);
 }
 
 /* Parses every <secDNS:dsData> child of [s,e) into ds_out[], up to max
@@ -2049,11 +2390,20 @@ static int epp_domain_create(epp_session_t *sess, const char *xml, int cmd_s, in
     char crdatestr[32], exdatestr[32];
     epp_iso_date(d.crdate, crdatestr, sizeof(crdatestr));
     epp_iso_date(d.exdate, exdatestr, sizeof(exdatestr));
-    char extra[512];
-    snprintf(extra, sizeof(extra),
+    char credata[512];
+    snprintf(credata, sizeof(credata),
              "<creData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
              "<name>%s</name><crDate>%s</crDate><exDate>%s</exDate></creData>",
              name, crdatestr, exdatestr);
+    char extra[1000];
+    int fes, fee_e;
+    if (epp_find_secdns_block(xml, cmd_s, cmd_e, "fee:create", &fes, &fee_e) == 1) {
+        char feeext[400];
+        epp_fee_response_extension("create", "fee:creData", feeext, sizeof(feeext));
+        snprintf(extra, sizeof(extra), "%s%s", credata, feeext);
+    } else {
+        safe_strcpy(extra, credata, sizeof(extra));
+    }
     dns_log(LOG_NOTICE, "[eppd] domain created: %s (%d ns, %d ds)\n", name, nns, nds);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
@@ -2490,6 +2840,160 @@ static int epp_contact_delete(epp_session_t *sess, const char *xml, int cmd_s, i
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
 }
 
+/* ── org:* update/delete (RFC 8543, Phase 3) ──────────────────────────── */
+static int epp_org_update(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                          int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "org:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: org:id", NULL,
+                                cltrid);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:org:%s", id);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[2048];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_org_t o;
+    if (tlen < 0 || epp_org_decode(tlv, tlen, &o) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (o.clid[0] && strcmp(o.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    for (int i = 0; i < o.nstatus; i++)
+        if (strcmp(o.status[i], "clientUpdateProhibited") == 0)
+            return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL,
+                                    cltrid);
+
+    int as, ae, anp;
+    if (xml_find_child(xml, qs, qe, "add", &as, &ae, &anp) == 1) {
+        int pos = as, rs, re, rnp;
+        while (o.nroles < EPP_MAX_ARR &&
+               xml_find_child(xml, pos, ae, "org:role", &rs, &re, &rnp) == 1) {
+            char role[32] = "";
+            if (xml_text_decode(xml, rs, re, role, sizeof(role)) >= 0 && role[0]) {
+                int dup = 0;
+                for (int i = 0; i < o.nroles; i++)
+                    if (strcmp(o.roles[i], role) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                if (!dup)
+                    safe_strcpy(o.roles[o.nroles++], role, sizeof(o.roles[0]));
+            }
+            pos = rnp;
+        }
+        pos = as;
+        char sval[32];
+        int xs, xe, xnp;
+        while (o.nstatus < EPP_MAX_ARR &&
+               xml_find_child_attr(xml, pos, ae, "org:status", "s", sval, sizeof(sval), &xs, &xe,
+                                   &xnp) == 1) {
+            if (sval[0] && epp_status_settable(sval)) {
+                int dup = 0;
+                for (int i = 0; i < o.nstatus; i++)
+                    if (strcmp(o.status[i], sval) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                if (!dup)
+                    safe_strcpy(o.status[o.nstatus++], sval, sizeof(o.status[0]));
+            }
+            pos = xnp;
+        }
+    }
+    int rs2, re2, rnp2;
+    if (xml_find_child(xml, qs, qe, "rem", &rs2, &re2, &rnp2) == 1) {
+        int pos = rs2, rs, re, rnp;
+        while (xml_find_child(xml, pos, re2, "org:role", &rs, &re, &rnp) == 1) {
+            char role[32] = "";
+            xml_text_decode(xml, rs, re, role, sizeof(role));
+            for (int i = 0; i < o.nroles; i++)
+                if (strcmp(o.roles[i], role) == 0) {
+                    memmove(&o.roles[i], &o.roles[i + 1],
+                           (size_t) (o.nroles - i - 1) * sizeof(o.roles[0]));
+                    o.nroles--;
+                    i--;
+                }
+            pos = rnp;
+        }
+        pos = rs2;
+        char sval[32];
+        int xs, xe, xnp;
+        while (xml_find_child_attr(xml, pos, re2, "org:status", "s", sval, sizeof(sval), &xs, &xe,
+                                   &xnp) == 1) {
+            for (int i = 0; i < o.nstatus; i++)
+                if (strcmp(o.status[i], sval) == 0) {
+                    memmove(&o.status[i], &o.status[i + 1],
+                           (size_t) (o.nstatus - i - 1) * sizeof(o.status[0]));
+                    o.nstatus--;
+                    i--;
+                }
+            pos = xnp;
+        }
+    }
+    int chs, che, chnp;
+    if (xml_find_child(xml, qs, qe, "chg", &chs, &che, &chnp) == 1) {
+        int pids, pide, pidnp;
+        if (xml_find_child(xml, chs, che, "org:parentId", &pids, &pide, &pidnp) == 1)
+            xml_text_decode(xml, pids, pide, o.parentid, sizeof(o.parentid));
+        int es_, ee_, enp;
+        if (xml_find_child(xml, chs, che, "org:email", &es_, &ee_, &enp) == 1)
+            xml_text_decode(xml, es_, ee_, o.email, sizeof(o.email));
+        int vs_, ve_, vnp;
+        if (xml_find_child(xml, chs, che, "org:voice", &vs_, &ve_, &vnp) == 1)
+            xml_text_decode(xml, vs_, ve_, o.voice, sizeof(o.voice));
+    }
+    uint8_t tlv2[2048];
+    int tlen2 = epp_org_encode(&o, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[4096];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(key, hexbuf);
+    dns_log(LOG_NOTICE, "[eppd] org updated: %s\n", id);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
+/* No association guard on delete: unlike host/contact, nothing in this
+ * implementation stores a reference TO an org (the <org:roid> cross-link
+ * onto domain/host/contact was deliberately not wired — see epp_org_t's
+ * comment), so there is nothing to check. If that linkage is ever added,
+ * this delete must gain the same 2305 guard host/contact already have. */
+static int epp_org_delete(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                          int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "org:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: org:id", NULL,
+                                cltrid);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:org:%s", id);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[2048];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_org_t o;
+    if (tlen < 0 || epp_org_decode(tlv, tlen, &o) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (o.clid[0] && strcmp(o.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    for (int i = 0; i < o.nstatus; i++)
+        if (strcmp(o.status[i], "clientDeleteProhibited") == 0)
+            return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL,
+                                    cltrid);
+    vk_del(key);
+    dns_log(LOG_NOTICE, "[eppd] org deleted: %s\n", id);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
 /* ── domain:* update/delete (RFC 5731) + RGP (RFC 3915) + secDNS (RFC 5910) ── */
 static int epp_domain_update(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
                              int qe, const char *cltrid, char *resp, int rcap) {
@@ -2754,12 +3258,358 @@ static int epp_domain_delete(epp_session_t *sess, const char *xml, int cmd_s, in
                             cltrid);
 }
 
+/* domain:renew (RFC 5731 §3.2.5, Phase 3). <domain:curExpDate> is an
+ * optimistic-concurrency check — the registrar must state the expiration
+ * date it believes is current, so a renew racing another change (autorenew,
+ * a transfer-driven extension) is caught rather than silently compounding
+ * onto an unexpected base. Only the date component is compared (curExpDate
+ * is a plain date per the schema; a client sending a full datetime is
+ * tolerated by comparing just the leading YYYY-MM-DD). A manual renew
+ * clears any in-flight RGP grace state — it is a deliberate registrar
+ * action, not the passive autorenew timeout that state exists to track. */
+static int epp_domain_renew(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                            int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char name[256] = "";
+    int ns_, ne_, np;
+    if (xml_find_child(xml, qs, qe, "domain:name", &ns_, &ne_, &np) != 1 ||
+        xml_text_decode(xml, ns_, ne_, name, sizeof(name)) < 0 || !name[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: domain:name", NULL,
+                                cltrid);
+    strlower(name);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:domain:%s", name);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_domain_t d;
+    if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (d.clid[0] && strcmp(d.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    if (epp_domain_status_has(&d, "clientRenewProhibited") ||
+        epp_domain_status_has(&d, "serverRenewProhibited"))
+        return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL, cltrid);
+
+    int ces, cee, cenp;
+    char curexp[32] = "";
+    if (xml_find_child(xml, qs, qe, "domain:curExpDate", &ces, &cee, &cenp) != 1 ||
+        xml_text_decode(xml, ces, cee, curexp, sizeof(curexp)) < 0 || !curexp[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: domain:curExpDate",
+                                NULL, cltrid);
+    char actual_date[32];
+    epp_iso_date(d.exdate, actual_date, sizeof(actual_date)); /* "YYYY-MM-DDT..." -> take date part */
+    actual_date[10] = 0;
+    if (strncmp(curexp, actual_date, 10) != 0)
+        return epp_build_result(resp, rcap, 2306,
+                                "Parameter value policy error: curExpDate does not match", NULL,
+                                cltrid);
+
+    uint32_t years = 1;
+    int pes, pee, penp;
+    if (xml_find_child(xml, qs, qe, "domain:period", &pes, &pee, &penp) == 1) {
+        char pstr[16] = "";
+        if (xml_text_decode(xml, pes, pee, pstr, sizeof(pstr)) >= 0 && pstr[0])
+            years = (uint32_t) atoi(pstr);
+        if (years < 1)
+            years = 1;
+    }
+    d.exdate += years * 365u * 24u * 3600u;
+    d.rgp_state = EPP_RGP_NONE;
+    d.rgp_until = 0;
+
+    uint8_t tlv2[4096];
+    int tlen2 = epp_domain_encode(&d, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[8192];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(key, hexbuf);
+
+    char exdatestr[32];
+    epp_iso_date(d.exdate, exdatestr, sizeof(exdatestr));
+    char rendata[400];
+    snprintf(rendata, sizeof(rendata),
+            "<renData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
+            "<name>%s</name><exDate>%s</exDate></renData>",
+            name, exdatestr);
+    char extra[800];
+    int fes, fee_e;
+    if (epp_find_secdns_block(xml, cmd_s, cmd_e, "fee:renew", &fes, &fee_e) == 1) {
+        char feeext[400];
+        epp_fee_response_extension("renew", "fee:renData", feeext, sizeof(feeext));
+        snprintf(extra, sizeof(extra), "%s%s", rendata, feeext);
+    } else {
+        safe_strcpy(extra, rendata, sizeof(extra));
+    }
+    dns_log(LOG_NOTICE, "[eppd] domain %s renewed %u year(s), new exDate %s\n", name, years,
+            exdatestr);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+}
+
+/* ── RFC 5730 §2.9.2.3 poll queue + RFC 8590 changePoll extension ────────
+ * A per-registrar FIFO of server-generated notifications: `<poll op="req">`
+ * dequeues (peeks, really — a client must ack to actually remove it) the
+ * oldest queued message; `<poll op="ack" msgID="X">` removes it. Storage is
+ * `epp:poll:<clID>:<seq>`, seq from a per-registrar monotonic counter
+ * (`epp:pollseq:<clID>`, INCR) so ordering is preserved without needing a
+ * separate sorted structure — the oldest message is simply the smallest
+ * seq among that registrar's keys. Bounded KEYS scan (cap 512), same
+ * convention as `epp_host_in_use`'s `epp:domain:*` scan; a registrar's
+ * pending-notification count is not expected to approach that in practice
+ * (each message here is enqueued by a lifecycle event a human registrar is
+ * expected to act on, not a high-volume stream). */
+typedef struct {
+    char msg[256];
+    uint32_t qdate;
+    char objtype[16];
+    char objid[256];
+    char cp_state[8];     /* RFC 8590 — "" if this message carries no changePoll data */
+    char cp_operation[32];
+    char cp_who[64];
+    char cp_reason[256];
+    char resdata[1024]; /* raw XML for <resData>, e.g. a domain:trnData block; "" if none */
+} epp_poll_msg_t;
+
+static int epp_poll_encode(const epp_poll_msg_t *m, uint8_t *buf, int cap) {
+    int off = tlv_begin(buf, cap, 1);
+    if (off < 0)
+        return -1;
+    off = tlv_put(buf, cap, off, EPP_TAG_MSG, (const uint8_t *) m->msg, (int) strlen(m->msg));
+    if (off >= 0)
+        off = tlv_put_u32(buf, cap, off, EPP_TAG_QDATE, m->qdate);
+    if (off >= 0)
+        off = tlv_put(buf, cap, off, EPP_TAG_OBJTYPE, (const uint8_t *) m->objtype,
+                      (int) strlen(m->objtype));
+    if (off >= 0)
+        off = tlv_put(buf, cap, off, EPP_TAG_OBJID, (const uint8_t *) m->objid,
+                      (int) strlen(m->objid));
+    if (off >= 0 && m->cp_state[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_CP_STATE, (const uint8_t *) m->cp_state,
+                      (int) strlen(m->cp_state));
+    if (off >= 0 && m->cp_operation[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_CP_OPERATION, (const uint8_t *) m->cp_operation,
+                      (int) strlen(m->cp_operation));
+    if (off >= 0 && m->cp_who[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_CP_WHO, (const uint8_t *) m->cp_who,
+                      (int) strlen(m->cp_who));
+    if (off >= 0 && m->cp_reason[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_CP_REASON, (const uint8_t *) m->cp_reason,
+                      (int) strlen(m->cp_reason));
+    if (off >= 0 && m->resdata[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_RESDATA, (const uint8_t *) m->resdata,
+                      (int) strlen(m->resdata));
+    return off;
+}
+
+static int epp_poll_decode(const uint8_t *buf, int len, epp_poll_msg_t *m) {
+    memset(m, 0, sizeof(*m));
+    int off = 1;
+    uint8_t tag;
+    const uint8_t *val;
+    uint16_t vlen;
+    int r;
+    while ((r = tlv_next(buf, len, &off, &tag, &val, &vlen)) == 1) {
+        char *dst = NULL;
+        int dstcap = 0;
+        switch (tag) {
+            case EPP_TAG_MSG:
+                dst = m->msg;
+                dstcap = (int) sizeof(m->msg);
+                break;
+            case EPP_TAG_QDATE:
+                m->qdate = tlv_u32_of(val, vlen);
+                continue;
+            case EPP_TAG_OBJTYPE:
+                dst = m->objtype;
+                dstcap = (int) sizeof(m->objtype);
+                break;
+            case EPP_TAG_OBJID:
+                dst = m->objid;
+                dstcap = (int) sizeof(m->objid);
+                break;
+            case EPP_TAG_CP_STATE:
+                dst = m->cp_state;
+                dstcap = (int) sizeof(m->cp_state);
+                break;
+            case EPP_TAG_CP_OPERATION:
+                dst = m->cp_operation;
+                dstcap = (int) sizeof(m->cp_operation);
+                break;
+            case EPP_TAG_CP_WHO:
+                dst = m->cp_who;
+                dstcap = (int) sizeof(m->cp_who);
+                break;
+            case EPP_TAG_CP_REASON:
+                dst = m->cp_reason;
+                dstcap = (int) sizeof(m->cp_reason);
+                break;
+            case EPP_TAG_RESDATA:
+                dst = m->resdata;
+                dstcap = (int) sizeof(m->resdata);
+                break;
+            default:
+                continue; /* unknown tag — skip (ADR-003 forward compat) */
+        }
+        if (dst && vlen < (uint16_t) dstcap) {
+            memcpy(dst, val, vlen);
+            dst[vlen] = 0;
+        }
+    }
+    return r < 0 ? -1 : 0;
+}
+
+/* Enqueues one poll message for `clid`. `cp_*`/`resdata` may be NULL/empty
+ * for a plain message with no RFC 8590/resData payload. Failure (Valkey
+ * down) is logged, not propagated — a poll notification is best-effort;
+ * the triggering command (transfer/RGP event) must not fail because the
+ * notification side-channel couldn't be written. */
+static void epp_poll_enqueue(const char *clid, const char *msgtext, const char *objtype,
+                             const char *objid, const char *cp_state, const char *cp_operation,
+                             const char *cp_who, const char *cp_reason, const char *resdata) {
+    if (!clid || !clid[0])
+        return;
+    char seqkey[128];
+    snprintf(seqkey, sizeof(seqkey), "epp:pollseq:%s", clid);
+    int seq = vk_incr(seqkey);
+    if (seq < 0) {
+        dns_log(LOG_WARNING, "[eppd] poll enqueue for %s failed (Valkey down?)\n", clid);
+        return;
+    }
+    epp_poll_msg_t m;
+    memset(&m, 0, sizeof(m));
+    safe_strcpy(m.msg, msgtext, sizeof(m.msg));
+    m.qdate = (uint32_t) time(NULL);
+    safe_strcpy(m.objtype, objtype ? objtype : "", sizeof(m.objtype));
+    safe_strcpy(m.objid, objid ? objid : "", sizeof(m.objid));
+    safe_strcpy(m.cp_state, cp_state ? cp_state : "", sizeof(m.cp_state));
+    safe_strcpy(m.cp_operation, cp_operation ? cp_operation : "", sizeof(m.cp_operation));
+    safe_strcpy(m.cp_who, cp_who ? cp_who : "", sizeof(m.cp_who));
+    safe_strcpy(m.cp_reason, cp_reason ? cp_reason : "", sizeof(m.cp_reason));
+    safe_strcpy(m.resdata, resdata ? resdata : "", sizeof(m.resdata));
+    uint8_t tlv[2048];
+    int tlen = epp_poll_encode(&m, tlv, sizeof(tlv));
+    if (tlen < 0) {
+        dns_log(LOG_WARNING, "[eppd] poll message encode failed for %s\n", clid);
+        return;
+    }
+    char hexbuf[4096];
+    hex_enc(tlv, tlen, hexbuf);
+    char key[160];
+    snprintf(key, sizeof(key), "epp:poll:%s:%d", clid, seq);
+    vk_set(key, hexbuf);
+}
+
+/* Number of messages currently queued for `clid`. */
+static int epp_poll_count(const char *clid) {
+    char pat[160];
+    snprintf(pat, sizeof(pat), "epp:poll:%s:*", clid);
+    char keys[512][256];
+    int n = vk_list_keys(pat, keys, 512);
+    return n < 0 ? 0 : n;
+}
+
+/* Finds the oldest (lowest seq) queued message for `clid`. Returns 1 and
+ * fills *out/out_seq on success, 0 if the queue is empty, -1 on a corrupt
+ * entry (treated the same as empty by the caller — a message this parser
+ * can't decode isn't one a registrar can be shown either). */
+static int epp_poll_oldest(const char *clid, epp_poll_msg_t *out, int *out_seq) {
+    char pat[160];
+    snprintf(pat, sizeof(pat), "epp:poll:%s:*", clid);
+    char keys[512][256];
+    int n = vk_list_keys(pat, keys, 512);
+    if (n <= 0)
+        return 0;
+    int best_seq = -1;
+    char best_key[256] = "";
+    for (int i = 0; i < n; i++) {
+        const char *p = strrchr(keys[i], ':');
+        if (!p)
+            continue;
+        int seq = atoi(p + 1);
+        if (best_seq < 0 || seq < best_seq) {
+            best_seq = seq;
+            safe_strcpy(best_key, keys[i], sizeof(best_key));
+        }
+    }
+    if (best_seq < 0)
+        return 0;
+    char blob[VKC_BUF];
+    if (!vk_get(best_key, blob, sizeof(blob)))
+        return 0;
+    uint8_t tlv[2048];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    if (tlen < 0 || epp_poll_decode(tlv, tlen, out) < 0)
+        return -1;
+    *out_seq = best_seq;
+    return 1;
+}
+
+/* RFC 5730 §2.9.2.3 <poll>. Not part of epp_obj_handler_fn's dispatch table
+ * (its op="req"/"ack" attribute shape, and ack's extra msgID attribute,
+ * don't fit that signature), so epp_handle_command calls this directly. */
+static int epp_handle_poll(epp_session_t *sess, const char *op, const char *msgid,
+                           const char *cltrid, char *resp, int rcap) {
+    if (strcmp(op, "ack") == 0) {
+        if (!msgid[0])
+            return epp_build_result(resp, rcap, 2003, "Required parameter missing: msgID", NULL,
+                                    cltrid);
+        char key[160];
+        snprintf(key, sizeof(key), "epp:poll:%s:%s", sess->clid, msgid);
+        char blob[16];
+        if (!vk_get(key, blob, sizeof(blob)))
+            return epp_build_result(resp, rcap, 2303, "Object does not exist: no such message ID",
+                                    NULL, cltrid);
+        vk_del(key);
+        int remaining = epp_poll_count(sess->clid);
+        char extra[128];
+        snprintf(extra, sizeof(extra), "<msgQ count=\"%d\" id=\"%s\"/>", remaining, msgid);
+        return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+    }
+    if (strcmp(op, "req") == 0) {
+        epp_poll_msg_t m;
+        int seq = 0;
+        int r = epp_poll_oldest(sess->clid, &m, &seq);
+        if (r <= 0)
+            return epp_build_result(resp, rcap, 1300, "Command completed successfully; no messages",
+                                    NULL, cltrid);
+        int remaining = epp_poll_count(sess->clid);
+        char qdatestr[32];
+        epp_iso_date(m.qdate, qdatestr, sizeof(qdatestr));
+        char cpxml[1000] = "";
+        if (m.cp_state[0])
+            snprintf(cpxml, sizeof(cpxml),
+                    "<extension><changePoll:changeData "
+                    "xmlns:changePoll=\"urn:ietf:params:xml:ns:changePoll-1.0\" state=\"%s\">"
+                    "<changePoll:operation>%s</changePoll:operation>"
+                    "<changePoll:date>%s</changePoll:date>"
+                    "<changePoll:svTRID>eppd-poll-%d</changePoll:svTRID>"
+                    "%s%s%s"
+                    "%s%s%s"
+                    "</changePoll:changeData></extension>",
+                    m.cp_state, m.cp_operation, qdatestr, seq, m.cp_who[0] ? "<changePoll:who>" : "",
+                    m.cp_who[0] ? m.cp_who : "", m.cp_who[0] ? "</changePoll:who>" : "",
+                    m.cp_reason[0] ? "<changePoll:reason>" : "",
+                    m.cp_reason[0] ? m.cp_reason : "", m.cp_reason[0] ? "</changePoll:reason>" : "");
+        char extra[2600];
+        snprintf(extra, sizeof(extra),
+                "<msgQ count=\"%d\" id=\"%d\"><qDate>%s</qDate><msg>%s</msg></msgQ>%s%s",
+                remaining, seq, qdatestr, m.msg, m.resdata, cpxml);
+        return epp_build_result(resp, rcap, 1301,
+                                "Command completed successfully; ack to dequeue", extra, cltrid);
+    }
+    return epp_build_result(resp, rcap, 2101, "Unimplemented option: poll op", NULL, cltrid);
+}
+
 /* ── domain:transfer (RFC 5731 §3.2.4) ────────────────────────────────────
  * Not part of epp_obj_handler_fn's dispatch table (its <transfer op="...">
  * shape needs the op attribute the table's callers don't have), so
  * epp_handle_command calls this directly. */
-static int epp_domain_transfer(epp_session_t *sess, const char *xml, int ts, int te, const char *op,
-                               const char *cltrid, char *resp, int rcap) {
+static int epp_domain_transfer(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int ts,
+                               int te, const char *op, const char *cltrid, char *resp, int rcap) {
     /* The object-specific payload is <domain:transfer>, nested one level
      * inside <transfer op="...">'s content — mirroring how <domain:create>
      * nests inside <create> — not domain:name/domain:authInfo directly at
@@ -2841,11 +3691,24 @@ static int epp_domain_transfer(epp_session_t *sess, const char *xml, int ts, int
         vk_set(key, hexbuf);
         dns_log(LOG_NOTICE, "[eppd] transfer requested for %s: %s -> %s\n", name, d.clid,
                 sess->clid);
-        char extra[700];
-        snprintf(extra, sizeof(extra),
+        char trndata[700];
+        snprintf(trndata, sizeof(trndata),
                 "<trnData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\"><name>%s</name>"
                 "<trStatus>pending</trStatus><reID>%s</reID><acID>%s</acID></trnData>",
                 name, d.transfer_reid, d.clid);
+        char pollmsg[400];
+        snprintf(pollmsg, sizeof(pollmsg), "Transfer of %s requested by %s", name, sess->clid);
+        epp_poll_enqueue(d.clid, pollmsg, "domain", name, "before", "transfer", sess->clid, NULL,
+                        trndata);
+        char extra[1100];
+        int fes, fee_e;
+        if (epp_find_secdns_block(xml, cmd_s, cmd_e, "fee:transfer", &fes, &fee_e) == 1) {
+            char feeext[400];
+            epp_fee_response_extension("transfer", "fee:trnData", feeext, sizeof(feeext));
+            snprintf(extra, sizeof(extra), "%s%s", trndata, feeext);
+        } else {
+            safe_strcpy(extra, trndata, sizeof(extra));
+        }
         return epp_build_result(resp, rcap, 1001, "Command completed successfully; action pending",
                                 extra, cltrid);
     }
@@ -2894,6 +3757,14 @@ static int epp_domain_transfer(epp_session_t *sess, const char *xml, int ts, int
                 "<trnData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\"><name>%s</name>"
                 "<trStatus>%s</trStatus><reID>%s</reID><acID>%s</acID></trnData>",
                 name, d.transfer_status, d.transfer_reid, d.clid);
+        /* Notify whichever party did NOT perform this action — the actor
+         * already sees the outcome in their own command response. */
+        const char *notify_clid = is_gaining ? d.clid : d.transfer_reid;
+        char pollmsg[400];
+        snprintf(pollmsg, sizeof(pollmsg), "Transfer of %s: %s (by %s)", name, d.transfer_status,
+                sess->clid);
+        epp_poll_enqueue(notify_clid, pollmsg, "domain", name, "after", "transfer", sess->clid, NULL,
+                        extra);
         return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
     }
 
@@ -2917,10 +3788,10 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
 
     if (!sess->logged_in) {
         int os, oe, onp;
-        /* <transfer> is handled below (its own dispatch, own auth checks per
-         * op= — a transfer request is inherently cross-registrar); every
-         * other command requires an existing session. */
-        if (xml_find_child(xml, cmd_s, cmd_e, "transfer", &os, &oe, &onp) != 1)
+        /* <transfer> and <poll> are handled below (their own dispatch, own
+         * op= attribute); every other command requires an existing session. */
+        if (xml_find_child(xml, cmd_s, cmd_e, "transfer", &os, &oe, &onp) != 1 &&
+            xml_find_child(xml, cmd_s, cmd_e, "poll", &os, &oe, &onp) != 1)
             return epp_build_result(resp, rcap, 2201, "Authorization error: not logged in", NULL,
                                     cltrid);
     }
@@ -2932,7 +3803,21 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
         if (!sess->logged_in)
             return epp_build_result(resp, rcap, 2201, "Authorization error: not logged in", NULL,
                                     cltrid);
-        return epp_domain_transfer(sess, xml, ts, te, transfer_op, cltrid, resp, rcap);
+        return epp_domain_transfer(sess, xml, cmd_s, cmd_e, ts, te, transfer_op, cltrid, resp, rcap);
+    }
+
+    int ps, pe, pnp;
+    char poll_op[16] = "";
+    if (xml_find_child_attr(xml, cmd_s, cmd_e, "poll", "op", poll_op, sizeof(poll_op), &ps, &pe,
+                            &pnp) == 1) {
+        if (!sess->logged_in)
+            return epp_build_result(resp, rcap, 2201, "Authorization error: not logged in", NULL,
+                                    cltrid);
+        char msgid[32] = "";
+        int ms, me, mnp;
+        xml_find_child_attr(xml, cmd_s, cmd_e, "poll", "msgID", msgid, sizeof(msgid), &ms, &me,
+                           &mnp);
+        return epp_handle_poll(sess, poll_op, msgid, cltrid, resp, rcap);
     }
 
     static const struct {
@@ -2940,7 +3825,7 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
         const char *op;
     } objcmds[] = {
         {"check", "check"},   {"info", "info"},     {"create", "create"},
-        {"update", "update"}, {"delete", "delete"},
+        {"update", "update"}, {"delete", "delete"}, {"renew", "renew"},
     };
     static const struct {
         const char *op;
@@ -2949,19 +3834,22 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
     } handlers[] = {
         {"check", "domain", epp_domain_check},     {"create", "domain", epp_domain_create},
         {"info", "domain", epp_domain_info},       {"update", "domain", epp_domain_update},
-        {"delete", "domain", epp_domain_delete},   {"check", "host", epp_host_check},
+        {"delete", "domain", epp_domain_delete},   {"renew", "domain", epp_domain_renew},
+        {"check", "host", epp_host_check},
         {"create", "host", epp_host_create},       {"info", "host", epp_host_info},
         {"update", "host", epp_host_update},       {"delete", "host", epp_host_delete},
         {"check", "contact", epp_contact_check},   {"create", "contact", epp_contact_create},
         {"info", "contact", epp_contact_info},     {"update", "contact", epp_contact_update},
-        {"delete", "contact", epp_contact_delete},
+        {"delete", "contact", epp_contact_delete}, {"check", "org", epp_org_check},
+        {"create", "org", epp_org_create},         {"info", "org", epp_org_info},
+        {"update", "org", epp_org_update},         {"delete", "org", epp_org_delete},
     };
     for (size_t i = 0; i < sizeof(objcmds) / sizeof(objcmds[0]); i++) {
         int os, oe, onp;
         if (xml_find_child(xml, cmd_s, cmd_e, objcmds[i].tag, &os, &oe, &onp) != 1)
             continue;
-        static const char *objs[] = {"domain", "host", "contact"};
-        for (size_t j = 0; j < 3; j++) {
+        static const char *objs[] = {"domain", "host", "contact", "org"};
+        for (size_t j = 0; j < 4; j++) {
             char qname[32];
             snprintf(qname, sizeof(qname), "%s:%s", objs[j], objcmds[i].tag);
             int qs, qe, qnp;
@@ -3070,6 +3958,8 @@ static void epp_rgp_tick_one(const char *domkey) {
             now - d.transfer_redate > (uint32_t) EPPD_TRANSFER_PENDING_SECS()) {
             /* RFC 5731 §3.2.4: no response within the pending window ->
              * server auto-approves. */
+            char old_clid[64];
+            safe_strcpy(old_clid, d.clid, sizeof(old_clid));
             safe_strcpy(d.transfer_status, "serverApproved", sizeof(d.transfer_status));
             safe_strcpy(d.clid, d.transfer_reid, sizeof(d.clid));
             d.exdate += 365u * 24u * 3600u;
@@ -3078,10 +3968,22 @@ static void epp_rgp_tick_one(const char *domkey) {
             changed = 1;
             dns_log(LOG_NOTICE, "[eppd] domain %s transfer auto-approved (pending window elapsed)\n",
                     name);
+            char extra[700], pollmsg[256];
+            snprintf(extra, sizeof(extra),
+                    "<trnData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\"><name>%s</name>"
+                    "<trStatus>serverApproved</trStatus><reID>%s</reID><acID>%s</acID></trnData>",
+                    name, d.transfer_reid, d.clid);
+            snprintf(pollmsg, sizeof(pollmsg), "Transfer of %s: serverApproved (pending window elapsed)",
+                    name);
+            epp_poll_enqueue(old_clid, pollmsg, "domain", name, "after", "transfer", "eppd", NULL,
+                            extra);
+            epp_poll_enqueue(d.clid, pollmsg, "domain", name, "after", "transfer", "eppd", NULL, extra);
         }
     }
 
     if (purge) {
+        epp_poll_enqueue(d.clid, "Domain purged: redemptionPeriod elapsed", "domain", name, "after",
+                        "delete", "eppd", NULL, NULL);
         vk_del(domkey); /* delegation was already retracted when delete entered redemption */
         dns_log(LOG_NOTICE, "[eppd] domain %s purged (redemptionPeriod elapsed)\n", name);
         return;

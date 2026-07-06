@@ -64,7 +64,7 @@ role, not a `dnsd` feature.
 ## Action items
 
 1. [x] Decide **public** vs **private/internal** registry — drives escrow/RDAP/policy scope. **Decided 2026-07-03: private/internal.** RDAP/escrow/public-TLD policy rows below are deferred, not built.
-2. [~] Phase 1 (core EPP) **in progress** → Phase 2 (security + lifecycle) → Phase 3 (extensions).
+2. [x] Phase 1 (core EPP) → Phase 2 (security + lifecycle) → Phase 3 (extensions). **All three done 2026-07-06.**
 3. [x] Define the Valkey object schema + publish pipeline to `dnsd`. **Done 2026-07-06**: `epp:*` TLV objects + `zone:*` NS/A/AAAA publish, see the checklist below.
 4. [ ] RDAP companion service decision (query side of registry data).
 
@@ -214,7 +214,46 @@ store. Required for public TLDs; skip for private/internal.
         authInfo and transfer-grace are meaningless without it). authInfo-
         gated request, extends registration by one year on approval,
         transfer-grace RGP window.
-- [ ] **Phase 3** — 8748 fee; 8543 org; 8590 change poll
+- [x] **Phase 3** — done 2026-07-06
+  - [x] **Prerequisite (not originally listed here, added by user decision):
+        RFC 5730 §2.9.2.3 `<poll>`** (req/ack, per-registrar message queue,
+        `epp:poll:<clID>:<seq>` + `epp:pollseq:<clID>`) — RFC 8590 has
+        nothing to decorate without it. Wired into: transfer request
+        (notifies the sponsor), transfer approve/reject/cancel (notifies
+        whichever party didn't act), the RGP tick's redemption purge
+        (notifies the sponsor) and transfer auto-approval (notifies both
+        parties).
+  - [x] **8590 changePoll** — `<extension><changePoll:changeData state=
+        "before"|"after">` decorates `<poll op="req">` responses whenever
+        the queued message carries operation/who/reason metadata (every
+        transfer/RGP event above sets it; a hypothetical plain message
+        would not).
+  - [x] **Prerequisite (not originally listed here, added by user decision):
+        `domain:renew`** (RFC 5731 §3.2.5) — 8748's main real-world use is
+        quoting/charging a renewal, and manual renew never existed
+        (autorenew was server-only). `curExpDate` optimistic-concurrency
+        check (mismatch → 2306); clears any in-flight RGP grace (a manual
+        renew is a deliberate action, not the passive autorenew timeout
+        that state tracks).
+  - [x] **8748 fee** — flat, informational quoting only (the scoped-down
+        option the user picked over a full credit-limit ledger): configurable
+        per-command flat fee (`config:eppd_fee_{create,renew,transfer}`,
+        default "0.00"), echoed back via `<fee:chkData>`/`<fee:creData>`/
+        `<fee:renData>`/`<fee:trnData>` when the matching request extension
+        is present on domain check/create/renew/transfer. No balance/
+        credit-limit enforcement — nothing to enforce against, since this
+        project has no billing/payment subsystem anywhere else either.
+  - [x] **8543 org** — a 4th object type (`epp_org_t`, `epp:org:<id>`)
+        mirroring contact's simplified shape (id/role(s)/parentId/email/
+        voice, no postalInfo), with `check`/`create`/`info`/`update`/
+        `delete` and the same sponsoring-registrar ownership model as
+        domain/host/contact. Deliberately **not** cross-linked into
+        domain/host/contact's own create/update (no `<org:roid>` extension
+        support there) — landing the object type itself is RFC 8543's
+        core; wiring other objects to reference an org is a smaller,
+        separate follow-up if ever needed. No association guard on
+        `org:delete` as a result (nothing in this implementation can point
+        at an org yet).
 - [ ] **RDAP** companion (9082/9083) — query side
 - [ ] **Escrow** (8909/9022) — only if public TLD
 - [ ] **ENUM** — EPP for E.164 provisioning (4114/5076) — see `CLAUDE-ENUM.md`
@@ -319,6 +358,30 @@ DS mapping actually depends on.
   `check-eppd` run: a non-sponsor's `domain:update` is rejected (2201), an
   authInfo-gated transfer moves ownership, and `host:delete`/`contact:delete`
   are blocked (2305) while still referenced by the domain.
+
+## Acceptance criteria (Phase 3)
+
+- [x] A transfer request/approve cycle produces poll notifications for
+  both parties, decorated with the RFC 8590 changePoll extension —
+  **verified live**: `make check-eppd` has registrar1 (the sponsor at
+  request time) `poll op="req"` and see a `changePoll:operation>transfer`
+  message with `state="before"`, ack it, confirm the queue is then empty
+  (1300); after approval, registrar2 (the new sponsor) polls and sees a
+  `state="after"` message, acks it too.
+- [x] `domain:renew` extends the registration and enforces the curExpDate
+  optimistic-concurrency check — **verified live**: a renew with the
+  domain's actual current expiration date succeeds (1000, new `<exDate>`
+  two years out per the requested period); a second renew reusing the
+  now-stale date is rejected (2306).
+- [x] The fee extension is echoed on `domain:check` and `domain:renew` when
+  requested — **verified live**: both responses carry the corresponding
+  `<fee:...Data>` extension with the configured (default "0.00") flat fee;
+  no balance/decline logic exists to test, by design (informational only).
+- [x] A registrar can `check`/`create`/`info`/`update`/`delete` an org
+  object, with the same ownership model as the other three object types —
+  **verified live**: create, duplicate-create rejection (2302), update
+  (add a second role), info (both roles present), a non-sponsor's delete
+  rejected (2201), then the sponsor's delete succeeds (1000).
 
 ## Test (Phase 1 sketch)
 

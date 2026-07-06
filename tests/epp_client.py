@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal RFC 5730/5734 EPP client, for `make check-eppd` (eppd Phase 1 + 2).
+"""Minimal RFC 5730/5734 EPP client, for `make check-eppd` (eppd Phase 1+2+3).
 No standard tool (dig/kdig) speaks EPP, so this hand-rolls just enough of
 the wire format: RFC 5734's 4-byte big-endian length-prefixed framing
 carrying RFC 5730 command/response XML. Runs a fixed scripted session
@@ -7,9 +7,12 @@ end-to-end — Phase 1: login, contact/host/domain create, info, duplicate-
 create rejection, logout; Phase 2: update (NS/status/registrant/secDNS),
 cross-registrar authorization, domain:transfer (request/query/approve),
 delete into redemptionPeriod + rgp:restore, and host/contact delete blocked
-by association — against a real eppd instance, printing one PASS/FAIL line
-per step plus a final "ALL TESTS PASSED" / "SOME TESTS FAILED" sentinel
-line the Makefile recipe greps for.
+by association; Phase 3: poll req/ack + changePoll around the transfer
+events above, domain:renew (+ curExpDate mismatch rejection), the fee
+extension on check/renew, and a full org check/create/info/update/delete
+cycle — against a real eppd instance, printing one PASS/FAIL line per step
+plus a final "ALL TESTS PASSED" / "SOME TESTS FAILED" sentinel line the
+Makefile recipe greps for.
 
 Usage: epp_client.py <host> <port> <ca_pem> \
            <cert1> <key1> <clid1> <pw1> <cert2> <key2> <clid2> <pw2>
@@ -270,6 +273,40 @@ r = recv_frame(s2)
 check('code="1001"' in r and "<trStatus>pending</trStatus>" in r,
       "registrar2 domain:transfer request (correct authInfo) -> pending", r)
 
+# ── Phase 3: RFC 5730 poll queue + RFC 8590 changePoll ───────────────────
+# The transfer request just enqueued a notification for registrar1 (the
+# sponsor at request time) — verify poll req/ack sees it, including the
+# changePoll extension.
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><poll op="req"/><clTRID>T-P01</clTRID></command></epp>',
+)
+r = recv_frame(s)
+check(
+    'code="1301"' in r and "<msgQ" in r and "changePoll:operation>transfer" in r,
+    "registrar1 poll req sees the transfer-request notification (changePoll)",
+    r,
+)
+m = re.search(r'<msgQ count="\d+" id="(\d+)"', r)
+check(m is not None, "poll response carries a numeric msgID")
+if m:
+    msgid = m.group(1)
+
+    send_frame(
+        s,
+        '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+        f'<command><poll op="ack" msgID="{msgid}"/><clTRID>T-P02</clTRID></command></epp>',
+    )
+    check('code="1000"' in recv_frame(s), "poll ack dequeues the message")
+
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><poll op="req"/><clTRID>T-P03</clTRID></command></epp>',
+)
+check('code="1300"' in recv_frame(s), "poll req after ack: queue empty (no messages)")
+
 send_frame(
     s2,
     '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
@@ -293,6 +330,23 @@ send_frame(
 r = recv_frame(s)
 check('code="1000"' in r and "<trStatus>clientApproved</trStatus>" in r,
       "sponsor approves the transfer", r)
+
+send_frame(
+    s2,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><poll op="req"/><clTRID>T-P04</clTRID></command></epp>',
+)
+r = recv_frame(s2)
+check('code="1301"' in r and "clientApproved" in r,
+      "registrar2 (gaining) poll req sees the transfer-approved notification", r)
+m = re.search(r'<msgQ count="\d+" id="(\d+)"', r)
+if m:
+    send_frame(
+        s2,
+        '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+        f'<command><poll op="ack" msgID="{m.group(1)}"/><clTRID>T-P05</clTRID></command></epp>',
+    )
+    check('code="1000"' in recv_frame(s2), "registrar2 poll ack dequeues the approval notification")
 
 send_frame(
     s2,
@@ -358,6 +412,130 @@ send_frame(
 )
 r = recv_frame(s2)
 check('s="pendingDelete"' not in r and 's="ok"' in r, "domain:info shows ok again after restore", r)
+m = re.search(r"<exDate>(\d{4}-\d{2}-\d{2})", r)
+check(m is not None, "domain:info exDate is parseable for the renew test below", r)
+
+# ── Phase 3: domain:renew (RFC 5731 §3.2.5) + fee extension ──────────────
+if m:
+    cur_exp = m.group(1)
+    send_frame(
+        s2,
+        '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+        '<command><renew><domain:renew xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">'
+        "<domain:name>epptest.example.local</domain:name>"
+        f"<domain:curExpDate>{cur_exp}</domain:curExpDate>"
+        '<domain:period unit="y">2</domain:period>'
+        "</domain:renew></renew>"
+        '<extension><fee:renew xmlns:fee="urn:ietf:params:xml:ns:fee-0.11">'
+        "<fee:currency>USD</fee:currency><fee:fee>10.00</fee:fee></fee:renew></extension>"
+        '<clTRID>T-REN1</clTRID></command></epp>',
+    )
+    r = recv_frame(s2)
+    check('code="1000"' in r and "<renData" in r and "<fee:renData" in r,
+          "domain:renew (curExpDate matches) succeeds and echoes the fee extension", r)
+
+    send_frame(
+        s2,
+        '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+        '<command><renew><domain:renew xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">'
+        "<domain:name>epptest.example.local</domain:name>"
+        f"<domain:curExpDate>{cur_exp}</domain:curExpDate>"
+        "</domain:renew></renew>"
+        '<clTRID>T-REN2</clTRID></command></epp>',
+    )
+    check('code="2306"' in recv_frame(s2),
+          "domain:renew with a stale curExpDate (already renewed) rejected")
+
+# ── Phase 3: RFC 8748 fee extension on domain:check ──────────────────────
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><check><domain:check xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">'
+    "<domain:name>feetest.example.local</domain:name></domain:check></check>"
+    '<extension><fee:check xmlns:fee="urn:ietf:params:xml:ns:fee-0.11">'
+    '<fee:command name="create"><fee:period unit="y">1</fee:period></fee:command>'
+    "</fee:check></extension>"
+    '<clTRID>T-FEE1</clTRID></command></epp>',
+)
+r = recv_frame(s)
+check(
+    'code="1000"' in r and "<fee:chkData" in r and '<fee:command name="create">' in r
+    and "<fee:fee>" in r,
+    "domain:check with fee:check extension echoes a fee quote",
+    r,
+)
+
+# ── Phase 3: RFC 8543 organization object (check/create/info/update/delete) ──
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><check><org:check xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id></org:check></check>"
+    '<clTRID>T-ORG1</clTRID></command></epp>',
+)
+check('avail="1"' in recv_frame(s), "org:check on a fresh id -> available")
+
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><create><org:create xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id><org:role>reseller</org:role>"
+    "<org:email>org@example.invalid</org:email></org:create></create>"
+    '<clTRID>T-ORG2</clTRID></command></epp>',
+)
+check('code="1000"' in recv_frame(s), "org:create")
+
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><create><org:create xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id></org:create></create>"
+    '<clTRID>T-ORG3</clTRID></command></epp>',
+)
+check('code="2302"' in recv_frame(s), "duplicate org:create rejected")
+
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><update><org:update xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id>"
+    "<add><org:role>privacyproxy</org:role></add>"
+    "</org:update></update>"
+    '<clTRID>T-ORG4</clTRID></command></epp>',
+)
+check('code="1000"' in recv_frame(s), "org:update adds a second role")
+
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><info><org:info xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id></org:info></info>"
+    '<clTRID>T-ORG5</clTRID></command></epp>',
+)
+r = recv_frame(s)
+check(
+    'code="1000"' in r and "<role>reseller</role>" in r and "<role>privacyproxy</role>" in r,
+    "org:info reflects both roles after update",
+    r,
+)
+
+send_frame(
+    s2,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><delete><org:delete xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id></org:delete></delete>"
+    '<clTRID>T-ORG6</clTRID></command></epp>',
+)
+check('code="2201"' in recv_frame(s2), "registrar2 (non-sponsor) org:delete rejected")
+
+send_frame(
+    s,
+    '<?xml version="1.0"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0">'
+    '<command><delete><org:delete xmlns:org="urn:ietf:params:xml:ns:org-1.0">'
+    "<org:id>EPPORG1</org:id></org:delete></delete>"
+    '<clTRID>T-ORG7</clTRID></command></epp>',
+)
+check('code="1000"' in recv_frame(s), "org:delete by the sponsor succeeds")
 
 # ── Phase 2: association guards on host/contact delete ───────────────────
 send_frame(

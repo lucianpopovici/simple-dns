@@ -318,6 +318,73 @@ static void test_host_contact_tlv_roundtrip(void) {
           "contact clid + authinfo round-trip");
 }
 
+/* Phase 3: RFC 8543 org object TLV round-trip. */
+static void test_org_tlv_roundtrip(void) {
+    printf("== epp_org_encode/decode: TLV round-trip KAT (RFC 8543) ==\n");
+    epp_org_t o;
+    memset(&o, 0, sizeof(o));
+    safe_strcpy(o.id, "reseller1", sizeof(o.id));
+    safe_strcpy(o.roid, "1-EPPD-O", sizeof(o.roid));
+    safe_strcpy(o.clid, "registrar1", sizeof(o.clid));
+    safe_strcpy(o.status[0], "ok", sizeof(o.status[0]));
+    o.nstatus = 1;
+    safe_strcpy(o.parentid, "parentorg", sizeof(o.parentid));
+    safe_strcpy(o.roles[0], "reseller", sizeof(o.roles[0]));
+    safe_strcpy(o.roles[1], "privacyproxy", sizeof(o.roles[1]));
+    o.nroles = 2;
+    safe_strcpy(o.email, "org@example.invalid", sizeof(o.email));
+    safe_strcpy(o.voice, "+1.5551234567", sizeof(o.voice));
+    o.crdate = 1700000000;
+
+    uint8_t buf[2048];
+    int len = epp_org_encode(&o, buf, sizeof(buf));
+    epp_org_t o2;
+    CHECK(len > 0 && epp_org_decode(buf, len, &o2) == 0 && strcmp(o.id, o2.id) == 0 &&
+              strcmp(o.roid, o2.roid) == 0 && strcmp(o.clid, o2.clid) == 0 &&
+              strcmp(o.parentid, o2.parentid) == 0 && o2.nroles == 2 &&
+              strcmp(o2.roles[0], "reseller") == 0 && strcmp(o2.roles[1], "privacyproxy") == 0 &&
+              o2.crdate == o.crdate,
+          "org id/roid/clid/parentid/roles[]/crdate round-trip");
+}
+
+/* Phase 3: RFC 5730 poll message + RFC 8590 changePoll fields TLV round-trip. */
+static void test_poll_tlv_roundtrip(void) {
+    printf("== epp_poll_encode/decode: TLV round-trip KAT (RFC 5730/8590) ==\n");
+    epp_poll_msg_t m;
+    memset(&m, 0, sizeof(m));
+    safe_strcpy(m.msg, "Transfer of example.test requested by registrar2", sizeof(m.msg));
+    m.qdate = 1700000000;
+    safe_strcpy(m.objtype, "domain", sizeof(m.objtype));
+    safe_strcpy(m.objid, "example.test", sizeof(m.objid));
+    safe_strcpy(m.cp_state, "before", sizeof(m.cp_state));
+    safe_strcpy(m.cp_operation, "transfer", sizeof(m.cp_operation));
+    safe_strcpy(m.cp_who, "registrar2", sizeof(m.cp_who));
+    safe_strcpy(m.cp_reason, "registrar-initiated", sizeof(m.cp_reason));
+    safe_strcpy(m.resdata, "<trnData><name>example.test</name></trnData>", sizeof(m.resdata));
+
+    uint8_t buf[2048];
+    int len = epp_poll_encode(&m, buf, sizeof(buf));
+    epp_poll_msg_t m2;
+    CHECK(len > 0 && epp_poll_decode(buf, len, &m2) == 0 && strcmp(m.msg, m2.msg) == 0 &&
+              m2.qdate == m.qdate && strcmp(m.objtype, m2.objtype) == 0 &&
+              strcmp(m.objid, m2.objid) == 0 && strcmp(m.cp_state, m2.cp_state) == 0 &&
+              strcmp(m.cp_operation, m2.cp_operation) == 0 && strcmp(m.cp_who, m2.cp_who) == 0 &&
+              strcmp(m.cp_reason, m2.cp_reason) == 0 && strcmp(m.resdata, m2.resdata) == 0,
+          "poll message + changePoll fields + resData round-trip");
+
+    epp_poll_msg_t plain;
+    memset(&plain, 0, sizeof(plain));
+    safe_strcpy(plain.msg, "Domain purged: redemptionPeriod elapsed", sizeof(plain.msg));
+    plain.qdate = 1700000001;
+    uint8_t buf2[2048];
+    int len2 = epp_poll_encode(&plain, buf2, sizeof(buf2));
+    epp_poll_msg_t plain2;
+    CHECK(len2 > 0 && epp_poll_decode(buf2, len2, &plain2) == 0 &&
+              strcmp(plain.msg, plain2.msg) == 0 && plain2.cp_state[0] == 0 &&
+              plain2.resdata[0] == 0,
+          "a plain message with no changePoll/resData fields decodes back empty, not garbage");
+}
+
 /* epp_gen_authinfo (RFC 9154): must produce a fixed-length hex token, not
  * silently truncate or leave the buffer partially filled. */
 static void test_gen_authinfo(void) {
@@ -340,6 +407,8 @@ int main(void) {
     test_xml_find_child_attr();
     test_domain_tlv_roundtrip();
     test_host_contact_tlv_roundtrip();
+    test_org_tlv_roundtrip();
+    test_poll_tlv_roundtrip();
     test_gen_authinfo();
     printf("\n%s: %d failure(s)\n", g_failures ? "FAIL" : "PASS", g_failures);
     return g_failures ? 1 : 0;

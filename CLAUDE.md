@@ -389,16 +389,18 @@ listener.
 
 ### `eppd` — EPP registry front-end (RFC 5730/5734/5731/5732/5733)
 
-**Phase 1 + Phase 2 done** (2026-07-06; Phase 3 extensions — 8748 fee, 8543
-org, 8590 change poll — remain open, see `CLAUDE-eppd.md`). `eppd.c`. Accepts
-registrar EPP sessions over TCP/700 with **mandatory** mutual TLS (RFC 5734
-§5.1) — unlike `apid`'s optional mTLS split between DoH and management,
-there is no plain-TLS fallback: `config:eppd_mtls_ca_pem` is a hard startup
-requirement, and `eppd` refuses to open its listener at all without it.
+**Phase 1 + Phase 2 + Phase 3 done** (2026-07-06; RDAP/escrow/ENUM remain
+open, see `CLAUDE-eppd.md`). `eppd.c`. Accepts registrar EPP sessions over
+TCP/700 with **mandatory** mutual TLS (RFC 5734 §5.1) — unlike `apid`'s
+optional mTLS split between DoH and management, there is no plain-TLS
+fallback: `config:eppd_mtls_ca_pem` is a hard startup requirement, and `eppd`
+refuses to open its listener at all without it.
 
 Implemented: the RFC 5730 session shell (unprompted greeting, `<hello>`,
 `<login>`/`<logout>`, clTRID/svTRID plumbing); RFC 5731/5732/5733
-domain/host/contact `check`/`create`/`info`/`update`/`delete`; per-object
+domain/host/contact **and** RFC 8543 org (a 4th object type, same shape as
+contact — id/role(s)/parentId/email/voice, no cross-linking into the other
+three objects) `check`/`create`/`info`/`update`/`delete`; per-object
 sponsoring-registrar ownership (`clid`, checked on every update/delete/info-
 authInfo-disclosure) with `association exists` (2305) guards so a host/
 contact still referenced by a domain can't be deleted out from under it;
@@ -409,15 +411,24 @@ logged and discarded, never trusted); RFC 5910 DS mapping via the
 multi-value like NS — this needed a `dnsd`-side prerequisite, the signed
 DS-at-cut read path, see the `dnsd` section above); RFC 5731 §3.2.4
 `domain:transfer` (request/query/approve/reject/cancel, authInfo-gated,
-extends the registration by one year on approval); and RFC 3915 RGP —
-add-grace immediate purge on delete, otherwise `pendingDelete` +
-`redemptionPeriod` (delegation retracted immediately, object retained),
-`rgp:restore` (simplified to a single request step, no separate report —
-a private/internal registry has no registrar-facing report workflow to
-gate on), and a background sweep thread (`epp_rgp_tick_loop`) handling
-autorenew, redemption purge, and transfer auto-approval after the pending
-window elapses — the state transitions that don't happen inside a command
-handler because nothing but the passage of time triggers them.
+extends the registration by one year on approval) and §3.2.5
+`domain:renew` (curExpDate optimistic-concurrency check, clears any
+in-flight RGP grace); RFC 3915 RGP — add-grace immediate purge on delete,
+otherwise `pendingDelete` + `redemptionPeriod` (delegation retracted
+immediately, object retained), `rgp:restore` (simplified to a single
+request step, no separate report — a private/internal registry has no
+registrar-facing report workflow to gate on), and a background sweep thread
+(`epp_rgp_tick_loop`) handling autorenew, redemption purge, and transfer
+auto-approval after the pending window elapses — the state transitions
+that don't happen inside a command handler because nothing but the
+passage of time triggers them; RFC 5730 §2.9.2.3 `<poll>` (a per-registrar
+message queue, `epp:poll:<clID>:<seq>` — a Phase 3 prerequisite RFC 8590
+needs to have anything to decorate) wired into every transfer/RGP event
+above; RFC 8590 changePoll decorating those poll messages with
+operation/state/who/reason; and RFC 8748 fee, scoped to flat informational
+quoting (configurable per-command flat amount, no balance/credit-limit
+enforcement — this project has no billing subsystem anywhere else to
+enforce one against) echoed on check/create/renew/transfer when requested.
 
 `eppd` never serves DNS and `dnsd` never speaks EPP — they meet only through
 Valkey, the same pattern every other sidecar uses. Its own `epp:*` object
@@ -685,19 +696,24 @@ transports on glibc/Fedora); re-harvest with `seccomp_mode=audit` only when
 porting to a different libc/kernel.
 
 `eppd` (EPP registry front-end, RFC 5730/5734/5731/5732/5733) — the one
-remaining roadmap item — is now **Phase 1 + Phase 2 done** (2026-07-06):
-session shell, domain/host/contact check/create/info/update/delete,
-registrar ownership + association guards, RFC 9154 secure authInfo, RFC 5910
-DS mapping, RFC 5731 §3.2.4 transfer, and RFC 3915 RGP (grace periods +
-redemption + restore + a background autorenew/purge/auto-approve sweep) are
-all implemented and covered by `make check-eppd` / `make fuzz-eppd`. Phase 3
-(8748 fee, 8543 org, 8590 change poll extensions) remains open — see
-`CLAUDE-eppd.md`. Landing Phase 1 required two prerequisite `dnsd` changes:
-**RFC 9471** delegation/referral support (`dnsd` had no zone-cut concept at
-all before this) and multi-value NS storage; landing Phase 2's DS mapping
+remaining roadmap item — is now **Phase 1 + Phase 2 + Phase 3 done**
+(2026-07-06): session shell, domain/host/contact/org check/create/info/
+update/delete, registrar ownership + association guards, RFC 9154 secure
+authInfo, RFC 5910 DS mapping, RFC 5731 §3.2.4 transfer + §3.2.5 renew, RFC
+3915 RGP (grace periods + redemption + restore + a background autorenew/
+purge/auto-approve sweep), RFC 5730 poll + RFC 8590 changePoll, and RFC
+8748 fee (flat informational quoting) are all implemented and covered by
+`make check-eppd` / `make fuzz-eppd`. RDAP, escrow, and EPP-for-ENUM remain
+open (see `CLAUDE-eppd.md`) — none are required for a private/internal
+registry. Landing Phase 1 required two prerequisite `dnsd` changes: **RFC
+9471** delegation/referral support (`dnsd` had no zone-cut concept at all
+before this) and multi-value NS storage; landing Phase 2's DS mapping
 required a third — `dnsd` growing a `zone:<zone>:DS:<name>` read path that
 answers a DS query at a delegation cut authoritatively and signed (RFC 5910/
-4035 §3.1.4). `eppd` is also the third daemon on `libsandbox` (after
+4035 §3.1.4). Phase 3 added two of its own implicit prerequisites the doc
+didn't originally list (the poll queue for changePoll, `domain:renew` for
+fee) rather than landing 8590/8748 as structurally-present but practically
+inert extensions. `eppd` is also the third daemon on `libsandbox` (after
 `dnsd`/`resolverd`) and the first caller of a newly-hoisted shared Valkey
 RESP client (`vkc_*`/`keyspace_watch_loop`, `dns_wire.{c,h}`) that the other
 daemons still have their own pre-hoist copies of.

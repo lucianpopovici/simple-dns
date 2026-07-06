@@ -2533,9 +2533,10 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 $$VC set config:eppd_autorenew_grace_secs 0 >/dev/null; \
 	 $$VC set config:eppd_transfer_grace_secs 0 >/dev/null; \
 	 $$VC del cert:current >/dev/null; \
-	 $$VC del epp:contact:EPPTC1 >/dev/null; \
+	 $$VC del epp:contact:EPPTC1 epp:org:EPPORG1 >/dev/null; \
  for k in $$($$VC --scan --pattern "epp:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
 	 for k in $$($$VC --scan --pattern "zone:example.local:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
+	 for k in $$($$VC --scan --pattern "epp:poll:registrar*") $$($$VC --scan --pattern "epp:pollseq:registrar*"); do $$VC del "$$k" >/dev/null; done; \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_eppd.log 2>&1 & DNS=$$!; \
 	 sleep 1.5; \
 	 ASAN_OPTIONS=detect_leaks=0 ./eppd_debug > /tmp/eppd_check.log 2>&1 & EPPD=$$!; \
@@ -2561,9 +2562,10 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 if [ -n "$$SAVE_ARS" ]; then $$VC set config:eppd_autorenew_grace_secs "$$SAVE_ARS" >/dev/null; else $$VC del config:eppd_autorenew_grace_secs >/dev/null; fi; \
 	 if [ -n "$$SAVE_TGS" ]; then $$VC set config:eppd_transfer_grace_secs "$$SAVE_TGS" >/dev/null; else $$VC del config:eppd_transfer_grace_secs >/dev/null; fi; \
 	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
-	 $$VC del epp:contact:EPPTC1 >/dev/null; \
+	 $$VC del epp:contact:EPPTC1 epp:org:EPPORG1 >/dev/null; \
  for k in $$($$VC --scan --pattern "epp:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
 	 for k in $$($$VC --scan --pattern "zone:example.local:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
+	 for k in $$($$VC --scan --pattern "epp:poll:registrar*") $$($$VC --scan --pattern "epp:pollseq:registrar*"); do $$VC del "$$k" >/dev/null; done; \
 	 rm -rf $$D; \
 	 echo "  --- epp_client.py output ---"; cat /tmp/epp_client.log; \
 	 echo "  delegation NS=[$$NS] glue-192.0.2.77=[$$GLUE1] glue-192.0.2.88=[$$GLUE2]"; \

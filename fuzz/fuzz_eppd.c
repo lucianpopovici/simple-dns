@@ -52,6 +52,10 @@ static void probe_children(const char *xml, int s, int e) {
         "secDNS:create", "secDNS:update", "secDNS:add", "secDNS:rem", "secDNS:chg",
         "secDNS:dsData", "secDNS:keyTag", "secDNS:alg", "secDNS:digestType",
         "secDNS:digest", "rgp:update",    "rgp:restore",
+        /* Phase 3: renew, org, fee, poll/changePoll extension shapes. */
+        "curExpDate",   "org:id",     "org:role",  "org:parentId",   "org:email",
+        "org:voice",    "fee:check",  "fee:create", "fee:renew",     "fee:transfer",
+        "fee:command",  "fee:period", "fee:currency", "fee:fee",
     };
     for (size_t i = 0; i < sizeof(leaf_tags) / sizeof(leaf_tags[0]); i++) {
         int cs, ce, cnp;
@@ -102,14 +106,25 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             probe_children(xml, qs, qe);
     }
 
-    static const char *ops[] = {"login", "logout", "check", "create", "info", "update", "delete"};
+    /* <poll op="req"/"ack" msgID="..."> — the other place this parser reads
+     * attribute values rather than element content. */
+    int ps, pe, pnp;
+    char pop[16];
+    if (xml_find_child_attr(xml, cs, ce, "poll", "op", pop, sizeof(pop), &ps, &pe, &pnp) == 1) {
+        char msgid[32];
+        int ms, me, mnp;
+        xml_find_child_attr(xml, cs, ce, "poll", "msgID", msgid, sizeof(msgid), &ms, &me, &mnp);
+    }
+
+    static const char *ops[] = {"login", "logout", "check",  "create",
+                               "info",  "update", "delete", "renew"};
     for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
         int os, oe, onp;
         if (xml_find_child(xml, cs, ce, ops[i], &os, &oe, &onp) != 1)
             continue;
         probe_children(xml, os, oe);
-        static const char *objs[] = {"domain", "host", "contact"};
-        for (size_t j = 0; j < 3; j++) {
+        static const char *objs[] = {"domain", "host", "contact", "org"};
+        for (size_t j = 0; j < 4; j++) {
             char qname[32];
             snprintf(qname, sizeof(qname), "%s:%s", objs[j], ops[i]);
             int qs, qe, qnp;
