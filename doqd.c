@@ -610,8 +610,8 @@ static void *keyspace_watch_thread(void *arg) {
                                  "boot/reconnect catch-up only\n");
         tls_reload();
         doq_config_reload(&sub);
-        static const char *prefixes[] = {"cert:current", "config:tls_cert_pem",
-                                         "config:tls_key_pem", "config:doq_max_conns",
+        static const char *prefixes[] = {"cert:current",        "config:tls_cert_pem",
+                                         "config:tls_key_pem",  "config:doq_max_conns",
                                          "config:doq_dns_port", NULL};
         int subok = 1;
         for (int i = 0; prefixes[i]; i++) {
@@ -658,7 +658,8 @@ static void *keyspace_watch_thread(void *arg) {
                 continue;
             if (strstr(channel, "cert:current") || strstr(channel, "config:tls_"))
                 tls_reload();
-            else if (strstr(channel, "config:doq_max_conns") || strstr(channel, "config:doq_dns_port"))
+            else if (strstr(channel, "config:doq_max_conns") ||
+                     strstr(channel, "config:doq_dns_port"))
                 doq_config_reload(&sub);
         }
         dns_log(LOG_WARNING, "[Reload] keyspace connection lost — reconnecting\n");
@@ -888,8 +889,9 @@ static int schema_gate(void) {
         case SCHEMA_ABSENT:
             return 0;
         default:
-            dns_log(LOG_ERR, "[Schema] schema:version %s incompatible with compiled %s — "
-                             "refusing to start\n",
+            dns_log(LOG_ERR,
+                    "[Schema] schema:version %s incompatible with compiled %s — "
+                    "refusing to start\n",
                     sv[0] ? sv : "(unparseable)", SCHEMA_VERSION_STR);
             return -1;
     }
