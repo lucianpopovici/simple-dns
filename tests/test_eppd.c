@@ -23,14 +23,14 @@
 
 static int g_failures = 0;
 
-#define CHECK(cond, msg)                                                                          \
-    do {                                                                                          \
-        if (cond) {                                                                               \
-            printf("  PASS  %s\n", msg);                                                          \
-        } else {                                                                                  \
-            printf("  FAIL  %s\n", msg);                                                          \
-            g_failures++;                                                                         \
-        }                                                                                         \
+#define CHECK(cond, msg)                                                                           \
+    do {                                                                                           \
+        if (cond) {                                                                                \
+            printf("  PASS  %s\n", msg);                                                           \
+        } else {                                                                                   \
+            printf("  FAIL  %s\n", msg);                                                           \
+            g_failures++;                                                                          \
+        }                                                                                          \
     } while (0)
 
 static void test_epp_frame_next(void) {

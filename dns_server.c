@@ -5445,8 +5445,8 @@ static int emit_ns_rrset(uint8_t *resp, int off, int resp_len, const char *name,
         uint8_t rd[300];
         int rl = name_to_wire(ns, rd, sizeof(rd));
         if (rl > 0)
-            off = emit_rr(resp, off, resp_len, name, DNS_TYPE_NS, ttl, rd, (uint16_t) rl,
-                          dnssec_ok, count);
+            off = emit_rr(resp, off, resp_len, name, DNS_TYPE_NS, ttl, rd, (uint16_t) rl, dnssec_ok,
+                          count);
     }
     return off;
 }
@@ -6468,22 +6468,10 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Provisioned record types from Valkey */
     {
-        uint16_t pts[] = {DNS_TYPE_CNAME,
-                          DNS_TYPE_MX,
-                          DNS_TYPE_TXT,
-                          DNS_TYPE_SRV,
-                          DNS_TYPE_CAA,
-                          DNS_TYPE_SSHFP,
-                          DNS_TYPE_TLSA,
-                          DNS_TYPE_DNAME,
-                          DNS_TYPE_LOC,
-                          DNS_TYPE_URI,
-                          DNS_TYPE_NAPTR,
-                          DNS_TYPE_SVCB,
-                          DNS_TYPE_HTTPS,
-                          DNS_TYPE_ZONEMD,
-                          DNS_TYPE_CSYNC,
-                          0};
+        uint16_t pts[] = {DNS_TYPE_CNAME, DNS_TYPE_MX,     DNS_TYPE_TXT,   DNS_TYPE_SRV,
+                          DNS_TYPE_CAA,   DNS_TYPE_SSHFP,  DNS_TYPE_TLSA,  DNS_TYPE_DNAME,
+                          DNS_TYPE_LOC,   DNS_TYPE_URI,    DNS_TYPE_NAPTR, DNS_TYPE_SVCB,
+                          DNS_TYPE_HTTPS, DNS_TYPE_ZONEMD, DNS_TYPE_CSYNC, 0};
         for (int pi = 0; pts[pi]; pi++) {
             uint16_t pt = pts[pi];
             if (qtype != pt && qtype != DNS_TYPE_ANY)

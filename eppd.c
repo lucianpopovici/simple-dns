@@ -467,7 +467,7 @@ static xml_tagkind_t xml_next_tag(const char *buf, int *pos, int end, const char
     }
     int nstart = p;
     while (p < end && buf[p] != '>' && buf[p] != '/' && buf[p] != ' ' && buf[p] != '\t' &&
-          buf[p] != '\r' && buf[p] != '\n')
+           buf[p] != '\r' && buf[p] != '\n')
         p++;
     if (p == nstart || p >= end)
         return XMLTAG_ERROR; /* empty or unterminated tag name */
@@ -796,8 +796,7 @@ static int epp_handle_login(epp_session_t *sess, const char *xml, int len, int c
     char pw[256] = "";
     if (xml_find_child(xml, cstart, cend, "pw", &pwc_s, &pwc_e, &np) != 1 ||
         xml_text_decode(xml, pwc_s, pwc_e, pw, sizeof(pw)) < 0)
-        return epp_build_result(resp, rcap, 2001, "Command syntax error: missing pw", NULL,
-                                cltrid);
+        return epp_build_result(resp, rcap, 2001, "Command syntax error: missing pw", NULL, cltrid);
     char vkey[128], expected[256] = "";
     snprintf(vkey, sizeof(vkey), "config:eppd_registrar_pw:%s", clid);
     if (!vk_get(vkey, expected, sizeof(expected)) || !expected[0] || strcmp(expected, pw) != 0) {
@@ -818,15 +817,15 @@ static int epp_handle_login(epp_session_t *sess, const char *xml, int len, int c
 #define EPP_TAG_ROID 1
 #define EPP_TAG_STATUS 2 /* repeated */
 #define EPP_TAG_AUTHINFO 3
-#define EPP_TAG_CRDATE 4 /* u32 unix time */
-#define EPP_TAG_EXDATE 5 /* u32 unix time, domain only */
+#define EPP_TAG_CRDATE 4     /* u32 unix time */
+#define EPP_TAG_EXDATE 5     /* u32 unix time, domain only */
 #define EPP_TAG_REGISTRANT 6 /* domain only */
-#define EPP_TAG_NS 7 /* repeated, domain only */
-#define EPP_TAG_ADDR_V4 8 /* repeated, host only */
-#define EPP_TAG_ADDR_V6 9 /* repeated, host only */
-#define EPP_TAG_NAME 10 /* contact only */
-#define EPP_TAG_EMAIL 11 /* contact only */
-#define EPP_TAG_VOICE 12 /* contact only */
+#define EPP_TAG_NS 7         /* repeated, domain only */
+#define EPP_TAG_ADDR_V4 8    /* repeated, host only */
+#define EPP_TAG_ADDR_V6 9    /* repeated, host only */
+#define EPP_TAG_NAME 10      /* contact only */
+#define EPP_TAG_EMAIL 11     /* contact only */
+#define EPP_TAG_VOICE 12     /* contact only */
 
 #define EPP_MAX_ARR 16 /* status/ns/addr entries per object — ample for Phase 1 */
 
@@ -841,7 +840,7 @@ static uint32_t tlv_u32_of(const uint8_t *val, uint16_t vlen) {
     if (vlen != 4)
         return 0;
     return ((uint32_t) val[0] << 24) | ((uint32_t) val[1] << 16) | ((uint32_t) val[2] << 8) |
-          (uint32_t) val[3];
+           (uint32_t) val[3];
 }
 
 typedef struct {
@@ -895,8 +894,8 @@ static int epp_domain_encode(const epp_domain_t *d, uint8_t *buf, int cap) {
         off = tlv_put(buf, cap, off, EPP_TAG_REGISTRANT, (const uint8_t *) d->registrant,
                       (int) strlen(d->registrant));
     for (int i = 0; off >= 0 && i < d->nns; i++)
-        off = tlv_put(buf, cap, off, EPP_TAG_NS, (const uint8_t *) d->ns[i],
-                      (int) strlen(d->ns[i]));
+        off =
+            tlv_put(buf, cap, off, EPP_TAG_NS, (const uint8_t *) d->ns[i], (int) strlen(d->ns[i]));
     return off;
 }
 
@@ -1025,8 +1024,8 @@ static int epp_contact_encode(const epp_contact_t *c, uint8_t *buf, int cap) {
         return -1;
     off = tlv_put(buf, cap, off, EPP_TAG_ROID, (const uint8_t *) c->roid, (int) strlen(c->roid));
     if (off >= 0 && c->name[0])
-        off = tlv_put(buf, cap, off, EPP_TAG_NAME, (const uint8_t *) c->name,
-                      (int) strlen(c->name));
+        off =
+            tlv_put(buf, cap, off, EPP_TAG_NAME, (const uint8_t *) c->name, (int) strlen(c->name));
     if (off >= 0 && c->email[0])
         off = tlv_put(buf, cap, off, EPP_TAG_EMAIL, (const uint8_t *) c->email,
                       (int) strlen(c->email));
@@ -1230,9 +1229,9 @@ static int epp_host_check(const char *xml, int qs, int qe, const char *cltrid, c
     int exists = vk_get(key, blob, sizeof(blob));
     char extra[600];
     snprintf(extra, sizeof(extra),
-            "<chkData xmlns=\"urn:ietf:params:xml:ns:host-1.0\">"
-            "<cd><name avail=\"%d\">%s</name></cd></chkData>",
-            exists ? 0 : 1, name);
+             "<chkData xmlns=\"urn:ietf:params:xml:ns:host-1.0\">"
+             "<cd><name avail=\"%d\">%s</name></cd></chkData>",
+             exists ? 0 : 1, name);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
@@ -1254,7 +1253,7 @@ static int epp_host_create(const char *xml, int qs, int qe, const char *cltrid, 
     memset(&h, 0, sizeof(h));
     int pos = qs, as, ae, anp;
     while (h.nv4 + h.nv6 < EPP_MAX_ARR &&
-          xml_find_child(xml, pos, qe, "host:addr", &as, &ae, &anp) == 1) {
+           xml_find_child(xml, pos, qe, "host:addr", &as, &ae, &anp) == 1) {
         char addr[64] = "";
         xml_text_decode(xml, as, ae, addr, sizeof(addr));
         if (strchr(addr, ':')) {
@@ -1279,9 +1278,9 @@ static int epp_host_create(const char *xml, int qs, int qe, const char *cltrid, 
     epp_iso_date(h.crdate, crdatestr, sizeof(crdatestr));
     char extra[512];
     snprintf(extra, sizeof(extra),
-            "<creData xmlns=\"urn:ietf:params:xml:ns:host-1.0\">"
-            "<name>%s</name><crDate>%s</crDate></creData>",
-            name, crdatestr);
+             "<creData xmlns=\"urn:ietf:params:xml:ns:host-1.0\">"
+             "<name>%s</name><crDate>%s</crDate></creData>",
+             name, crdatestr);
     dns_log(LOG_NOTICE, "[eppd] host created: %s (%d v4, %d v6)\n", name, h.nv4, h.nv6);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
@@ -1314,10 +1313,10 @@ static int epp_host_info(const char *xml, int qs, int qe, const char *cltrid, ch
     epp_iso_date(h.crdate, crdatestr, sizeof(crdatestr));
     char extra[3000];
     snprintf(extra, sizeof(extra),
-            "<infData xmlns=\"urn:ietf:params:xml:ns:host-1.0\">"
-            "<name>%s</name><roid>%s</roid><status s=\"ok\"/>%s"
-            "<crDate>%s</crDate></infData>",
-            name, h.roid, addrs, crdatestr);
+             "<infData xmlns=\"urn:ietf:params:xml:ns:host-1.0\">"
+             "<name>%s</name><roid>%s</roid><status s=\"ok\"/>%s"
+             "<crDate>%s</crDate></infData>",
+             name, h.roid, addrs, crdatestr);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
@@ -1336,9 +1335,9 @@ static int epp_contact_check(const char *xml, int qs, int qe, const char *cltrid
     int exists = vk_get(key, blob, sizeof(blob));
     char extra[400];
     snprintf(extra, sizeof(extra),
-            "<chkData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
-            "<cd><id avail=\"%d\">%s</id></cd></chkData>",
-            exists ? 0 : 1, id);
+             "<chkData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
+             "<cd><id avail=\"%d\">%s</id></cd></chkData>",
+             exists ? 0 : 1, id);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
@@ -1381,9 +1380,9 @@ static int epp_contact_create(const char *xml, int qs, int qe, const char *cltri
     epp_iso_date(c.crdate, crdatestr, sizeof(crdatestr));
     char extra[400];
     snprintf(extra, sizeof(extra),
-            "<creData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
-            "<id>%s</id><crDate>%s</crDate></creData>",
-            id, crdatestr);
+             "<creData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
+             "<id>%s</id><crDate>%s</crDate></creData>",
+             id, crdatestr);
     dns_log(LOG_NOTICE, "[eppd] contact created: %s\n", id);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
@@ -1409,11 +1408,11 @@ static int epp_contact_info(const char *xml, int qs, int qe, const char *cltrid,
     epp_iso_date(c.crdate, crdatestr, sizeof(crdatestr));
     char extra[900];
     snprintf(extra, sizeof(extra),
-            "<infData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
-            "<id>%s</id><roid>%s</roid><status s=\"ok\"/>%s%s%s"
-            "<crDate>%s</crDate></infData>",
-            id, c.roid, c.name[0] ? "<name>" : "", c.name[0] ? c.name : "",
-            c.name[0] ? "</name>" : "", crdatestr);
+             "<infData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
+             "<id>%s</id><roid>%s</roid><status s=\"ok\"/>%s%s%s"
+             "<crDate>%s</crDate></infData>",
+             id, c.roid, c.name[0] ? "<name>" : "", c.name[0] ? c.name : "",
+             c.name[0] ? "</name>" : "", crdatestr);
     (void) c.email;
     (void) c.voice; /* Phase 1: not echoed in infData yet, stored for later use */
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
@@ -1434,9 +1433,9 @@ static int epp_domain_check(const char *xml, int qs, int qe, const char *cltrid,
     int exists = vk_get(key, blob, sizeof(blob));
     char extra[600];
     snprintf(extra, sizeof(extra),
-            "<chkData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
-            "<cd><name avail=\"%d\">%s</name></cd></chkData>",
-            exists ? 0 : 1, name);
+             "<chkData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
+             "<cd><name avail=\"%d\">%s</name></cd></chkData>",
+             exists ? 0 : 1, name);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
@@ -1488,7 +1487,7 @@ static int epp_domain_parse_ns(const char *xml, int qs, int qe, char ns_out[][25
                 }
                 int apos = has, aas, aae, aanp;
                 while (h.nv4 + h.nv6 < EPP_MAX_ARR &&
-                      xml_find_child(xml, apos, hae, "domain:hostAddr", &aas, &aae, &aanp) == 1) {
+                       xml_find_child(xml, apos, hae, "domain:hostAddr", &aas, &aae, &aanp) == 1) {
                     char addr[64] = "";
                     xml_text_decode(xml, aas, aae, addr, sizeof(addr));
                     if (strchr(addr, ':')) {
@@ -1571,9 +1570,9 @@ static int epp_domain_create(const char *xml, int qs, int qe, const char *cltrid
     epp_iso_date(d.exdate, exdatestr, sizeof(exdatestr));
     char extra[512];
     snprintf(extra, sizeof(extra),
-            "<creData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
-            "<name>%s</name><crDate>%s</crDate><exDate>%s</exDate></creData>",
-            name, crdatestr, exdatestr);
+             "<creData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
+             "<name>%s</name><crDate>%s</crDate><exDate>%s</exDate></creData>",
+             name, crdatestr, exdatestr);
     dns_log(LOG_NOTICE, "[eppd] domain created: %s (%d ns)\n", name, nns);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
@@ -1605,14 +1604,14 @@ static int epp_domain_info(const char *xml, int qs, int qe, const char *cltrid, 
     epp_iso_date(d.exdate, exdatestr, sizeof(exdatestr));
     char extra[4000];
     snprintf(extra, sizeof(extra),
-            "<infData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
-            "<name>%s</name><roid>%s</roid><status s=\"ok\"/>"
-            "%s%s%s"
-            "<ns>%s</ns>"
-            "<crDate>%s</crDate><exDate>%s</exDate></infData>",
-            name, d.roid, d.registrant[0] ? "<registrant>" : "",
-            d.registrant[0] ? d.registrant : "", d.registrant[0] ? "</registrant>" : "", nsxml,
-            crdatestr, exdatestr);
+             "<infData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
+             "<name>%s</name><roid>%s</roid><status s=\"ok\"/>"
+             "%s%s%s"
+             "<ns>%s</ns>"
+             "<crDate>%s</crDate><exDate>%s</exDate></infData>",
+             name, d.roid, d.registrant[0] ? "<registrant>" : "",
+             d.registrant[0] ? d.registrant : "", d.registrant[0] ? "</registrant>" : "", nsxml,
+             crdatestr, exdatestr);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
@@ -1647,7 +1646,7 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
         const char *tag;
         const char *op;
     } objcmds[] = {
-        {"check", "check"}, {"info", "info"}, {"create", "create"},
+        {"check", "check"},   {"info", "info"},     {"create", "create"},
         {"update", "update"}, {"delete", "delete"},
     };
     /* Implemented (op, obj) combinations — everything else recognized-but-
@@ -1714,8 +1713,9 @@ static int epp_dispatch(epp_session_t *sess, char *xml, int xlen, char *resp, in
             *should_close = 1;
             dns_log(LOG_NOTICE, "[eppd] registrar %s logged out\n",
                     sess->clid[0] ? sess->clid : "(none)");
-            return epp_build_result(resp, rcap, 1500, "Command completed successfully; ending "
-                                                       "session",
+            return epp_build_result(resp, rcap, 1500,
+                                    "Command completed successfully; ending "
+                                    "session",
                                     NULL, cltrid);
         }
         if (xml_find_child(xml, cs, ce, "login", &ls, &le, &lnp) == 1) {

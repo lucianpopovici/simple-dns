@@ -10,8 +10,8 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <stdio.h>
-#include <stdarg.h>  /* vkc_cmd/vkc_send_cmd varargs */
-#include <unistd.h>  /* close, sleep */
+#include <stdarg.h> /* vkc_cmd/vkc_send_cmd varargs */
+#include <unistd.h> /* close, sleep */
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>

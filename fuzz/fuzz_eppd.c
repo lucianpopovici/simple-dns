@@ -46,8 +46,8 @@
 
 static void probe_children(const char *xml, int s, int e) {
     static const char *leaf_tags[] = {
-        "clTRID", "clID",  "pw",       "authInfo", "hostObj",
-        "hostAttr", "hostName", "hostAddr", "period", "registrant",
+        "clTRID",   "clID",     "pw",       "authInfo", "hostObj",
+        "hostAttr", "hostName", "hostAddr", "period",   "registrant",
     };
     for (size_t i = 0; i < sizeof(leaf_tags) / sizeof(leaf_tags[0]); i++) {
         int cs, ce, cnp;
@@ -86,8 +86,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (xml_find_child(xml, es, ee, "command", &cs, &ce, &cnp) != 1)
         return 0;
     probe_children(xml, cs, ce);
-    static const char *ops[] = {"login",  "logout", "check", "create",
-                               "info",   "update", "delete"};
+    static const char *ops[] = {"login", "logout", "check", "create", "info", "update", "delete"};
     for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
         int os, oe, onp;
         if (xml_find_child(xml, cs, ce, ops[i], &os, &oe, &onp) != 1)
