@@ -1912,7 +1912,7 @@ void *keyspace_watch_loop(void *arg) {
                 break;
             if (hdr.type != 5 || hdr.count < 1)
                 continue;
-            char kind[16] = "";
+            int is_pmessage = 0;
             char key[512] = "";
             int rderr = 0;
             for (int i = 0; i < hdr.count; i++) {
@@ -1921,18 +1921,33 @@ void *keyspace_watch_loop(void *arg) {
                     rderr = 1;
                     break;
                 }
+                /* Compared directly against el.str (a fixed VKC_BUF-sized
+                 * buffer) rather than copied into a short local first --
+                 * copying tripped -Wstringop-truncation under -Werror -O2
+                 * (GCC assumes the worst-case full-length source; el.str's
+                 * real content is always the short literal "pmessage" or
+                 * "psubscribe" here, but that isn't visible statically). */
                 if (i == 0)
-                    safe_strcpy(kind, el.str, sizeof(kind));
+                    is_pmessage = strcmp(el.str, "pmessage") == 0;
                 /* pmessage array is [kind, pattern, channel, payload]; the
-                 * channel (index 2) is "__keyspace@<db>__:<key>". */
+                 * channel (index 2) is "__keyspace@<db>__:<key>". A length-
+                 * clamped memcpy avoids the same truncation warning a
+                 * safe_strcpy call here would trip, for the same reason. */
                 else if (i == 2) {
+                    const char *src = el.str;
                     const char *sep = strstr(el.str, "__:");
-                    safe_strcpy(key, sep ? sep + 3 : el.str, sizeof(key));
+                    if (sep)
+                        src = sep + 3;
+                    size_t klen = strlen(src);
+                    if (klen >= sizeof(key))
+                        klen = sizeof(key) - 1;
+                    memcpy(key, src, klen);
+                    key[klen] = 0;
                 }
             }
             if (rderr)
                 break;
-            if (strcmp(kind, "pmessage") == 0 && cfg->on_key)
+            if (is_pmessage && cfg->on_key)
                 cfg->on_key(key, cfg->ctx);
         }
         if (cfg->log)
