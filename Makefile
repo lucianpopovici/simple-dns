@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -967,6 +967,20 @@ check-ari: certd_debug | ossl-sanity
 	 echo "$$FUTURE_LINE" | grep -q "not yet due" || { echo "  FAIL  future ARI window did not suppress renewal"; cat /tmp/certd_future.log; exit 1; }; \
 	 echo "$$PAST_LINE"   | grep -q "renewing"    || { echo "  FAIL  past ARI window did not trigger renewal"; cat /tmp/certd_past.log; exit 1; }; \
 	 echo "  OK  ARI window drives the renewal decision (future window suppresses, past window triggers)"
+
+# CLAUDE-certd.md Add 2/Add 3: RFC 8737 TLS-ALPN-01 + RFC 8738 IP identifiers.
+# Both live entirely in isolated `static` helpers inside certd.c (SAN/CSR
+# construction, the acmeIdentifier extension, and the challenge listener), so
+# — matching check-ari's own precedent of testing the new isolated piece
+# rather than a full mock ACME server — this builds certd.c under UNIT_TEST
+# and exercises those helpers directly, including a live TLS handshake
+# against the real tlsalpn01_start listener.
+check-acme-challenges: tests/test_certd_challenges.c certd.c dns_wire.c dns_wire.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_certd_challenges (RFC 8737 TLS-ALPN-01 + RFC 8738 IP identifiers)"
+	$(CC) $(CSTD) -Wall -Wextra -Wno-unused-function -DUNIT_TEST $(DEBUG_FLAGS) \
+	      $(INCLUDES) -I. -o tests/test_certd_challenges \
+	      tests/test_certd_challenges.c dns_wire.c $(LIBS)
+	./tests/test_certd_challenges
 
 check-wire: tests/test_name_from_wire.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [TEST]  tests/test_name_from_wire"

@@ -54,7 +54,6 @@
 #include "dns_wire.h"
 
 #define HTTP_BUF 16384
-#define RESP_BUF 65536
 #define MAX_PEM 65536
 #define DNS_BUF 65535
 #define DEFAULT_TTL 60
@@ -94,243 +93,27 @@ static const char *cfgenv(const char *k, const char *def) {
     return v ? v : def;
 }
 
-/* ── Valkey RESP client (same minimal client as certd.c / mdnsd.c) ───────── */
-typedef struct {
-    int fd;
-    char rbuf[RESP_BUF];
-    int rlen, rpos;
-} resp_conn_t;
-static resp_conn_t vk = {.fd = -1};
+/* ── Valkey — thin wrappers over the shared libdnswire RESP client (see
+ * dns_wire.h: vkc_connect_to/vkc_ensure_to/vkc_cmd). apid used to carry its
+ * own copy (same shape as certd.c/mdnsd.c); repointed at the shared version
+ * so a parser fix only has to happen once. ─────────────────────────────── */
+static vkc_conn_t vk = {.fd = -1};
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int resp_fill(resp_conn_t *c) {
-    if (c->rpos > 0 && c->rlen > c->rpos) {
-        memmove(c->rbuf, c->rbuf + c->rpos, c->rlen - c->rpos);
-        c->rlen -= c->rpos;
-        c->rpos = 0;
-    } else if (c->rpos >= c->rlen) {
-        c->rlen = c->rpos = 0;
-    }
-    int room = RESP_BUF - c->rlen - 1;
-    if (room <= 0)
-        return -1;
-    int n = (int) recv(c->fd, c->rbuf + c->rlen, room, 0);
-    if (n <= 0)
-        return -1;
-    c->rlen += n;
-    c->rbuf[c->rlen] = 0;
-    return n;
-}
-static int resp_readline(resp_conn_t *c, char *out, int olen) {
-    for (;;) {
-        char *p = (char *) memchr(c->rbuf + c->rpos, '\n', c->rlen - c->rpos);
-        if (p) {
-            int len = (int) (p - (c->rbuf + c->rpos));
-            if (len > 0 && *(p - 1) == '\r')
-                len--;
-            if (len >= olen)
-                len = olen - 1;
-            memcpy(out, c->rbuf + c->rpos, len);
-            out[len] = 0;
-            c->rpos = (int) (p - c->rbuf) + 1;
-            return len;
-        }
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-}
-static int resp_readbytes(resp_conn_t *c, char *out, int n) {
-    int got = 0;
-    while (got < n) {
-        int have = c->rlen - c->rpos;
-        if (have <= 0) {
-            if (resp_fill(c) < 0)
-                return -1;
-            continue;
-        }
-        int take = (n - got < have) ? (n - got) : have;
-        memcpy(out + got, c->rbuf + c->rpos, take);
-        c->rpos += take;
-        got += take;
-    }
-    while (c->rlen - c->rpos < 2) {
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-    c->rpos += 2;
-    out[n] = 0;
-    return n;
-}
-typedef struct {
-    int type;
-    long integer;
-    char str[MAX_PEM];
-    int count;
-} resp_reply_t;
-static int resp_parse(resp_conn_t *c, resp_reply_t *r) {
-    char line[512];
-    if (resp_readline(c, line, sizeof(line)) < 0)
-        return -1;
-    memset(r, 0, sizeof(*r));
-    switch (line[0]) {
-        case '+':
-            r->type = 0;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case '-':
-            r->type = 1;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case ':':
-            r->type = 3;
-            r->integer = atol(line + 1);
-            return 0;
-        case '$': {
-            int bl = atoi(line + 1);
-            if (bl < 0) {
-                r->type = 4;
-                return 0;
-            }
-            r->type = 2;
-            int take = bl < (int) sizeof(r->str) - 1 ? bl : (int) sizeof(r->str) - 1;
-            if (resp_readbytes(c, r->str, take) < 0)
-                return -1;
-            int excess = bl - take;
-            while (excess > 0) {
-                char drain[257];
-                int d = excess > (int) (sizeof(drain) - 1) ? (int) (sizeof(drain) - 1) : excess;
-                if (resp_readbytes(c, drain, d) < 0)
-                    return -1;
-                excess -= d;
-            }
-            r->str[take] = 0;
-            return 0;
-        }
-        case '*':
-            r->type = 5;
-            r->count = atoi(line + 1);
-            return 0;
-        default:
-            return -1;
-    }
-}
-static int resp_send(resp_conn_t *c, const char *cmd, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int n = (int) send(c->fd, cmd + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-            return -1;
-        sent += n;
-    }
-    return 0;
-}
-static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    if (resp_send(c, buf, pos) < 0)
-        return -1;
-    return resp_parse(c, r);
-}
-/* Send a command without reading a reply — for (P)SUBSCRIBE, whose replies and
- * subsequent messages are consumed by the subscriber read loop. */
-static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    return resp_send(c, buf, pos);
-}
-static int valkey_connect(resp_conn_t *c) {
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    c->rlen = c->rpos = 0;
-    c->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (c->fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 4};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(g_valkey_port)};
-    if (inet_pton(AF_INET, g_valkey_host, &sa.sin_addr) != 1) {
-        struct addrinfo hints = {0}, *res;
-        char ps[8];
-        snprintf(ps, sizeof(ps), "%d", g_valkey_port);
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(g_valkey_host, ps, &hints, &res) != 0) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-        memcpy(&sa, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
-    }
-    if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(c->fd);
-        c->fd = -1;
-        return -1;
-    }
-    resp_reply_t r;
-    if (g_valkey_pass[0]) {
-        if (resp_cmd(c, &r, 2, "AUTH", g_valkey_pass) < 0 || r.type == 1) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-    }
-    resp_cmd(c, &r, 2, "SELECT", "0");
-    return 0;
-}
-static int valkey_ensure(resp_conn_t *c) {
-    if (c->fd < 0)
-        return valkey_connect(c);
-    resp_reply_t r;
-    if (resp_cmd(c, &r, 1, "PING") < 0)
-        return valkey_connect(c);
-    return 0;
-}
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
+    vkc_reply_t r;
     int ok;
     if (ttl > 0) {
         char ts[32];
         snprintf(ts, sizeof(ts), "%u", ttl);
-        ok = resp_cmd(&vk, &r, 5, "SET", key, val, "EX", ts);
+        ok = vkc_cmd(&vk, &r, 5, "SET", key, val, "EX", ts);
     } else
-        ok = resp_cmd(&vk, &r, 3, "SET", key, val);
+        ok = vkc_cmd(&vk, &r, 3, "SET", key, val);
     if (ok < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
@@ -341,12 +124,12 @@ static int vk_set(const char *key, const char *val, uint32_t ttl) {
 }
 static int vk_get(const char *key, char *out, int olen) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "GET", key) < 0) {
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "GET", key) < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
@@ -359,12 +142,12 @@ static int vk_get(const char *key, char *out, int olen) {
 }
 static int vk_del(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "DEL", key) < 0) {
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "DEL", key) < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
@@ -374,12 +157,12 @@ static int vk_del(const char *key) {
 }
 static long vk_incr(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "INCR", key) < 0) {
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "INCR", key) < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
@@ -398,14 +181,14 @@ static void resolve_zone(const char *name, char *out, int outsz) {
     char zns[MAX_ZONES_LIST][256];
     int nz = 0;
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) >= 0) {
-        resp_reply_t r;
-        resp_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
+        vkc_reply_t r;
+        vkc_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
         if (r.type == 5) {
             int cnt = r.count;
             for (int i = 0; i < cnt; i++) {
-                resp_reply_t kr;
-                if (resp_parse(&vk, &kr) < 0)
+                vkc_reply_t kr;
+                if (vkc_parse(&vk, &kr) < 0)
                     break;
                 if (kr.type == 2 && nz < MAX_ZONES_LIST) {
                     safe_strcpy(zns[nz], kr.str + 11, sizeof(zns[nz])); /* skip "zone_table:" */
@@ -568,78 +351,18 @@ static void tls_material_reload(void) {
  * A dedicated subscriber connection (separate from the request/reply `vk`);
  * reconnects use capped backoff and re-run the catch-up so nothing is missed. */
 #define KEYSPACE_DB 0
-static void *keyspace_watch_thread(void *arg) {
-    (void) arg;
-    static resp_conn_t sub;
-    int backoff = 1;
-    for (;;) {
-        memset(&sub, 0, sizeof(sub));
-        sub.fd = -1;
-        if (valkey_connect(&sub) < 0) {
-            sleep(backoff);
-            if (backoff < 30)
-                backoff *= 2;
-            continue;
-        }
-        struct timeval no_to = {0}; /* block for events; drop the 4s read timeout */
-        setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
-        resp_reply_t r;
-        if (resp_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
-            r.type == 1)
-            dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications — "
-                                 "boot/reconnect catch-up only\n");
-        tls_material_reload(); /* catch up via the shared vk connection */
-        static const char *prefixes[] = {"cert:current", "config:tls_cert_pem",
-                                         "config:tls_key_pem", "config:mtls_ca_pem", NULL};
-        int subok = 1;
-        for (int i = 0; prefixes[i]; i++) {
-            char pat[160];
-            snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", KEYSPACE_DB, prefixes[i]);
-            if (resp_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
-                subok = 0;
-                break;
-            }
-        }
-        if (!subok) {
-            close(sub.fd);
-            sub.fd = -1;
-            sleep(backoff);
-            if (backoff < 30)
-                backoff *= 2;
-            continue;
-        }
-        backoff = 1;
-        dns_log(LOG_NOTICE, "[Reload] live TLS reload active (keyspace notifications)\n");
-        for (;;) {
-            resp_reply_t hdr;
-            if (resp_parse(&sub, &hdr) < 0)
-                break;
-            if (hdr.type != 5 || hdr.count < 1)
-                continue;
-            char kind[16] = "";
-            int rderr = 0;
-            for (int i = 0; i < hdr.count; i++) {
-                resp_reply_t el;
-                if (resp_parse(&sub, &el) < 0) {
-                    rderr = 1;
-                    break;
-                }
-                if (i == 0)
-                    safe_strcpy(kind, el.str, sizeof(kind));
-            }
-            if (rderr)
-                break;
-            if (strcmp(kind, "pmessage") == 0)
-                tls_material_reload();
-        }
-        dns_log(LOG_WARNING, "[Reload] keyspace connection lost — reconnecting\n");
-        close(sub.fd);
-        sub.fd = -1;
-        sleep(backoff);
-        if (backoff < 30)
-            backoff *= 2;
-    }
-    return NULL;
+/* apid doesn't care which of the 4 watched keys changed — all four feed the
+ * one tls_material_reload() catch-up, so both the reconnect callback and the
+ * per-key callback just call it unconditionally (matching the hand-rolled
+ * loop this replaces, which never inspected the channel name either). */
+static void apid_keyspace_catchup(void *ctx) {
+    (void) ctx;
+    tls_material_reload();
+}
+static void apid_keyspace_on_key(const char *key, void *ctx) {
+    (void) key;
+    (void) ctx;
+    tls_material_reload();
 }
 
 /* ── HTTP plumbing ───────────────────────────────────────────────────────── */
@@ -944,21 +667,21 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         vk_get("config:zone_serial", zs, sizeof(zs));
         bp += snprintf(body + bp, sizeof(body) - bp, "Zone: %s  Serial: %s\n\n", zn, zs);
         pthread_mutex_lock(&g_vk_mutex);
-        if (valkey_ensure(&vk) >= 0) {
+        if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
             const char *pfxs[] = {"ddns:*", "zone:*", NULL};
             for (int pi = 0; pfxs[pi]; pi++) {
-                resp_reply_t r;
-                resp_cmd(&vk, &r, 2, "KEYS", pfxs[pi]);
+                vkc_reply_t r;
+                vkc_cmd(&vk, &r, 2, "KEYS", pfxs[pi]);
                 if (r.type == 5) {
                     for (int i = 0; i < r.count && bp < (int) sizeof(body) - 256; i++) {
-                        resp_reply_t kr;
-                        resp_parse(&vk, &kr);
+                        vkc_reply_t kr;
+                        vkc_parse(&vk, &kr);
                         if (kr.type != 2)
                             continue;
-                        resp_reply_t vr;
-                        resp_cmd(&vk, &vr, 2, "GET", kr.str);
-                        resp_reply_t tr;
-                        resp_cmd(&vk, &tr, 2, "TTL", kr.str);
+                        vkc_reply_t vr;
+                        vkc_cmd(&vk, &vr, 2, "GET", kr.str);
+                        vkc_reply_t tr;
+                        vkc_cmd(&vk, &tr, 2, "TTL", kr.str);
                         bp += snprintf(body + bp, sizeof(body) - bp, "  %-50s = %s  TTL=%ld\n",
                                        kr.str, vr.str, tr.type == 3 ? tr.integer : -1L);
                     }
@@ -1187,18 +910,18 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         char body[HTTP_BUF];
         int bp = 0;
         pthread_mutex_lock(&g_vk_mutex);
-        if (valkey_ensure(&vk) >= 0) {
-            resp_reply_t r;
-            resp_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
+        if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
+            vkc_reply_t r;
+            vkc_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
             if (r.type == 5) {
                 bp += snprintf(body + bp, sizeof(body) - bp, "zones: %d\n", r.count);
                 for (int i = 0; i < r.count && bp < (int) sizeof(body) - 512; i++) {
-                    resp_reply_t kr;
-                    resp_parse(&vk, &kr);
+                    vkc_reply_t kr;
+                    vkc_parse(&vk, &kr);
                     if (kr.type != 2)
                         continue;
-                    resp_reply_t vr;
-                    resp_cmd(&vk, &vr, 2, "GET", kr.str);
+                    vkc_reply_t vr;
+                    vkc_cmd(&vk, &vr, 2, "GET", kr.str);
                     bp += snprintf(body + bp, sizeof(body) - bp, "  %-40s = %s\n", kr.str + 11,
                                    vr.type == 2 ? vr.str : "?");
                 }
@@ -1527,7 +1250,20 @@ int main(int argc, char **argv) {
     dns_log(LOG_NOTICE, "[apid] Starting: HTTP :%d, HTTPS :%d, dnsd at 127.0.0.1:%d\n", g_http_port,
             g_https_port, g_dns_port);
     pthread_t t1, t2, t3;
-    if (pthread_create(&t3, NULL, keyspace_watch_thread, NULL) == 0)
+    static keyspace_watch_config_t kcfg;
+    memset(&kcfg, 0, sizeof(kcfg));
+    kcfg.host = g_valkey_host;
+    kcfg.port = g_valkey_port;
+    kcfg.pass = g_valkey_pass;
+    kcfg.db = KEYSPACE_DB;
+    static const char *prefixes[] = {"cert:current", "config:tls_cert_pem", "config:tls_key_pem",
+                                     "config:mtls_ca_pem", NULL};
+    kcfg.prefixes = prefixes;
+    kcfg.on_reconnect = apid_keyspace_catchup;
+    kcfg.on_key = apid_keyspace_on_key;
+    kcfg.log = dns_log;
+    kcfg.tag = "apid";
+    if (pthread_create(&t3, NULL, keyspace_watch_loop, &kcfg) == 0)
         pthread_detach(t3);
     if (pthread_create(&t2, NULL, https_thread, NULL) == 0)
         pthread_detach(t2);

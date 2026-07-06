@@ -207,13 +207,29 @@ unconditional `#include <openssl/quic.h>` into a file every other daemon
 compiles against the lower OpenSSL 3.0+ floor, so `doqd` carries its own
 small QUIC-specific context constructor instead (documented in `doqd.c`).
 `eppd` *does* use `tls_server_ctx_from_pem` directly (RFC 5734's transport is
-plain TLS, no QUIC floor issue) and is also the first caller of the shared
+plain TLS, no QUIC floor issue) and was the first caller of the shared
 Valkey RESP client + keyspace-notification watcher (`vkc_*` /
 `keyspace_watch_loop`, `dns_wire.{c,h}`) — hoisted out of what were
-previously five-plus near-identical per-daemon copies (`certd`/`apid`/
-`mdnsd`/`doqd`/`resolverd`/`dns_server.c` each still carry their own; only
-`eppd` was written against the shared version). Repointing the others is an
-explicit, still-open follow-up, not assumed done by this hoist.
+previously five-plus near-identical per-daemon copies. **`certd`, `apid`,
+`mdnsd`, and `doqd` are now repointed at it too** (2026-07-06): each dropped
+its own `resp_conn_t`/`resp_reply_t`/`resp_fill`/`resp_readline`/
+`resp_readbytes`/`resp_parse`/`resp_send`/`resp_cmd`/`resp_send_cmd`/
+`valkey_connect`/`valkey_ensure` copy in favor of `vkc_conn_t`/`vkc_reply_t`/
+`vkc_cmd`/`vkc_ensure_to`/`vkc_connect_to`, and (`apid`/`mdnsd`/`doqd`, which
+each had their own hand-rolled subscriber loop) their own keyspace-watch
+thread in favor of `keyspace_watch_loop` + a small per-daemon
+`on_reconnect`/`on_key` pair. This is also the fix for a real, previously
+undiscovered bug: mdnsd's own copy sized its reply buffer at 4096 bytes
+(every other copy used 65536) — large enough to silently truncate a
+multi-intermediate-CA `cert:current` chain read through its own `vk_get`;
+confirmed live with a >4096-byte RSA chain before and after the repoint.
+**`resolverd.c` and `dns_server.c` still carry their own copies** — both are
+much larger (5755 / 11804 lines) than the four already repointed, and
+`dns_server.c` additionally has a thread-local connection-pooling pattern
+(`t_vk_conn`, lock-free per-UDP-worker access) the shared client has no
+special support for yet; repointing those two is an explicit, still-open
+follow-up (CLAUDE.md's security-sensitive-change gate applies to touching
+`dnsd`'s Valkey trust boundary), not assumed done by this pass.
 
 ---
 
@@ -262,13 +278,22 @@ all interfaces; it refuses to start unconfigured.
 **Done (migration Step 2):** `certd.c`. All ACME and EST client code is out of
 `dnsd`.
 
-Owns: ACME directory/JWS/order flow, DNS-01 challenge orchestration, EST
-mTLS enrollment, CSR generation, renewal scheduling (daemon mode checks daily;
-`certd --once` for cron/manual runs).
+Owns: ACME directory/JWS/order flow, dns-01 **and** tls-alpn-01 challenge
+orchestration (RFC 8737, 2026-07-06 — `config:acme_challenge_type`, forced to
+tls-alpn-01 for an RFC 8738 IP identifier since dns-01 has no defined meaning
+for the "ip" type), EST mTLS enrollment, CSR generation (DNS **or** IP
+identifiers, RFC 8738), renewal scheduling (daemon mode checks daily; `certd
+--once` for cron/manual runs; RFC 9773 ARI lets the CA drive the renewal
+window instead of a fixed threshold).
 
 Integration is entirely through Valkey:
-- For ACME DNS-01: writes the challenge as a normal zone record
+- For ACME dns-01: writes the challenge as a normal zone record
   (`zone:TXT:_acme-challenge.<domain>`), waits, then deletes it.
+- For ACME tls-alpn-01: no Valkey write at all — instead a short-lived
+  in-process TLS listener (`config:acme_tls_alpn_port`, default 443) presents
+  an ephemeral self-signed challenge cert to the validator and closes; no
+  zone record, no `cert:current` write, nothing persisted past the
+  validation window.
 - On success: writes the issued cert chain + key to `cert:current` (one PEM
   blob). That is its only output — no `config:*`, no TLSA.
 - `dnsd` watches `cert:current` and hot-reloads — it never speaks ACME/EST.
@@ -277,7 +302,12 @@ Integration is entirely through Valkey:
 
 This is the change that removes the most attacker-adjacent parser code from the
 trusted core. `certd` is the only component (besides `resolverd`) that makes
-arbitrary outbound connections.
+arbitrary outbound connections — and, since the tls-alpn-01 add, the only one
+of the two that *also* gets a narrow, on-demand **inbound** surface (the
+challenge listener, live only for the seconds a validation is in flight,
+gone the moment `acme_issue` tears it down). `signal(SIGPIPE, SIG_IGN)` was
+added to `main()` for this reason — the same protection every other
+listening daemon already carries.
 
 ### `resolverd` — recursive/forwarding resolver (separate role)
 
@@ -580,7 +610,14 @@ The Valkey bus is a **versioned contract**, not an ad-hoc set of strings
 
 - **Internet-facing, untrusted input:** `dnsd` (DNS wire), `resolverd`
   (upstream responses), `eppd` (registrar EPP/XML sessions, mTLS-gated), the
-  reverse proxy (HTTP/TLS). These get the strongest sandboxing.
+  reverse proxy (HTTP/TLS). These get the strongest sandboxing. `certd` is a
+  narrower, on-demand case: when `config:acme_challenge_type` is
+  `tls-alpn-01` (or forced there for an RFC 8738 IP identifier) it opens an
+  inbound TLS listener, but only for the seconds an ACME validation is in
+  flight — not a standing service — and the only bytes it ever parses from
+  that connection are the TLS handshake itself (ALPN + SNI), never
+  application data (RFC 8737 §3 — the server sends none and closes right
+  after the handshake).
 - **Outbound network:** only `certd` (to the CA / EST server) and `resolverd`
   (to upstreams). `dnsd` should reach nothing but Valkey.
 - **Link-local:** `mdnsd` only.
@@ -714,9 +751,11 @@ answers a DS query at a delegation cut authoritatively and signed (RFC 5910/
 didn't originally list (the poll queue for changePoll, `domain:renew` for
 fee) rather than landing 8590/8748 as structurally-present but practically
 inert extensions. `eppd` is also the third daemon on `libsandbox` (after
-`dnsd`/`resolverd`) and the first caller of a newly-hoisted shared Valkey
-RESP client (`vkc_*`/`keyspace_watch_loop`, `dns_wire.{c,h}`) that the other
-daemons still have their own pre-hoist copies of.
+`dnsd`/`resolverd`) and was the first caller of a newly-hoisted shared Valkey
+RESP client (`vkc_*`/`keyspace_watch_loop`, `dns_wire.{c,h}`); `certd`/`apid`/
+`mdnsd`/`doqd` are now repointed at it too (2026-07-06, see the "Shared code"
+paragraph above) — only `resolverd.c` and `dns_server.c` still carry their
+own pre-hoist copies.
 
 Verifying the new DS-at-cut signing surfaced an unrelated, pre-existing bug
 in `dnsd`'s core signer: `make_rrsig` used the RRset's own owner name for

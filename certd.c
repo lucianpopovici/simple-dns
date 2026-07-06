@@ -30,11 +30,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include <syslog.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -53,7 +55,6 @@
 #define ACME_CA_PROD "https://acme-v02.api.letsencrypt.org/directory"
 #define ACME_RENEW_DAYS 30
 #define HTTP_BUF 16384
-#define RESP_BUF 65536
 #define MAX_PEM 65536
 #define RENEW_CHECK_SECS 86400
 
@@ -81,6 +82,11 @@ static char g_valkey_pass[256] = "";
 static char g_acme_domain[256] = "";
 static char g_acme_email[256] = "";
 static char g_acme_ca[512] = ACME_CA_PROD;
+/* RFC 8555 §8 challenge type: "dns-01" (default) or "tls-alpn-01" (RFC 8737).
+ * An IP identifier (RFC 8738) forces tls-alpn-01 regardless of this setting —
+ * dns-01 has no defined meaning for the "ip" identifier type. */
+static char g_acme_challenge_type[16] = "dns-01";
+static int g_acme_tls_alpn_port = 443; /* RFC 8737 fixes 443; overridable for a private CA/NAT setup */
 static char g_acme_client_cert_pem[MAX_PEM] = "";
 static char g_acme_client_key_pem[MAX_PEM] = "";
 static char g_acme_ca_pem[MAX_PEM] = "";
@@ -141,224 +147,28 @@ static int json_str(const char *j, const char *key, char *out, int olen) {
     return 1;
 }
 
-/* ── Valkey RESP client ──────────────────────────────────────────────────── */
-/* Same implementation as dns_server.c minus the RFC 8767 stale-shadow keys:
- * certd does not own the stale:* namespace and has no cache to keep warm. */
-typedef struct {
-    int fd;
-    char rbuf[RESP_BUF];
-    int rlen, rpos;
-} resp_conn_t;
-static resp_conn_t vk = {.fd = -1};
+/* ── Valkey — thin wrappers over the shared libdnswire RESP client (see
+ * dns_wire.h: vkc_connect_to/vkc_ensure_to/vkc_cmd). certd used to carry its
+ * own copy (same shape as dns_server.c's, minus the RFC 8767 stale-shadow
+ * keys certd doesn't own); repointed at the shared version so a parser fix
+ * only has to happen once. ──────────────────────────────────────────────── */
+static vkc_conn_t vk = {.fd = -1};
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int resp_fill(resp_conn_t *c) {
-    if (c->rpos > 0 && c->rlen > c->rpos) {
-        memmove(c->rbuf, c->rbuf + c->rpos, c->rlen - c->rpos);
-        c->rlen -= c->rpos;
-        c->rpos = 0;
-    } else if (c->rpos >= c->rlen) {
-        c->rlen = c->rpos = 0;
-    }
-    int room = RESP_BUF - c->rlen - 1;
-    if (room <= 0)
-        return -1;
-    int n = (int) recv(c->fd, c->rbuf + c->rlen, room, 0);
-    if (n <= 0)
-        return -1;
-    c->rlen += n;
-    c->rbuf[c->rlen] = 0;
-    return n;
-}
-static int resp_readline(resp_conn_t *c, char *out, int olen) {
-    for (;;) {
-        char *p = (char *) memchr(c->rbuf + c->rpos, '\n', c->rlen - c->rpos);
-        if (p) {
-            int len = (int) (p - (c->rbuf + c->rpos));
-            if (len > 0 && *(p - 1) == '\r')
-                len--;
-            if (len >= olen)
-                len = olen - 1;
-            memcpy(out, c->rbuf + c->rpos, len);
-            out[len] = 0;
-            c->rpos = (int) (p - c->rbuf) + 1;
-            return len;
-        }
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-}
-static int resp_readbytes(resp_conn_t *c, char *out, int n) {
-    int got = 0;
-    while (got < n) {
-        int have = c->rlen - c->rpos;
-        if (have <= 0) {
-            if (resp_fill(c) < 0)
-                return -1;
-            continue;
-        }
-        int take = (n - got < have) ? (n - got) : have;
-        memcpy(out + got, c->rbuf + c->rpos, take);
-        c->rpos += take;
-        got += take;
-    }
-    while (c->rlen - c->rpos < 2) {
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-    c->rpos += 2;
-    out[n] = 0;
-    return n;
-}
-typedef struct {
-    int type;
-    long integer;
-    char str[MAX_PEM];
-    int count;
-} resp_reply_t;
-static int resp_parse(resp_conn_t *c, resp_reply_t *r) {
-    char line[512];
-    if (resp_readline(c, line, sizeof(line)) < 0)
-        return -1;
-    memset(r, 0, sizeof(*r));
-    switch (line[0]) {
-        case '+':
-            r->type = 0;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case '-':
-            r->type = 1;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case ':':
-            r->type = 3;
-            r->integer = atol(line + 1);
-            return 0;
-        case '$': {
-            int bl = atoi(line + 1);
-            if (bl < 0) {
-                r->type = 4;
-                return 0;
-            }
-            r->type = 2;
-            int take = bl < (int) sizeof(r->str) - 1 ? bl : (int) sizeof(r->str) - 1;
-            if (resp_readbytes(c, r->str, take) < 0)
-                return -1;
-            int excess = bl - take;
-            while (excess > 0) {
-                char drain[257];
-                int d = excess > (int) (sizeof(drain) - 1) ? (int) (sizeof(drain) - 1) : excess;
-                if (resp_readbytes(c, drain, d) < 0)
-                    return -1;
-                excess -= d;
-            }
-            r->str[take] = 0;
-            return 0;
-        }
-        case '*':
-            r->type = 5;
-            r->count = atoi(line + 1);
-            return 0;
-        default:
-            return -1;
-    }
-}
-static int resp_send(resp_conn_t *c, const char *cmd, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int n = (int) send(c->fd, cmd + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-            return -1;
-        sent += n;
-    }
-    return 0;
-}
-static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    if (resp_send(c, buf, pos) < 0)
-        return -1;
-    return resp_parse(c, r);
-}
-static int valkey_connect(resp_conn_t *c) {
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    c->rlen = c->rpos = 0;
-    c->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (c->fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 4};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(g_valkey_port)};
-    if (inet_pton(AF_INET, g_valkey_host, &sa.sin_addr) != 1) {
-        struct addrinfo hints = {0}, *res;
-        char ps[8];
-        snprintf(ps, sizeof(ps), "%d", g_valkey_port);
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(g_valkey_host, ps, &hints, &res) != 0) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-        memcpy(&sa, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
-    }
-    if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(c->fd);
-        c->fd = -1;
-        return -1;
-    }
-    resp_reply_t r;
-    if (g_valkey_pass[0]) {
-        if (resp_cmd(c, &r, 2, "AUTH", g_valkey_pass) < 0 || r.type == 1) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-    }
-    resp_cmd(c, &r, 2, "SELECT", "0");
-    return 0;
-}
-static int valkey_ensure(resp_conn_t *c) {
-    if (c->fd < 0)
-        return valkey_connect(c);
-    resp_reply_t r;
-    if (resp_cmd(c, &r, 1, "PING") < 0)
-        return valkey_connect(c);
-    return 0;
-}
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
+    vkc_reply_t r;
     int ok;
     if (ttl > 0) {
         char ts[32];
         snprintf(ts, sizeof(ts), "%u", ttl);
-        ok = resp_cmd(&vk, &r, 5, "SET", key, val, "EX", ts);
+        ok = vkc_cmd(&vk, &r, 5, "SET", key, val, "EX", ts);
     } else
-        ok = resp_cmd(&vk, &r, 3, "SET", key, val);
+        ok = vkc_cmd(&vk, &r, 3, "SET", key, val);
     if (ok < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
@@ -369,12 +179,12 @@ static int vk_set(const char *key, const char *val, uint32_t ttl) {
 }
 static int vk_get(const char *key, char *out, int olen) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "GET", key) < 0) {
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "GET", key) < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
@@ -387,12 +197,12 @@ static int vk_get(const char *key, char *out, int olen) {
 }
 static int vk_del(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "DEL", key) < 0) {
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "DEL", key) < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
@@ -791,8 +601,26 @@ static int acme_directory(const char *host, int port) {
     return 0;
 }
 
-/* make_csr_der — PKCS#10 DER with CN=domain and DNS SAN. */
-static uint8_t *make_csr_der(const char *domain, EVP_PKEY **dkout, int *derlen) {
+/* RFC 8738 — an ACME identifier is either "dns" (a name) or "ip" (an address
+ * literal). is_ip_literal drives that split everywhere an identifier value
+ * is used: the order request, the CSR/challenge-cert SAN, and (since dns-01
+ * has no defined meaning for the "ip" type) the forced challenge type. */
+static int is_ip_literal(const char *s) {
+    unsigned char buf[16];
+    return inet_pton(AF_INET, s, buf) == 1 || inet_pton(AF_INET6, s, buf) == 1;
+}
+
+/* Shared SAN builder — one identifier, DNS or IP, used by both the real CSR
+ * and the ephemeral TLS-ALPN-01 challenge cert (RFC 8737/8738). */
+static X509_EXTENSION *make_san_ext(const char *value, int is_ip) {
+    char san[512];
+    snprintf(san, sizeof(san), "%s:%s", is_ip ? "IP" : "DNS", value);
+    return X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, san);
+}
+
+/* make_csr_der — PKCS#10 DER with CN=<value> and a single SAN entry (DNS or
+ * IP per RFC 8738). */
+static uint8_t *make_csr_der(const char *value, int is_ip, EVP_PKEY **dkout, int *derlen) {
     EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
     EVP_PKEY_keygen_init(kctx);
     EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1);
@@ -807,11 +635,9 @@ static uint8_t *make_csr_der(const char *domain, EVP_PKEY **dkout, int *derlen) 
     X509_REQ *req = X509_REQ_new();
     X509_REQ_set_pubkey(req, dk);
     X509_NAME *nm = X509_REQ_get_subject_name(req);
-    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (unsigned char *) domain, -1, -1, 0);
+    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (unsigned char *) value, -1, -1, 0);
     STACK_OF(X509_EXTENSION) *exts = sk_X509_EXTENSION_new_null();
-    char san[512];
-    snprintf(san, sizeof(san), "DNS:%s", domain);
-    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, san);
+    X509_EXTENSION *ext = make_san_ext(value, is_ip);
     if (ext)
         sk_X509_EXTENSION_push(exts, ext);
     X509_REQ_add_extensions(req, exts);
@@ -838,9 +664,9 @@ static uint8_t *make_csr_der(const char *domain, EVP_PKEY **dkout, int *derlen) 
     return der;
 }
 
-static char *acme_gen_csr(const char *domain, EVP_PKEY **dkout) {
+static char *acme_gen_csr(const char *value, int is_ip, EVP_PKEY **dkout) {
     int derlen = 0;
-    uint8_t *der = make_csr_der(domain, dkout, &derlen);
+    uint8_t *der = make_csr_der(value, is_ip, dkout, &derlen);
     if (!der)
         return NULL;
     char *cb64 = malloc((size_t) derlen * 2 + 4);
@@ -853,6 +679,238 @@ static char *acme_gen_csr(const char *domain, EVP_PKEY **dkout) {
     b64url_enc(der, derlen, cb64, (int) ((size_t) derlen * 2 + 4));
     free(der);
     return cb64;
+}
+
+/* ── RFC 8737: TLS-ALPN-01 challenge ─────────────────────────────────────── */
+#define ACME_TLS_ALPN_PROTO "acme-tls/1"
+#define OID_ACME_IDENTIFIER "1.3.6.1.5.5.7.1.31"
+
+/* RFC 8737 §3: a critical id-pe-acmeIdentifier extension whose value is a DER
+ * OCTET STRING wrapping the 32-byte SHA-256 "acmeValidation" digest (the same
+ * SHA-256(keyAuthorization) digest dns-01 base64url-encodes into its TXT
+ * record — computed once in acme_issue and passed in raw here). */
+static X509_EXTENSION *make_acme_identifier_ext(const uint8_t hash32[32]) {
+    ASN1_OCTET_STRING *inner = ASN1_OCTET_STRING_new();
+    if (!inner)
+        return NULL;
+    if (!ASN1_OCTET_STRING_set(inner, hash32, 32)) {
+        ASN1_OCTET_STRING_free(inner);
+        return NULL;
+    }
+    int ilen = i2d_ASN1_OCTET_STRING(inner, NULL);
+    unsigned char *ibuf = ilen > 0 ? malloc((size_t) ilen) : NULL;
+    if (!ibuf) {
+        ASN1_OCTET_STRING_free(inner);
+        return NULL;
+    }
+    unsigned char *pp = ibuf;
+    i2d_ASN1_OCTET_STRING(inner, &pp);
+    ASN1_OCTET_STRING_free(inner);
+    ASN1_OCTET_STRING *extval = ASN1_OCTET_STRING_new();
+    if (!extval || !ASN1_OCTET_STRING_set(extval, ibuf, ilen)) {
+        free(ibuf);
+        if (extval)
+            ASN1_OCTET_STRING_free(extval);
+        return NULL;
+    }
+    free(ibuf);
+    ASN1_OBJECT *obj = OBJ_txt2obj(OID_ACME_IDENTIFIER, 1);
+    X509_EXTENSION *ext = obj ? X509_EXTENSION_create_by_OBJ(NULL, obj, 1 /* critical */, extval) : NULL;
+    if (obj)
+        ASN1_OBJECT_free(obj);
+    ASN1_OCTET_STRING_free(extval);
+    return ext;
+}
+
+/* Ephemeral, self-signed challenge certificate: a fresh EC P-256 key, a SAN
+ * matching the identifier under validation, and the acmeIdentifier extension
+ * above. Never touches the real server key/cert:current — the key and cert
+ * are discarded the moment the challenge window closes (tlsalpn01_stop). */
+static int tlsalpn01_make_cert(const char *value, int is_ip, const uint8_t hash32[32],
+                                X509 **out_cert, EVP_PKEY **out_key) {
+    *out_cert = NULL;
+    *out_key = NULL;
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    if (!kctx)
+        return -1;
+    EVP_PKEY_keygen_init(kctx);
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1);
+    EVP_PKEY *key = NULL;
+    EVP_PKEY_keygen(kctx, &key);
+    EVP_PKEY_CTX_free(kctx);
+    if (!key)
+        return -1;
+    X509 *cert = X509_new();
+    if (!cert) {
+        EVP_PKEY_free(key);
+        return -1;
+    }
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), (long) time(NULL));
+    X509_gmtime_adj(X509_get_notBefore(cert), -60);
+    X509_gmtime_adj(X509_get_notAfter(cert), 300);
+    X509_set_pubkey(cert, key);
+    X509_NAME *nm = X509_get_subject_name(cert);
+    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (unsigned char *) value, -1, -1, 0);
+    X509_set_issuer_name(cert, nm);
+    X509_EXTENSION *san = make_san_ext(value, is_ip);
+    X509_EXTENSION *acid = make_acme_identifier_ext(hash32);
+    if (!san || !acid) {
+        if (san)
+            X509_EXTENSION_free(san);
+        if (acid)
+            X509_EXTENSION_free(acid);
+        X509_free(cert);
+        EVP_PKEY_free(key);
+        return -1;
+    }
+    X509_add_ext(cert, san, -1);
+    X509_add_ext(cert, acid, -1);
+    X509_EXTENSION_free(san);
+    X509_EXTENSION_free(acid);
+    if (!X509_sign(cert, key, EVP_sha256())) {
+        X509_free(cert);
+        EVP_PKEY_free(key);
+        return -1;
+    }
+    *out_cert = cert;
+    *out_key = key;
+    return 0;
+}
+
+typedef struct {
+    int fd;
+    volatile int stop;
+    SSL_CTX *ctx;
+} tlsalpn01_listener_t;
+
+/* RFC 8737 §3: the server MUST negotiate the "acme-tls/1" ALPN protocol and
+ * MUST NOT negotiate anything else on this listener. Our server-side
+ * preference list contains only that one protocol, so SSL_select_next_proto
+ * can never pick anything else — a client that didn't offer it gets
+ * OPENSSL_NPN_NO_OVERLAP and the handshake is aborted. */
+static int tlsalpn01_alpn_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                             const unsigned char *in, unsigned int inlen, void *arg) {
+    (void) ssl;
+    (void) arg;
+    /* Protocol-list format: a 1-byte length prefix followed by the bytes
+     * (same wire format the client's offered list arrives in as in/inlen).
+     * The literal-concatenation split below keeps the octal length escape
+     * ("\012" == 10 == strlen(ACME_TLS_ALPN_PROTO)) in its own string
+     * literal so it can't absorb the following letters as more octal
+     * digits. */
+    static const unsigned char proto[] = "\012" ACME_TLS_ALPN_PROTO;
+    if (SSL_select_next_proto((unsigned char **) out, outlen, proto, sizeof(proto) - 1, in, inlen) !=
+        OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    return SSL_TLSEXT_ERR_OK;
+}
+
+/* Accept loop: handshake-only, no application data (RFC 8737 §3) — the CA's
+ * validator proves possession purely by completing the TLS handshake against
+ * the acmeIdentifier-bearing cert over the negotiated acme-tls/1 protocol.
+ * Polls with a short timeout so tlsalpn01_stop can join it promptly. A
+ * low-concurrency accept-and-close loop is adequate for a private/internal
+ * registry's validation traffic; it is not meant to survive a flood. */
+static void *tlsalpn01_accept_loop(void *arg) {
+    tlsalpn01_listener_t *l = (tlsalpn01_listener_t *) arg;
+    while (!l->stop) {
+        struct pollfd pfd = {.fd = l->fd, .events = POLLIN};
+        if (poll(&pfd, 1, 500) <= 0)
+            continue;
+        int cfd = accept(l->fd, NULL, NULL);
+        if (cfd < 0)
+            continue;
+        struct timeval tv = {.tv_sec = 10};
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        SSL *ssl = SSL_new(l->ctx);
+        SSL_set_fd(ssl, cfd);
+        if (SSL_accept(ssl) <= 0)
+            dns_log(LOG_DEBUG, "[ACME] tls-alpn-01: handshake did not complete (ok if a "
+                                "probe/unrelated connection)\n");
+        else
+            dns_log(LOG_NOTICE, "[ACME] tls-alpn-01: served a validation handshake\n");
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(cfd);
+    }
+    return NULL;
+}
+
+/* Binds and listens synchronously — so the caller knows the port is actually
+ * held before telling the CA to validate — then hands the socket to a
+ * background accept-loop thread. Tries a dual-stack IPv6 bind first (so a v4
+ * validator source still reaches it via v4-mapped addresses), falling back
+ * to IPv4-only if that fails (e.g. IPv6 disabled on this host). */
+static int tlsalpn01_start(int port, X509 *cert, EVP_PKEY *key, tlsalpn01_listener_t **out,
+                           pthread_t *tid) {
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        int v6only = 0;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in6 sa6 = {.sin6_family = AF_INET6, .sin6_port = htons((uint16_t) port)};
+        if (bind(fd, (struct sockaddr *) &sa6, sizeof(sa6)) < 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+    if (fd < 0) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+            return -1;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in sa4 = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
+        if (bind(fd, (struct sockaddr *) &sa4, sizeof(sa4)) < 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    if (listen(fd, 16) < 0) {
+        close(fd);
+        return -1;
+    }
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        close(fd);
+        return -1;
+    }
+    SSL_CTX_use_certificate(ctx, cert);
+    SSL_CTX_use_PrivateKey(ctx, key);
+    if (!SSL_CTX_check_private_key(ctx)) {
+        SSL_CTX_free(ctx);
+        close(fd);
+        return -1;
+    }
+    SSL_CTX_set_alpn_select_cb(ctx, tlsalpn01_alpn_cb, NULL);
+    tlsalpn01_listener_t *l = calloc(1, sizeof(*l));
+    if (!l) {
+        SSL_CTX_free(ctx);
+        close(fd);
+        return -1;
+    }
+    l->fd = fd;
+    l->ctx = ctx;
+    if (pthread_create(tid, NULL, tlsalpn01_accept_loop, l) != 0) {
+        SSL_CTX_free(ctx);
+        close(fd);
+        free(l);
+        return -1;
+    }
+    *out = l;
+    return 0;
+}
+
+static void tlsalpn01_stop(tlsalpn01_listener_t *l, pthread_t tid) {
+    if (!l)
+        return;
+    l->stop = 1;
+    pthread_join(tid, NULL);
+    SSL_CTX_free(l->ctx);
+    close(l->fd);
+    free(l);
 }
 
 static int acme_issue(void) {
@@ -906,9 +964,16 @@ static int acme_issue(void) {
             dns_log(LOG_NOTICE, "[ACME] Account: %s\n", g_acme_account_url);
         }
     }
+    int is_ip = is_ip_literal(g_acme_domain);
+    const char *chal_type = is_ip ? "tls-alpn-01" : g_acme_challenge_type;
+    if (is_ip && strcmp(g_acme_challenge_type, "tls-alpn-01") != 0)
+        dns_log(LOG_NOTICE,
+                "[ACME] %s is an IP identifier — dns-01 has no defined meaning for it "
+                "(RFC 8555 §8.4); forcing tls-alpn-01\n",
+                g_acme_domain);
     char pay[512];
-    snprintf(pay, sizeof(pay), "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"%s\"}]}",
-             g_acme_domain);
+    snprintf(pay, sizeof(pay), "{\"identifiers\":[{\"type\":\"%s\",\"value\":\"%s\"}]}",
+             is_ip ? "ip" : "dns", g_acme_domain);
     char ord_hdrs[4096] = {0};
     int code = 0;
     char *ord_body =
@@ -952,8 +1017,10 @@ static int acme_issue(void) {
     }
     char ch_tok[256] = {0}, ch_url[512] = {0};
     {
+        char needle[32];
+        snprintf(needle, sizeof(needle), "\"%s\"", chal_type);
         char *p = az_body;
-        while ((p = strstr(p, "\"dns-01\"")) != NULL) {
+        while ((p = strstr(p, needle)) != NULL) {
             char *obj = p - 300;
             if (obj < az_body)
                 obj = az_body;
@@ -964,13 +1031,13 @@ static int acme_issue(void) {
                 safe_strcpy(ch_tok, tok2, sizeof(ch_tok));
                 safe_strcpy(ch_url, uv, sizeof(ch_url));
             }
-            p += 8;
+            p += strlen(needle);
             break;
         }
     }
     free(az_body);
     if (!ch_tok[0]) {
-        dns_log(LOG_ERR, "[ACME] No dns-01 challenge\n");
+        dns_log(LOG_ERR, "[ACME] No %s challenge offered\n", chal_type);
         return -1;
     }
     char thumb[256];
@@ -979,24 +1046,56 @@ static int acme_issue(void) {
     snprintf(kauth, sizeof(kauth), "%s.%s", ch_tok, thumb);
     uint8_t h32[32];
     sha256((uint8_t *) kauth, strlen(kauth), h32);
-    char dns01val[256];
-    b64url_enc(h32, 32, dns01val, sizeof(dns01val));
-    dns_log(LOG_NOTICE, "[ACME] DNS-01 TXT: %s\n", dns01val);
-    char acme_name[512];
-    snprintf(acme_name, sizeof(acme_name), "_acme-challenge.%s", g_acme_domain);
-    strlower(acme_name);
-    char acme_val[512];
-    snprintf(acme_val, sizeof(acme_val), "120|%s", dns01val);
-    char acme_vk[560];
-    snprintf(acme_vk, sizeof(acme_vk), "zone:TXT:%s", acme_name);
-    vk_set(acme_vk, acme_val, 0);
-    dns_log(LOG_NOTICE, "[ACME] TXT %s set — waiting 5s\n", acme_name);
-    sleep(5);
+
+    char acme_vk[560] = {0};
+    tlsalpn01_listener_t *alpn_listener = NULL;
+    pthread_t alpn_tid;
+    X509 *alpn_cert = NULL;
+    EVP_PKEY *alpn_key = NULL;
+
+    if (!strcmp(chal_type, "tls-alpn-01")) {
+        if (tlsalpn01_make_cert(g_acme_domain, is_ip, h32, &alpn_cert, &alpn_key) < 0) {
+            dns_log(LOG_ERR, "[ACME] tls-alpn-01: failed to build the challenge cert\n");
+            return -1;
+        }
+        if (tlsalpn01_start(g_acme_tls_alpn_port, alpn_cert, alpn_key, &alpn_listener, &alpn_tid) <
+            0) {
+            dns_log(LOG_ERR,
+                    "[ACME] tls-alpn-01: failed to bind :%d (a port <1024 needs "
+                    "CAP_NET_BIND_SERVICE or root)\n",
+                    g_acme_tls_alpn_port);
+            X509_free(alpn_cert);
+            EVP_PKEY_free(alpn_key);
+            return -1;
+        }
+        dns_log(LOG_NOTICE, "[ACME] tls-alpn-01: listening on :%d for %s\n", g_acme_tls_alpn_port,
+                g_acme_domain);
+    } else {
+        char dns01val[256];
+        b64url_enc(h32, 32, dns01val, sizeof(dns01val));
+        dns_log(LOG_NOTICE, "[ACME] DNS-01 TXT: %s\n", dns01val);
+        char acme_name[512];
+        snprintf(acme_name, sizeof(acme_name), "_acme-challenge.%s", g_acme_domain);
+        strlower(acme_name);
+        char acme_val[512];
+        snprintf(acme_val, sizeof(acme_val), "120|%s", dns01val);
+        snprintf(acme_vk, sizeof(acme_vk), "zone:TXT:%s", acme_name);
+        vk_set(acme_vk, acme_val, 0);
+        dns_log(LOG_NOTICE, "[ACME] TXT %s set — waiting 5s\n", acme_name);
+        sleep(5);
+    }
     char ch_hdrs[4096] = {0};
     char *ch_body = acme_post(ch_url, "{}", achost, acport, &code, ch_hdrs, sizeof(ch_hdrs));
     free(ch_body);
     if (code < 200 || code >= 300) {
-        vk_del(acme_vk);
+        if (acme_vk[0])
+            vk_del(acme_vk);
+        if (alpn_listener)
+            tlsalpn01_stop(alpn_listener, alpn_tid);
+        if (alpn_cert) {
+            X509_free(alpn_cert);
+            EVP_PKEY_free(alpn_key);
+        }
         return -1;
     }
     dns_log(LOG_NOTICE, "[ACME] Polling authz (up to 3min)\n");
@@ -1020,13 +1119,20 @@ static int acme_issue(void) {
         if (!strcmp(status, "invalid"))
             break;
     }
-    vk_del(acme_vk);
+    if (acme_vk[0])
+        vk_del(acme_vk);
+    if (alpn_listener)
+        tlsalpn01_stop(alpn_listener, alpn_tid);
+    if (alpn_cert) {
+        X509_free(alpn_cert);
+        EVP_PKEY_free(alpn_key);
+    }
     dns_log(LOG_NOTICE, "[ACME] Polling done\n");
     if (!validated) {
         return -1;
     }
     EVP_PKEY *dkey = NULL;
-    char *csr = acme_gen_csr(g_acme_domain, &dkey);
+    char *csr = acme_gen_csr(g_acme_domain, is_ip, &dkey);
     if (!csr)
         return -1;
     char fin_pay[4096];
@@ -1295,7 +1401,7 @@ static char *est_enroll(const char *host, int port, const char *domain, const ch
                         const char *cc, const char *ck, const char *ca, char **key_pem_out) {
     EVP_PKEY *dk = NULL;
     int derlen = 0;
-    uint8_t *csr = make_csr_der(domain, &dk, &derlen);
+    uint8_t *csr = make_csr_der(domain, 0 /* EST enrolls DNS names only */, &dk, &derlen);
     if (!csr) {
         dns_log(LOG_ERR, "[EST] CSR generation failed\n");
         return NULL;
@@ -1336,7 +1442,7 @@ static char *est_enroll(const char *host, int port, const char *domain, const ch
         int b64bsz = (derlen / 3 + 1) * 4 + 2;
         char *b64b = malloc(b64bsz);
         if (b64b) {
-            uint8_t *csr2 = make_csr_der(domain, &dk, &derlen);
+            uint8_t *csr2 = make_csr_der(domain, 0 /* EST enrolls DNS names only */, &dk, &derlen);
             if (csr2) {
                 b64url_enc(csr2, derlen, b64b, b64bsz);
                 free(csr2);
@@ -1447,6 +1553,16 @@ static void load_config(void) {
         safe_strcpy(g_acme_email, val, sizeof(g_acme_email));
     if (vk_get("config:acme_ca", val, sizeof(val)) && val[0])
         safe_strcpy(g_acme_ca, val, sizeof(g_acme_ca));
+    if (vk_get("config:acme_challenge_type", val, sizeof(val)) && val[0])
+        safe_strcpy(g_acme_challenge_type, val, sizeof(g_acme_challenge_type));
+    if (strcmp(g_acme_challenge_type, "dns-01") != 0 &&
+        strcmp(g_acme_challenge_type, "tls-alpn-01") != 0) {
+        dns_log(LOG_WARNING, "[ACME] Unknown config:acme_challenge_type '%s' — defaulting to dns-01\n",
+                g_acme_challenge_type);
+        safe_strcpy(g_acme_challenge_type, "dns-01", sizeof(g_acme_challenge_type));
+    }
+    if (vk_get("config:acme_tls_alpn_port", val, sizeof(val)) && val[0])
+        g_acme_tls_alpn_port = atoi(val);
     vk_get("config:acme_client_cert_pem", g_acme_client_cert_pem, sizeof(g_acme_client_cert_pem));
     vk_get("config:acme_client_key_pem", g_acme_client_key_pem, sizeof(g_acme_client_key_pem));
     vk_get("config:acme_ca_pem", g_acme_ca_pem, sizeof(g_acme_ca_pem));
@@ -1515,6 +1631,7 @@ static int schema_gate(void) {
     }
 }
 
+#ifndef UNIT_TEST
 int main(int argc, char **argv) {
     int once = 0;
     for (int i = 1; i < argc; i++) {
@@ -1525,6 +1642,10 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    /* Add 2 (RFC 8737) gives certd its first inbound listener — a validator
+     * that resets the connection mid-write would otherwise SIGPIPE-kill the
+     * whole daemon, same reason every other listening daemon ignores it. */
+    signal(SIGPIPE, SIG_IGN);
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
@@ -1543,3 +1664,4 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+#endif /* UNIT_TEST */

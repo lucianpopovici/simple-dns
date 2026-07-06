@@ -42,6 +42,7 @@ tests/test_dns64
 tests/test_doq
 tests/test_eppd
 tests/test_csync
+tests/test_certd_challenges
 fuzz/fuzz_name_from_wire
 fuzz/fuzz_response
 fuzz/fuzz_tlv

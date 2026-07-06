@@ -45,7 +45,7 @@ authoritative answer at the delegation cut.
 | Daemon | Role | Listens on | Talks to |
 |---|---|---|---|
 | **`dnsd`** (`dns_server.c`) | Authoritative core: query resolution, DNSSEC signing, UPDATE/TSIG, AXFR/IXFR/NOTIFY, EDNS/cookies, RFC 9471 delegation referrals | `5353/udp+tcp` (DNS), `8853` (DoT), `127.0.0.1:8054` (read-only `/health`+`/metrics`) | Valkey only |
-| **`certd`** (`certd.c`) | ACME (RFC 8555, DNS-01) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA) | Valkey + CA |
+| **`certd`** (`certd.c`) | ACME (RFC 8555, dns-01/tls-alpn-01, RFC 8737/8738, RFC 9773 ARI) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA; briefly inbound on `config:acme_tls_alpn_port` during a tls-alpn-01 validation) | Valkey + CA |
 | **`mdnsd`** (`mdnsd.c`) | mDNS (RFC 6762) + DNS-SD (RFC 6763) responder, link-local | `5353` multicast on explicitly-configured interfaces | Valkey (read) |
 | **`apid`** (`apid.c`) | HTTP/HTTPS front: DoH + management API | `8053` (HTTP), `8443` (HTTPS/mTLS) | Valkey + dnsd (DoH forward) |
 | **`doqd`** (`doqd.c`) | DNS-over-QUIC (RFC 9250) sidecar | `8853/udp` (opt-in via `config:doq_enabled`) | Valkey (read) + dnsd (loopback forward) |
@@ -66,7 +66,7 @@ linked by every binary.
 | `apid.c` | `apid`, the HTTP/HTTPS front for DoH + management. |
 | `doqd.c` | `doqd`, the DNS-over-QUIC (RFC 9250) sidecar. Needs OpenSSL ≥ 3.5 (server-side QUIC API) — only this one binary; the rest of the build stays on the 3.0+ floor. |
 | `eppd.c` | `eppd`, the EPP registry front-end (RFC 5730/5734/5731/5732/5733 + RFC 8543 org). Registrar mTLS sessions; publishes domain delegations (NS/A/AAAA/DS) into `zone:*`. All phases done — see `CLAUDE-eppd.md`. |
-| `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library — also the shared Valkey RESP client + keyspace-watch loop (`vkc_*`/`keyspace_watch_loop`), hoisted out of per-daemon copies with `eppd` as the first caller. |
+| `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library — also the shared Valkey RESP client + keyspace-watch loop (`vkc_*`/`keyspace_watch_loop`), hoisted out of per-daemon copies. `eppd` was the first caller; `certd`, `apid`, `mdnsd`, and `doqd` are now repointed at it too. Only `resolverd.c` and `dns_server.c` still carry their own pre-hoist copies. |
 | `sandbox.{c,h}` | `libsandbox`, the shared privilege-drop / chroot+mountns / seccomp sandbox, linked by `dnsd`, `resolverd`, and `eppd`. |
 | `resolverd.c` | `resolverd`, the recursive/forwarding resolver + cache + DNSSEC validation (the recursive role; formerly `dns_client.c`). |
 | `object_graph.{c,h}` | Vendored [objectdb](https://github.com/lucianpopovici/objectdb) engine (pinned; see the file headers) backing `resolverd`'s optional embedded cache tier (`RESOLVERD_CACHE_BACKEND=objectdb`, ADR-008 pilot). |
@@ -165,7 +165,8 @@ glance:
   UDP response at 1232 even when a client advertises more, setting TC so the
   client retries over TCP rather than emitting a fragmentable datagram.
 - **mDNS / DNS-SD** (`mdnsd`): 6762 + 6763, dual-stack IPv4 + IPv6.
-- **PKI bootstrap** (`certd`): ACME (8555, DNS-01) and EST (7030) over mTLS.
+- **PKI bootstrap** (`certd`): ACME (8555, dns-01 and tls-alpn-01/8737, DNS
+  and IP identifiers/8738, renewal-info/9773) and EST (7030) over mTLS.
 - **DNS-over-QUIC** (`doqd`, RFC 9250): a separate sidecar terminating
   QUIC/UDP 853 and relaying framed messages to `dnsd`'s loopback DNS port —
   the same pattern `apid` uses for DoH. Needs OpenSSL ≥ 3.5 to build (only
@@ -320,12 +321,17 @@ AXFR over DoT works on `:8853` for encrypted transfers.
 
 ### Certificates
 
-`certd` performs ACME DNS-01 (it writes the challenge to
-`zone:TXT:_acme-challenge.<domain>` and deletes it after validation) or EST
-enrollment, then writes the issued chain+key to `cert:current`. `dnsd` and
-`apid` watch `cert:current` and hot-reload TLS within seconds; `dnsd` also
-publishes the matching TLSA records. Run `certd` as a daemon (daily renewal
-check) or `certd --once` from cron.
+`certd` performs ACME dns-01 (it writes the challenge to
+`zone:TXT:_acme-challenge.<domain>` and deletes it after validation),
+tls-alpn-01 (`config:acme_challenge_type=tls-alpn-01` — no zone write at all;
+a short-lived in-process TLS listener on `config:acme_tls_alpn_port`, default
+443, presents an ephemeral challenge cert and closes), or EST enrollment,
+then writes the issued chain+key to `cert:current`. An IP-address
+`config:acme_domain` (RFC 8738) forces tls-alpn-01 automatically, since
+dns-01 has no defined meaning for an IP identifier. `dnsd` and `apid` watch
+`cert:current` and hot-reload TLS within seconds; `dnsd` also publishes the
+matching TLSA records. Run `certd` as a daemon (daily renewal check) or
+`certd --once` from cron.
 
 ### Live reload
 

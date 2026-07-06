@@ -51,7 +51,6 @@
 #include "dns_wire.h"
 
 #define MAX_PEM 65536
-#define RESP_BUF 65536
 #define DOQ_MAX_MSG 65535 /* a DNS message's own 16-bit length ceiling */
 
 /* RFC 9250 §4.3 application error codes — named once, no bare literals at
@@ -99,235 +98,21 @@ static const char *cfgenv(const char *k, const char *def) {
     return v ? v : def;
 }
 
-/* ── Valkey RESP client (same minimal client as certd.c/mdnsd.c/apid.c) ──── */
-typedef struct {
-    int fd;
-    char rbuf[RESP_BUF];
-    int rlen, rpos;
-} resp_conn_t;
-static resp_conn_t vk = {.fd = -1};
+/* ── Valkey — thin wrappers over the shared libdnswire RESP client (see
+ * dns_wire.h: vkc_connect_to/vkc_ensure_to/vkc_cmd). doqd used to carry its
+ * own copy (same shape as certd.c/mdnsd.c/apid.c); repointed at the shared
+ * version so a parser fix only has to happen once. ─────────────────────── */
+static vkc_conn_t vk = {.fd = -1};
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int resp_fill(resp_conn_t *c) {
-    if (c->rpos > 0 && c->rlen > c->rpos) {
-        memmove(c->rbuf, c->rbuf + c->rpos, c->rlen - c->rpos);
-        c->rlen -= c->rpos;
-        c->rpos = 0;
-    } else if (c->rpos >= c->rlen) {
-        c->rlen = c->rpos = 0;
-    }
-    int room = RESP_BUF - c->rlen - 1;
-    if (room <= 0)
-        return -1;
-    int n = (int) recv(c->fd, c->rbuf + c->rlen, room, 0);
-    if (n <= 0)
-        return -1;
-    c->rlen += n;
-    c->rbuf[c->rlen] = 0;
-    return n;
-}
-static int resp_readline(resp_conn_t *c, char *out, int olen) {
-    for (;;) {
-        char *p = (char *) memchr(c->rbuf + c->rpos, '\n', c->rlen - c->rpos);
-        if (p) {
-            int len = (int) (p - (c->rbuf + c->rpos));
-            if (len > 0 && *(p - 1) == '\r')
-                len--;
-            if (len >= olen)
-                len = olen - 1;
-            memcpy(out, c->rbuf + c->rpos, len);
-            out[len] = 0;
-            c->rpos = (int) (p - c->rbuf) + 1;
-            return len;
-        }
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-}
-static int resp_readbytes(resp_conn_t *c, char *out, int n) {
-    int got = 0;
-    while (got < n) {
-        int have = c->rlen - c->rpos;
-        if (have <= 0) {
-            if (resp_fill(c) < 0)
-                return -1;
-            continue;
-        }
-        int take = (n - got < have) ? (n - got) : have;
-        memcpy(out + got, c->rbuf + c->rpos, take);
-        c->rpos += take;
-        got += take;
-    }
-    while (c->rlen - c->rpos < 2) {
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-    c->rpos += 2;
-    out[n] = 0;
-    return n;
-}
-typedef struct {
-    int type;
-    long integer;
-    char str[MAX_PEM];
-    int count;
-} resp_reply_t;
-static int resp_parse(resp_conn_t *c, resp_reply_t *r) {
-    char line[512];
-    if (resp_readline(c, line, sizeof(line)) < 0)
-        return -1;
-    memset(r, 0, sizeof(*r));
-    switch (line[0]) {
-        case '+':
-            r->type = 0;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case '-':
-            r->type = 1;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case ':':
-            r->type = 3;
-            r->integer = atol(line + 1);
-            return 0;
-        case '$': {
-            int bl = atoi(line + 1);
-            if (bl < 0) {
-                r->type = 4;
-                return 0;
-            }
-            r->type = 2;
-            int take = bl < (int) sizeof(r->str) - 1 ? bl : (int) sizeof(r->str) - 1;
-            if (resp_readbytes(c, r->str, take) < 0)
-                return -1;
-            int excess = bl - take;
-            while (excess > 0) {
-                char drain[257];
-                int d = excess > (int) (sizeof(drain) - 1) ? (int) (sizeof(drain) - 1) : excess;
-                if (resp_readbytes(c, drain, d) < 0)
-                    return -1;
-                excess -= d;
-            }
-            r->str[take] = 0;
-            return 0;
-        }
-        case '*':
-            r->type = 5;
-            r->count = atoi(line + 1);
-            return 0;
-        default:
-            return -1;
-    }
-}
-static int resp_send(resp_conn_t *c, const char *cmd, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int n = (int) send(c->fd, cmd + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-            return -1;
-        sent += n;
-    }
-    return 0;
-}
-static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    if (resp_send(c, buf, pos) < 0)
-        return -1;
-    return resp_parse(c, r);
-}
-static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    return resp_send(c, buf, pos);
-}
-static int valkey_connect(resp_conn_t *c) {
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    c->rlen = c->rpos = 0;
-    c->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (c->fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 4};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(g_valkey_port)};
-    if (inet_pton(AF_INET, g_valkey_host, &sa.sin_addr) != 1) {
-        struct addrinfo hints = {0}, *res;
-        char ps[8];
-        snprintf(ps, sizeof(ps), "%d", g_valkey_port);
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(g_valkey_host, ps, &hints, &res) != 0) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-        memcpy(&sa, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
-    }
-    if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(c->fd);
-        c->fd = -1;
-        return -1;
-    }
-    resp_reply_t r;
-    if (g_valkey_pass[0]) {
-        if (resp_cmd(c, &r, 2, "AUTH", g_valkey_pass) < 0 || r.type == 1) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-    }
-    resp_cmd(c, &r, 2, "SELECT", "0");
-    return 0;
-}
-static int valkey_ensure(resp_conn_t *c) {
-    if (c->fd < 0)
-        return valkey_connect(c);
-    resp_reply_t r;
-    if (resp_cmd(c, &r, 1, "PING") < 0)
-        return valkey_connect(c);
-    return 0;
-}
 static int vk_get(const char *key, char *out, int olen) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "GET", key) < 0) {
+    vkc_reply_t r;
+    if (vkc_cmd(&vk, &r, 2, "GET", key) < 0) {
         vk.fd = -1;
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
@@ -568,108 +353,35 @@ static void tls_reload(void) {
  * loopback forwarding port. config:doq_port is deliberately NOT reloaded
  * here — changing it would require rebinding the UDP listener socket, which
  * this simple accept-loop architecture does not support live. */
-static void doq_config_reload(resp_conn_t *c) {
-    resp_reply_t r;
-    if (resp_cmd(c, &r, 2, "GET", "config:doq_max_conns") == 0 && r.type == 2 && r.str[0]) {
-        int n = atoi(r.str);
+static void doq_config_reload(void) {
+    char v[32];
+    if (vk_get("config:doq_max_conns", v, sizeof(v)) && v[0]) {
+        int n = atoi(v);
         if (n > 0)
             g_doq_max_conns = n;
     }
-    if (resp_cmd(c, &r, 2, "GET", "config:doq_dns_port") == 0 && r.type == 2 && r.str[0]) {
-        int n = atoi(r.str);
+    if (vk_get("config:doq_dns_port", v, sizeof(v)) && v[0]) {
+        int n = atoi(v);
         if (n > 0)
             g_dns_port = n;
     }
 }
 
-/* Live reload via Valkey keyspace notifications (migration Step 6), mirroring
- * apid's keyspace_watch_thread: a dedicated subscriber connection (separate
- * from the request/reply `vk`), capped-backoff reconnect, full catch-up
- * re-run after every reconnect so a Valkey restart never causes a missed
- * update. doqd only ever reads; it writes nothing to Valkey. */
+/* Live reload via the shared keyspace_watch_loop (dns_wire.h) — full
+ * catch-up re-run after every reconnect so a Valkey restart never causes a
+ * missed update. doqd only ever reads; it writes nothing to Valkey. */
 #define KEYSPACE_DB 0
-static void *keyspace_watch_thread(void *arg) {
-    (void) arg;
-    static resp_conn_t sub;
-    int backoff = 1;
-    for (;;) {
-        memset(&sub, 0, sizeof(sub));
-        sub.fd = -1;
-        if (valkey_connect(&sub) < 0) {
-            sleep(backoff);
-            if (backoff < 30)
-                backoff *= 2;
-            continue;
-        }
-        struct timeval no_to = {0}; /* block for events; drop the 4s read timeout */
-        setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
-        resp_reply_t r;
-        if (resp_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
-            r.type == 1)
-            dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications — "
-                                 "boot/reconnect catch-up only\n");
+static void doqd_keyspace_catchup(void *ctx) {
+    (void) ctx;
+    tls_reload();
+    doq_config_reload();
+}
+static void doqd_keyspace_on_key(const char *key, void *ctx) {
+    (void) ctx;
+    if (strstr(key, "cert:current") || strstr(key, "config:tls_"))
         tls_reload();
-        doq_config_reload(&sub);
-        static const char *prefixes[] = {"cert:current",        "config:tls_cert_pem",
-                                         "config:tls_key_pem",  "config:doq_max_conns",
-                                         "config:doq_dns_port", NULL};
-        int subok = 1;
-        for (int i = 0; prefixes[i]; i++) {
-            char pat[160];
-            snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", KEYSPACE_DB, prefixes[i]);
-            if (resp_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
-                subok = 0;
-                break;
-            }
-        }
-        if (!subok) {
-            close(sub.fd);
-            sub.fd = -1;
-            sleep(backoff);
-            if (backoff < 30)
-                backoff *= 2;
-            continue;
-        }
-        backoff = 1;
-        dns_log(LOG_NOTICE, "[Reload] live reload active (keyspace notifications)\n");
-        for (;;) {
-            resp_reply_t hdr;
-            if (resp_parse(&sub, &hdr) < 0)
-                break;
-            if (hdr.type != 5 || hdr.count < 1)
-                continue;
-            char kind[16] = "";
-            char channel[160] = "";
-            int rderr = 0;
-            for (int i = 0; i < hdr.count; i++) {
-                resp_reply_t el;
-                if (resp_parse(&sub, &el) < 0) {
-                    rderr = 1;
-                    break;
-                }
-                if (i == 0)
-                    safe_strcpy(kind, el.str, sizeof(kind));
-                else if (i == 1)
-                    safe_strcpy(channel, el.str, sizeof(channel));
-            }
-            if (rderr)
-                break;
-            if (strcmp(kind, "pmessage") != 0)
-                continue;
-            if (strstr(channel, "cert:current") || strstr(channel, "config:tls_"))
-                tls_reload();
-            else if (strstr(channel, "config:doq_max_conns") ||
-                     strstr(channel, "config:doq_dns_port"))
-                doq_config_reload(&sub);
-        }
-        dns_log(LOG_WARNING, "[Reload] keyspace connection lost — reconnecting\n");
-        close(sub.fd);
-        sub.fd = -1;
-        sleep(backoff);
-        if (backoff < 30)
-            backoff *= 2;
-    }
-    return NULL;
+    else if (strstr(key, "config:doq_max_conns") || strstr(key, "config:doq_dns_port"))
+        doq_config_reload();
 }
 
 /* ── Per-stream / per-connection handling ─────────────────────────────────
@@ -913,7 +625,21 @@ int main(int argc, char **argv) {
     dns_log(LOG_NOTICE, "[doqd] Starting: DoQ :%d/udp, dnsd at 127.0.0.1:%d\n", g_doq_port,
             g_dns_port);
     pthread_t kt, lt;
-    if (pthread_create(&kt, NULL, keyspace_watch_thread, NULL) == 0)
+    static keyspace_watch_config_t kcfg;
+    memset(&kcfg, 0, sizeof(kcfg));
+    kcfg.host = g_valkey_host;
+    kcfg.port = g_valkey_port;
+    kcfg.pass = g_valkey_pass;
+    kcfg.db = KEYSPACE_DB;
+    static const char *prefixes[] = {"cert:current",        "config:tls_cert_pem",
+                                     "config:tls_key_pem",  "config:doq_max_conns",
+                                     "config:doq_dns_port", NULL};
+    kcfg.prefixes = prefixes;
+    kcfg.on_reconnect = doqd_keyspace_catchup;
+    kcfg.on_key = doqd_keyspace_on_key;
+    kcfg.log = dns_log;
+    kcfg.tag = "doqd";
+    if (pthread_create(&kt, NULL, keyspace_watch_loop, &kcfg) == 0)
         pthread_detach(kt);
     if (pthread_create(&lt, NULL, doq_listen_thread, NULL) != 0) {
         dns_log(LOG_ERR, "[DoQ] failed to start listener thread\n");
