@@ -5098,8 +5098,8 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
-            int sl =
-                make_rrsig(name, t_zone->name, type, ttl, rdata, rdlen, zsk, DNS_ALG_ED25519, tag, sig);
+            int sl = make_rrsig(name, t_zone->name, type, ttl, rdata, rdlen, zsk, DNS_ALG_ED25519,
+                                tag, sig);
             if (sl > 0) {
                 int so = append_rr(resp, off, resp_len, name, DNS_TYPE_RRSIG, DNS_CLASS_IN, ttl,
                                    sig, (uint16_t) sl);
@@ -6201,8 +6201,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
             if (dnssec_ok) {
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk_next,
-                                    DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, sig);
+                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 68,
+                                    g_ksk_next, DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, sig);
                 if (sl > 0) {
                     int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
                                        3600, sig, (uint16_t) sl);
@@ -6222,8 +6222,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
             if (dnssec_ok) {
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed_next,
-                                    DNS_ALG_ED25519, g_ksk_ed_next_tag, sig);
+                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 36,
+                                    g_ksk_ed_next, DNS_ALG_ED25519, g_ksk_ed_next_tag, sig);
                 if (sl > 0) {
                     int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
                                        3600, sig, (uint16_t) sl);
@@ -8659,7 +8659,8 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                         pipe = val;
                     }
                     char *sp = NULL;
-                    for (char *ent = strtok_r(pipe, "|", &sp); ent; ent = strtok_r(NULL, "|", &sp)) {
+                    for (char *ent = strtok_r(pipe, "|", &sp); ent;
+                         ent = strtok_r(NULL, "|", &sp)) {
                         int keytag = 0, alg = 0, digtype = 0;
                         char hexdigest[257];
                         if (sscanf(ent, "%d,%d,%d,%256[0-9a-fA-F]", &keytag, &alg, &digtype,

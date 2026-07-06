@@ -134,7 +134,8 @@ static void test_acme_identifier_ext(void) {
     CHECK(X509_EXTENSION_get_critical(ext) == 1, "marked critical");
     char oidbuf[64];
     OBJ_obj2txt(oidbuf, sizeof(oidbuf), X509_EXTENSION_get_object(ext), 1);
-    CHECK(strcmp(oidbuf, OID_ACME_IDENTIFIER) == 0, "OID is 1.3.6.1.5.5.7.1.31 (id-pe-acmeIdentifier)");
+    CHECK(strcmp(oidbuf, OID_ACME_IDENTIFIER) == 0,
+          "OID is 1.3.6.1.5.5.7.1.31 (id-pe-acmeIdentifier)");
     ASN1_OCTET_STRING *val = X509_EXTENSION_get_data(ext);
     const unsigned char *p = ASN1_STRING_get0_data(val);
     ASN1_OCTET_STRING *inner = d2i_ASN1_OCTET_STRING(NULL, &p, ASN1_STRING_length(val));
@@ -203,7 +204,8 @@ static int cert_has_acme_identifier(X509 *cert, const uint8_t expect_hash[32]) {
  * and returns the peer cert on a successful handshake (NULL if the server
  * rejected it, e.g. no ALPN overlap). Verification is intentionally off —
  * this is a self-signed one-shot challenge cert, not a trust decision. */
-static X509 *tls_test_connect(int port, const char *alpn_proto, char *negotiated, int negotiated_sz) {
+static X509 *tls_test_connect(int port, const char *alpn_proto, char *negotiated,
+                              int negotiated_sz) {
     SSL_CTX *cctx = SSL_CTX_new(TLS_client_method());
     if (!cctx)
         return NULL;
@@ -277,7 +279,8 @@ static void test_tlsalpn01_listener(void) {
     char negotiated[32] = {0};
     X509 *seen = tls_test_connect(port, ACME_TLS_ALPN_PROTO, negotiated, sizeof(negotiated));
     CHECK(seen != NULL, "a client offering acme-tls/1 completes the handshake");
-    CHECK(!strcmp(negotiated, ACME_TLS_ALPN_PROTO), "server negotiates acme-tls/1 (and nothing else)");
+    CHECK(!strcmp(negotiated, ACME_TLS_ALPN_PROTO),
+          "server negotiates acme-tls/1 (and nothing else)");
     if (seen) {
         CHECK(cert_san_matches(seen, 1, "192.0.2.77"),
               "presented cert's SAN matches the identifier under validation");
@@ -288,7 +291,8 @@ static void test_tlsalpn01_listener(void) {
 
     char negotiated2[32] = {0};
     X509 *rejected = tls_test_connect(port, "http/1.1", negotiated2, sizeof(negotiated2));
-    CHECK(rejected == NULL, "a client NOT offering acme-tls/1 is refused (fail-closed ALPN, RFC 8737 s3)");
+    CHECK(rejected == NULL,
+          "a client NOT offering acme-tls/1 is refused (fail-closed ALPN, RFC 8737 s3)");
     if (rejected)
         X509_free(rejected);
 

@@ -86,7 +86,8 @@ static char g_acme_ca[512] = ACME_CA_PROD;
  * An IP identifier (RFC 8738) forces tls-alpn-01 regardless of this setting —
  * dns-01 has no defined meaning for the "ip" identifier type. */
 static char g_acme_challenge_type[16] = "dns-01";
-static int g_acme_tls_alpn_port = 443; /* RFC 8737 fixes 443; overridable for a private CA/NAT setup */
+static int g_acme_tls_alpn_port =
+    443; /* RFC 8737 fixes 443; overridable for a private CA/NAT setup */
 static char g_acme_client_cert_pem[MAX_PEM] = "";
 static char g_acme_client_key_pem[MAX_PEM] = "";
 static char g_acme_ca_pem[MAX_PEM] = "";
@@ -715,7 +716,8 @@ static X509_EXTENSION *make_acme_identifier_ext(const uint8_t hash32[32]) {
     }
     free(ibuf);
     ASN1_OBJECT *obj = OBJ_txt2obj(OID_ACME_IDENTIFIER, 1);
-    X509_EXTENSION *ext = obj ? X509_EXTENSION_create_by_OBJ(NULL, obj, 1 /* critical */, extval) : NULL;
+    X509_EXTENSION *ext =
+        obj ? X509_EXTENSION_create_by_OBJ(NULL, obj, 1 /* critical */, extval) : NULL;
     if (obj)
         ASN1_OBJECT_free(obj);
     ASN1_OCTET_STRING_free(extval);
@@ -727,7 +729,7 @@ static X509_EXTENSION *make_acme_identifier_ext(const uint8_t hash32[32]) {
  * above. Never touches the real server key/cert:current — the key and cert
  * are discarded the moment the challenge window closes (tlsalpn01_stop). */
 static int tlsalpn01_make_cert(const char *value, int is_ip, const uint8_t hash32[32],
-                                X509 **out_cert, EVP_PKEY **out_key) {
+                               X509 **out_cert, EVP_PKEY **out_key) {
     *out_cert = NULL;
     *out_key = NULL;
     EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
@@ -799,8 +801,8 @@ static int tlsalpn01_alpn_cb(SSL *ssl, const unsigned char **out, unsigned char 
      * literal so it can't absorb the following letters as more octal
      * digits. */
     static const unsigned char proto[] = "\012" ACME_TLS_ALPN_PROTO;
-    if (SSL_select_next_proto((unsigned char **) out, outlen, proto, sizeof(proto) - 1, in, inlen) !=
-        OPENSSL_NPN_NEGOTIATED)
+    if (SSL_select_next_proto((unsigned char **) out, outlen, proto, sizeof(proto) - 1, in,
+                              inlen) != OPENSSL_NPN_NEGOTIATED)
         return SSL_TLSEXT_ERR_ALERT_FATAL;
     return SSL_TLSEXT_ERR_OK;
 }
@@ -827,7 +829,7 @@ static void *tlsalpn01_accept_loop(void *arg) {
         SSL_set_fd(ssl, cfd);
         if (SSL_accept(ssl) <= 0)
             dns_log(LOG_DEBUG, "[ACME] tls-alpn-01: handshake did not complete (ok if a "
-                                "probe/unrelated connection)\n");
+                               "probe/unrelated connection)\n");
         else
             dns_log(LOG_NOTICE, "[ACME] tls-alpn-01: served a validation handshake\n");
         SSL_shutdown(ssl);
@@ -1557,7 +1559,8 @@ static void load_config(void) {
         safe_strcpy(g_acme_challenge_type, val, sizeof(g_acme_challenge_type));
     if (strcmp(g_acme_challenge_type, "dns-01") != 0 &&
         strcmp(g_acme_challenge_type, "tls-alpn-01") != 0) {
-        dns_log(LOG_WARNING, "[ACME] Unknown config:acme_challenge_type '%s' — defaulting to dns-01\n",
+        dns_log(LOG_WARNING,
+                "[ACME] Unknown config:acme_challenge_type '%s' — defaulting to dns-01\n",
                 g_acme_challenge_type);
         safe_strcpy(g_acme_challenge_type, "dns-01", sizeof(g_acme_challenge_type));
     }

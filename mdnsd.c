@@ -2172,8 +2172,8 @@ int main(int argc, char **argv) {
         kcfg.port = g_valkey_port;
         kcfg.pass = g_valkey_pass;
         kcfg.db = KEYSPACE_DB;
-        static const char *prefixes[] = {"mdns:*", "config:mdns_*", "cert:current",
-                                         "config:dso_*", NULL};
+        static const char *prefixes[] = {"mdns:*", "config:mdns_*", "cert:current", "config:dso_*",
+                                         NULL};
         kcfg.prefixes = prefixes;
         kcfg.on_reconnect = mdns_keyspace_catchup;
         kcfg.on_key = mdns_keyspace_apply;

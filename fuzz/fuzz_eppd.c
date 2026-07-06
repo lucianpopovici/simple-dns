@@ -46,16 +46,48 @@
 
 static void probe_children(const char *xml, int s, int e) {
     static const char *leaf_tags[] = {
-        "clTRID",       "clID",       "pw",        "authInfo",       "hostObj",
-        "hostAttr",     "hostName",   "hostAddr",  "period",         "registrant",
-        "add",          "rem",        "chg",       "status",         "extension",
-        "secDNS:create", "secDNS:update", "secDNS:add", "secDNS:rem", "secDNS:chg",
-        "secDNS:dsData", "secDNS:keyTag", "secDNS:alg", "secDNS:digestType",
-        "secDNS:digest", "rgp:update",    "rgp:restore",
+        "clTRID",
+        "clID",
+        "pw",
+        "authInfo",
+        "hostObj",
+        "hostAttr",
+        "hostName",
+        "hostAddr",
+        "period",
+        "registrant",
+        "add",
+        "rem",
+        "chg",
+        "status",
+        "extension",
+        "secDNS:create",
+        "secDNS:update",
+        "secDNS:add",
+        "secDNS:rem",
+        "secDNS:chg",
+        "secDNS:dsData",
+        "secDNS:keyTag",
+        "secDNS:alg",
+        "secDNS:digestType",
+        "secDNS:digest",
+        "rgp:update",
+        "rgp:restore",
         /* Phase 3: renew, org, fee, poll/changePoll extension shapes. */
-        "curExpDate",   "org:id",     "org:role",  "org:parentId",   "org:email",
-        "org:voice",    "fee:check",  "fee:create", "fee:renew",     "fee:transfer",
-        "fee:command",  "fee:period", "fee:currency", "fee:fee",
+        "curExpDate",
+        "org:id",
+        "org:role",
+        "org:parentId",
+        "org:email",
+        "org:voice",
+        "fee:check",
+        "fee:create",
+        "fee:renew",
+        "fee:transfer",
+        "fee:command",
+        "fee:period",
+        "fee:currency",
+        "fee:fee",
     };
     for (size_t i = 0; i < sizeof(leaf_tags) / sizeof(leaf_tags[0]); i++) {
         int cs, ce, cnp;
@@ -117,7 +149,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
 
     static const char *ops[] = {"login", "logout", "check",  "create",
-                               "info",  "update", "delete", "renew"};
+                                "info",  "update", "delete", "renew"};
     for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
         int os, oe, onp;
         if (xml_find_child(xml, cs, ce, ops[i], &os, &oe, &onp) != 1)

@@ -187,13 +187,14 @@ static void test_xml_find_child_attr(void) {
     char op[16];
     int ts, te, tnp;
     CHECK(xml_find_child_attr(withop, cs, ce, "transfer", "op", op, sizeof(op), &ts, &te, &tnp) ==
-              1 &&
+                  1 &&
               strcmp(op, "request") == 0,
           "extracts op=\"request\" from <transfer op=\"request\">");
 
     const char *noop = "<command><transfer><domain:name>x</domain:name></transfer></command>";
     xml_find_child(noop, 0, (int) strlen(noop), "command", &cs, &ce, &cnp);
-    CHECK(xml_find_child_attr(noop, cs, ce, "transfer", "op", op, sizeof(op), &ts, &te, &tnp) == 1 &&
+    CHECK(xml_find_child_attr(noop, cs, ce, "transfer", "op", op, sizeof(op), &ts, &te, &tnp) ==
+                  1 &&
               op[0] == 0,
           "attribute absent: match still succeeds, attr_out is empty (not an error)");
 
@@ -266,13 +267,13 @@ static void test_domain_tlv_roundtrip(void) {
     CHECK(d2.nns == 2 && strcmp(d2.ns[0], "ns1.example.test") == 0 &&
               strcmp(d2.ns[1], "ns2.example.test") == 0,
           "ns[] round-trips in order");
-    CHECK(d2.nds == 1 && d2.ds[0].keytag == 12345 && d2.ds[0].alg == 13 &&
-              d2.ds[0].digtype == 2 && d2.ds[0].digestlen == 32 &&
-              memcmp(d2.ds[0].digest, d.ds[0].digest, 32) == 0,
+    CHECK(d2.nds == 1 && d2.ds[0].keytag == 12345 && d2.ds[0].alg == 13 && d2.ds[0].digtype == 2 &&
+              d2.ds[0].digestlen == 32 && memcmp(d2.ds[0].digest, d.ds[0].digest, 32) == 0,
           "ds[] (RFC 5910) round-trips including the full digest");
     CHECK(d2.rgp_state == EPP_RGP_REDEMPTION && d2.rgp_until == d.rgp_until,
           "rgp_state/rgp_until (RFC 3915) round-trip");
-    CHECK(strcmp(d.transfer_reid, d2.transfer_reid) == 0 && d2.transfer_redate == d.transfer_redate &&
+    CHECK(strcmp(d.transfer_reid, d2.transfer_reid) == 0 &&
+              d2.transfer_redate == d.transfer_redate &&
               strcmp(d.transfer_status, d2.transfer_status) == 0,
           "transfer_reid/transfer_redate/transfer_status round-trip");
 
