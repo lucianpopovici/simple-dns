@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1077,6 +1077,31 @@ check-dnssec-live: $(BIN_DEBUG)
 	 test "$$DO" -ge 1  || { echo "  FAIL  DO=1 query returned no RRSIG (DO bit misparsed?)"; exit 1; }; \
 	 test "$$NODO" -eq 0 || { echo "  FAIL  DO=0 query returned RRSIG (DNSSEC not gated on DO)"; exit 1; }; \
 	 echo "  OK  RRSIGs returned iff the DO bit is set"
+
+# Regression guard for a real bug found + fixed during eppd Phase 2 (RFC 5910
+# DS mapping needed a signed DS at a delegation cut, which surfaced this):
+# make_rrsig's Signer's Name field must be the ZONE APEX (RFC 4034 §3.1.7),
+# not the RRset's own owner name — they only coincide for apex data (SOA,
+# DNSKEY). check-dnssec's unit KATs link resolverd.c, not dns_server.c, so
+# they never exercised dnsd's actual signer; this is a live check against
+# the real binary, using the built-in static-zone record www.example.local
+# (a non-apex name) alongside the apex SOA. Needs Valkey + dig.
+check-rrsig-signer: $(BIN_DEBUG)
+	@echo "  CHECK  RRSIG Signer's Name is the zone apex, not the RR owner (requires Valkey + dig)"
+	@ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_signer.log 2>&1 & DNS=$$!; \
+	 sleep 1.5; \
+	 APEX_SIGNER=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) example.local SOA +time=2 +tries=1 \
+	     | awk '$$4=="RRSIG"{print $$12; exit}'); \
+	 NONAPEX_SIGNER=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) www.example.local A +time=2 +tries=1 \
+	     | awk '$$4=="RRSIG"{print $$12; exit}'); \
+	 DNSKEY_SIGNER=$$(dig +dnssec +nocookie @127.0.0.1 -p $(TPORT) example.local DNSKEY +time=2 +tries=1 \
+	     | awk '$$4=="RRSIG"{print $$12; exit}'); \
+	 kill $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
+	 echo "  apex(SOA) signer=[$$APEX_SIGNER]  non-apex(www A) signer=[$$NONAPEX_SIGNER]  DNSKEY signer=[$$DNSKEY_SIGNER]"; \
+	 test "$$APEX_SIGNER" = "example.local." || { echo "  FAIL  apex SOA RRSIG signer is not the zone apex"; exit 1; }; \
+	 test "$$NONAPEX_SIGNER" = "example.local." || { echo "  FAIL  non-apex A RRSIG signer is not the zone apex (it's the RR's own owner name — the bug this guards against)"; exit 1; }; \
+	 test "$$DNSKEY_SIGNER" = "example.local." || { echo "  FAIL  DNSKEY RRSIG signer is not the zone apex"; exit 1; }; \
+	 echo "  OK  every RRSIG's Signer's Name is the zone apex, including for a non-apex RRset"
 
 # Transfer TSIG (hidden-master plan Gap 4, RFC 8945). A secondary signs its AXFR
 # request and verifies the master's chained-response MAC. Drive a TSIG-capable
@@ -2452,23 +2477,28 @@ check-doq: $(BIN_DEBUG) doqd_debug
 	 test "$$NOTBOUND" = "0" || { echo "  FAIL  doqd bound :18853/udp while disabled"; exit 1; }; \
 	 echo "  OK  DoQ resolves correctly, _853._udp TLSA published, doqd refuses to start/bind when disabled"
 
-# eppd Phase 1 (RFC 5730/5734/5731/5732/5733): registrar mTLS session shell +
-# the domain/host/contact publish pipeline, end to end. Three parts:
-#   (1) KAT for epp_frame_next's accept/reject/need-more-data boundary and
-#       the XML tokenizer's correctness (tests/test_eppd.c; memory safety of
-#       the same functions is covered separately by fuzz-eppd).
-#   (2) tests/epp_client.py drives a live EPP session (login/create/info/
-#       duplicate-reject/logout) against a real eppd instance.
-#   (3) dig verifies the resulting NS+glue delegation is actually served by
-#       dnsd — the real point of the publish pipeline, not just that eppd
-#       answered the right EPP result codes.
+# eppd Phase 1 (RFC 5730/5734/5731/5732/5733) + Phase 2 (RFC 3915 RGP, RFC
+# 5910 DS mapping, RFC 5731 §3.2.4 transfer, RFC 9154 secure authInfo):
+# registrar mTLS session shell + the domain/host/contact publish pipeline +
+# update/delete/transfer lifecycle, end to end. Three parts:
+#   (1) KAT for epp_frame_next, the XML tokenizer, xml_find_child_attr (the
+#       <transfer op="..."> attribute reader), and the TLV encode/decode
+#       round-trips for every Phase 1+2 object field (tests/test_eppd.c;
+#       memory safety of the parser is covered separately by fuzz-eppd).
+#   (2) tests/epp_client.py drives two live EPP sessions (two registrar
+#       client certs) through login/create/info/update/transfer/delete/
+#       restore/association-guard/logout against a real eppd instance.
+#   (3) dig verifies the resulting NS+glue+DS delegation is actually served
+#       (and DS is DNSSEC-signed by the parent) by dnsd — the real point of
+#       the publish pipeline, not just that eppd answered the right EPP
+#       result codes.
 check-eppd: $(BIN_DEBUG) eppd_debug
 	@echo "  CC [TEST]  tests/test_eppd"
 	@clang -std=c99 -D_GNU_SOURCE -g -fsanitize=address,undefined -DUNIT_TEST -I. \
 	      $(SECCOMP_CFLAGS) -Wno-unused-function -o tests/test_eppd tests/test_eppd.c \
 	      $(WIRE_SRC) $(SANDBOX_SRC) -lssl -lcrypto -lpthread $(SECCOMP_LIBS)
 	./tests/test_eppd
-	@echo "  CHECK  eppd Phase 1: EPP session + zone:* publish pipeline (requires Valkey + dig + openssl + python3)"
+	@echo "  CHECK  eppd Phase 1+2: EPP session + zone:* publish pipeline + lifecycle (requires Valkey + dig + openssl + python3)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
@@ -2480,10 +2510,16 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
 	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=registrar1" >/dev/null 2>&1; \
 	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli2.key -out $$D/cli2.csr -subj "/CN=registrar2" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli2.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli2.pem -days 2 >/dev/null 2>&1; \
 	 SAVE_ZN=$$($$VC get config:zone_name); \
 	 SAVE_EN=$$($$VC get config:eppd_enabled); SAVE_PT=$$($$VC get config:eppd_port); \
 	 SAVE_CERT=$$($$VC get config:eppd_tls_cert_pem); SAVE_KEY=$$($$VC get config:eppd_tls_key_pem); \
 	 SAVE_CA=$$($$VC get config:eppd_mtls_ca_pem); SAVE_PW=$$($$VC get config:eppd_registrar_pw:registrar1); \
+	 SAVE_PW2=$$($$VC get config:eppd_registrar_pw:registrar2); \
+	 SAVE_AGS=$$($$VC get config:eppd_add_grace_secs); \
+	 SAVE_ARS=$$($$VC get config:eppd_autorenew_grace_secs); \
+	 SAVE_TGS=$$($$VC get config:eppd_transfer_grace_secs); \
 	 SAVE_CUR=$$($$VC get cert:current); \
 	 $$VC set config:zone_name example.local >/dev/null; \
 	 $$VC set config:eppd_enabled 1 >/dev/null; \
@@ -2492,6 +2528,10 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 $$VC set config:eppd_tls_key_pem "$$(cat $$D/srv.key)" >/dev/null; \
 	 $$VC set config:eppd_mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null; \
 	 $$VC set config:eppd_registrar_pw:registrar1 "test-pw-correct" >/dev/null; \
+	 $$VC set config:eppd_registrar_pw:registrar2 "test-pw2-correct" >/dev/null; \
+	 $$VC set config:eppd_add_grace_secs 0 >/dev/null; \
+	 $$VC set config:eppd_autorenew_grace_secs 0 >/dev/null; \
+	 $$VC set config:eppd_transfer_grace_secs 0 >/dev/null; \
 	 $$VC del cert:current >/dev/null; \
 	 $$VC del epp:contact:EPPTC1 >/dev/null; \
  for k in $$($$VC --scan --pattern "epp:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
@@ -2500,10 +2540,14 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 sleep 1.5; \
 	 ASAN_OPTIONS=detect_leaks=0 ./eppd_debug > /tmp/eppd_check.log 2>&1 & EPPD=$$!; \
 	 sleep 1.5; \
-	 python3 tests/epp_client.py 127.0.0.1 17700 $$D/ca.pem $$D/cli.pem $$D/cli.key registrar1 test-pw-correct \
+	 python3 tests/epp_client.py 127.0.0.1 17700 $$D/ca.pem \
+	     $$D/cli.pem $$D/cli.key registrar1 test-pw-correct \
+	     $$D/cli2.pem $$D/cli2.key registrar2 test-pw2-correct \
 	     > /tmp/epp_client.log 2>&1; CLIENTRC=$$?; \
 	 NS=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local NS +noall +authority | awk '{print $$5}'); \
-	 GLUE=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local NS +noall +additional | grep -c "192.0.2.77"); \
+	 GLUE1=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local NS +noall +additional | grep -c "192.0.2.77"); \
+	 GLUE2=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local NS +noall +additional | grep -c "192.0.2.88"); \
+	 DS=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local DS +dnssec +noall +answer); \
 	 kill $$EPPD $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
 	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
 	 if [ -n "$$SAVE_EN" ]; then $$VC set config:eppd_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:eppd_enabled >/dev/null; fi; \
@@ -2512,17 +2556,25 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 if [ -n "$$SAVE_KEY" ]; then $$VC set config:eppd_tls_key_pem "$$SAVE_KEY" >/dev/null; else $$VC del config:eppd_tls_key_pem >/dev/null; fi; \
 	 if [ -n "$$SAVE_CA" ]; then $$VC set config:eppd_mtls_ca_pem "$$SAVE_CA" >/dev/null; else $$VC del config:eppd_mtls_ca_pem >/dev/null; fi; \
 	 if [ -n "$$SAVE_PW" ]; then $$VC set config:eppd_registrar_pw:registrar1 "$$SAVE_PW" >/dev/null; else $$VC del config:eppd_registrar_pw:registrar1 >/dev/null; fi; \
+	 if [ -n "$$SAVE_PW2" ]; then $$VC set config:eppd_registrar_pw:registrar2 "$$SAVE_PW2" >/dev/null; else $$VC del config:eppd_registrar_pw:registrar2 >/dev/null; fi; \
+	 if [ -n "$$SAVE_AGS" ]; then $$VC set config:eppd_add_grace_secs "$$SAVE_AGS" >/dev/null; else $$VC del config:eppd_add_grace_secs >/dev/null; fi; \
+	 if [ -n "$$SAVE_ARS" ]; then $$VC set config:eppd_autorenew_grace_secs "$$SAVE_ARS" >/dev/null; else $$VC del config:eppd_autorenew_grace_secs >/dev/null; fi; \
+	 if [ -n "$$SAVE_TGS" ]; then $$VC set config:eppd_transfer_grace_secs "$$SAVE_TGS" >/dev/null; else $$VC del config:eppd_transfer_grace_secs >/dev/null; fi; \
 	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
 	 $$VC del epp:contact:EPPTC1 >/dev/null; \
  for k in $$($$VC --scan --pattern "epp:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
 	 for k in $$($$VC --scan --pattern "zone:example.local:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
 	 rm -rf $$D; \
 	 echo "  --- epp_client.py output ---"; cat /tmp/epp_client.log; \
-	 echo "  delegation NS=[$$NS] glue-192.0.2.77-present=[$$GLUE]"; \
+	 echo "  delegation NS=[$$NS] glue-192.0.2.77=[$$GLUE1] glue-192.0.2.88=[$$GLUE2]"; \
+	 echo "  DS answer:"; echo "$$DS"; \
 	 test "$$CLIENTRC" -eq 0 || { echo "  FAIL  EPP session/protocol assertions failed"; cat /tmp/eppd_check.log; exit 1; }; \
-	 test "$$NS" = "ns1.epptest.example.local." || { echo "  FAIL  dnsd is not serving the published NS delegation"; exit 1; }; \
-	 test "$$GLUE" -ge 1 || { echo "  FAIL  dnsd did not serve the published glue A record"; exit 1; }; \
-	 echo "  OK  EPP session (login/create/info/duplicate-reject/logout) + zone:* publish pipeline verified by dig"
+	 test "$$NS" = "ns1.epptest.example.local." || { echo "  FAIL  dnsd is not serving the published NS delegation (post-restore)"; exit 1; }; \
+	 test "$$GLUE1" -ge 1 || { echo "  FAIL  dnsd did not serve the original glue A record"; exit 1; }; \
+	 test "$$GLUE2" -ge 1 || { echo "  FAIL  dnsd did not serve the host:update-added glue A record"; exit 1; }; \
+	 echo "$$DS" | grep -qi "12345 13 2 " || { echo "  FAIL  dnsd is not serving the secDNS-submitted DS record"; exit 1; }; \
+	 echo "$$DS" | grep -q "RRSIG" || { echo "  FAIL  the DS RRset at the delegation cut is not DNSSEC-signed (RFC 4035 3.1.4)"; exit 1; }; \
+	 echo "  OK  EPP session + zone:* publish pipeline + update/transfer/delete/restore lifecycle verified by dig"
 
 # =============================================================================
 # Clean

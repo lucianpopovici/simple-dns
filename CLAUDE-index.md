@@ -27,13 +27,13 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `specs/CLAUDE-discovery.md` | dnsd | Automatic FQDN registration — **done**, archived untracked |
 | `CLAUDE-architecture.md` | all | System-level ADRs (schema, atomicity, data access, keys, HA/DR, embedded store/objectdb) |
 | `specs/CLAUDE-rfc-additions.md` | dnsd | Batch 1–2: Adds 1–5 + doc reconciliations — **done**, archived untracked |
-| `CLAUDE-rfc-additions-batch3.md` | dnsd (+libdnswire) | Batch 3: Adds 7–11 + complementary + reference |
+| `specs/CLAUDE-rfc-additions-batch3.md` | dnsd (+libdnswire) | Batch 3: Adds 7–10 done (Add 8/9471 done 2026-07-06, alongside eppd's dnsd prerequisites); Add 11 (9824) deliberately deferred as a follow-on — archived untracked |
 | `specs/CLAUDE-rfc-additions-batch4.md` | dnsd | Batch 4: Add 12 (2317, Done) + 3258 anycast note (Done) — archived untracked |
 | `CLAUDE-ENUM.md` | dnsd | ADR-001, Add 6 (ENUM), bind config, ENUM roadmap |
-| `CLAUDE-eppd.md` | eppd | ADR-002, registry back-end (phased) |
-| `CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance — done except moving the libFuzzer harness into the lib's own test tree |
+| `CLAUDE-eppd.md` | eppd | ADR-002, registry back-end (phased) — **Phase 1+2 done** 2026-07-06 (session shell + domain/host/contact check/create/info/update/delete + zone:* publish pipeline incl. DS; registrar ownership + association guards; RFC 9154 secure authInfo; RFC 5910 DS mapping; RFC 5731 transfer; RFC 3915 RGP + background sweep; also required three dnsd prerequisites: RFC 9471 referrals + multi-value NS + signed DS-at-cut read path, plus an unrelated pre-existing dnsd RRSIG signer-name bug fixed along the way — see CLAUDE.md's eppd section); Phase 3 (8748 fee, 8543 org, 8590 change poll) still open |
+| `specs/CLAUDE-libdnswire.md` | libdnswire | Shared wire codec extraction + conformance — **done** (fuzzer-harness-location cleanup optionally remains), archived untracked |
 | `CLAUDE-certd.md` | certd | PKI: ACME/EST extraction (done) + ARI (Add 1, done); Add 2/3 optional, TLSA/CAA integration + STAR roadmap still open |
-| `CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy (Add 1) + DSO/Push (Add 2) + SRP (Add 3, registration handler lives in dnsd) — all done |
+| `specs/CLAUDE-mdnsd.md` | mdnsd | mDNS/DNS-SD extraction + Discovery Proxy (Add 1) + DSO/Push (Add 2) + SRP (Add 3, registration handler lives in dnsd) — **done**, archived untracked |
 | `specs/CLAUDE-resolverd.md` | resolverd | Forwarding/validating cache, Option A — **done** (Add 1 skipped, Adds 2–7 done), archived untracked |
 | `specs/CLAUDE-DoQ.md` | doqd | RFC 9250 DNS-over-QUIC sidecar — **done** (Gaps 1–3; Gap 4, resolverd outbound DoQ client, deferred by the plan itself), archived untracked |
 | `CLAUDE-rfc-skipped.md` | (triage) | Exclusion record with reasons |
@@ -55,8 +55,8 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | 4 | 9077 | NSEC/NSEC3 + negative-response TTL | **Done** | rfc-additions |
 | 5 | 7477 | CSYNC record (62) | **Done** (pipe serial\|flags\|NS,A,AAAA; dnsd serves+AXFR; DNSSEC-signed; `make check-csync`) | rfc-additions |
 | 6 | 6116/6117/6118 | ENUM profile over NAPTR | **Done** (config:enum_apex; NAPTR `\|`-in-regexp parser fix; Enumservice warning; `make check-enum`) | ENUM |
-| 7 | 8976 | ZONEMD (63) | Specced | batch3 |
-| 8 | 9471 | Glue in referrals | Conditional | batch3 |
+| 7 | 8976 | ZONEMD (63) | **Done** (SIMPLE/SHA-384, `zonemd_compute` reuses the AXFR encoders; PR #39, 2026-06-30) | batch3 |
+| 8 | 9471 | Glue in referrals | **Done** (dnsd zone-cut/referral engine; done 2026-07-06 as an eppd prerequisite) | batch3 |
 | 9 | 1982 | Serial-number arithmetic | **Done** (libdnswire + IXFR uses serial_lt) | batch3 |
 | 10 | 9715 | UDP fragmentation avoidance | **Done** | batch3 |
 | 11 | 9824 (+4470) | Compact denial of existence | Follow-on | batch3 |

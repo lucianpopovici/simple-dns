@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <time.h>
@@ -62,6 +63,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <openssl/rand.h>
 
 #include "dns_wire.h"
 #include "sandbox.h"
@@ -152,6 +154,22 @@ static int vk_incr(const char *key) {
     int ok = vkc_cmd(&g_vk, &r, 2, "INCR", key) == 0;
     pthread_mutex_unlock(&g_vk_mutex);
     return ok ? 0 : -1;
+}
+
+/* Retract a previously published key — used by delete/update to remove a
+ * zone:* delegation record or purge an epp:* object outright. A missing key
+ * is not an error (DEL is idempotent in Valkey); only a connection failure
+ * is reported. */
+static int vk_del(const char *key) {
+    pthread_mutex_lock(&g_vk_mutex);
+    if (vkc_ensure_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        return 0;
+    }
+    vkc_reply_t r;
+    int ok = vkc_cmd(&g_vk, &r, 2, "DEL", key) == 0;
+    pthread_mutex_unlock(&g_vk_mutex);
+    return ok;
 }
 
 /* KEYS (not SCAN) — matches this project's existing convention for bounded,
@@ -612,6 +630,101 @@ static int xml_find_child(const char *buf, int start, int end, const char *tag, 
  * previous match's *next_pos; it already accepts an arbitrary start
  * position, so no separate "find next" entry point is needed. */
 
+/* Extracts the value of `attr` (e.g. "op") from the raw opening-tag text
+ * xml[tag_start,tag_end) — i.e. `attr="value"` or `attr='value'` — into out
+ * (empty if absent or malformed; never partially filled). Requires a
+ * non-identifier character (or the tag start) immediately before the match
+ * so "op=" doesn't false-positive inside some other attribute name that
+ * merely ends in "op". This is deliberately narrower than xml_next_tag's own
+ * attribute *skipping*: it is the one place (RFC 5730 <transfer op="...">)
+ * this parser needs an attribute *value*, not just element content. */
+static void epp_xml_attr_extract(const char *xml, int tag_start, int tag_end, const char *attr,
+                                 char *out, int outcap) {
+    out[0] = 0;
+    int alen = (int) strlen(attr);
+    for (int i = tag_start; i + alen < tag_end; i++) {
+        if ((i > tag_start) &&
+            (isalnum((unsigned char) xml[i - 1]) || xml[i - 1] == ':' || xml[i - 1] == '-'))
+            continue; /* mid-identifier — not a real attribute-name start */
+        if (memcmp(xml + i, attr, (size_t) alen) != 0)
+            continue;
+        int j = i + alen;
+        while (j < tag_end && (xml[j] == ' ' || xml[j] == '\t'))
+            j++;
+        if (j >= tag_end || xml[j] != '=')
+            continue;
+        j++;
+        while (j < tag_end && (xml[j] == ' ' || xml[j] == '\t'))
+            j++;
+        if (j >= tag_end || (xml[j] != '"' && xml[j] != '\''))
+            continue;
+        char q = xml[j++];
+        int vs = j;
+        while (j < tag_end && xml[j] != q)
+            j++;
+        if (j >= tag_end)
+            return; /* unterminated attribute value — fail closed, leave out empty */
+        int vlen = j - vs;
+        if (vlen >= outcap)
+            vlen = outcap - 1;
+        memcpy(out, xml + vs, (size_t) vlen);
+        out[vlen] = 0;
+        return;
+    }
+}
+
+/* Same traversal as xml_find_child, but additionally extracts one attribute
+ * (`attr`) from the matched element's opening tag — needed only for
+ * <transfer op="...">, the sole place in RFC 5730/5910 this parser cares
+ * about an attribute value rather than element content. attr_out is set to
+ * "" (not an error) if the tag has no such attribute. */
+static int xml_find_child_attr(const char *xml, int start, int end, const char *tag,
+                               const char *attr, char *attr_out, int attr_cap, int *content_start,
+                               int *content_end, int *next_pos) {
+    int pos = start;
+    int tag_len = (int) strlen(tag);
+    for (;;) {
+        const char *tn;
+        int tnl, tag_start;
+        xml_tagkind_t k = xml_next_tag(xml, &pos, end, &tn, &tnl, &tag_start);
+        int open_tag_end = pos; /* right after this tag's own '>' / '/>' */
+        switch (k) {
+            case XMLTAG_SKIP:
+                continue;
+            case XMLTAG_CLOSE:
+            case XMLTAG_EOF:
+                return 0;
+            case XMLTAG_SELFCLOSE:
+                if (tnl == tag_len && memcmp(tn, tag, (size_t) tag_len) == 0) {
+                    epp_xml_attr_extract(xml, tag_start, open_tag_end, attr, attr_out, attr_cap);
+                    *content_start = *content_end = pos;
+                    *next_pos = pos;
+                    return 1;
+                }
+                continue;
+            case XMLTAG_OPEN: {
+                int cstart = pos;
+                int close_start;
+                int np = xml_skip_to_close(xml, pos, end, tn, tnl, 1, &close_start);
+                if (np < 0)
+                    return -1;
+                if (tnl == tag_len && memcmp(tn, tag, (size_t) tag_len) == 0) {
+                    epp_xml_attr_extract(xml, tag_start, open_tag_end, attr, attr_out, attr_cap);
+                    *content_start = cstart;
+                    *content_end = close_start;
+                    *next_pos = np;
+                    return 1;
+                }
+                pos = np;
+                continue;
+            }
+            case XMLTAG_ERROR:
+            default:
+                return -1;
+        }
+    }
+}
+
 /* Decode XML entity references (&lt; &gt; &amp; &apos; &quot; &#NN; &#xNN;)
  * from buf[start,end) into out (NUL-terminated), bounded by outcap. A literal
  * "<![CDATA[...]]>" spanning the whole range is unwrapped verbatim (no entity
@@ -826,14 +939,64 @@ static int epp_handle_login(epp_session_t *sess, const char *xml, int len, int c
 #define EPP_TAG_NAME 10      /* contact only */
 #define EPP_TAG_EMAIL 11     /* contact only */
 #define EPP_TAG_VOICE 12     /* contact only */
+/* Phase 2 additions (RFC 3915 RGP, RFC 5910 DS mapping, RFC 5731 §3.2.4
+ * transfer, and object ownership — see CLAUDE-eppd.md). */
+#define EPP_TAG_CLID 13         /* sponsoring registrar; domain/host/contact */
+#define EPP_TAG_RGP_STATE 14    /* u8, domain only — epp_rgp_state_t */
+#define EPP_TAG_RGP_UNTIL 15    /* u32 unix time, domain only */
+#define EPP_TAG_DS 16           /* repeated, domain only: keytag(2 BE)|alg(1)|digtype(1)|digest */
+#define EPP_TAG_TRANSFER_REID 17    /* domain only — gaining registrar of a pending/last transfer */
+#define EPP_TAG_TRANSFER_REDATE 18  /* u32 unix time, domain only */
+#define EPP_TAG_TRANSFER_STATUS 19  /* domain only — "", "pending", "clientApproved", ... */
 
-#define EPP_MAX_ARR 16 /* status/ns/addr entries per object — ample for Phase 1 */
+#define EPP_MAX_ARR 16 /* status/ns/addr/ds entries per object — ample for Phase 1/2 */
+#define EPP_DS_MAX_DIGEST 68 /* SHA-512 (64) + headroom; covers every registered digest type */
+
+/* RFC 3915 RGP grace-period state a domain can be in. NONE covers ordinary
+ * "ok" life; the others gate what a delete/renew does and what <rgp:*>
+ * status domain:info reports. Deliberately collapses RFC 3915's two-stage
+ * redemptionPeriod + "pendingDelete scheduled for release" into one
+ * REDEMPTION window (config:eppd_redemption_secs) followed directly by
+ * purge — a private/internal registry has no registrar-facing distinction
+ * between the two, and this project has no billing/credit system for the
+ * add/autorenew/transfer grace periods to protect either; they only gate
+ * "does a delete during this window purge immediately or enter redemption". */
+typedef enum {
+    EPP_RGP_NONE = 0,
+    EPP_RGP_ADD = 1,
+    EPP_RGP_AUTORENEW = 2,
+    EPP_RGP_TRANSFER = 3,
+    EPP_RGP_REDEMPTION = 4,
+} epp_rgp_state_t;
 
 static atomic_uint g_roid_counter = 0;
 
 static void epp_gen_roid(char *out, int cap, const char *suffix) {
     unsigned n = atomic_fetch_add(&g_roid_counter, 1u) + 1;
     snprintf(out, (size_t) cap, "%u-%s", n, suffix);
+}
+
+/* RFC 9154 "secure authInfo": a registrar-chosen authInfo pw is a weak,
+ * often-reused shared secret — the whole reason 9154 exists. eppd never
+ * trusts a client-supplied value (create/update silently discard one and
+ * log a notice); every object's authInfo is always this server-generated
+ * 128-bit random token, hex-encoded to 32 chars. Falls back to a PRNG-only
+ * warning rather than failing the whole command if RAND_bytes reports an
+ * entropy-pool failure — an authInfo that is merely weak (not attacker-
+ * controlled) is still strictly better than refusing to create the object,
+ * and OpenSSL's default RNG only fails this way in practice on a
+ * mis-provisioned host that has bigger problems than this one token. */
+static void epp_gen_authinfo(char *out, int cap) {
+    uint8_t raw[16];
+    if (RAND_bytes(raw, sizeof(raw)) != 1) {
+        dns_log(LOG_WARNING, "[eppd] RAND_bytes failed generating authInfo — host entropy pool "
+                             "may be exhausted\n");
+        for (size_t i = 0; i < sizeof(raw); i++)
+            raw[i] = (uint8_t) (rand() ^ (i * 2654435761u));
+    }
+    hex_enc(raw, sizeof(raw), out);
+    (void) cap; /* hex_enc's output is always 2*sizeof(raw)+1 = 33 bytes; every authinfo[] field
+                 * this feeds is >= 256 bytes, so cap is always ample — kept for call-site clarity */
 }
 
 static uint32_t tlv_u32_of(const uint8_t *val, uint16_t vlen) {
@@ -843,8 +1006,19 @@ static uint32_t tlv_u32_of(const uint8_t *val, uint16_t vlen) {
            (uint32_t) val[3];
 }
 
+/* One RFC 5910 dsData entry: DS rdata fields, pre-digest-decoded to bytes so
+ * emit/publish never has to re-parse hex out of a TLV blob. */
+typedef struct {
+    uint16_t keytag;
+    uint8_t alg;
+    uint8_t digtype;
+    uint8_t digest[EPP_DS_MAX_DIGEST];
+    int digestlen;
+} epp_ds_t;
+
 typedef struct {
     char roid[32];
+    char clid[64]; /* sponsoring registrar — authorization + transfer source of truth */
     char status[EPP_MAX_ARR][32];
     int nstatus;
     char authinfo[256];
@@ -853,10 +1027,19 @@ typedef struct {
     char registrant[64];
     char ns[EPP_MAX_ARR][256];
     int nns;
+    epp_ds_t ds[EPP_MAX_ARR];
+    int nds;
+    epp_rgp_state_t rgp_state;
+    uint32_t rgp_until; /* unix time the current rgp_state's grace/redemption window ends */
+    char transfer_reid[64];    /* gaining registrar of the last/pending transfer */
+    uint32_t transfer_redate;  /* when that transfer was requested */
+    char transfer_status[24];  /* "" (never transferred), "pending", "clientApproved",
+                                 * "clientRejected", "clientCancelled", "serverApproved" */
 } epp_domain_t;
 
 typedef struct {
     char roid[32];
+    char clid[64];
     char status[EPP_MAX_ARR][32];
     int nstatus;
     char v4[EPP_MAX_ARR][16];
@@ -868,6 +1051,7 @@ typedef struct {
 
 typedef struct {
     char roid[32];
+    char clid[64];
     char name[128];
     char email[128];
     char voice[32];
@@ -880,6 +1064,9 @@ static int epp_domain_encode(const epp_domain_t *d, uint8_t *buf, int cap) {
     if (off < 0)
         return -1;
     off = tlv_put(buf, cap, off, EPP_TAG_ROID, (const uint8_t *) d->roid, (int) strlen(d->roid));
+    if (off >= 0 && d->clid[0])
+        off =
+            tlv_put(buf, cap, off, EPP_TAG_CLID, (const uint8_t *) d->clid, (int) strlen(d->clid));
     for (int i = 0; off >= 0 && i < d->nstatus; i++)
         off = tlv_put(buf, cap, off, EPP_TAG_STATUS, (const uint8_t *) d->status[i],
                       (int) strlen(d->status[i]));
@@ -896,6 +1083,33 @@ static int epp_domain_encode(const epp_domain_t *d, uint8_t *buf, int cap) {
     for (int i = 0; off >= 0 && i < d->nns; i++)
         off =
             tlv_put(buf, cap, off, EPP_TAG_NS, (const uint8_t *) d->ns[i], (int) strlen(d->ns[i]));
+    for (int i = 0; off >= 0 && i < d->nds; i++) {
+        const epp_ds_t *e = &d->ds[i];
+        uint8_t dsraw[4 + EPP_DS_MAX_DIGEST];
+        dsraw[0] = (uint8_t) (e->keytag >> 8);
+        dsraw[1] = (uint8_t) (e->keytag & 0xFF);
+        dsraw[2] = e->alg;
+        dsraw[3] = e->digtype;
+        int dl = e->digestlen;
+        if (dl < 0)
+            dl = 0;
+        if (dl > EPP_DS_MAX_DIGEST)
+            dl = EPP_DS_MAX_DIGEST;
+        memcpy(dsraw + 4, e->digest, (size_t) dl);
+        off = tlv_put(buf, cap, off, EPP_TAG_DS, dsraw, 4 + dl);
+    }
+    if (off >= 0 && d->rgp_state != EPP_RGP_NONE)
+        off = tlv_put_u8(buf, cap, off, EPP_TAG_RGP_STATE, (uint8_t) d->rgp_state);
+    if (off >= 0 && d->rgp_until)
+        off = tlv_put_u32(buf, cap, off, EPP_TAG_RGP_UNTIL, d->rgp_until);
+    if (off >= 0 && d->transfer_reid[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_TRANSFER_REID, (const uint8_t *) d->transfer_reid,
+                      (int) strlen(d->transfer_reid));
+    if (off >= 0 && d->transfer_redate)
+        off = tlv_put_u32(buf, cap, off, EPP_TAG_TRANSFER_REDATE, d->transfer_redate);
+    if (off >= 0 && d->transfer_status[0])
+        off = tlv_put(buf, cap, off, EPP_TAG_TRANSFER_STATUS,
+                      (const uint8_t *) d->transfer_status, (int) strlen(d->transfer_status));
     return off;
 }
 
@@ -946,6 +1160,45 @@ static int epp_domain_decode(const uint8_t *buf, int len, epp_domain_t *d) {
                     d->nns++;
                 }
                 break;
+            case EPP_TAG_CLID:
+                if (vlen < sizeof(d->clid)) {
+                    memcpy(d->clid, val, vlen);
+                    d->clid[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_DS:
+                if (d->nds < EPP_MAX_ARR && vlen >= 4 && vlen - 4 <= EPP_DS_MAX_DIGEST) {
+                    epp_ds_t *e = &d->ds[d->nds];
+                    e->keytag = (uint16_t) ((val[0] << 8) | val[1]);
+                    e->alg = val[2];
+                    e->digtype = val[3];
+                    e->digestlen = vlen - 4;
+                    memcpy(e->digest, val + 4, (size_t) e->digestlen);
+                    d->nds++;
+                }
+                break;
+            case EPP_TAG_RGP_STATE:
+                if (vlen == 1)
+                    d->rgp_state = (epp_rgp_state_t) val[0];
+                break;
+            case EPP_TAG_RGP_UNTIL:
+                d->rgp_until = tlv_u32_of(val, vlen);
+                break;
+            case EPP_TAG_TRANSFER_REID:
+                if (vlen < sizeof(d->transfer_reid)) {
+                    memcpy(d->transfer_reid, val, vlen);
+                    d->transfer_reid[vlen] = 0;
+                }
+                break;
+            case EPP_TAG_TRANSFER_REDATE:
+                d->transfer_redate = tlv_u32_of(val, vlen);
+                break;
+            case EPP_TAG_TRANSFER_STATUS:
+                if (vlen < sizeof(d->transfer_status)) {
+                    memcpy(d->transfer_status, val, vlen);
+                    d->transfer_status[vlen] = 0;
+                }
+                break;
             default:
                 break; /* unknown tag — skip (ADR-003 forward compat) */
         }
@@ -958,6 +1211,9 @@ static int epp_host_encode(const epp_host_t *h, uint8_t *buf, int cap) {
     if (off < 0)
         return -1;
     off = tlv_put(buf, cap, off, EPP_TAG_ROID, (const uint8_t *) h->roid, (int) strlen(h->roid));
+    if (off >= 0 && h->clid[0])
+        off =
+            tlv_put(buf, cap, off, EPP_TAG_CLID, (const uint8_t *) h->clid, (int) strlen(h->clid));
     for (int i = 0; off >= 0 && i < h->nstatus; i++)
         off = tlv_put(buf, cap, off, EPP_TAG_STATUS, (const uint8_t *) h->status[i],
                       (int) strlen(h->status[i]));
@@ -1011,6 +1267,12 @@ static int epp_host_decode(const uint8_t *buf, int len, epp_host_t *h) {
             case EPP_TAG_CRDATE:
                 h->crdate = tlv_u32_of(val, vlen);
                 break;
+            case EPP_TAG_CLID:
+                if (vlen < sizeof(h->clid)) {
+                    memcpy(h->clid, val, vlen);
+                    h->clid[vlen] = 0;
+                }
+                break;
             default:
                 break;
         }
@@ -1023,6 +1285,9 @@ static int epp_contact_encode(const epp_contact_t *c, uint8_t *buf, int cap) {
     if (off < 0)
         return -1;
     off = tlv_put(buf, cap, off, EPP_TAG_ROID, (const uint8_t *) c->roid, (int) strlen(c->roid));
+    if (off >= 0 && c->clid[0])
+        off =
+            tlv_put(buf, cap, off, EPP_TAG_CLID, (const uint8_t *) c->clid, (int) strlen(c->clid));
     if (off >= 0 && c->name[0])
         off =
             tlv_put(buf, cap, off, EPP_TAG_NAME, (const uint8_t *) c->name, (int) strlen(c->name));
@@ -1081,6 +1346,12 @@ static int epp_contact_decode(const uint8_t *buf, int len, epp_contact_t *c) {
                 break;
             case EPP_TAG_CRDATE:
                 c->crdate = tlv_u32_of(val, vlen);
+                break;
+            case EPP_TAG_CLID:
+                if (vlen < sizeof(c->clid)) {
+                    memcpy(c->clid, val, vlen);
+                    c->clid[vlen] = 0;
+                }
                 break;
             default:
                 break;
@@ -1160,10 +1431,15 @@ static void epp_serial_bump_zone(const char *zn) {
 }
 
 /* Publish a domain's delegation into the parent zone dnsd already serves:
- * writes zone:<parent>:NS:<name> (multi-value, P0b) and, for each
- * in-bailiwick NS target, zone:<parent>:A/AAAA:<ns> glue looked up from
- * that host's own epp:host:* record, then bumps the parent's serial. */
-static void epp_publish_domain(const char *name, const char ns[][256], int nns) {
+ * writes zone:<parent>:NS:<name> (multi-value, P0b) and zone:<parent>:DS:<name>
+ * (RFC 5910, Phase 2 — "ttl|keytag,alg,digtype,hexdigest|..."; deleted rather
+ * than written when nds==0, since a domain can legitimately go from secure to
+ * insecure) and, for each in-bailiwick NS target, zone:<parent>:A/AAAA:<ns>
+ * glue looked up from that host's own epp:host:* record, then bumps the
+ * parent's serial. Called from create and from update whenever NS or DS
+ * changed. */
+static void epp_publish_domain(const char *name, const char ns[][256], int nns,
+                               const epp_ds_t *ds, int nds) {
     char zone[256];
     if (find_parent_zone(name, zone, sizeof(zone)) < 0) {
         dns_log(LOG_WARNING, "[eppd] no configured parent zone for %s — not publishing\n", name);
@@ -1176,6 +1452,21 @@ static void epp_publish_domain(const char *name, const char ns[][256], int nns) 
     char key[900];
     snprintf(key, sizeof(key), "zone:%s:NS:%s", zone, name);
     vk_set(key, nsval);
+
+    snprintf(key, sizeof(key), "zone:%s:DS:%s", zone, name);
+    if (nds > 0) {
+        char dsval[4096];
+        int doff = snprintf(dsval, sizeof(dsval), "%d", 3600);
+        for (int i = 0; i < nds && doff < (int) sizeof(dsval) - 1; i++) {
+            char hexdigest[2 * EPP_DS_MAX_DIGEST + 1];
+            hex_enc(ds[i].digest, ds[i].digestlen, hexdigest);
+            doff += snprintf(dsval + doff, sizeof(dsval) - doff, "|%u,%u,%u,%s", ds[i].keytag,
+                             ds[i].alg, ds[i].digtype, hexdigest);
+        }
+        vk_set(key, dsval);
+    } else {
+        vk_del(key); /* domain went (or stayed) insecure — retract any stale DS */
+    }
 
     for (int i = 0; i < nns; i++) {
         if (!name_in_zone(ns[i], zone))
@@ -1210,13 +1501,89 @@ static void epp_publish_domain(const char *name, const char ns[][256], int nns) 
         }
     }
     epp_serial_bump_zone(zone);
-    dns_log(LOG_NOTICE, "[eppd] published %s NS delegation into zone %s (%d ns)\n", name, zone,
-            nns);
+    dns_log(LOG_NOTICE, "[eppd] published %s NS delegation into zone %s (%d ns, %d ds)\n", name,
+            zone, nns, nds);
+}
+
+/* Retract a domain's delegation from the parent zone (RFC 3915 delete):
+ * removes zone:<parent>:NS/DS:<name> and bumps the parent's serial.
+ * In-bailiwick glue A/AAAA for the host(s) is deliberately left in place —
+ * it is keyed by hostname, not by this domain, and another delegation may
+ * still reference the same host (host:delete's own association check is
+ * what actually guards against a dangling glue record). */
+static void epp_retract_domain(const char *name) {
+    char zone[256];
+    if (find_parent_zone(name, zone, sizeof(zone)) < 0)
+        return;
+    char key[900];
+    snprintf(key, sizeof(key), "zone:%s:NS:%s", zone, name);
+    vk_del(key);
+    snprintf(key, sizeof(key), "zone:%s:DS:%s", zone, name);
+    vk_del(key);
+    epp_serial_bump_zone(zone);
+    dns_log(LOG_NOTICE, "[eppd] retracted %s delegation from zone %s\n", name, zone);
+}
+
+/* Config knobs (seconds; day-scale defaults, see CLAUDE-eppd.md Phase 2) — a
+ * plain vk_get per call rather than a cached global, since these are only
+ * read on create/delete/transfer/the RGP tick, never on the query hot path.
+ */
+static long epp_cfg_secs(const char *key, long defval) {
+    char v[32];
+    if (vk_get(key, v, sizeof(v)) && v[0])
+        return atol(v);
+    return defval;
+}
+#define EPPD_ADD_GRACE_SECS() epp_cfg_secs("config:eppd_add_grace_secs", 5L * 86400)
+#define EPPD_AUTORENEW_GRACE_SECS() epp_cfg_secs("config:eppd_autorenew_grace_secs", 45L * 86400)
+#define EPPD_REDEMPTION_SECS() epp_cfg_secs("config:eppd_redemption_secs", 30L * 86400)
+#define EPPD_TRANSFER_GRACE_SECS() epp_cfg_secs("config:eppd_transfer_grace_secs", 5L * 86400)
+#define EPPD_TRANSFER_PENDING_SECS() epp_cfg_secs("config:eppd_transfer_pending_secs", 5L * 86400)
+#define EPPD_RGP_TICK_SECS() epp_cfg_secs("config:eppd_rgp_tick_secs", 3600L)
+
+/* Does d->status[] contain `name` (one of the client-settable prohibition/
+ * hold flags — clientUpdateProhibited, clientDeleteProhibited,
+ * clientTransferProhibited, clientHold)? Used to enforce RFC 5731 §2.3
+ * status semantics on update/delete/transfer. */
+static int epp_domain_status_has(const epp_domain_t *d, const char *name) {
+    for (int i = 0; i < d->nstatus; i++)
+        if (strcmp(d->status[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+/* Renders the full <status> tag list for domain:info: computed states
+ * (pendingDelete from RGP redemption, pendingTransfer from a pending
+ * transfer) take precedence for registrar visibility, then any explicit
+ * client-set flags, falling back to plain "ok" if none apply. Server-status
+ * "ok"/pendingDelete/pendingTransfer are never stored in d->status[] itself
+ * (single source of truth: rgp_state / transfer_status), only computed here. */
+static int epp_domain_compute_status(const epp_domain_t *d, char *out, int cap) {
+    int off = 0;
+    int any = 0;
+    if (d->rgp_state == EPP_RGP_REDEMPTION) {
+        off += snprintf(out + off, (size_t) (cap - off), "<status s=\"pendingDelete\"/>");
+        any = 1;
+    }
+    if (strcmp(d->transfer_status, "pending") == 0) {
+        off += snprintf(out + off, (size_t) (cap - off), "<status s=\"pendingTransfer\"/>");
+        any = 1;
+    }
+    for (int i = 0; i < d->nstatus && off < cap - 1; i++) {
+        off += snprintf(out + off, (size_t) (cap - off), "<status s=\"%s\"/>", d->status[i]);
+        any = 1;
+    }
+    if (!any)
+        off += snprintf(out + off, (size_t) (cap - off), "<status s=\"ok\"/>");
+    return off;
 }
 
 /* ── host:* command handlers (RFC 5732) ───────────────────────────────── */
-static int epp_host_check(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                          int rcap) {
+static int epp_host_check(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                          int qe, const char *cltrid, char *resp, int rcap) {
+    (void) sess;
+    (void) cmd_s;
+    (void) cmd_e;
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "host:name", &ns, &ne, &np) != 1 ||
@@ -1235,8 +1602,10 @@ static int epp_host_check(const char *xml, int qs, int qe, const char *cltrid, c
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
-static int epp_host_create(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                           int rcap) {
+static int epp_host_create(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                           int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "host:name", &ns, &ne, &np) != 1 ||
@@ -1251,6 +1620,7 @@ static int epp_host_create(const char *xml, int qs, int qe, const char *cltrid, 
 
     epp_host_t h;
     memset(&h, 0, sizeof(h));
+    safe_strcpy(h.clid, sess->clid, sizeof(h.clid));
     int pos = qs, as, ae, anp;
     while (h.nv4 + h.nv6 < EPP_MAX_ARR &&
            xml_find_child(xml, pos, qe, "host:addr", &as, &ae, &anp) == 1) {
@@ -1285,8 +1655,11 @@ static int epp_host_create(const char *xml, int qs, int qe, const char *cltrid, 
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
-static int epp_host_info(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                         int rcap) {
+static int epp_host_info(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                         int qe, const char *cltrid, char *resp, int rcap) {
+    (void) sess;
+    (void) cmd_s;
+    (void) cmd_e;
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "host:name", &ns, &ne, &np) != 1 ||
@@ -1322,8 +1695,11 @@ static int epp_host_info(const char *xml, int qs, int qe, const char *cltrid, ch
 
 /* ── contact:* command handlers (RFC 5733, simplified for a private/
  * internal registry: name/email/voice only, no postalInfo address block) ── */
-static int epp_contact_check(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                             int rcap) {
+static int epp_contact_check(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                             int qe, const char *cltrid, char *resp, int rcap) {
+    (void) sess;
+    (void) cmd_s;
+    (void) cmd_e;
     char id[64] = "";
     int is, ie, inp;
     if (xml_find_child(xml, qs, qe, "contact:id", &is, &ie, &inp) != 1 ||
@@ -1341,8 +1717,10 @@ static int epp_contact_check(const char *xml, int qs, int qe, const char *cltrid
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
-static int epp_contact_create(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                              int rcap) {
+static int epp_contact_create(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                              int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
     char id[64] = "";
     int is, ie, inp;
     if (xml_find_child(xml, qs, qe, "contact:id", &is, &ie, &inp) != 1 ||
@@ -1356,6 +1734,7 @@ static int epp_contact_create(const char *xml, int qs, int qe, const char *cltri
 
     epp_contact_t c;
     memset(&c, 0, sizeof(c));
+    safe_strcpy(c.clid, sess->clid, sizeof(c.clid));
     int ns, ne, nnp;
     if (xml_find_child(xml, qs, qe, "contact:name", &ns, &ne, &nnp) == 1)
         xml_text_decode(xml, ns, ne, c.name, sizeof(c.name));
@@ -1365,6 +1744,18 @@ static int epp_contact_create(const char *xml, int qs, int qe, const char *cltri
     int vs, ve, vnp;
     if (xml_find_child(xml, qs, qe, "contact:voice", &vs, &ve, &vnp) == 1)
         xml_text_decode(xml, vs, ve, c.voice, sizeof(c.voice));
+    /* RFC 9154: never trust a client-supplied authInfo — always generate a
+     * fresh server-side random token, silently discarding any <contact:pw>
+     * the create carried (a client that supplies one is doing so per RFC
+     * 5733's grammar, which still requires the element; noting it is not an
+     * error, just not honored). */
+    int aps, ape, apnp;
+    if (xml_find_child(xml, qs, qe, "contact:authInfo", &aps, &ape, &apnp) == 1)
+        dns_log(LOG_INFO,
+                "[eppd] contact:create for %s supplied an authInfo pw — ignored, server-generates "
+                "one (RFC 9154)\n",
+                id);
+    epp_gen_authinfo(c.authinfo, sizeof(c.authinfo));
     epp_gen_roid(c.roid, sizeof(c.roid), "EPPD-C");
     c.crdate = (uint32_t) time(NULL);
 
@@ -1387,8 +1778,10 @@ static int epp_contact_create(const char *xml, int qs, int qe, const char *cltri
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
-static int epp_contact_info(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                            int rcap) {
+static int epp_contact_info(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                            int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
     char id[64] = "";
     int is, ie, inp;
     if (xml_find_child(xml, qs, qe, "contact:id", &is, &ie, &inp) != 1 ||
@@ -1406,21 +1799,32 @@ static int epp_contact_info(const char *xml, int qs, int qe, const char *cltrid,
         return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
     char crdatestr[32];
     epp_iso_date(c.crdate, crdatestr, sizeof(crdatestr));
-    char extra[900];
+    /* RFC 9154: authInfo is only ever disclosed to the sponsoring registrar's
+     * own session — not to any other logged-in registrar querying the same
+     * object (a different registrar wanting to prepare a transfer request
+     * must obtain it from the sponsor out of band, then present it via
+     * domain:transfer, not read it back from contact:info). */
+    char authxml[320] = "";
+    if (c.clid[0] && strcmp(c.clid, sess->clid) == 0 && c.authinfo[0])
+        snprintf(authxml, sizeof(authxml), "<authInfo><pw>%s</pw></authInfo>", c.authinfo);
+    char extra[1300];
     snprintf(extra, sizeof(extra),
              "<infData xmlns=\"urn:ietf:params:xml:ns:contact-1.0\">"
              "<id>%s</id><roid>%s</roid><status s=\"ok\"/>%s%s%s"
-             "<crDate>%s</crDate></infData>",
+             "<crDate>%s</crDate>%s</infData>",
              id, c.roid, c.name[0] ? "<name>" : "", c.name[0] ? c.name : "",
-             c.name[0] ? "</name>" : "", crdatestr);
+             c.name[0] ? "</name>" : "", crdatestr, authxml);
     (void) c.email;
     (void) c.voice; /* Phase 1: not echoed in infData yet, stored for later use */
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
 /* ── domain:* command handlers (RFC 5731) ─────────────────────────────── */
-static int epp_domain_check(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                            int rcap) {
+static int epp_domain_check(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                            int qe, const char *cltrid, char *resp, int rcap) {
+    (void) sess;
+    (void) cmd_s;
+    (void) cmd_e;
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "domain:name", &ns, &ne, &np) != 1 ||
@@ -1518,8 +1922,60 @@ static int epp_domain_parse_ns(const char *xml, int qs, int qe, char ns_out[][25
     return nns;
 }
 
-static int epp_domain_create(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                             int rcap) {
+/* ── RFC 5910 secDNS extension (DS mapping) ───────────────────────────────
+ * RFC 5910's DS data always rides in <command>'s <extension> sibling, not
+ * inside <create>/<update> itself, so these need the whole command range
+ * (cmd_s/cmd_e), not just the domain:create/domain:update object range. */
+static int epp_find_secdns_block(const char *xml, int cmd_s, int cmd_e, const char *secdns_tag,
+                                 int *bs, int *be) {
+    int es, ee, enp;
+    if (xml_find_child(xml, cmd_s, cmd_e, "extension", &es, &ee, &enp) != 1)
+        return 0;
+    return xml_find_child(xml, es, ee, secdns_tag, bs, be, &enp);
+}
+
+/* Parses every <secDNS:dsData> child of [s,e) into ds_out[], up to max
+ * entries. An entry with a missing field or an undecodable digest is
+ * skipped (fail closed per-entry, not per-command — mirrors dnsd's
+ * emit_ds_rrset on the read side). Returns the count actually parsed. */
+static int epp_parse_ds_block(const char *xml, int s, int e, epp_ds_t *ds_out, int max) {
+    int n = 0, pos = s;
+    while (n < max) {
+        int ds_s, ds_e, ds_np;
+        if (xml_find_child(xml, pos, e, "secDNS:dsData", &ds_s, &ds_e, &ds_np) != 1)
+            break;
+        pos = ds_np;
+        char keytag_s[16] = "", alg_s[16] = "", digtype_s[16] = "", digest_s[257] = "";
+        int fs, fe, fnp;
+        if (xml_find_child(xml, ds_s, ds_e, "secDNS:keyTag", &fs, &fe, &fnp) != 1 ||
+            xml_text_decode(xml, fs, fe, keytag_s, sizeof(keytag_s)) < 0)
+            continue;
+        if (xml_find_child(xml, ds_s, ds_e, "secDNS:alg", &fs, &fe, &fnp) != 1 ||
+            xml_text_decode(xml, fs, fe, alg_s, sizeof(alg_s)) < 0)
+            continue;
+        if (xml_find_child(xml, ds_s, ds_e, "secDNS:digestType", &fs, &fe, &fnp) != 1 ||
+            xml_text_decode(xml, fs, fe, digtype_s, sizeof(digtype_s)) < 0)
+            continue;
+        if (xml_find_child(xml, ds_s, ds_e, "secDNS:digest", &fs, &fe, &fnp) != 1 ||
+            xml_text_decode(xml, fs, fe, digest_s, sizeof(digest_s)) < 0)
+            continue;
+        uint8_t digest[EPP_DS_MAX_DIGEST];
+        int dlen = hex_dec(digest_s, digest, sizeof(digest));
+        if (dlen <= 0)
+            continue;
+        epp_ds_t *d = &ds_out[n];
+        d->keytag = (uint16_t) atoi(keytag_s);
+        d->alg = (uint8_t) atoi(alg_s);
+        d->digtype = (uint8_t) atoi(digtype_s);
+        d->digestlen = dlen;
+        memcpy(d->digest, digest, (size_t) dlen);
+        n++;
+    }
+    return n;
+}
+
+static int epp_domain_create(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                             int qe, const char *cltrid, char *resp, int rcap) {
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "domain:name", &ns, &ne, &np) != 1 ||
@@ -1542,8 +1998,26 @@ static int epp_domain_create(const char *xml, int qs, int qe, const char *cltrid
     if (xml_find_child(xml, qs, qe, "domain:registrant", &rs, &re, &rnp) == 1)
         xml_text_decode(xml, rs, re, registrant, sizeof(registrant));
 
+    /* RFC 5910: DS data (if any) rides in <extension><secDNS:create>, a
+     * sibling of <create>, not inside domain:create itself. */
+    epp_ds_t dslist[EPP_MAX_ARR];
+    int nds = 0;
+    int sbs, sbe;
+    if (epp_find_secdns_block(xml, cmd_s, cmd_e, "secDNS:create", &sbs, &sbe) == 1)
+        nds = epp_parse_ds_block(xml, sbs, sbe, dslist, EPP_MAX_ARR);
+
+    /* RFC 9154: never trust a client-supplied authInfo (see epp_gen_authinfo). */
+    int aps, ape, apnp;
+    if (xml_find_child(xml, qs, qe, "domain:authInfo", &aps, &ape, &apnp) == 1)
+        dns_log(LOG_INFO,
+                "[eppd] domain:create for %s supplied an authInfo pw — ignored, server-generates "
+                "one (RFC 9154)\n",
+                name);
+
     epp_domain_t d;
     memset(&d, 0, sizeof(d));
+    safe_strcpy(d.clid, sess->clid, sizeof(d.clid));
+    epp_gen_authinfo(d.authinfo, sizeof(d.authinfo));
     epp_gen_roid(d.roid, sizeof(d.roid), "EPPD-D");
     d.crdate = (uint32_t) time(NULL);
     d.exdate = d.crdate + 365u * 24u * 3600u; /* Phase 1: fixed 1y; <domain:period> parsing TODO */
@@ -1551,8 +2025,15 @@ static int epp_domain_create(const char *xml, int qs, int qe, const char *cltrid
     d.nns = nns;
     for (int i = 0; i < nns; i++)
         safe_strcpy(d.ns[i], nslist[i], sizeof(d.ns[0]));
+    d.nds = nds;
+    for (int i = 0; i < nds; i++)
+        d.ds[i] = dslist[i];
     safe_strcpy(d.status[0], "ok", sizeof(d.status[0]));
     d.nstatus = 1;
+    /* RFC 3915 addGracePeriod starts at creation — a delete before it ends
+     * purges immediately rather than entering redemption (see delete). */
+    d.rgp_state = EPP_RGP_ADD;
+    d.rgp_until = d.crdate + (uint32_t) EPPD_ADD_GRACE_SECS();
 
     uint8_t tlv[4096];
     int tlen = epp_domain_encode(&d, tlv, sizeof(tlv));
@@ -1562,8 +2043,8 @@ static int epp_domain_create(const char *xml, int qs, int qe, const char *cltrid
     hex_enc(tlv, tlen, hexbuf);
     vk_set(key, hexbuf);
 
-    if (nns > 0)
-        epp_publish_domain(name, nslist, nns);
+    if (nns > 0 || nds > 0)
+        epp_publish_domain(name, nslist, nns, d.ds, nds);
 
     char crdatestr[32], exdatestr[32];
     epp_iso_date(d.crdate, crdatestr, sizeof(crdatestr));
@@ -1573,12 +2054,33 @@ static int epp_domain_create(const char *xml, int qs, int qe, const char *cltrid
              "<creData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
              "<name>%s</name><crDate>%s</crDate><exDate>%s</exDate></creData>",
              name, crdatestr, exdatestr);
-    dns_log(LOG_NOTICE, "[eppd] domain created: %s (%d ns)\n", name, nns);
+    dns_log(LOG_NOTICE, "[eppd] domain created: %s (%d ns, %d ds)\n", name, nns, nds);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
-static int epp_domain_info(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                           int rcap) {
+/* Maps the domain's current RGP grace/redemption phase, if any, to its RFC
+ * 3915 §3.1.1 <rgp:rgpStatus> value. Returns NULL for EPP_RGP_NONE (no rgp
+ * extension emitted at all — the common case for a domain not near any
+ * lifecycle edge). */
+static const char *epp_rgp_status_str(epp_rgp_state_t s) {
+    switch (s) {
+        case EPP_RGP_ADD:
+            return "addPeriod";
+        case EPP_RGP_AUTORENEW:
+            return "autoRenewPeriod";
+        case EPP_RGP_TRANSFER:
+            return "transferPeriod";
+        case EPP_RGP_REDEMPTION:
+            return "redemptionPeriod";
+        default:
+            return NULL;
+    }
+}
+
+static int epp_domain_info(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                           int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
     char name[256] = "";
     int ns, ne, np;
     if (xml_find_child(xml, qs, qe, "domain:name", &ns, &ne, &np) != 1 ||
@@ -1599,36 +2101,807 @@ static int epp_domain_info(const char *xml, int qs, int qe, const char *cltrid, 
     int noff = 0;
     for (int i = 0; i < d.nns && noff < (int) sizeof(nsxml) - 1; i++)
         noff += snprintf(nsxml + noff, sizeof(nsxml) - noff, "<hostObj>%s</hostObj>", d.ns[i]);
+    char statusxml[600];
+    epp_domain_compute_status(&d, statusxml, sizeof(statusxml));
     char crdatestr[32], exdatestr[32];
     epp_iso_date(d.crdate, crdatestr, sizeof(crdatestr));
     epp_iso_date(d.exdate, exdatestr, sizeof(exdatestr));
-    char extra[4000];
+    /* RFC 9154: only the sponsoring registrar's own session sees authInfo. */
+    char authxml[320] = "";
+    if (d.clid[0] && strcmp(d.clid, sess->clid) == 0 && d.authinfo[0])
+        snprintf(authxml, sizeof(authxml), "<authInfo><pw>%s</pw></authInfo>", d.authinfo);
+    /* RFC 5910 secDNS + RFC 3915 rgp companion extensions — both optional,
+     * both live in the single <extension> sibling of <infData>. */
+    char extxml[3000] = "";
+    int extoff = 0;
+    if (d.nds > 0) {
+        extoff += snprintf(extxml + extoff, sizeof(extxml) - (size_t) extoff,
+                           "<secDNS:infData xmlns:secDNS=\"urn:ietf:params:xml:ns:secDNS-1.1\">");
+        for (int i = 0; i < d.nds && extoff < (int) sizeof(extxml) - 1; i++) {
+            char hexdigest[2 * EPP_DS_MAX_DIGEST + 1];
+            hex_enc(d.ds[i].digest, d.ds[i].digestlen, hexdigest);
+            extoff += snprintf(extxml + extoff, sizeof(extxml) - (size_t) extoff,
+                               "<secDNS:dsData><secDNS:keyTag>%u</secDNS:keyTag>"
+                               "<secDNS:alg>%u</secDNS:alg><secDNS:digestType>%u</secDNS:digestType>"
+                               "<secDNS:digest>%s</secDNS:digest></secDNS:dsData>",
+                               d.ds[i].keytag, d.ds[i].alg, d.ds[i].digtype, hexdigest);
+        }
+        extoff += snprintf(extxml + extoff, sizeof(extxml) - (size_t) extoff, "</secDNS:infData>");
+    }
+    const char *rgpstr = epp_rgp_status_str(d.rgp_state);
+    if (rgpstr && extoff < (int) sizeof(extxml) - 1)
+        extoff += snprintf(extxml + extoff, sizeof(extxml) - (size_t) extoff,
+                           "<rgp:infData xmlns:rgp=\"urn:ietf:params:xml:ns:rgp-1.0\">"
+                           "<rgp:rgpStatus s=\"%s\"/></rgp:infData>",
+                           rgpstr);
+    char extension[3100] = "";
+    if (extoff > 0)
+        snprintf(extension, sizeof(extension), "<extension>%s</extension>", extxml);
+    char extra[8000];
     snprintf(extra, sizeof(extra),
              "<infData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\">"
-             "<name>%s</name><roid>%s</roid><status s=\"ok\"/>"
+             "<name>%s</name><roid>%s</roid>%s"
              "%s%s%s"
              "<ns>%s</ns>"
-             "<crDate>%s</crDate><exDate>%s</exDate></infData>",
-             name, d.roid, d.registrant[0] ? "<registrant>" : "",
+             "<clID>%s</clID>"
+             "<crDate>%s</crDate><exDate>%s</exDate>%s</infData>%s",
+             name, d.roid, statusxml, d.registrant[0] ? "<registrant>" : "",
              d.registrant[0] ? d.registrant : "", d.registrant[0] ? "</registrant>" : "", nsxml,
-             crdatestr, exdatestr);
+             d.clid, crdatestr, exdatestr, authxml, extension);
     return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
 }
 
-/* Recognized-but-not-yet-implemented (domain/host/contact update/delete —
- * RFC 3915 grace periods are explicitly Phase 2) gets 2400 (command
- * failed), distinct from 2101 (unimplemented option) or 2000 (unknown
- * command) so a real registrar client's logs distinguish "eppd doesn't have
- * this yet" from "eppd doesn't understand what you sent". */
+/* Unreachable in practice now that Phase 2 registers all 15 (op, obj)
+ * combinations in epp_handle_command's handlers[] table — kept as a fail-
+ * closed default for any combination a future edit forgets to register,
+ * rather than falling through to "unknown command" (2000), which would
+ * misdescribe a recognized-but-unwired op/obj pair as unrecognized syntax. */
 static int epp_handle_object_command_stub(const char *op, const char *obj, const char *cltrid,
                                           char *resp, int rcap) {
     char msg[128];
-    snprintf(msg, sizeof(msg), "Command failed: %s %s not yet implemented (Phase 2)", op, obj);
+    snprintf(msg, sizeof(msg), "Command failed: %s %s not implemented", op, obj);
     return epp_build_result(resp, rcap, 2400, msg, NULL, cltrid);
 }
 
-typedef int (*epp_obj_handler_fn)(const char *xml, int qs, int qe, const char *cltrid, char *resp,
-                                  int rcap);
+/* Whitelist of client-settable status flags accepted by domain:update's
+ * <domain:add>/<domain:rem><domain:status s="..."/> (and reused, loosely,
+ * for host:update's <host:status> — RFC 5732's status set is a subset of
+ * this one; a private/internal registry does not need to reject the few
+ * domain-only values on a host, so one shared whitelist is kept rather than
+ * two nearly-identical ones). Server-computed statuses (ok, pendingDelete,
+ * pendingTransfer, ...) are never client-settable — see
+ * epp_domain_compute_status. */
+static int epp_status_settable(const char *s) {
+    static const char *allowed[] = {
+        "clientUpdateProhibited",
+        "clientDeleteProhibited",
+        "clientTransferProhibited",
+        "clientRenewProhibited",
+        "clientHold",
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+        if (strcmp(s, allowed[i]) == 0)
+            return 1;
+    return 0;
+}
+
+/* Does any epp:domain:* object currently list `hostname` in its NS set?
+ * Used by host:delete's RFC 5732 §3.2.2 "association exists" (2305) guard
+ * and by host:update/epp_republish_host_glue to find which domains' glue
+ * needs refreshing. Bounded KEYS scan (cap 512) — same convention as
+ * find_parent_zone's zone_table:* scan; epp:domain:* is not expected to be
+ * huge for a private/internal registry (ADR-002). used_by/cap may be
+ * NULL/0 to just get the count (host:delete's use). */
+static int epp_host_in_use(const char *hostname, char used_by[][256], int cap) {
+    char keys[512][256];
+    int n = vk_list_keys("epp:domain:*", keys, 512);
+    int nu = 0;
+    for (int i = 0; i < n; i++) {
+        char blob[VKC_BUF];
+        if (!vk_get(keys[i], blob, sizeof(blob)))
+            continue;
+        uint8_t tlv[4096];
+        int tlen = hex_dec(blob, tlv, sizeof(tlv));
+        epp_domain_t d;
+        if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+            continue;
+        for (int j = 0; j < d.nns; j++) {
+            if (strcasecmp(d.ns[j], hostname) != 0)
+                continue;
+            if (used_by && nu < cap)
+                safe_strcpy(used_by[nu], keys[i] + strlen("epp:domain:"), 256);
+            nu++;
+            break;
+        }
+    }
+    return nu;
+}
+
+/* Does any epp:domain:* object have `contact_id` as its registrant? Guards
+ * contact:delete's RFC 5733 §3.2.2 "association exists" (2305) check. */
+static int epp_contact_in_use(const char *contact_id) {
+    char keys[512][256];
+    int n = vk_list_keys("epp:domain:*", keys, 512);
+    for (int i = 0; i < n; i++) {
+        char blob[VKC_BUF];
+        if (!vk_get(keys[i], blob, sizeof(blob)))
+            continue;
+        uint8_t tlv[4096];
+        int tlen = hex_dec(blob, tlv, sizeof(tlv));
+        epp_domain_t d;
+        if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+            continue;
+        if (d.registrant[0] && strcasecmp(d.registrant, contact_id) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* host:update changed this host's addresses — any domain that already
+ * published it as glue needs that glue refreshed. epp_publish_domain is
+ * idempotent (re-derives NS/DS/glue from the domain's own stored state), so
+ * simply re-running it for every referencing domain is correct, if heavier
+ * than a targeted glue-only patch — acceptable given host updates are rare
+ * compared to DNS query volume. */
+static void epp_republish_host_glue(const char *hostname) {
+    char used_by[512][256];
+    int nu = epp_host_in_use(hostname, used_by, 512);
+    for (int i = 0; i < nu; i++) {
+        char key[300], blob[VKC_BUF];
+        snprintf(key, sizeof(key), "epp:domain:%s", used_by[i]);
+        if (!vk_get(key, blob, sizeof(blob)))
+            continue;
+        uint8_t tlv[4096];
+        int tlen = hex_dec(blob, tlv, sizeof(tlv));
+        epp_domain_t d;
+        if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+            continue;
+        epp_publish_domain(used_by[i], d.ns, d.nns, d.ds, d.nds);
+    }
+}
+
+/* ── host:* update/delete (RFC 5732) ──────────────────────────────────── */
+static int epp_host_update(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                           int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char name[256] = "";
+    int ns_, ne_, np;
+    if (xml_find_child(xml, qs, qe, "host:name", &ns_, &ne_, &np) != 1 ||
+        xml_text_decode(xml, ns_, ne_, name, sizeof(name)) < 0 || !name[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: host:name", NULL,
+                                cltrid);
+    strlower(name);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:host:%s", name);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_host_t h;
+    if (tlen < 0 || epp_host_decode(tlv, tlen, &h) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (h.clid[0] && strcmp(h.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    for (int i = 0; i < h.nstatus; i++)
+        if (strcmp(h.status[i], "clientUpdateProhibited") == 0)
+            return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL,
+                                    cltrid);
+
+    int as, ae, anp;
+    if (xml_find_child(xml, qs, qe, "add", &as, &ae, &anp) == 1) {
+        int pos = as, xs, xe, xnp;
+        while (h.nv4 + h.nv6 < EPP_MAX_ARR &&
+               xml_find_child(xml, pos, ae, "host:addr", &xs, &xe, &xnp) == 1) {
+            char addr[64] = "";
+            xml_text_decode(xml, xs, xe, addr, sizeof(addr));
+            if (strchr(addr, ':')) {
+                if (h.nv6 < EPP_MAX_ARR)
+                    safe_strcpy(h.v6[h.nv6++], addr, sizeof(h.v6[0]));
+            } else if (addr[0] && h.nv4 < EPP_MAX_ARR)
+                safe_strcpy(h.v4[h.nv4++], addr, sizeof(h.v4[0]));
+            pos = xnp;
+        }
+        pos = as;
+        char sval[32];
+        while (h.nstatus < EPP_MAX_ARR &&
+               xml_find_child_attr(xml, pos, ae, "host:status", "s", sval, sizeof(sval), &xs, &xe,
+                                   &xnp) == 1) {
+            if (sval[0] && epp_status_settable(sval)) {
+                int dup = 0;
+                for (int i = 0; i < h.nstatus; i++)
+                    if (strcmp(h.status[i], sval) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                if (!dup)
+                    safe_strcpy(h.status[h.nstatus++], sval, sizeof(h.status[0]));
+            }
+            pos = xnp;
+        }
+    }
+    int rs, re, rnp;
+    if (xml_find_child(xml, qs, qe, "rem", &rs, &re, &rnp) == 1) {
+        int pos = rs, xs, xe, xnp;
+        while (xml_find_child(xml, pos, re, "host:addr", &xs, &xe, &xnp) == 1) {
+            char addr[64] = "";
+            xml_text_decode(xml, xs, xe, addr, sizeof(addr));
+            for (int i = 0; i < h.nv4; i++)
+                if (strcmp(h.v4[i], addr) == 0) {
+                    memmove(&h.v4[i], &h.v4[i + 1], (size_t) (h.nv4 - i - 1) * sizeof(h.v4[0]));
+                    h.nv4--;
+                    i--;
+                }
+            for (int i = 0; i < h.nv6; i++)
+                if (strcmp(h.v6[i], addr) == 0) {
+                    memmove(&h.v6[i], &h.v6[i + 1], (size_t) (h.nv6 - i - 1) * sizeof(h.v6[0]));
+                    h.nv6--;
+                    i--;
+                }
+            pos = xnp;
+        }
+        pos = rs;
+        char sval[32];
+        while (xml_find_child_attr(xml, pos, re, "host:status", "s", sval, sizeof(sval), &xs, &xe,
+                                   &xnp) == 1) {
+            for (int i = 0; i < h.nstatus; i++)
+                if (strcmp(h.status[i], sval) == 0) {
+                    memmove(&h.status[i], &h.status[i + 1],
+                           (size_t) (h.nstatus - i - 1) * sizeof(h.status[0]));
+                    h.nstatus--;
+                    i--;
+                }
+            pos = xnp;
+        }
+    }
+    uint8_t tlv2[4096];
+    int tlen2 = epp_host_encode(&h, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[8192];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(key, hexbuf);
+    epp_republish_host_glue(name);
+    dns_log(LOG_NOTICE, "[eppd] host updated: %s (%d v4, %d v6)\n", name, h.nv4, h.nv6);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
+static int epp_host_delete(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                           int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char name[256] = "";
+    int ns_, ne_, np;
+    if (xml_find_child(xml, qs, qe, "host:name", &ns_, &ne_, &np) != 1 ||
+        xml_text_decode(xml, ns_, ne_, name, sizeof(name)) < 0 || !name[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: host:name", NULL,
+                                cltrid);
+    strlower(name);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:host:%s", name);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_host_t h;
+    if (tlen < 0 || epp_host_decode(tlv, tlen, &h) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (h.clid[0] && strcmp(h.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    for (int i = 0; i < h.nstatus; i++)
+        if (strcmp(h.status[i], "clientDeleteProhibited") == 0)
+            return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL,
+                                    cltrid);
+    if (epp_host_in_use(name, NULL, 0) > 0)
+        return epp_build_result(resp, rcap, 2305,
+                                "Association prohibits operation: host is in use by a domain's NS set",
+                                NULL, cltrid);
+    vk_del(key);
+    dns_log(LOG_NOTICE, "[eppd] host deleted: %s\n", name);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
+/* ── contact:* update/delete (RFC 5733) ───────────────────────────────── */
+static int epp_contact_update(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                              int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "contact:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: contact:id", NULL,
+                                cltrid);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:contact:%s", id);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[2048];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_contact_t c;
+    if (tlen < 0 || epp_contact_decode(tlv, tlen, &c) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (c.clid[0] && strcmp(c.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+
+    int chs, che, chnp;
+    if (xml_find_child(xml, qs, qe, "chg", &chs, &che, &chnp) == 1) {
+        int ns2, ne2, nnp2;
+        if (xml_find_child(xml, chs, che, "contact:name", &ns2, &ne2, &nnp2) == 1)
+            xml_text_decode(xml, ns2, ne2, c.name, sizeof(c.name));
+        int es2, ee2, enp2;
+        if (xml_find_child(xml, chs, che, "contact:email", &es2, &ee2, &enp2) == 1)
+            xml_text_decode(xml, es2, ee2, c.email, sizeof(c.email));
+        int vs2, ve2, vnp2;
+        if (xml_find_child(xml, chs, che, "contact:voice", &vs2, &ve2, &vnp2) == 1)
+            xml_text_decode(xml, vs2, ve2, c.voice, sizeof(c.voice));
+        int aps, ape, apnp;
+        if (xml_find_child(xml, chs, che, "contact:authInfo", &aps, &ape, &apnp) == 1) {
+            /* RFC 9154: regenerate server-side, never accept the client's value. */
+            epp_gen_authinfo(c.authinfo, sizeof(c.authinfo));
+            dns_log(LOG_INFO,
+                    "[eppd] contact:update for %s requested authInfo change — regenerated "
+                    "server-side (RFC 9154)\n",
+                    id);
+        }
+    }
+    uint8_t tlv2[2048];
+    int tlen2 = epp_contact_encode(&c, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[4096];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(key, hexbuf);
+    dns_log(LOG_NOTICE, "[eppd] contact updated: %s\n", id);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
+static int epp_contact_delete(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                              int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char id[64] = "";
+    int is_, ie_, inp;
+    if (xml_find_child(xml, qs, qe, "contact:id", &is_, &ie_, &inp) != 1 ||
+        xml_text_decode(xml, is_, ie_, id, sizeof(id)) < 0 || !id[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: contact:id", NULL,
+                                cltrid);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:contact:%s", id);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[2048];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_contact_t c;
+    if (tlen < 0 || epp_contact_decode(tlv, tlen, &c) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (c.clid[0] && strcmp(c.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    if (epp_contact_in_use(id))
+        return epp_build_result(
+            resp, rcap, 2305, "Association prohibits operation: contact is a domain's registrant",
+            NULL, cltrid);
+    vk_del(key);
+    dns_log(LOG_NOTICE, "[eppd] contact deleted: %s\n", id);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
+/* ── domain:* update/delete (RFC 5731) + RGP (RFC 3915) + secDNS (RFC 5910) ── */
+static int epp_domain_update(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                             int qe, const char *cltrid, char *resp, int rcap) {
+    char name[256] = "";
+    int ns_, ne_, np;
+    if (xml_find_child(xml, qs, qe, "domain:name", &ns_, &ne_, &np) != 1 ||
+        xml_text_decode(xml, ns_, ne_, name, sizeof(name)) < 0 || !name[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: domain:name", NULL,
+                                cltrid);
+    strlower(name);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:domain:%s", name);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_domain_t d;
+    if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (d.clid[0] && strcmp(d.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    if (epp_domain_status_has(&d, "clientUpdateProhibited"))
+        return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL, cltrid);
+
+    int changed_ns = 0, changed_ds = 0;
+
+    int as, ae, anp;
+    if (xml_find_child(xml, qs, qe, "add", &as, &ae, &anp) == 1) {
+        int nss, nse, nsnp;
+        if (xml_find_child(xml, as, ae, "domain:ns", &nss, &nse, &nsnp) == 1) {
+            /* update only accepts hostObj referencing an already-existing host
+             * — hostAttr's implicit host create/update is domain:create-only
+             * (kept there, not duplicated here: a real update rarely needs it,
+             * and the object model has no natural place to record "this host
+             * was implicitly modified by an unrelated domain's update"). */
+            int pos = nss, hos, hoe, honp;
+            while (d.nns < EPP_MAX_ARR &&
+                   xml_find_child(xml, pos, nse, "domain:hostObj", &hos, &hoe, &honp) == 1) {
+                char hn[256] = "";
+                xml_text_decode(xml, hos, hoe, hn, sizeof(hn));
+                strlower(hn);
+                char hkey[300], hblob[16];
+                snprintf(hkey, sizeof(hkey), "epp:host:%s", hn);
+                if (vk_get(hkey, hblob, sizeof(hblob))) {
+                    int dup = 0;
+                    for (int i = 0; i < d.nns; i++)
+                        if (strcasecmp(d.ns[i], hn) == 0) {
+                            dup = 1;
+                            break;
+                        }
+                    if (!dup) {
+                        safe_strcpy(d.ns[d.nns], hn, sizeof(d.ns[0]));
+                        d.nns++;
+                        changed_ns = 1;
+                    }
+                }
+                pos = honp;
+            }
+        }
+        int pos = as, xs, xe, xnp;
+        char sval[32];
+        while (d.nstatus < EPP_MAX_ARR &&
+               xml_find_child_attr(xml, pos, ae, "domain:status", "s", sval, sizeof(sval), &xs, &xe,
+                                   &xnp) == 1) {
+            if (sval[0] && epp_status_settable(sval)) {
+                int dup = 0;
+                for (int i = 0; i < d.nstatus; i++)
+                    if (strcmp(d.status[i], sval) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                if (!dup)
+                    safe_strcpy(d.status[d.nstatus++], sval, sizeof(d.status[0]));
+            }
+            pos = xnp;
+        }
+    }
+
+    int rs, re, rnp;
+    if (xml_find_child(xml, qs, qe, "rem", &rs, &re, &rnp) == 1) {
+        int nss, nse, nsnp;
+        if (xml_find_child(xml, rs, re, "domain:ns", &nss, &nse, &nsnp) == 1) {
+            int pos = nss, hos, hoe, honp;
+            while (xml_find_child(xml, pos, nse, "domain:hostObj", &hos, &hoe, &honp) == 1) {
+                char hn[256] = "";
+                xml_text_decode(xml, hos, hoe, hn, sizeof(hn));
+                strlower(hn);
+                for (int i = 0; i < d.nns; i++)
+                    if (strcasecmp(d.ns[i], hn) == 0) {
+                        memmove(&d.ns[i], &d.ns[i + 1], (size_t) (d.nns - i - 1) * sizeof(d.ns[0]));
+                        d.nns--;
+                        changed_ns = 1;
+                        i--;
+                    }
+                pos = honp;
+            }
+        }
+        int pos = rs, xs, xe, xnp;
+        char sval[32];
+        while (xml_find_child_attr(xml, pos, re, "domain:status", "s", sval, sizeof(sval), &xs, &xe,
+                                   &xnp) == 1) {
+            for (int i = 0; i < d.nstatus; i++)
+                if (strcmp(d.status[i], sval) == 0) {
+                    memmove(&d.status[i], &d.status[i + 1],
+                           (size_t) (d.nstatus - i - 1) * sizeof(d.status[0]));
+                    d.nstatus--;
+                    i--;
+                }
+            pos = xnp;
+        }
+    }
+
+    int chs, che, chnp;
+    if (xml_find_child(xml, qs, qe, "chg", &chs, &che, &chnp) == 1) {
+        int rgs, rge, rgnp;
+        if (xml_find_child(xml, chs, che, "domain:registrant", &rgs, &rge, &rgnp) == 1)
+            xml_text_decode(xml, rgs, rge, d.registrant, sizeof(d.registrant));
+        int aps, ape, apnp;
+        if (xml_find_child(xml, chs, che, "domain:authInfo", &aps, &ape, &apnp) == 1) {
+            epp_gen_authinfo(d.authinfo, sizeof(d.authinfo));
+            dns_log(LOG_INFO,
+                    "[eppd] domain:update for %s requested authInfo change — regenerated "
+                    "server-side (RFC 9154)\n",
+                    name);
+        }
+    }
+
+    /* RFC 5910 secDNS extension: <secDNS:chg> replaces the whole DS set;
+     * otherwise <secDNS:add>/<secDNS:rem> are additive (rem matches on
+     * keyTag+alg+digestType, ignoring the digest bytes — the identifying
+     * triple per RFC 5910 §3.2). */
+    int secs_, sece;
+    if (epp_find_secdns_block(xml, cmd_s, cmd_e, "secDNS:update", &secs_, &sece) == 1) {
+        int cs2, ce2, cnp2;
+        if (xml_find_child(xml, secs_, sece, "secDNS:chg", &cs2, &ce2, &cnp2) == 1) {
+            d.nds = epp_parse_ds_block(xml, cs2, ce2, d.ds, EPP_MAX_ARR);
+            changed_ds = 1;
+        } else {
+            int ads, ade, adnp;
+            if (xml_find_child(xml, secs_, sece, "secDNS:add", &ads, &ade, &adnp) == 1) {
+                epp_ds_t toadd[EPP_MAX_ARR];
+                int nadd = epp_parse_ds_block(xml, ads, ade, toadd, EPP_MAX_ARR);
+                for (int i = 0; i < nadd && d.nds < EPP_MAX_ARR; i++) {
+                    d.ds[d.nds++] = toadd[i];
+                    changed_ds = 1;
+                }
+            }
+            int rds, rde, rdnp;
+            if (xml_find_child(xml, secs_, sece, "secDNS:rem", &rds, &rde, &rdnp) == 1) {
+                epp_ds_t torem[EPP_MAX_ARR];
+                int nrem = epp_parse_ds_block(xml, rds, rde, torem, EPP_MAX_ARR);
+                for (int i = 0; i < nrem; i++)
+                    for (int j = 0; j < d.nds; j++)
+                        if (d.ds[j].keytag == torem[i].keytag && d.ds[j].alg == torem[i].alg &&
+                            d.ds[j].digtype == torem[i].digtype) {
+                            memmove(&d.ds[j], &d.ds[j + 1],
+                                   (size_t) (d.nds - j - 1) * sizeof(d.ds[0]));
+                            d.nds--;
+                            changed_ds = 1;
+                            j--;
+                        }
+            }
+        }
+    }
+
+    /* RFC 3915 restore: <extension><rgp:update><rgp:restore op="request"/>
+     * ...</rgp:update></extension>. Simplified from the full request+report
+     * two-step (see CLAUDE-eppd.md) — a request alone restores the domain
+     * to "ok" immediately, since a private/internal registry has no
+     * registrar-facing report workflow to gate on. */
+    int rgs2, rge2;
+    if (epp_find_secdns_block(xml, cmd_s, cmd_e, "rgp:update", &rgs2, &rge2) == 1) {
+        char restoreop[16] = "";
+        int rrs, rre, rrnp;
+        if (xml_find_child_attr(xml, rgs2, rge2, "rgp:restore", "op", restoreop, sizeof(restoreop),
+                                &rrs, &rre, &rrnp) == 1 &&
+            strcmp(restoreop, "request") == 0 && d.rgp_state == EPP_RGP_REDEMPTION) {
+            d.rgp_state = EPP_RGP_NONE;
+            d.rgp_until = 0;
+            changed_ns = 1; /* force republish — the delegation was retracted on delete */
+            dns_log(LOG_NOTICE, "[eppd] domain %s restored from redemptionPeriod\n", name);
+        }
+    }
+
+    uint8_t tlv2[4096];
+    int tlen2 = epp_domain_encode(&d, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[8192];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(key, hexbuf);
+
+    if (changed_ns || changed_ds)
+        epp_publish_domain(name, d.ns, d.nns, d.ds, d.nds);
+
+    dns_log(LOG_NOTICE, "[eppd] domain updated: %s (ns=%d ds=%d)\n", name, d.nns, d.nds);
+    return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+}
+
+static int epp_domain_delete(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e, int qs,
+                             int qe, const char *cltrid, char *resp, int rcap) {
+    (void) cmd_s;
+    (void) cmd_e;
+    char name[256] = "";
+    int ns_, ne_, np;
+    if (xml_find_child(xml, qs, qe, "domain:name", &ns_, &ne_, &np) != 1 ||
+        xml_text_decode(xml, ns_, ne_, name, sizeof(name)) < 0 || !name[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: domain:name", NULL,
+                                cltrid);
+    strlower(name);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:domain:%s", name);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_domain_t d;
+    if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    if (d.clid[0] && strcmp(d.clid, sess->clid) != 0)
+        return epp_build_result(resp, rcap, 2201, "Authorization error: not the sponsoring registrar",
+                                NULL, cltrid);
+    if (epp_domain_status_has(&d, "clientDeleteProhibited"))
+        return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL, cltrid);
+    if (strcmp(d.transfer_status, "pending") == 0)
+        return epp_build_result(resp, rcap, 2304,
+                                "Object status prohibits operation: transfer pending", NULL, cltrid);
+
+    time_t now = time(NULL);
+    /* RFC 3915 §3.2: a delete during the add, autoRenew, or transfer grace
+     * window is a full (immediate) delete — no redemptionPeriod. Checked
+     * directly against rgp_state/rgp_until (which the RGP tick keeps
+     * current), not by re-deriving "how long ago was the triggering event"
+     * from crDate — crDate must never change once set (an autorenew is not
+     * a recreation), so it can't double as that reference point. */
+    int in_grace =
+        (d.rgp_state == EPP_RGP_ADD || d.rgp_state == EPP_RGP_AUTORENEW ||
+         d.rgp_state == EPP_RGP_TRANSFER) &&
+        now < (time_t) d.rgp_until;
+
+    if (in_grace) {
+        epp_retract_domain(name);
+        vk_del(key);
+        dns_log(LOG_NOTICE, "[eppd] domain deleted (grace period, immediate purge): %s\n", name);
+        return epp_build_result(resp, rcap, 1000, "Command completed successfully", NULL, cltrid);
+    }
+
+    d.rgp_state = EPP_RGP_REDEMPTION;
+    d.rgp_until = (uint32_t) now + (uint32_t) EPPD_REDEMPTION_SECS();
+    uint8_t tlv2[4096];
+    int tlen2 = epp_domain_encode(&d, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+    char hexbuf[8192];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(key, hexbuf);
+    epp_retract_domain(name); /* stops resolving during redemption, like every real registry */
+    dns_log(LOG_NOTICE, "[eppd] domain %s entered redemptionPeriod (purge in %lds unless restored)\n",
+            name, (long) EPPD_REDEMPTION_SECS());
+    return epp_build_result(resp, rcap, 1001, "Command completed successfully; action pending", NULL,
+                            cltrid);
+}
+
+/* ── domain:transfer (RFC 5731 §3.2.4) ────────────────────────────────────
+ * Not part of epp_obj_handler_fn's dispatch table (its <transfer op="...">
+ * shape needs the op attribute the table's callers don't have), so
+ * epp_handle_command calls this directly. */
+static int epp_domain_transfer(epp_session_t *sess, const char *xml, int ts, int te, const char *op,
+                               const char *cltrid, char *resp, int rcap) {
+    /* The object-specific payload is <domain:transfer>, nested one level
+     * inside <transfer op="...">'s content — mirroring how <domain:create>
+     * nests inside <create> — not domain:name/domain:authInfo directly at
+     * the <transfer> level. */
+    int dts, dte, dtnp;
+    if (xml_find_child(xml, ts, te, "domain:transfer", &dts, &dte, &dtnp) != 1)
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: domain:transfer",
+                                NULL, cltrid);
+    int ds_, de_, dnp;
+    char name[256] = "";
+    if (xml_find_child(xml, dts, dte, "domain:name", &ds_, &de_, &dnp) != 1 ||
+        xml_text_decode(xml, ds_, de_, name, sizeof(name)) < 0 || !name[0])
+        return epp_build_result(resp, rcap, 2003, "Required parameter missing: domain:name", NULL,
+                                cltrid);
+    strlower(name);
+    char key[300], blob[VKC_BUF];
+    snprintf(key, sizeof(key), "epp:domain:%s", name);
+    if (!vk_get(key, blob, sizeof(blob)))
+        return epp_build_result(resp, rcap, 2303, "Object does not exist", NULL, cltrid);
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_domain_t d;
+    if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+        return epp_build_result(resp, rcap, 2400, "Command failed: corrupt object", NULL, cltrid);
+    int is_pending = strcmp(d.transfer_status, "pending") == 0;
+
+    if (strcmp(op, "query") == 0) {
+        if (!d.transfer_status[0])
+            return epp_build_result(resp, rcap, 2303, "Object does not exist: no transfer history",
+                                    NULL, cltrid);
+        if (strcmp(sess->clid, d.clid) != 0 && strcmp(sess->clid, d.transfer_reid) != 0)
+            return epp_build_result(resp, rcap, 2201,
+                                    "Authorization error: not a party to this transfer", NULL,
+                                    cltrid);
+        char extra[700];
+        snprintf(extra, sizeof(extra),
+                "<trnData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\"><name>%s</name>"
+                "<trStatus>%s</trStatus><reID>%s</reID><acID>%s</acID></trnData>",
+                name, d.transfer_status, d.transfer_reid, d.clid);
+        return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+    }
+
+    if (strcmp(op, "request") == 0) {
+        if (is_pending)
+            return epp_build_result(resp, rcap, 2304,
+                                    "Object status prohibits operation: transfer already pending",
+                                    NULL, cltrid);
+        if (epp_domain_status_has(&d, "clientTransferProhibited") ||
+            epp_domain_status_has(&d, "serverTransferProhibited"))
+            return epp_build_result(resp, rcap, 2304, "Object status prohibits operation", NULL,
+                                    cltrid);
+        if (d.clid[0] && strcmp(d.clid, sess->clid) == 0)
+            return epp_build_result(resp, rcap, 2002,
+                                    "Command use error: already the sponsoring registrar", NULL,
+                                    cltrid);
+        int as_, ae_, anp;
+        char pw[256] = "";
+        if (xml_find_child(xml, dts, dte, "domain:authInfo", &as_, &ae_, &anp) != 1)
+            return epp_build_result(resp, rcap, 2003,
+                                    "Required parameter missing: domain:authInfo", NULL, cltrid);
+        int pws, pwe, pwnp;
+        if (xml_find_child(xml, as_, ae_, "domain:pw", &pws, &pwe, &pwnp) != 1 ||
+            xml_text_decode(xml, pws, pwe, pw, sizeof(pw)) < 0)
+            return epp_build_result(resp, rcap, 2003,
+                                    "Required parameter missing: domain:authInfo/pw", NULL, cltrid);
+        if (!d.authinfo[0] || strcmp(d.authinfo, pw) != 0)
+            return epp_build_result(resp, rcap, 2200, "Authentication error: authInfo mismatch",
+                                    NULL, cltrid);
+
+        safe_strcpy(d.transfer_reid, sess->clid, sizeof(d.transfer_reid));
+        d.transfer_redate = (uint32_t) time(NULL);
+        safe_strcpy(d.transfer_status, "pending", sizeof(d.transfer_status));
+        uint8_t tlv2[4096];
+        int tlen2 = epp_domain_encode(&d, tlv2, sizeof(tlv2));
+        if (tlen2 < 0)
+            return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+        char hexbuf[8192];
+        hex_enc(tlv2, tlen2, hexbuf);
+        vk_set(key, hexbuf);
+        dns_log(LOG_NOTICE, "[eppd] transfer requested for %s: %s -> %s\n", name, d.clid,
+                sess->clid);
+        char extra[700];
+        snprintf(extra, sizeof(extra),
+                "<trnData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\"><name>%s</name>"
+                "<trStatus>pending</trStatus><reID>%s</reID><acID>%s</acID></trnData>",
+                name, d.transfer_reid, d.clid);
+        return epp_build_result(resp, rcap, 1001, "Command completed successfully; action pending",
+                                extra, cltrid);
+    }
+
+    if (strcmp(op, "cancel") == 0 || strcmp(op, "reject") == 0 || strcmp(op, "approve") == 0) {
+        if (!is_pending)
+            return epp_build_result(resp, rcap, 2304,
+                                    "Object status prohibits operation: no pending transfer", NULL,
+                                    cltrid);
+        int is_gaining = strcmp(sess->clid, d.transfer_reid) == 0;
+        int is_losing = d.clid[0] && strcmp(sess->clid, d.clid) == 0;
+        if (strcmp(op, "cancel") == 0) {
+            if (!is_gaining)
+                return epp_build_result(resp, rcap, 2201,
+                                        "Authorization error: not the requesting registrar", NULL,
+                                        cltrid);
+            safe_strcpy(d.transfer_status, "clientCancelled", sizeof(d.transfer_status));
+        } else if (strcmp(op, "reject") == 0) {
+            if (!is_losing)
+                return epp_build_result(resp, rcap, 2201,
+                                        "Authorization error: not the sponsoring registrar", NULL,
+                                        cltrid);
+            safe_strcpy(d.transfer_status, "clientRejected", sizeof(d.transfer_status));
+        } else {
+            if (!is_losing)
+                return epp_build_result(resp, rcap, 2201,
+                                        "Authorization error: not the sponsoring registrar", NULL,
+                                        cltrid);
+            safe_strcpy(d.transfer_status, "clientApproved", sizeof(d.transfer_status));
+            safe_strcpy(d.clid, d.transfer_reid, sizeof(d.clid));
+            d.exdate += 365u * 24u * 3600u; /* RFC 5731 §3.2.4: transfer extends by 1 registration
+                                              * period */
+            d.rgp_state = EPP_RGP_TRANSFER;
+            d.rgp_until = (uint32_t) time(NULL) + (uint32_t) EPPD_TRANSFER_GRACE_SECS();
+        }
+        uint8_t tlv2[4096];
+        int tlen2 = epp_domain_encode(&d, tlv2, sizeof(tlv2));
+        if (tlen2 < 0)
+            return epp_build_result(resp, rcap, 2400, "Command failed: encode error", NULL, cltrid);
+        char hexbuf[8192];
+        hex_enc(tlv2, tlen2, hexbuf);
+        vk_set(key, hexbuf);
+        dns_log(LOG_NOTICE, "[eppd] transfer %s for %s (now %s)\n", op, name, d.transfer_status);
+        char extra[700];
+        snprintf(extra, sizeof(extra),
+                "<trnData xmlns=\"urn:ietf:params:xml:ns:domain-1.0\"><name>%s</name>"
+                "<trStatus>%s</trStatus><reID>%s</reID><acID>%s</acID></trnData>",
+                name, d.transfer_status, d.transfer_reid, d.clid);
+        return epp_build_result(resp, rcap, 1000, "Command completed successfully", extra, cltrid);
+    }
+
+    return epp_build_result(resp, rcap, 2101, "Unimplemented option: transfer op", NULL, cltrid);
+}
+
+typedef int (*epp_obj_handler_fn)(epp_session_t *sess, const char *xml, int cmd_s, int cmd_e,
+                                  int qs, int qe, const char *cltrid, char *resp, int rcap);
 
 /* Parse <command> and dispatch. Returns the response XML length, or -1 if
  * the input was too malformed to even build an error response for (the
@@ -1642,6 +2915,26 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
     if (xml_find_child(xml, cmd_s, cmd_e, "clTRID", &cs, &ce, &np) == 1)
         xml_text_decode(xml, cs, ce, cltrid, sizeof(cltrid));
 
+    if (!sess->logged_in) {
+        int os, oe, onp;
+        /* <transfer> is handled below (its own dispatch, own auth checks per
+         * op= — a transfer request is inherently cross-registrar); every
+         * other command requires an existing session. */
+        if (xml_find_child(xml, cmd_s, cmd_e, "transfer", &os, &oe, &onp) != 1)
+            return epp_build_result(resp, rcap, 2201, "Authorization error: not logged in", NULL,
+                                    cltrid);
+    }
+
+    int ts, te, tnp;
+    char transfer_op[16] = "";
+    if (xml_find_child_attr(xml, cmd_s, cmd_e, "transfer", "op", transfer_op, sizeof(transfer_op),
+                            &ts, &te, &tnp) == 1) {
+        if (!sess->logged_in)
+            return epp_build_result(resp, rcap, 2201, "Authorization error: not logged in", NULL,
+                                    cltrid);
+        return epp_domain_transfer(sess, xml, ts, te, transfer_op, cltrid, resp, rcap);
+    }
+
     static const struct {
         const char *tag;
         const char *op;
@@ -1649,27 +2942,24 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
         {"check", "check"},   {"info", "info"},     {"create", "create"},
         {"update", "update"}, {"delete", "delete"},
     };
-    /* Implemented (op, obj) combinations — everything else recognized-but-
-     * not-yet-implemented (update/delete for all three objects; RFC 3915
-     * grace periods are explicitly Phase 2) falls through to the stub. */
     static const struct {
         const char *op;
         const char *obj;
         epp_obj_handler_fn fn;
     } handlers[] = {
-        {"check", "domain", epp_domain_check},   {"create", "domain", epp_domain_create},
-        {"info", "domain", epp_domain_info},     {"check", "host", epp_host_check},
-        {"create", "host", epp_host_create},     {"info", "host", epp_host_info},
-        {"check", "contact", epp_contact_check}, {"create", "contact", epp_contact_create},
-        {"info", "contact", epp_contact_info},
+        {"check", "domain", epp_domain_check},     {"create", "domain", epp_domain_create},
+        {"info", "domain", epp_domain_info},       {"update", "domain", epp_domain_update},
+        {"delete", "domain", epp_domain_delete},   {"check", "host", epp_host_check},
+        {"create", "host", epp_host_create},       {"info", "host", epp_host_info},
+        {"update", "host", epp_host_update},       {"delete", "host", epp_host_delete},
+        {"check", "contact", epp_contact_check},   {"create", "contact", epp_contact_create},
+        {"info", "contact", epp_contact_info},     {"update", "contact", epp_contact_update},
+        {"delete", "contact", epp_contact_delete},
     };
     for (size_t i = 0; i < sizeof(objcmds) / sizeof(objcmds[0]); i++) {
         int os, oe, onp;
         if (xml_find_child(xml, cmd_s, cmd_e, objcmds[i].tag, &os, &oe, &onp) != 1)
             continue;
-        if (!sess->logged_in)
-            return epp_build_result(resp, rcap, 2201, "Authorization error: not logged in", NULL,
-                                    cltrid);
         static const char *objs[] = {"domain", "host", "contact"};
         for (size_t j = 0; j < 3; j++) {
             char qname[32];
@@ -1680,7 +2970,7 @@ static int epp_handle_command(epp_session_t *sess, const char *xml, int len, int
             for (size_t k = 0; k < sizeof(handlers) / sizeof(handlers[0]); k++)
                 if (strcmp(handlers[k].op, objcmds[i].op) == 0 &&
                     strcmp(handlers[k].obj, objs[j]) == 0)
-                    return handlers[k].fn(xml, qs, qe, cltrid, resp, rcap);
+                    return handlers[k].fn(sess, xml, cmd_s, cmd_e, qs, qe, cltrid, resp, rcap);
             return epp_handle_object_command_stub(objcmds[i].op, objs[j], cltrid, resp, rcap);
         }
         return epp_build_result(resp, rcap, 2000, "Unknown object type", NULL, cltrid);
@@ -1728,6 +3018,102 @@ static int epp_dispatch(epp_session_t *sess, char *xml, int xlen, char *resp, in
         return epp_handle_command(sess, xml, xlen, cs, ce, resp, rcap);
     }
     return -1; /* neither <hello> nor <command> under <epp> — nothing safe to say */
+}
+
+/* ── RFC 3915 RGP background sweep ─────────────────────────────────────────
+ * The state transitions that don't happen synchronously inside a command
+ * handler because nothing triggers them except the passage of time:
+ * autoRenewPeriod (exdate reached), redemption purge (redemption window
+ * elapsed with no restore), grace-window expiry (add/autorenew/transfer
+ * revert to plain "ok"), and transfer auto-approval (RFC 5731 §3.2.4 — a
+ * registry auto-approves a transfer request the losing registrar neither
+ * approved nor rejected within the pending window). One domain at a time,
+ * each independently encoded/stored — a crash or Valkey hiccup mid-sweep
+ * loses at most the domains not yet reached this tick, not the whole batch.
+ */
+static void epp_rgp_tick_one(const char *domkey) {
+    char blob[VKC_BUF];
+    if (!vk_get(domkey, blob, sizeof(blob)))
+        return;
+    uint8_t tlv[4096];
+    int tlen = hex_dec(blob, tlv, sizeof(tlv));
+    epp_domain_t d;
+    if (tlen < 0 || epp_domain_decode(tlv, tlen, &d) < 0)
+        return;
+    const char *name = domkey + strlen("epp:domain:");
+    uint32_t now = (uint32_t) time(NULL);
+    int changed = 0;
+    int purge = 0;
+
+    if (d.rgp_state == EPP_RGP_REDEMPTION && now >= d.rgp_until) {
+        purge = 1;
+    } else {
+        if (d.rgp_state != EPP_RGP_REDEMPTION && now >= d.exdate) {
+            /* RFC 3915 autoRenewPeriod: registration renews automatically;
+             * a delete during the grace window that follows is immediate
+             * (epp_domain_delete checks rgp_state/rgp_until directly, not
+             * crDate — crDate must never change once set, an autorenew is
+             * not a recreation). */
+            d.exdate += 365u * 24u * 3600u;
+            d.rgp_state = EPP_RGP_AUTORENEW;
+            d.rgp_until = now + (uint32_t) EPPD_AUTORENEW_GRACE_SECS();
+            changed = 1;
+            dns_log(LOG_NOTICE, "[eppd] domain %s auto-renewed (new exdate)\n", name);
+        } else if ((d.rgp_state == EPP_RGP_ADD || d.rgp_state == EPP_RGP_AUTORENEW ||
+                   d.rgp_state == EPP_RGP_TRANSFER) &&
+                  now >= d.rgp_until) {
+            d.rgp_state = EPP_RGP_NONE;
+            d.rgp_until = 0;
+            changed = 1;
+        }
+        if (strcmp(d.transfer_status, "pending") == 0 &&
+            now - d.transfer_redate > (uint32_t) EPPD_TRANSFER_PENDING_SECS()) {
+            /* RFC 5731 §3.2.4: no response within the pending window ->
+             * server auto-approves. */
+            safe_strcpy(d.transfer_status, "serverApproved", sizeof(d.transfer_status));
+            safe_strcpy(d.clid, d.transfer_reid, sizeof(d.clid));
+            d.exdate += 365u * 24u * 3600u;
+            d.rgp_state = EPP_RGP_TRANSFER;
+            d.rgp_until = now + (uint32_t) EPPD_TRANSFER_GRACE_SECS();
+            changed = 1;
+            dns_log(LOG_NOTICE, "[eppd] domain %s transfer auto-approved (pending window elapsed)\n",
+                    name);
+        }
+    }
+
+    if (purge) {
+        vk_del(domkey); /* delegation was already retracted when delete entered redemption */
+        dns_log(LOG_NOTICE, "[eppd] domain %s purged (redemptionPeriod elapsed)\n", name);
+        return;
+    }
+    if (!changed)
+        return;
+    uint8_t tlv2[4096];
+    int tlen2 = epp_domain_encode(&d, tlv2, sizeof(tlv2));
+    if (tlen2 < 0)
+        return;
+    char hexbuf[8192];
+    hex_enc(tlv2, tlen2, hexbuf);
+    vk_set(domkey, hexbuf);
+}
+
+static void epp_rgp_tick_scan(void) {
+    char keys[512][256];
+    int n = vk_list_keys("epp:domain:*", keys, 512);
+    for (int i = 0; i < n; i++)
+        epp_rgp_tick_one(keys[i]);
+}
+
+static void *epp_rgp_tick_loop(void *arg) {
+    (void) arg;
+    for (;;) {
+        long secs = EPPD_RGP_TICK_SECS();
+        if (secs < 1)
+            secs = 1;
+        sleep((unsigned int) secs);
+        epp_rgp_tick_scan();
+    }
+    return NULL;
 }
 
 /* ── Listener ────────────────────────────────────────────────────────────── */
@@ -1963,6 +3349,12 @@ int main(int argc, char **argv) {
     pthread_t kt;
     if (pthread_create(&kt, NULL, keyspace_watch_loop, &kcfg) == 0)
         pthread_detach(kt);
+
+    /* RFC 3915 RGP background sweep — autorenew, redemption purge, grace-
+     * window expiry, transfer auto-approval (see epp_rgp_tick_loop). */
+    pthread_t rt;
+    if (pthread_create(&rt, NULL, epp_rgp_tick_loop, NULL) == 0)
+        pthread_detach(rt);
 
     pthread_join(lt, NULL);
     return 0;

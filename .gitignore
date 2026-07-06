@@ -10,6 +10,8 @@ resolverd
 resolverd_debug
 doqd
 doqd_debug
+eppd
+eppd_debug
 
 # Secrets — never commit private keys / cert chains
 *.key
@@ -38,6 +40,8 @@ tests/test_aggressive_nsec
 tests/test_ede
 tests/test_dns64
 tests/test_doq
+tests/test_eppd
+tests/test_csync
 fuzz/fuzz_name_from_wire
 fuzz/fuzz_response
 fuzz/fuzz_tlv

@@ -81,6 +81,14 @@
  *              lets the `eppd` sidecar (RFC 5730/5734/5731/5732/5733
  *              registry front-end; not in this binary, see CLAUDE.md)
  *              publish a delegation dnsd actually treats as one.
+ *   5910       DNSSEC delegation signer (DS) mapping, parent side – a DS
+ *              query exactly at a delegation cut is answered authoritatively
+ *              and DNSSEC-signed from zone:<zone>:DS:<name> (RFC 4035
+ *              §3.1.4), the one RRset the parent is authoritative for at a
+ *              name it otherwise delegates away. No DS published for that
+ *              child falls through to the ordinary unsigned referral above
+ *              (insecure delegation). Written only by `eppd` (its own DS
+ *              mapping via the secDNS-1.1 EPP extension, not in this binary).
  *   9619       QDCOUNT=1 enforcement for QUERY
  *   5452       Forwarder upstream-reply validation (source addr/port + ID +
  *              question match; random ephemeral source port) — anti-spoofing
@@ -2999,9 +3007,9 @@ static int ecdsa_der_to_raw(const uint8_t *der, int dl, uint8_t raw[64]) {
 }
 
 /* Build RRSIG rdata for one RR, using given ZSK key + algorithm */
-static int make_rrsig(const char *owner, uint16_t rrtype, uint32_t ttl, const uint8_t *rrdata,
-                      uint16_t rrdata_len, EVP_PKEY *zsk, uint8_t alg, uint16_t tag,
-                      uint8_t *outbuf) {
+static int make_rrsig(const char *owner, const char *signer, uint16_t rrtype, uint32_t ttl,
+                      const uint8_t *rrdata, uint16_t rrdata_len, EVP_PKEY *zsk, uint8_t alg,
+                      uint16_t tag, uint8_t *outbuf) {
     if (!zsk)
         return -1;
     uint8_t hdr[512];
@@ -3026,14 +3034,21 @@ static int make_rrsig(const char *owner, uint16_t rrtype, uint32_t ttl, const ui
     hdr[hp++] = t_inc & 0xFF;
     hdr[hp++] = tag >> 8;
     hdr[hp++] = tag & 0xFF;
-    /* Signer name wire */
-    char sn[256];
-    safe_strcpy(sn, owner, sizeof(sn));
-    strlower(sn);
+    /* Signer's Name wire (RFC 4034 §3.1.7): the zone apex owning the DNSKEY
+     * that validates this signature — NOT this RRset's own owner name. They
+     * only coincide when signing apex data itself (SOA, DNSKEY, CDS/CDNSKEY,
+     * the apex's own NSEC/NSEC3). For every other RRset (an ordinary A/AAAA/
+     * MX/TXT/... below the apex, or a DS at a delegation cut) they differ,
+     * and a validator resolves the signer field to find which DNSKEY to
+     * fetch — get this wrong and validation fails, since no DNSKEY is
+     * published at the RRset's own name. */
+    char sgn[256];
+    safe_strcpy(sgn, signer, sizeof(sgn));
+    strlower(sgn);
     {
         char *sp1 = NULL;
         char tmp[256];
-        safe_strcpy(tmp, sn, sizeof(tmp));
+        safe_strcpy(tmp, sgn, sizeof(tmp));
         char *lbl = strtok_r(tmp, ".", &sp1);
         while (lbl) {
             int ll = (int) strlen(lbl);
@@ -3047,7 +3062,10 @@ static int make_rrsig(const char *owner, uint16_t rrtype, uint32_t ttl, const ui
         }
         hdr[hp++] = 0;
     }
-    /* Canonical RR */
+    /* Canonical RR — this RRset's own owner name (may differ from signer). */
+    char sn[256];
+    safe_strcpy(sn, owner, sizeof(sn));
+    strlower(sn);
     uint8_t own_w[256];
     int ow = 0;
     {
@@ -5060,8 +5078,8 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
-            int sl =
-                make_rrsig(name, type, ttl, rdata, rdlen, zsk, DNS_ALG_ECDSAP256SHA256, tag, sig);
+            int sl = make_rrsig(name, t_zone->name, type, ttl, rdata, rdlen, zsk,
+                                DNS_ALG_ECDSAP256SHA256, tag, sig);
             if (sl > 0) {
                 int so = append_rr(resp, off, resp_len, name, DNS_TYPE_RRSIG, DNS_CLASS_IN, ttl,
                                    sig, (uint16_t) sl);
@@ -5080,7 +5098,8 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
         pthread_mutex_unlock(&g_zsk_mutex);
         if (zsk) {
             uint8_t sig[512];
-            int sl = make_rrsig(name, type, ttl, rdata, rdlen, zsk, DNS_ALG_ED25519, tag, sig);
+            int sl =
+                make_rrsig(name, t_zone->name, type, ttl, rdata, rdlen, zsk, DNS_ALG_ED25519, tag, sig);
             if (sl > 0) {
                 int so = append_rr(resp, off, resp_len, name, DNS_TYPE_RRSIG, DNS_CLASS_IN, ttl,
                                    sig, (uint16_t) sl);
@@ -5447,6 +5466,52 @@ static int emit_ns_rrset(uint8_t *resp, int off, int resp_len, const char *name,
         if (rl > 0)
             off = emit_rr(resp, off, resp_len, name, DNS_TYPE_NS, ttl, rd, (uint16_t) rl, dnssec_ok,
                           count);
+    }
+    return off;
+}
+
+/* Emit a DS RRset for a delegation-cut owner name from a stored
+ * "ttl|keytag,alg,digtype,hexdigest|..." value (RFC 5910 — `eppd` is the
+ * only writer of zone:<zone>:DS:<name>, either from EPP <domain:ds> data a
+ * registrar submitted directly or, in a future add, scanned child CDS).
+ * Unlike the NS/glue at the same cut, this DS RRset IS authoritative parent
+ * data and is signed with the parent zone's ZSK (RFC 4035 §3.1.4) — the
+ * caller passes dnssec_ok accordingly, not the referral's fixed 0. `val` is
+ * mutated (tokenised) in place, same convention as emit_ns_rrset. Malformed
+ * entries (bad field count, undecodable hex) are skipped rather than
+ * aborting the whole RRset — fail closed per-entry, not per-name, since a
+ * corrupt entry is not distinguishable from a partial write here and the
+ * other entries may still be valid. */
+static int emit_ds_rrset(uint8_t *resp, int off, int resp_len, const char *name, char *val,
+                         int dnssec_ok, int *count) {
+    uint32_t ttl = DEFAULT_TTL;
+    char *pipe = strchr(val, '|');
+    if (pipe) {
+        ttl = (uint32_t) atoi(val);
+        pipe++;
+    } else {
+        pipe = val;
+    }
+    char *sp = NULL;
+    for (char *ent = strtok_r(pipe, "|", &sp); ent; ent = strtok_r(NULL, "|", &sp)) {
+        int keytag = 0, alg = 0, digtype = 0;
+        char hexdigest[257];
+        if (sscanf(ent, "%d,%d,%d,%256[0-9a-fA-F]", &keytag, &alg, &digtype, hexdigest) != 4)
+            continue;
+        if (keytag < 0 || keytag > 0xFFFF || alg < 0 || alg > 0xFF || digtype < 0 || digtype > 0xFF)
+            continue;
+        uint8_t digest[128];
+        int dlen = hex_dec(hexdigest, digest, sizeof(digest));
+        if (dlen <= 0)
+            continue;
+        uint8_t rd[4 + 128];
+        rd[0] = (uint8_t) (keytag >> 8);
+        rd[1] = (uint8_t) (keytag & 0xFF);
+        rd[2] = (uint8_t) alg;
+        rd[3] = (uint8_t) digtype;
+        memcpy(rd + 4, digest, (size_t) dlen);
+        off = emit_rr(resp, off, resp_len, name, DNS_TYPE_DS, ttl, rd, (uint16_t) (4 + dlen),
+                      dnssec_ok, count);
     }
     return off;
 }
@@ -5967,13 +6032,30 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
      * delegates away. Only applies within a real configured zone (t_zone;
      * RFC 6303 locally-served zones return above and never reach here).
      * Exception: a DS query exactly at the cut is answered by the PARENT
-     * (RFC 4035 §3.1.4) — that per-child DS store doesn't exist yet
-     * (zone:<zone>:DS:<name>, Phase 2), so it falls through unchanged to the
-     * existing (zone's-own-KSK-based) DS logic below rather than referring. */
+     * (RFC 4035 §3.1.4) from zone:<zone>:DS:<name> (RFC 5910 — eppd is the
+     * writer, Phase 2) rather than referred: DS is the one RRset a parent
+     * zone is authoritative for at a name it otherwise delegates away, and
+     * unlike NS/glue at the same cut it IS signed with the parent's ZSK. If
+     * no DS is published for this child (an insecure delegation, or one
+     * whose DS hasn't been submitted yet), fall through to the ordinary
+     * unsigned referral below rather than the zone's-own-KSK DS synth
+     * further down, which would be answering with the wrong key entirely. */
     if (t_zone) {
         char cut[256], cutval[512];
-        if (zone_delegation_cut(t_zone, qname, cut, sizeof(cut), cutval, sizeof(cutval)) &&
-            !(qtype == DNS_TYPE_DS && streq_ci(qname, cut))) {
+        int at_cut = zone_delegation_cut(t_zone, qname, cut, sizeof(cut), cutval, sizeof(cutval));
+        if (at_cut && qtype == DNS_TYPE_DS && streq_ci(qname, cut)) {
+            char dsval[900], dk[900];
+            snprintf(dk, sizeof(dk), "zone:%s:DS:%s", t_zone->name, cut);
+            if (vk_get(dk, dsval, sizeof(dsval))) {
+                found = 1;
+                rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NOERROR); /* parent-authoritative */
+                off = emit_ds_rrset(resp, off, resp_len, cut, dsval, dnssec_ok, &answers);
+                goto finish_answer;
+            }
+            /* no DS for this child — fall through to the insecure-delegation
+             * referral below, same as any other qtype at this cut. */
+        }
+        if (at_cut) {
             is_referral = 1;
             found = 1;
             rh->flags = htons(DNS_QR | DNS_RCODE_NOERROR); /* AA cleared: non-authoritative */
@@ -6072,7 +6154,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             /* Sign DNSKEY with KSK */
             if (dnssec_ok) {
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk,
+                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk,
                                     DNS_ALG_ECDSAP256SHA256, g_ksk_tag, sig);
                 if (sl > 0) {
                     int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
@@ -6095,7 +6177,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
             if (dnssec_ok) {
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed,
+                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed,
                                     DNS_ALG_ED25519, g_ksk_ed_tag, sig);
                 if (sl > 0) {
                     int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
@@ -6119,7 +6201,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
             if (dnssec_ok) {
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk_next,
+                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk_next,
                                     DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, sig);
                 if (sl > 0) {
                     int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
@@ -6140,7 +6222,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             }
             if (dnssec_ok) {
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed_next,
+                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed_next,
                                     DNS_ALG_ED25519, g_ksk_ed_next_tag, sig);
                 if (sl > 0) {
                     int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
@@ -8485,7 +8567,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
         {"TLSA", DNS_TYPE_TLSA},   {"DNAME", DNS_TYPE_DNAME}, {"LOC", DNS_TYPE_LOC},
         {"URI", DNS_TYPE_URI},     {"NAPTR", DNS_TYPE_NAPTR}, {"PTR", DNS_TYPE_PTR},
         {"SVCB", DNS_TYPE_SVCB},   {"HTTPS", DNS_TYPE_HTTPS}, {"ZONEMD", DNS_TYPE_ZONEMD},
-        {"CSYNC", DNS_TYPE_CSYNC},
+        {"CSYNC", DNS_TYPE_CSYNC}, {"DS", DNS_TYPE_DS},
     };
     /* ddns:* leases that transfer: A/AAAA plus auto-PTR reverse records. */
     static const xtype_t dtypes[] = {
@@ -8565,6 +8647,39 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                         if (rl > 0)
                             axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, (uint16_t) rl, mac,
                                           maclen);
+                    }
+                } else if (T == DNS_TYPE_DS) { /* zone: ttl|keytag,alg,digtype,hex|... (RFC 5910,
+                                                   eppd-written child delegation DS) */
+                    uint32_t ttl = DEFAULT_TTL;
+                    char *pipe = strchr(val, '|');
+                    if (pipe) {
+                        ttl = (uint32_t) atoi(val);
+                        pipe++;
+                    } else {
+                        pipe = val;
+                    }
+                    char *sp = NULL;
+                    for (char *ent = strtok_r(pipe, "|", &sp); ent; ent = strtok_r(NULL, "|", &sp)) {
+                        int keytag = 0, alg = 0, digtype = 0;
+                        char hexdigest[257];
+                        if (sscanf(ent, "%d,%d,%d,%256[0-9a-fA-F]", &keytag, &alg, &digtype,
+                                   hexdigest) != 4)
+                            continue;
+                        if (keytag < 0 || keytag > 0xFFFF || alg < 0 || alg > 0xFF || digtype < 0 ||
+                            digtype > 0xFF)
+                            continue;
+                        uint8_t digest[128];
+                        int dlen = hex_dec(hexdigest, digest, sizeof(digest));
+                        if (dlen <= 0)
+                            continue;
+                        uint8_t rd[4 + 128];
+                        rd[0] = (uint8_t) (keytag >> 8);
+                        rd[1] = (uint8_t) (keytag & 0xFF);
+                        rd[2] = (uint8_t) alg;
+                        rd[3] = (uint8_t) digtype;
+                        memcpy(rd + 4, digest, (size_t) dlen);
+                        axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, (uint16_t) (4 + dlen), mac,
+                                      maclen);
                     }
                 } else { /* rich provisioned types via the shared encoder */
                     uint32_t ttl = DEFAULT_TTL;

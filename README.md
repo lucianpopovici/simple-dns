@@ -36,10 +36,11 @@ keyspace notifications; no restarts.
 
 `doqd` forwards to `dnsd`'s loopback DNS port (UDP, TCP retry on truncation) —
 the same relay pattern `apid` uses for DoH — so it never parses DNS payloads,
-only RFC 9250's 2-octet stream-length framing. `eppd` (Phase 1 in progress)
-never forwards to `dnsd` at all — it writes delegation records into `zone:*`
-and its own `epp:*` object store; `dnsd` picks up the resulting NS/glue via
-its RFC 9471 referral logic.
+only RFC 9250's 2-octet stream-length framing. `eppd` (Phase 1+2 done) never
+forwards to `dnsd` at all — it writes delegation records into `zone:*` and
+its own `epp:*` object store; `dnsd` picks up the resulting NS/glue via its
+RFC 9471 referral logic, and the resulting DS (RFC 5910) via a signed
+authoritative answer at the delegation cut.
 
 | Daemon | Role | Listens on | Talks to |
 |---|---|---|---|
@@ -48,7 +49,7 @@ its RFC 9471 referral logic.
 | **`mdnsd`** (`mdnsd.c`) | mDNS (RFC 6762) + DNS-SD (RFC 6763) responder, link-local | `5353` multicast on explicitly-configured interfaces | Valkey (read) |
 | **`apid`** (`apid.c`) | HTTP/HTTPS front: DoH + management API | `8053` (HTTP), `8443` (HTTPS/mTLS) | Valkey + dnsd (DoH forward) |
 | **`doqd`** (`doqd.c`) | DNS-over-QUIC (RFC 9250) sidecar | `8853/udp` (opt-in via `config:doq_enabled`) | Valkey (read) + dnsd (loopback forward) |
-| **`eppd`** (`eppd.c`) | EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1) | `700/tcp` (opt-in via `config:eppd_enabled`; mTLS mandatory) | Valkey only |
+| **`eppd`** (`eppd.c`) | EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1+2) | `700/tcp` (opt-in via `config:eppd_enabled`; mTLS mandatory) | Valkey only |
 | **`dashboard`** (`dashboard/app.py`) | Authenticated control-plane UI | `127.0.0.1:5000` (configurable) | Valkey |
 
 Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) — the single
@@ -64,7 +65,7 @@ linked by every binary.
 | `mdnsd.c` | `mdnsd`, the mDNS/DNS-SD responder. |
 | `apid.c` | `apid`, the HTTP/HTTPS front for DoH + management. |
 | `doqd.c` | `doqd`, the DNS-over-QUIC (RFC 9250) sidecar. Needs OpenSSL ≥ 3.5 (server-side QUIC API) — only this one binary; the rest of the build stays on the 3.0+ floor. |
-| `eppd.c` | `eppd`, the EPP registry front-end (RFC 5730/5734/5731/5732/5733). Registrar mTLS sessions; publishes domain delegations into `zone:*`. Phase 1 in progress — see `CLAUDE-eppd.md`. |
+| `eppd.c` | `eppd`, the EPP registry front-end (RFC 5730/5734/5731/5732/5733). Registrar mTLS sessions; publishes domain delegations (NS/A/AAAA/DS) into `zone:*`. Phase 1+2 done, Phase 3 extensions open — see `CLAUDE-eppd.md`. |
 | `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library — also the shared Valkey RESP client + keyspace-watch loop (`vkc_*`/`keyspace_watch_loop`), hoisted out of per-daemon copies with `eppd` as the first caller. |
 | `sandbox.{c,h}` | `libsandbox`, the shared privilege-drop / chroot+mountns / seccomp sandbox, linked by `dnsd`, `resolverd`, and `eppd`. |
 | `resolverd.c` | `resolverd`, the recursive/forwarding resolver + cache + DNSSEC validation (the recursive role; formerly `dns_client.c`). |
@@ -119,7 +120,11 @@ glance:
   delegation point gets a non-authoritative referral — AA=0, unsigned NS in
   Authority, in-bailiwick glue in Additional, TC=1 if the glue doesn't fit a
   UDP response — rather than an ordinary in-zone answer. The prerequisite
-  that makes `eppd` (below) able to publish a real delegation.
+  that makes `eppd` (below) able to publish a real delegation. A DS query
+  exactly at the cut (RFC 5910/4035 §3.1.4) is the one exception: `dnsd`
+  answers it authoritatively and DNSSEC-signed from `zone:<zone>:DS:<name>`
+  when `eppd` has published one, falling back to the ordinary unsigned
+  referral for an insecure delegation.
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
   and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
   authenticated denial. Validation (in `resolverd.c`) covers the full
@@ -171,13 +176,18 @@ glance:
   9665 SRP + RFC 9664 Update Leases — opt-in (`config:srp_enabled`) device
   self-registration via a SIG(0)-authenticated, delete-all-then-add UPDATE
   with trust-on-first-use and a lease-expiry sweeper.
-- **EPP registry front-end** (`eppd`, RFC 5730/5734/5731/5732/5733, Phase 1
-  in progress): registrar provisioning over mandatory-mTLS TCP/700.
-  `check`/`create`/`info` for domain/host/contact objects (`epp:*`,
-  TLV-encoded); a domain's NS delegation is published into `zone:*`
-  (multi-value NS + in-bailiwick glue, SOA serial bump), which `dnsd` then
-  serves via the RFC 9471 referral logic above. `update`/`delete` and RFC
-  5910 DS mapping are Phase 2 — see `CLAUDE-eppd.md`.
+- **EPP registry front-end** (`eppd`, RFC 5730/5734/5731/5732/5733, Phase
+  1+2 done): registrar provisioning over mandatory-mTLS TCP/700.
+  `check`/`create`/`info`/`update`/`delete` for domain/host/contact objects
+  (`epp:*`, TLV-encoded, sponsoring-registrar ownership enforced, RFC 9154
+  secure server-generated authInfo); a domain's NS/DS is published into
+  `zone:*` (multi-value NS + DS + in-bailiwick glue, SOA serial bump), which
+  `dnsd` then serves via the RFC 9471 referral logic above and a signed
+  authoritative DS answer at the cut (RFC 5910/4035 §3.1.4); RFC 5731 §3.2.4
+  `domain:transfer` (request/query/approve/reject/cancel); RFC 3915 RGP
+  grace periods (add/autorenew/transfer), `redemptionPeriod` + `rgp:restore`,
+  and a background sweep for autorenew/purge/transfer-auto-approval. Phase 3
+  (fee/org/change-poll extensions) is open — see `CLAUDE-eppd.md`.
 
 ## Configuration
 

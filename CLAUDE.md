@@ -88,7 +88,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | `apid.c` | **`apid`** — HTTP/HTTPS front for DoH + management (migration Step 4, done). Forwards DoH to `dnsd`; all writes go to Valkey. |
 | `resolverd.c` | **`resolverd`** — recursive/forwarding resolver + cache + DNSSEC **validation** (the recursive role; formerly `dns_client.c`). Distinct daemon from `dnsd`; own `make resolverd` target + `make check-resolverd`. |
 | `doqd.c` | **`doqd`** — DNS-over-QUIC sidecar (RFC 9250, done). Relays framed messages to `dnsd`'s loopback DNS port; writes nothing. |
-| `eppd.c` | **`eppd`** — EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1 in progress). Registrar mTLS sessions; writes `epp:*` + delegation `zone:*` records. Own `make eppd`/`make check-eppd`/`make fuzz-eppd`. |
+| `eppd.c` | **`eppd`** — EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1+2 done; Phase 3 extensions open). Registrar mTLS sessions; writes `epp:*` + delegation `zone:*` (NS/A/AAAA/DS) records; RFC 3915 RGP lifecycle + RFC 5731 transfer. Own `make eppd`/`make check-eppd`/`make fuzz-eppd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
 | `fuzz/` | libFuzzer harness + corpus: `make fuzz-wire` (60s smoke; needs clang). |
@@ -389,15 +389,35 @@ listener.
 
 ### `eppd` — EPP registry front-end (RFC 5730/5734/5731/5732/5733)
 
-**Phase 1 in progress.** `eppd.c`. Accepts registrar EPP sessions over
-TCP/700 with **mandatory** mutual TLS (RFC 5734 §5.1) — unlike `apid`'s
-optional mTLS split between DoH and management, there is no plain-TLS
-fallback: `config:eppd_mtls_ca_pem` is a hard startup requirement, and `eppd`
-refuses to open its listener at all without it. Implemented: the RFC 5730
-session shell (unprompted greeting, `<hello>`, `<login>`/`<logout>`,
-clTRID/svTRID plumbing) and RFC 5731/5732/5733 domain/host/contact
-`check`/`create`/`info` (update/delete remain unimplemented — RFC 3915 grace
-periods are explicitly Phase 2, per `CLAUDE-eppd.md`).
+**Phase 1 + Phase 2 done** (2026-07-06; Phase 3 extensions — 8748 fee, 8543
+org, 8590 change poll — remain open, see `CLAUDE-eppd.md`). `eppd.c`. Accepts
+registrar EPP sessions over TCP/700 with **mandatory** mutual TLS (RFC 5734
+§5.1) — unlike `apid`'s optional mTLS split between DoH and management,
+there is no plain-TLS fallback: `config:eppd_mtls_ca_pem` is a hard startup
+requirement, and `eppd` refuses to open its listener at all without it.
+
+Implemented: the RFC 5730 session shell (unprompted greeting, `<hello>`,
+`<login>`/`<logout>`, clTRID/svTRID plumbing); RFC 5731/5732/5733
+domain/host/contact `check`/`create`/`info`/`update`/`delete`; per-object
+sponsoring-registrar ownership (`clid`, checked on every update/delete/info-
+authInfo-disclosure) with `association exists` (2305) guards so a host/
+contact still referenced by a domain can't be deleted out from under it;
+RFC 9154 secure authInfo (always a server-generated random token — a
+client-supplied `<domain:authInfo>`/`<contact:authInfo>` on create/update is
+logged and discarded, never trusted); RFC 5910 DS mapping via the
+`secDNS-1.1` extension on domain create/update (`zone:<parent>:DS:<name>`,
+multi-value like NS — this needed a `dnsd`-side prerequisite, the signed
+DS-at-cut read path, see the `dnsd` section above); RFC 5731 §3.2.4
+`domain:transfer` (request/query/approve/reject/cancel, authInfo-gated,
+extends the registration by one year on approval); and RFC 3915 RGP —
+add-grace immediate purge on delete, otherwise `pendingDelete` +
+`redemptionPeriod` (delegation retracted immediately, object retained),
+`rgp:restore` (simplified to a single request step, no separate report —
+a private/internal registry has no registrar-facing report workflow to
+gate on), and a background sweep thread (`epp_rgp_tick_loop`) handling
+autorenew, redemption purge, and transfer auto-approval after the pending
+window elapses — the state transitions that don't happen inside a command
+handler because nothing but the passage of time triggers them.
 
 `eppd` never serves DNS and `dnsd` never speaks EPP — they meet only through
 Valkey, the same pattern every other sidecar uses. Its own `epp:*` object
@@ -405,15 +425,20 @@ store (domain/host/contact records, TLV-encoded per ADR-003, hex-encoded
 before storing — the shared RESP client's argument encoding is
 `strlen()`-based text, so a raw binary blob with an embedded NUL would
 silently truncate, the same reason ZONEMD/SVCB hex-encode their TLV blobs)
-is `eppd`'s alone to write. On a domain's NS delegation it publishes into
+is `eppd`'s alone to write. On a domain's NS/DS change it (re)publishes into
 the parent zone exactly the way `certd` publishes challenge TXT records:
-`zone:<parent>:NS:<domain>` (multi-value) and, for each in-bailiwick
-nameserver, `zone:<parent>:A/AAAA:<ns>` glue, then bumps the parent's SOA
-serial — mirroring `apid`'s own `serial_bump_zone` exactly, including its
-`config:zone_name` fallback for the primary zone (which has no
+`zone:<parent>:NS:<domain>` and `zone:<parent>:DS:<domain>` (both
+multi-value; DS is deleted rather than written when the domain has none —
+a domain can legitimately go from secure to insecure) and, for each
+in-bailiwick nameserver, `zone:<parent>:A/AAAA:<ns>` glue, then bumps the
+parent's SOA serial — mirroring `apid`'s own `serial_bump_zone` exactly,
+including its `config:zone_name` fallback for the primary zone (which has no
 `zone_table:<name>` key of its own; **operators must set `config:zone_name`
 explicitly in Valkey** for `eppd` — or `apid` — to resolve it, even though
-`dnsd` itself tolerates it being unset via a compiled-in default).
+`dnsd` itself tolerates it being unset via a compiled-in default). A
+host:update republishes glue for every domain currently referencing that
+host (a bounded `epp:domain:*` KEYS scan, same convention as
+`find_parent_zone`'s `zone_table:*` scan).
 
 No IXFR-journal entry or NOTIFY is written by the publish step — secondaries
 converge via the normal periodic-refresh → IXFR-gap → AXFR-fallback path,
@@ -426,15 +451,21 @@ dormant "forward requirement... when delegation support is added"
 (`CLAUDE-rfc-additions-batch3.md`), is now implemented in `dnsd` itself — a
 qname at or below a configured NS delegation point gets a non-authoritative
 referral (AA=0, unsigned NS in Authority, in-bailiwick glue in Additional,
-TC=1 if glue overflows UDP) rather than an ordinary in-zone answer. `dnsd`'s
-NS storage (`zone:<zone>:NS:<name>`) is correspondingly multi-value now
+TC=1 if glue overflows UDP) rather than an ordinary in-zone answer, *except*
+a DS query exactly at the cut, which `dnsd` now answers authoritatively and
+**signed** from `zone:<zone>:DS:<name>` when eppd has published one (RFC
+5910/4035 §3.1.4 — DS is the one RRset the parent is authoritative for at a
+name it otherwise delegates away). `dnsd`'s NS storage
+(`zone:<zone>:NS:<name>`) is correspondingly multi-value
 (`"ttl|ns1|ns2|..."`), matching how A/AAAA already worked — both prerequisite
 changes for `eppd` to have anything real to publish into.
 
 `eppd` is also the first daemon besides `dnsd`/`resolverd` to call
-`sandbox_apply()` (`libsandbox`); seccomp starts in `audit` mode pending a
-strace harvest (no inbound-TLS-listener whitelist exists yet, unlike
-`resolverd`'s upstream-transport harvest).
+`sandbox_apply()` (`libsandbox`); seccomp defaults to `enforce` — a strace
+harvest (startup, an mTLS-rejected connection, a full login/create/info/
+update/delete/transfer session, a malformed-frame connection) found zero
+gaps. Re-harvest with `seccomp_mode=audit` first if this profile is ever
+ported to a different libc/kernel.
 
 Config (Valkey): `config:eppd_enabled` (must be `"1"`, default off — never
 on by accident, same convention as `doqd`), `config:eppd_port` (RFC 5734
@@ -443,9 +474,12 @@ pw:<clID>` (per-registrar EPP login password — plaintext, gated by the same
 `config:*` trust boundary as `ddns_secret`/`tsig_secret`), `config:eppd_
 {chroot_dir,isolation_mode,privdrop_user,privdrop_group,seccomp_mode}`
 (sandbox knobs, resolverd-style, own prefix since `eppd`'s filesystem/
-syscall profile differs — inbound TLS only, no outbound network). TLS
-material: `cert:current`, falling back to `config:eppd_tls_{cert,key}_pem` —
-same hot-reload contract as `dnsd`/`apid`/`doqd`.
+syscall profile differs — inbound TLS only, no outbound network),
+`config:eppd_{add_grace,autorenew_grace,redemption,transfer_grace,
+transfer_pending,rgp_tick}_secs` (RFC 3915 RGP window lengths, in seconds —
+day-scale defaults; overridable for testing). TLS material: `cert:current`,
+falling back to `config:eppd_tls_{cert,key}_pem` — same hot-reload contract
+as `dnsd`/`apid`/`doqd`.
 
 ### `libdnswire` — shared wire-format library
 
@@ -471,7 +505,7 @@ HTTP front-ends. Define and enforce this.
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
 | `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | Runtime configuration |
-| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976), eppd (NS/A/AAAA delegation only, from its own `epp:*` object store) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
+| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976), eppd (NS/A/AAAA/DS delegation only, from its own `epp:*` object store — DS per RFC 5910, Phase 2) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
 | `ddns:*` | dnsd (RFC 2136 UPDATE), apid (HTTP `/update`, `ddns_secret`-gated) | dnsd | Dynamic records |
 | `srp:*` | dnsd (RFC 9665 SRP UPDATE, SIG(0)-authenticated, `config:srp_enabled`-gated) | dnsd (mdnsd read-only in a future add) | Service-registration records + FCFS ownership + lease/key-lease expiry (RFC 9664) |
 | `ixfr:*` | dnsd (records each A/AAAA change) | dnsd | RFC 1995 IXFR journal (incremental diff; gap → AXFR fallback) |
@@ -651,16 +685,37 @@ transports on glibc/Fedora); re-harvest with `seccomp_mode=audit` only when
 porting to a different libc/kernel.
 
 `eppd` (EPP registry front-end, RFC 5730/5734/5731/5732/5733) — the one
-remaining roadmap item — is now **Phase 1 in progress**: the session shell,
-domain/host/contact check/create/info, and the zone:* publish pipeline are
-done (`make check-eppd`, `make fuzz-eppd`); update/delete and RFC 5910 DS
-mapping are Phase 2. Landing it required two prerequisite `dnsd` changes,
-both done: **RFC 9471** delegation/referral support (`dnsd` had no zone-cut
-concept at all before this) and multi-value NS storage. `eppd` is also the
-third daemon on `libsandbox` (after `dnsd`/`resolverd`) and the first caller
-of a newly-hoisted shared Valkey RESP client (`vkc_*`/`keyspace_watch_loop`,
-`dns_wire.{c,h}`) that the other daemons still have their own pre-hoist
-copies of.
+remaining roadmap item — is now **Phase 1 + Phase 2 done** (2026-07-06):
+session shell, domain/host/contact check/create/info/update/delete,
+registrar ownership + association guards, RFC 9154 secure authInfo, RFC 5910
+DS mapping, RFC 5731 §3.2.4 transfer, and RFC 3915 RGP (grace periods +
+redemption + restore + a background autorenew/purge/auto-approve sweep) are
+all implemented and covered by `make check-eppd` / `make fuzz-eppd`. Phase 3
+(8748 fee, 8543 org, 8590 change poll extensions) remains open — see
+`CLAUDE-eppd.md`. Landing Phase 1 required two prerequisite `dnsd` changes:
+**RFC 9471** delegation/referral support (`dnsd` had no zone-cut concept at
+all before this) and multi-value NS storage; landing Phase 2's DS mapping
+required a third — `dnsd` growing a `zone:<zone>:DS:<name>` read path that
+answers a DS query at a delegation cut authoritatively and signed (RFC 5910/
+4035 §3.1.4). `eppd` is also the third daemon on `libsandbox` (after
+`dnsd`/`resolverd`) and the first caller of a newly-hoisted shared Valkey
+RESP client (`vkc_*`/`keyspace_watch_loop`, `dns_wire.{c,h}`) that the other
+daemons still have their own pre-hoist copies of.
+
+Verifying the new DS-at-cut signing surfaced an unrelated, pre-existing bug
+in `dnsd`'s core signer: `make_rrsig` used the RRset's own owner name for
+the RRSIG's Signer's Name field (RFC 4034 §3.1.7) instead of the zone apex —
+correct only by coincidence for apex data (SOA, DNSKEY), wrong for every
+non-apex RRset (an ordinary subdomain A/AAAA/MX/TXT, or a DS at a cut),
+which would fail validation in any conformant resolver since it resolves
+the signer field to find the DNSKEY. Fixed (`make_rrsig` now takes the
+apex as a separate parameter from the RRset owner); guarded going forward
+by `make check-rrsig-signer` (a live check comparing apex vs. non-apex
+signer names — `check-dnssec`'s unit KATs link `resolverd.c`, not
+`dns_server.c`, so they never exercised `dnsd`'s actual signer and hadn't
+caught this). `simple_dns.c` carries the identical bug in its own
+`make_rrsig` copy but isn't referenced by the Makefile (not built/shipped),
+so it was left alone.
 
 ---
 

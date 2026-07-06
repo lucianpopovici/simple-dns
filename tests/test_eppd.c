@@ -174,9 +174,173 @@ static void test_xml_tokenizer(void) {
           "a genuinely absent child returns 0 (not found), not an error");
 }
 
+/* Phase 2: <transfer op="request"> is the one place this parser reads an
+ * attribute value rather than element content — xml_find_child_attr's own
+ * KAT, since xml_find_child never exercises it. */
+static void test_xml_find_child_attr(void) {
+    printf("== xml_find_child_attr: KAT ==\n");
+    const char *withop = "<command><transfer op=\"request\"><domain:name>x</domain:name>"
+                         "</transfer></command>";
+    int len = (int) strlen(withop);
+    int cs, ce, cnp;
+    CHECK(xml_find_child(withop, 0, len, "command", &cs, &ce, &cnp) == 1, "finds <command>");
+    char op[16];
+    int ts, te, tnp;
+    CHECK(xml_find_child_attr(withop, cs, ce, "transfer", "op", op, sizeof(op), &ts, &te, &tnp) ==
+              1 &&
+              strcmp(op, "request") == 0,
+          "extracts op=\"request\" from <transfer op=\"request\">");
+
+    const char *noop = "<command><transfer><domain:name>x</domain:name></transfer></command>";
+    xml_find_child(noop, 0, (int) strlen(noop), "command", &cs, &ce, &cnp);
+    CHECK(xml_find_child_attr(noop, cs, ce, "transfer", "op", op, sizeof(op), &ts, &te, &tnp) == 1 &&
+              op[0] == 0,
+          "attribute absent: match still succeeds, attr_out is empty (not an error)");
+
+    const char *singlequote = "<transfer op='approve'/>";
+    CHECK(xml_find_child_attr(singlequote, 0, (int) strlen(singlequote), "transfer", "op", op,
+                              sizeof(op), &ts, &te, &tnp) == 1 &&
+              strcmp(op, "approve") == 0,
+          "single-quoted attribute value accepted");
+
+    const char *decoy = "<transfer stop=\"x\" op=\"cancel\"/>";
+    CHECK(xml_find_child_attr(decoy, 0, (int) strlen(decoy), "transfer", "op", op, sizeof(op), &ts,
+                              &te, &tnp) == 1 &&
+              strcmp(op, "cancel") == 0,
+          "a decoy attribute ending in \"op\" (\"stop\") does not false-positive match");
+
+    const char *unterminated = "<transfer op=\"cancel";
+    CHECK(xml_find_child_attr(unterminated, 0, (int) strlen(unterminated), "transfer", "op", op,
+                              sizeof(op), &ts, &te, &tnp) == -1,
+          "unterminated tag: malformed, not a false match");
+}
+
+/* Phase 2 TLV round-trips: encode then decode must reproduce every field,
+ * including the new ownership (clid), RGP, DS (RFC 5910), and transfer
+ * fields. Pure functions, no Valkey needed — memory safety of the same
+ * codec is covered by make fuzz-tlv (dns_wire.c's tlv_* is shared, already
+ * fuzzed there); this pins down eppd's own tag mapping. */
+static void test_domain_tlv_roundtrip(void) {
+    printf("== epp_domain_encode/decode: TLV round-trip KAT ==\n");
+    epp_domain_t d;
+    memset(&d, 0, sizeof(d));
+    safe_strcpy(d.roid, "1-EPPD-D", sizeof(d.roid));
+    safe_strcpy(d.clid, "registrar1", sizeof(d.clid));
+    safe_strcpy(d.status[0], "ok", sizeof(d.status[0]));
+    safe_strcpy(d.status[1], "clientHold", sizeof(d.status[1]));
+    d.nstatus = 2;
+    safe_strcpy(d.authinfo, "deadbeefcafef00d00112233445566ff", sizeof(d.authinfo));
+    d.crdate = 1700000000;
+    d.exdate = 1731536000;
+    safe_strcpy(d.registrant, "EPPTC1", sizeof(d.registrant));
+    safe_strcpy(d.ns[0], "ns1.example.test", sizeof(d.ns[0]));
+    safe_strcpy(d.ns[1], "ns2.example.test", sizeof(d.ns[1]));
+    d.nns = 2;
+    d.ds[0].keytag = 12345;
+    d.ds[0].alg = 13;
+    d.ds[0].digtype = 2;
+    d.ds[0].digestlen = 32;
+    for (int i = 0; i < 32; i++)
+        d.ds[0].digest[i] = (uint8_t) i;
+    d.nds = 1;
+    d.rgp_state = EPP_RGP_REDEMPTION;
+    d.rgp_until = 1731600000;
+    safe_strcpy(d.transfer_reid, "registrar2", sizeof(d.transfer_reid));
+    d.transfer_redate = 1730000000;
+    safe_strcpy(d.transfer_status, "pending", sizeof(d.transfer_status));
+
+    uint8_t buf[4096];
+    int len = epp_domain_encode(&d, buf, sizeof(buf));
+    CHECK(len > 0, "encode succeeds");
+
+    epp_domain_t d2;
+    CHECK(epp_domain_decode(buf, len, &d2) == 0, "decode succeeds");
+    CHECK(strcmp(d.roid, d2.roid) == 0, "roid round-trips");
+    CHECK(strcmp(d.clid, d2.clid) == 0, "clid round-trips");
+    CHECK(d2.nstatus == 2 && strcmp(d2.status[0], "ok") == 0 &&
+              strcmp(d2.status[1], "clientHold") == 0,
+          "status[] round-trips in order");
+    CHECK(strcmp(d.authinfo, d2.authinfo) == 0, "authinfo round-trips");
+    CHECK(d2.crdate == d.crdate && d2.exdate == d.exdate, "crdate/exdate round-trip");
+    CHECK(strcmp(d.registrant, d2.registrant) == 0, "registrant round-trips");
+    CHECK(d2.nns == 2 && strcmp(d2.ns[0], "ns1.example.test") == 0 &&
+              strcmp(d2.ns[1], "ns2.example.test") == 0,
+          "ns[] round-trips in order");
+    CHECK(d2.nds == 1 && d2.ds[0].keytag == 12345 && d2.ds[0].alg == 13 &&
+              d2.ds[0].digtype == 2 && d2.ds[0].digestlen == 32 &&
+              memcmp(d2.ds[0].digest, d.ds[0].digest, 32) == 0,
+          "ds[] (RFC 5910) round-trips including the full digest");
+    CHECK(d2.rgp_state == EPP_RGP_REDEMPTION && d2.rgp_until == d.rgp_until,
+          "rgp_state/rgp_until (RFC 3915) round-trip");
+    CHECK(strcmp(d.transfer_reid, d2.transfer_reid) == 0 && d2.transfer_redate == d.transfer_redate &&
+              strcmp(d.transfer_status, d2.transfer_status) == 0,
+          "transfer_reid/transfer_redate/transfer_status round-trip");
+
+    epp_domain_t empty;
+    memset(&empty, 0, sizeof(empty));
+    safe_strcpy(empty.roid, "2-EPPD-D", sizeof(empty.roid));
+    empty.crdate = 1700000001;
+    uint8_t buf2[4096];
+    int len2 = epp_domain_encode(&empty, buf2, sizeof(buf2));
+    epp_domain_t empty2;
+    CHECK(len2 > 0 && epp_domain_decode(buf2, len2, &empty2) == 0 &&
+              empty2.rgp_state == EPP_RGP_NONE && empty2.nds == 0 && empty2.clid[0] == 0 &&
+              empty2.transfer_status[0] == 0,
+          "a domain with none of the Phase 2 fields set decodes back to all-zero/NONE defaults");
+}
+
+static void test_host_contact_tlv_roundtrip(void) {
+    printf("== epp_host_encode/decode + epp_contact_encode/decode: clid round-trip KAT ==\n");
+    epp_host_t h;
+    memset(&h, 0, sizeof(h));
+    safe_strcpy(h.roid, "1-EPPD-H", sizeof(h.roid));
+    safe_strcpy(h.clid, "registrar1", sizeof(h.clid));
+    safe_strcpy(h.v4[0], "192.0.2.1", sizeof(h.v4[0]));
+    h.nv4 = 1;
+    h.crdate = 1700000000;
+    uint8_t hbuf[4096];
+    int hlen = epp_host_encode(&h, hbuf, sizeof(hbuf));
+    epp_host_t h2;
+    CHECK(hlen > 0 && epp_host_decode(hbuf, hlen, &h2) == 0 && strcmp(h.clid, h2.clid) == 0 &&
+              h2.nv4 == 1 && strcmp(h2.v4[0], "192.0.2.1") == 0,
+          "host clid + addr round-trip");
+
+    epp_contact_t c;
+    memset(&c, 0, sizeof(c));
+    safe_strcpy(c.roid, "1-EPPD-C", sizeof(c.roid));
+    safe_strcpy(c.clid, "registrar1", sizeof(c.clid));
+    safe_strcpy(c.authinfo, "0123456789abcdef0123456789abcdef", sizeof(c.authinfo));
+    uint8_t cbuf[2048];
+    int clen = epp_contact_encode(&c, cbuf, sizeof(cbuf));
+    epp_contact_t c2;
+    CHECK(clen > 0 && epp_contact_decode(cbuf, clen, &c2) == 0 && strcmp(c.clid, c2.clid) == 0 &&
+              strcmp(c.authinfo, c2.authinfo) == 0,
+          "contact clid + authinfo round-trip");
+}
+
+/* epp_gen_authinfo (RFC 9154): must produce a fixed-length hex token, not
+ * silently truncate or leave the buffer partially filled. */
+static void test_gen_authinfo(void) {
+    printf("== epp_gen_authinfo: KAT ==\n");
+    char a[256], b[256];
+    epp_gen_authinfo(a, sizeof(a));
+    epp_gen_authinfo(b, sizeof(b));
+    CHECK(strlen(a) == 32, "32 hex chars (128-bit token)");
+    int all_hex = 1;
+    for (size_t i = 0; i < strlen(a); i++)
+        if (!isxdigit((unsigned char) a[i]))
+            all_hex = 0;
+    CHECK(all_hex, "every character is a hex digit");
+    CHECK(strcmp(a, b) != 0, "two calls produce different tokens (not a fixed/predictable value)");
+}
+
 int main(void) {
     test_epp_frame_next();
     test_xml_tokenizer();
+    test_xml_find_child_attr();
+    test_domain_tlv_roundtrip();
+    test_host_contact_tlv_roundtrip();
+    test_gen_authinfo();
     printf("\n%s: %d failure(s)\n", g_failures ? "FAIL" : "PASS", g_failures);
     return g_failures ? 1 : 0;
 }

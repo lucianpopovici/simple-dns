@@ -167,27 +167,53 @@ store. Required for public TLDs; skip for private/internal.
 ## Tracked checklist
 
 - [x] **ADR-002** — ratify; choose public vs private registry (private/internal, 2026-07-03)
-- [x] **Prerequisites in `dnsd`** (discovered during Phase 1 scoping, not originally
-      listed here — see "Prerequisite work" below): RFC 9471 delegation/referral
-      support + multi-value NS storage. Both done 2026-07-06.
-- [~] **Phase 1** — EPP core (session shell + check/create/info done; update/delete
-      + DS mapping intentionally deferred to Phase 2 below)
+- [x] **Prerequisites in `dnsd`** (discovered during Phase 1/2 scoping, not
+      originally listed here — see "Prerequisite work" below): RFC 9471
+      delegation/referral support + multi-value NS storage (2026-07-06,
+      Phase 1); `zone:<zone>:DS:<name>` signed-at-cut read path (2026-07-06,
+      Phase 2).
+- [x] **Phase 1** — EPP core (done 2026-07-06)
   - [x] 5734 TCP/700 transport, length-prefixed XML framing, registrar mTLS
         (mandatory — no plain-TLS fallback, unlike `apid`'s DoH/mgmt split)
   - [x] 5730 session: greeting → login/logout → command/response, clTRID/svTRID
   - [x] 5731 domain + 5732 host + 5733 contact objects in Valkey (`epp:*`,
-        TLV-encoded/ADR-003, hex-encoded before storing); `check`/`create`/
-        `info` implemented, `update`/`delete` still stubbed (2400)
+        TLV-encoded/ADR-003, hex-encoded before storing)
   - [x] Publish pipeline → `zone:NS/A/AAAA` + serial bump (verified live: a
         real `domain:create` + `dig` shows `dnsd` serving the referral with
-        glue). **`zone:DS`** intentionally NOT included — DS mapping is RFC
-        5910, Phase 2 (`dnsd` has no per-child DS storage today either)
+        glue)
   - [x] `make check-eppd` (KAT + live EPP session + dig verification) /
         `make fuzz-eppd` (XML tokenizer + RFC 5734 framing, 60s clean)
-- [ ] **Phase 2** — 9154 secure authInfo; 3915 RGP grace periods; 5910 DS mapping
-      (needs a `dnsd`-side `zone:<zone>:DS:<name>` read path first — doesn't
-      exist yet, see "Prerequisite work" below); `update`/`delete` for all
-      three object types
+- [x] **Phase 2** — done 2026-07-06
+  - [x] `update`/`delete` for domain/host/contact, with sponsoring-registrar
+        (`clid`) ownership checks, status prohibitions (client*Prohibited/
+        clientHold), and `association exists` (2305) guards on host/contact
+        delete
+  - [x] 9154 secure authInfo — always a server-generated random 128-bit
+        token (`epp_gen_authinfo`, `RAND_bytes`); a client-supplied value on
+        create/update is logged and discarded, never trusted; disclosed only
+        to the sponsoring registrar's own session
+  - [x] 5910 DS mapping — `secDNS-1.1` extension on domain create/update
+        (add/rem/chg), published as `zone:<parent>:DS:<name>` (multi-value,
+        deleted rather than written when the domain has none); required the
+        `dnsd` prerequisite above. Verified live: `make check-eppd` submits a
+        DS via `secDNS:update`, and `dig +dnssec` shows `dnsd` serving it
+        signed at the delegation cut (see the RRSIG-signer note below).
+  - [x] 3915 RGP — add-grace immediate purge on delete; otherwise
+        `pendingDelete` + `redemptionPeriod` (delegation retracted
+        immediately, object retained) with `rgp:restore` (simplified to a
+        single request step, no separate report — a private/internal
+        registry has no report workflow to gate on); background sweep
+        (`epp_rgp_tick_loop`) for autorenew, redemption purge, and transfer
+        auto-approval after the pending window elapses. Collapses RFC
+        3915's two-stage redemptionPeriod + "pendingDelete scheduled for
+        release" into one window — see the `epp_rgp_state_t` comment in
+        `eppd.c`.
+  - [x] RFC 5731 §3.2.4 `domain:transfer` (request/query/approve/reject/
+        cancel) — added as an implicit prerequisite for 9154/3915 to have
+        real effect (not originally in this doc's Phase 2 list, but
+        authInfo and transfer-grace are meaningless without it). authInfo-
+        gated request, extends registration by one year on approval,
+        transfer-grace RGP window.
 - [ ] **Phase 3** — 8748 fee; 8543 org; 8590 change poll
 - [ ] **RDAP** companion (9082/9083) — query side
 - [ ] **Escrow** (8909/9022) — only if public TLD
@@ -216,6 +242,27 @@ found via codebase research before writing any `eppd` code (see
 Both are load-bearing for Phase 1's own acceptance criteria below, not
 optional polish — `eppd` has nothing real to publish into without them.
 
+A third gap, found during Phase 2 scoping: **`dnsd` had no parent-side DS
+storage or read path at all** — a DS query exactly at a delegation cut fell
+through to the zone's-own-KSK DS synthesis (meant for the zone's *own*
+apex DS as a child of some other parent), which would have answered a
+child's DS query with a DS computed over the wrong key entirely. **Done**:
+`zone:<zone>:DS:<name>` (multi-value, same shape as NS), served
+authoritatively and DNSSEC-signed with the parent's ZSK when present,
+falling through to the ordinary unsigned referral (insecure delegation)
+when absent.
+
+**Also found, while live-verifying the DS-at-cut signing** (not an eppd
+bug, but a `dnsd` bug this work's verification uncovered): `make_rrsig`'s
+Signer's Name field (RFC 4034 §3.1.7) was the RRset's own owner name
+instead of the zone apex — correct only by coincidence for apex data (SOA,
+DNSKEY), wrong for every non-apex RRset, which would fail validation in any
+conformant resolver. Fixed in the same session (`make_rrsig` now takes the
+apex as a parameter separate from the RRset owner); guarded by
+`make check-rrsig-signer`. See `CLAUDE.md`'s `eppd` section for the full
+writeup — noted here because it's what "validates in resolverd" for the new
+DS mapping actually depends on.
+
 ---
 
 ## Guardrails (do NOT)
@@ -223,16 +270,22 @@ optional polish — `eppd` has nothing real to publish into without them.
 - **Do NOT** let `eppd` serve DNS or write non-delegation records. It publishes
   only NS / DS / in-bailiwick glue for domains it is the registry for; zone
   *content* below a delegation belongs to the child, served elsewhere.
-- **Do NOT** use plaintext transfer authInfo — Phase 2's RFC 9154 secure
-  authInfo is mandatory for transfers; a plaintext implementation is a security
-  defect, not a simplification.
+- **Do NOT** use plaintext transfer authInfo — RFC 9154 secure authInfo
+  (server-generated, never client-supplied) is mandatory for transfers; a
+  plaintext/client-chosen implementation is a security defect, not a
+  simplification. **Done** — see Phase 2.
 - **Do NOT** shortcut the grace-period state machine. `pendingDelete` →
   redemption → purge (RFC 3915) has legal/operational meaning; an "instant
-  delete" path is wrong for a registry.
+  delete" path is wrong for a registry. **Done** — see Phase 2 (the one
+  accepted simplification is collapsing the two-stage redemption/pending-
+  delete-scheduled-for-release into one window, documented at the
+  `epp_rgp_state_t` definition).
 - **Do NOT** accept EPP without registrar mTLS client-cert authentication —
   registrar identity is the basis for every authorization check.
 - **Do NOT** accept child DS via CDS without a policy gate (acceptance window,
-  RFC 8078 §3 self-consistency) — blind acceptance is a hijack vector.
+  RFC 8078 §3 self-consistency) — blind acceptance is a hijack vector. (Still
+  applies: Phase 2 only implemented the EPP-submitted DS path, not in-band
+  CDS scanning — that path remains unimplemented, not merely ungated.)
 - **Do NOT** treat this as a small add. Phase 1 alone is a substantial service;
   public-TLD scope (escrow + RDAP + policy) is a multi-component program.
 
@@ -245,15 +298,27 @@ optional polish — `eppd` has nothing real to publish into without them.
   check-eppd` runs the full sequence and confirms via `dig` that the
   resulting `epptest.example.local NS` query returns the referral (RFC 9471)
   with the published nameserver and its glue A record.
-- [ ] `<domain:delete>` moves the object through the grace-period states
-  (Phase 2), not an immediate purge — not yet implemented (`update`/`delete`
-  are still stubbed, 2400).
-- [ ] DS submitted via `<domain:update>` (5910) appears as a `zone:DS:<name>`
-  the parent zone serves and that validates in `resolverd` — not yet
-  implemented; blocked on `dnsd` growing a `zone:<zone>:DS:<name>` read path,
-  which doesn't exist today (DS answers are currently synthesized live from
-  the zone's own KSK, unrelated to a child's delegation) — a Phase 2
-  prerequisite, mirroring this session's P0a/P0b work for NS.
+
+## Acceptance criteria (Phase 2)
+
+- [x] `<domain:delete>` moves the object through the grace-period states —
+  **verified live**: `make check-eppd` deletes a domain outside its grace
+  window (1001, `pendingDelete`/`redemptionPeriod`, delegation retracted),
+  then `<rgp:restore>` brings it back to `ok` with the delegation republished.
+- [x] DS submitted via `<domain:update>` (secDNS-1.1 extension) appears as a
+  `zone:DS:<name>` the parent zone serves, DNSSEC-signed — **verified live**:
+  `make check-eppd` submits a DS entry and confirms via `dig +dnssec` that
+  `dnsd` serves it with an RRSIG whose Signer's Name is the zone apex (not
+  the delegation name — see the RRSIG-signer bug note above; this is the
+  check that would have caught it directly had it existed before that fix).
+  Full validation in a running `resolverd` instance is not exercised by this
+  recipe (it only starts `dnsd`); the signer-name correctness this proves is
+  the load-bearing part of "would validate".
+- [x] Cross-registrar authorization, transfer (request/query/approve), and
+  host/contact association guards — **verified live** in the same
+  `check-eppd` run: a non-sponsor's `domain:update` is rejected (2201), an
+  authInfo-gated transfer moves ownership, and `host:delete`/`contact:delete`
+  are blocked (2305) while still referenced by the domain.
 
 ## Test (Phase 1 sketch)
 

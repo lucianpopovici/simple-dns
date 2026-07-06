@@ -46,8 +46,12 @@
 
 static void probe_children(const char *xml, int s, int e) {
     static const char *leaf_tags[] = {
-        "clTRID",   "clID",     "pw",       "authInfo", "hostObj",
-        "hostAttr", "hostName", "hostAddr", "period",   "registrant",
+        "clTRID",       "clID",       "pw",        "authInfo",       "hostObj",
+        "hostAttr",     "hostName",   "hostAddr",  "period",         "registrant",
+        "add",          "rem",        "chg",       "status",         "extension",
+        "secDNS:create", "secDNS:update", "secDNS:add", "secDNS:rem", "secDNS:chg",
+        "secDNS:dsData", "secDNS:keyTag", "secDNS:alg", "secDNS:digestType",
+        "secDNS:digest", "rgp:update",    "rgp:restore",
     };
     for (size_t i = 0; i < sizeof(leaf_tags) / sizeof(leaf_tags[0]); i++) {
         int cs, ce, cnp;
@@ -86,6 +90,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (xml_find_child(xml, es, ee, "command", &cs, &ce, &cnp) != 1)
         return 0;
     probe_children(xml, cs, ce);
+
+    /* <transfer op="..."> (RFC 5731 §3.2.4) — the one place this parser reads
+     * an attribute value rather than element content. */
+    int ts, te, tnp;
+    char top[16];
+    if (xml_find_child_attr(xml, cs, ce, "transfer", "op", top, sizeof(top), &ts, &te, &tnp) == 1) {
+        probe_children(xml, ts, te);
+        int qs, qe, qnp;
+        if (xml_find_child(xml, ts, te, "domain:transfer", &qs, &qe, &qnp) == 1)
+            probe_children(xml, qs, qe);
+    }
+
     static const char *ops[] = {"login", "logout", "check", "create", "info", "update", "delete"};
     for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
         int os, oe, onp;
