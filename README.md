@@ -23,28 +23,32 @@ keyspace notifications; no restarts.
                        │           Valkey            │
                        │   source of truth + bus     │
                        └─────────────────────────────┘
-     ▲      ▲        ▲             ▲              ▲          ▲       ▲
-     │      │        │             │              │          │       │
- ┌───┴──┐ ┌─┴────┐ ┌─┴────┐   ┌────┴─────┐   ┌────┴─────┐  ┌─┴────┐ (reads/writes)
- │ dnsd │ │mdnsd │ │certd │   │   apid   │   │dashboard │  │ doqd │
- │auth. │ │ mDNS │ │ PKI  │   │HTTP/DoH/ │   │ Flask UI │  │ DoQ  │
- │      │ │      │ │      │   │   mgmt   │   │          │  │      │
- └──┬───┘ └──────┘ └──────┘   └────┬─────┘   └──────────┘  └──┬───┘
-    │ DNS 53 / DoT 853                │ DoH + mgmt (8053/8443)    │ DoQ 853/udp
-  clients                          clients                    clients
+     ▲      ▲        ▲             ▲              ▲          ▲       ▲        ▲
+     │      │        │             │              │          │       │        │
+ ┌───┴──┐ ┌─┴────┐ ┌─┴────┐   ┌────┴─────┐   ┌────┴─────┐  ┌─┴────┐ ┌┴─────┐ (reads/writes)
+ │ dnsd │ │mdnsd │ │certd │   │   apid   │   │dashboard │  │ doqd │ │ eppd │
+ │auth. │ │ mDNS │ │ PKI  │   │HTTP/DoH/ │   │ Flask UI │  │ DoQ  │ │ EPP  │
+ │      │ │      │ │      │   │   mgmt   │   │          │  │      │ │      │
+ └──┬───┘ └──────┘ └──────┘   └────┬─────┘   └──────────┘  └──┬───┘ └──┬───┘
+    │ DNS 53 / DoT 853                │ DoH + mgmt (8053/8443)    │ DoQ 853/udp │ EPP 700/tcp (mTLS)
+  clients                          clients                    clients      registrars
 ```
 
 `doqd` forwards to `dnsd`'s loopback DNS port (UDP, TCP retry on truncation) —
 the same relay pattern `apid` uses for DoH — so it never parses DNS payloads,
-only RFC 9250's 2-octet stream-length framing.
+only RFC 9250's 2-octet stream-length framing. `eppd` (Phase 1 in progress)
+never forwards to `dnsd` at all — it writes delegation records into `zone:*`
+and its own `epp:*` object store; `dnsd` picks up the resulting NS/glue via
+its RFC 9471 referral logic.
 
 | Daemon | Role | Listens on | Talks to |
 |---|---|---|---|
-| **`dnsd`** (`dns_server.c`) | Authoritative core: query resolution, DNSSEC signing, UPDATE/TSIG, AXFR/IXFR/NOTIFY, EDNS/cookies | `5353/udp+tcp` (DNS), `8853` (DoT), `127.0.0.1:8054` (read-only `/health`+`/metrics`) | Valkey only |
+| **`dnsd`** (`dns_server.c`) | Authoritative core: query resolution, DNSSEC signing, UPDATE/TSIG, AXFR/IXFR/NOTIFY, EDNS/cookies, RFC 9471 delegation referrals | `5353/udp+tcp` (DNS), `8853` (DoT), `127.0.0.1:8054` (read-only `/health`+`/metrics`) | Valkey only |
 | **`certd`** (`certd.c`) | ACME (RFC 8555, DNS-01) + EST (RFC 7030) cert issuance/renewal | — (outbound to the CA) | Valkey + CA |
 | **`mdnsd`** (`mdnsd.c`) | mDNS (RFC 6762) + DNS-SD (RFC 6763) responder, link-local | `5353` multicast on explicitly-configured interfaces | Valkey (read) |
 | **`apid`** (`apid.c`) | HTTP/HTTPS front: DoH + management API | `8053` (HTTP), `8443` (HTTPS/mTLS) | Valkey + dnsd (DoH forward) |
 | **`doqd`** (`doqd.c`) | DNS-over-QUIC (RFC 9250) sidecar | `8853/udp` (opt-in via `config:doq_enabled`) | Valkey (read) + dnsd (loopback forward) |
+| **`eppd`** (`eppd.c`) | EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1) | `700/tcp` (opt-in via `config:eppd_enabled`; mTLS mandatory) | Valkey only |
 | **`dashboard`** (`dashboard/app.py`) | Authenticated control-plane UI | `127.0.0.1:5000` (configurable) | Valkey |
 
 Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) — the single
@@ -60,13 +64,14 @@ linked by every binary.
 | `mdnsd.c` | `mdnsd`, the mDNS/DNS-SD responder. |
 | `apid.c` | `apid`, the HTTP/HTTPS front for DoH + management. |
 | `doqd.c` | `doqd`, the DNS-over-QUIC (RFC 9250) sidecar. Needs OpenSSL ≥ 3.5 (server-side QUIC API) — only this one binary; the rest of the build stays on the 3.0+ floor. |
-| `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library. |
-| `sandbox.{c,h}` | `libsandbox`, the shared privilege-drop / chroot+mountns / seccomp sandbox, linked by `dnsd` and `resolverd`. |
+| `eppd.c` | `eppd`, the EPP registry front-end (RFC 5730/5734/5731/5732/5733). Registrar mTLS sessions; publishes domain delegations into `zone:*`. Phase 1 in progress — see `CLAUDE-eppd.md`. |
+| `dns_wire.{c,h}` | `libdnswire`, the shared wire-format library — also the shared Valkey RESP client + keyspace-watch loop (`vkc_*`/`keyspace_watch_loop`), hoisted out of per-daemon copies with `eppd` as the first caller. |
+| `sandbox.{c,h}` | `libsandbox`, the shared privilege-drop / chroot+mountns / seccomp sandbox, linked by `dnsd`, `resolverd`, and `eppd`. |
 | `resolverd.c` | `resolverd`, the recursive/forwarding resolver + cache + DNSSEC validation (the recursive role; formerly `dns_client.c`). |
 | `object_graph.{c,h}` | Vendored [objectdb](https://github.com/lucianpopovici/objectdb) engine (pinned; see the file headers) backing `resolverd`'s optional embedded cache tier (`RESOLVERD_CACHE_BACKEND=objectdb`, ADR-008 pilot). |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire`. |
 | `dashboard/` | Flask control-plane UI (see [Dashboard](#dashboard)). |
-| `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`) and a libFuzzer harness (`make fuzz-wire`). |
+| `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`, `make check-eppd`) and libFuzzer harnesses (`make fuzz-wire`, `make fuzz-eppd`, …). |
 | `Makefile` | Per-binary production + debug builds, GPG/OpenSSL signing, install. |
 
 ## Quick start
@@ -74,7 +79,7 @@ linked by every binary.
 ```bash
 # 1. Build. `make` builds + GPG-signs dnsd (needs a signing key); for local/CI
 #    use the unsigned per-binary targets:
-make dns_server certd mdnsd apid resolverd   # stripped, hardened production binaries (unsigned)
+make dns_server certd mdnsd apid resolverd eppd   # stripped, hardened production binaries (unsigned)
 make debug                           # dnsd ASan/UBSan build → dns_server_debug
 
 # 2. Valkey on 127.0.0.1:6379 (or set DNS_VALKEY_HOST / _PORT / _PASSWORD)
@@ -88,6 +93,7 @@ valkey-server &
 ./certd --once                       # one ACME/EST renewal check (or run as a daemon)
 ./mdnsd                              # needs config:mdns_enabled=1 + config:mdns_interfaces
 ./doqd                               # needs config:doq_enabled=1; OpenSSL >= 3.5 to build
+./eppd                                # needs config:eppd_enabled=1 + config:eppd_mtls_ca_pem
 ```
 
 If Valkey is unreachable at startup, `dnsd` retries (≈1 min) and then exits with
@@ -105,9 +111,15 @@ glance:
 - **Core / queries**: RFC 1034/1035, 2181, 2308, 9077 (negative-response
   NSEC/NSEC3 + SOA TTL = min(SOA.MINIMUM, SOA-TTL)), 4592 wildcards, 6303
   locally-served zones, 8482 minimal-ANY, 9619 QDCOUNT enforcement.
-- **Record types**: A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV (2782),
+- **Record types**: A, AAAA, NS (multi-value, `"ttl|ns1|ns2|…"` — a delegation
+  can carry more than one nameserver), CNAME, SOA, PTR, MX, TXT, SRV (2782),
   CAA (8659), SSHFP (4255), TLSA/DANE (6698/7671), LOC (1876), URI (7553),
   NAPTR (stub), DNAME (6672), CDS/CDNSKEY (7344/8078), SVCB + HTTPS (9460).
+- **Delegation / referrals** (RFC 9471): a qname at or below a configured NS
+  delegation point gets a non-authoritative referral — AA=0, unsigned NS in
+  Authority, in-bailiwick glue in Additional, TC=1 if the glue doesn't fit a
+  UDP response — rather than an ordinary in-zone answer. The prerequisite
+  that makes `eppd` (below) able to publish a real delegation.
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
   and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
   authenticated denial. Validation (in `resolverd.c`) covers the full
@@ -159,6 +171,13 @@ glance:
   9665 SRP + RFC 9664 Update Leases — opt-in (`config:srp_enabled`) device
   self-registration via a SIG(0)-authenticated, delete-all-then-add UPDATE
   with trust-on-first-use and a lease-expiry sweeper.
+- **EPP registry front-end** (`eppd`, RFC 5730/5734/5731/5732/5733, Phase 1
+  in progress): registrar provisioning over mandatory-mTLS TCP/700.
+  `check`/`create`/`info` for domain/host/contact objects (`epp:*`,
+  TLV-encoded); a domain's NS delegation is published into `zone:*`
+  (multi-value NS + in-bailiwick glue, SOA serial bump), which `dnsd` then
+  serves via the RFC 9471 referral logic above. `update`/`delete` and RFC
+  5910 DS mapping are Phase 2 — see `CLAUDE-eppd.md`.
 
 ## Configuration
 

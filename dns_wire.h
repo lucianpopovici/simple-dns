@@ -502,6 +502,117 @@ int dot_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outle
 int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *key_out,
                        size_t key_sz);
 
+/* ── Valkey RESP client + keyspace-notification watcher ──────────────────────
+ * Every daemon that talks to Valkey (certd, apid, mdnsd, doqd, resolverd,
+ * dns_server.c, and the untracked simple_dns.c) carries its OWN hand-rolled,
+ * near-identical copy of a resp_conn_t/resp_fill/resp_readline/.../
+ * valkey_connect/valkey_ensure client — the exact "duplicated parser" class
+ * CLAUDE.md's Do-NOT list forbids, just never consolidated because each
+ * predates libdnswire's split-out. eppd is the first caller of this shared
+ * version; repointing the existing daemons at it is a separate, optional
+ * follow-up. Named with a vkc_ prefix (not the resp_/valkey_ names those
+ * daemons already use for their own copies) specifically so
+ * this header can be included by those daemons today without colliding with
+ * their own static resp_conn_t/resp_reply_t/resp_fill/... — those are
+ * distinct per-TU identifiers until (if ever) a daemon is repointed at this
+ * one. One divergence this hoist fixes as a side effect: mdnsd's own copy
+ * sized its reply buffer at 4096 bytes (every other copy used 65536, matching
+ * VKC_BUF below) — large enough to silently truncate a multi-intermediate-CA
+ * cert:current chain read through its own vk_get. The shared version uses
+ * the larger size for every caller. */
+#define VKC_BUF 65536
+
+typedef struct {
+    int fd;
+    char rbuf[VKC_BUF];
+    int rlen, rpos;
+} vkc_conn_t;
+
+typedef struct {
+    int type; /* 0 simple-string, 1 error, 2 bulk-string, 3 integer, 4 nil, 5 array */
+    long integer;
+    char str[VKC_BUF];
+    int count;
+} vkc_reply_t;
+
+/* Refill c->rbuf from the socket (compacting first). -1 on any recv error
+ * (including EOF) — callers must treat that as connection-lost. */
+int vkc_fill(vkc_conn_t *c);
+
+/* Read one CRLF-terminated line (the CR is optional/stripped if present).
+ * Blocks (via vkc_fill) until a newline arrives or the connection drops. */
+int vkc_readline(vkc_conn_t *c, char *out, int olen);
+
+/* Read exactly n bytes plus the trailing CRLF a RESP bulk string carries,
+ * discarding the CRLF. Blocks until n+2 bytes are available or the
+ * connection drops. */
+int vkc_readbytes(vkc_conn_t *c, char *out, int n);
+
+/* Parse one RESP reply into `r`. Bulk strings longer than sizeof(r->str)-1
+ * are truncated in r->str but the excess is still drained from the wire
+ * (fail-closed framing: never leaves a partial reply for the next call). */
+int vkc_parse(vkc_conn_t *c, vkc_reply_t *r);
+
+/* Write `len` bytes, retrying on short writes. -1 on any send error. */
+int vkc_send(vkc_conn_t *c, const char *cmd, int len);
+
+/* Encode `argc` string arguments as a RESP array (the client->server command
+ * form), send it, and parse the one reply Valkey sends back. */
+int vkc_cmd(vkc_conn_t *c, vkc_reply_t *r, int argc, ...);
+
+/* Same encoding as vkc_cmd but does not read a reply — for (P)SUBSCRIBE,
+ * whose reply and subsequent push messages are consumed by a read loop
+ * instead of a single vkc_parse call. */
+int vkc_send_cmd(vkc_conn_t *c, int argc, ...);
+
+/* Open a fresh connection to host:port (closing any existing c->fd first),
+ * AUTH if pass is non-empty, then SELECT db 0. -1 on any failure (socket,
+ * resolve, connect, or a rejected AUTH). */
+int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass);
+
+/* PING an existing connection; reconnect via vkc_connect_to on any failure
+ * (including c->fd < 0, i.e. never connected). The common lazy-connect entry
+ * point for a request/reply-style vk_get/vk_set pair. */
+int vkc_ensure_to(vkc_conn_t *c, const char *host, int port, const char *pass);
+
+/* Per-key callback for a live keyspace-notification pmessage. `key` has the
+ * "__keyspace@<db>__:" channel prefix already stripped — just the Valkey key
+ * that changed. */
+typedef void (*keyspace_on_key_fn)(const char *key, void *ctx);
+
+/* Full state catch-up, called once right after every (re)connect and before
+ * (re)subscribing — so changes made while disconnected are never missed. */
+typedef void (*keyspace_catchup_fn)(void *ctx);
+
+typedef void (*vkc_log_fn)(int level, const char *fmt, ...);
+
+/* Config for keyspace_watch_loop — mirrors sandbox_config_t's shape
+ * (daemon-scoped config + callback + log fn) rather than a long parameter
+ * list. `prefixes` is a NULL-terminated array of key patterns to PSUBSCRIBE
+ * (e.g. "cert:current", "config:mdns_*"); `db` is the Valkey DB index
+ * (KEYSPACE_DB is 0 everywhere today). */
+typedef struct {
+    const char *host;
+    int port;
+    const char *pass;
+    int db;
+    const char **prefixes;
+    keyspace_catchup_fn on_reconnect;
+    keyspace_on_key_fn on_key;
+    void *ctx;
+    vkc_log_fn log;
+    const char *tag; /* e.g. "eppd" — prefixes log lines */
+} keyspace_watch_config_t;
+
+/* Runs forever: connect, enable keyspace notifications, run on_reconnect,
+ * PSUBSCRIBE every prefix, then dispatch each pmessage to on_key. Any
+ * disconnect (including a failed PSUBSCRIBE) triggers a capped-backoff
+ * reconnect that re-runs on_reconnect, so a Valkey restart neither misses
+ * updates nor causes a reconnect storm. Matches the pthread thread-function
+ * signature (void *(*)(void *), arg = a keyspace_watch_config_t *) so a
+ * caller can pthread_create it directly with no wrapper. Never returns. */
+void *keyspace_watch_loop(void *arg);
+
 /* ── Schema version contract (ADR-003) ────────────────────────────────────────
  * The Valkey bus is a versioned inter-daemon contract. Daemons compile in the
  * version they speak and compare it against the `schema:version` key at startup.

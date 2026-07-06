@@ -73,6 +73,14 @@
  *   9018       DNS Cookies – SipHash-2-4 anti-spoofing/amplification
  *   9364       DNSSEC (consolidation RFC)
  *   9432       Catalog Zones – bulk provisioning of member zones (consumer side)
+ *   9471       Glue in referrals – a qname at/below a configured NS
+ *              delegation point (zone_delegation_cut) gets a non-
+ *              authoritative referral (AA=0, unsigned NS in Authority,
+ *              in-bailiwick glue in Additional, TC=1 if it overflows UDP)
+ *              instead of an ordinary in-zone answer. The prerequisite that
+ *              lets the `eppd` sidecar (RFC 5730/5734/5731/5732/5733
+ *              registry front-end; not in this binary, see CLAUDE.md)
+ *              publish a delegation dnsd actually treats as one.
  *   9619       QDCOUNT=1 enforcement for QUERY
  *   5452       Forwarder upstream-reply validation (source addr/port + ID +
  *              question match; random ephemeral source port) — anti-spoofing
@@ -496,6 +504,53 @@ static int dkey(char *buf, size_t sz, const char *type, const char *name) {
 static int skey(char *buf, size_t sz, const char *type, const char *name) {
     const char *zn = t_zone ? t_zone->name : "";
     return snprintf(buf, sz, "srp:%s:%s:%s", zn, type, name);
+}
+
+/* Is `name` equal to, or a subdomain of, `zone`? Same longest-suffix match
+ * shape as zone_for_qname, but against one fixed zone rather than searching
+ * all configured zones — used to decide whether an in-domain nameserver name
+ * is one dnsd can itself supply glue for (RFC 9471). */
+static int name_in_zone(const char *name, const char *zone) {
+    size_t nl = strlen(name), zl = strlen(zone);
+    if (zl == 0 || zl > nl)
+        return 0;
+    if (zl == nl)
+        return strcasecmp(name, zone) == 0;
+    return nl > zl + 1 && name[nl - zl - 1] == '.' && strcasecmp(name + nl - zl, zone) == 0;
+}
+
+/* RFC 9471 / delegation support: is `qname` at or below an NS delegation
+ * point configured within zone `z` (a zone:<z>:NS:<name> record whose owner
+ * is not z's own apex)? Walks qname upward toward (but excluding) the apex,
+ * stopping at the first (most specific / closest enclosing) match. Builds
+ * the Valkey key directly from `z->name` (not via zkey(), which reads the
+ * thread-local t_zone) so this doesn't depend on the caller's call order. On
+ * a hit, fills `cut_out` with the delegation's owner name and `val_out` with
+ * its stored "ttl|ns1|ns2|..." value and returns 1; returns 0 for an
+ * ordinary in-zone name or the apex's own NS RRset (signed, authoritative
+ * zone content — not a delegation). */
+static int zone_delegation_cut(zone_entry_t *z, const char *qname, char *cut_out, size_t cutsz,
+                               char *val_out, size_t valsz) {
+    if (!z)
+        return 0;
+    size_t zl = strlen(z->name);
+    char cand[256];
+    safe_strcpy(cand, qname, sizeof(cand));
+    for (;;) {
+        size_t cl = strlen(cand);
+        if (cl <= zl)
+            return 0; /* reached the apex (or shorter) without finding a cut */
+        char k[900];
+        snprintf(k, sizeof(k), "zone:%s:NS:%s", z->name, cand);
+        if (vk_get(k, val_out, (int) valsz)) {
+            safe_strcpy(cut_out, cand, cutsz);
+            return 1;
+        }
+        char *dot = strchr(cand, '.');
+        if (!dot)
+            return 0;
+        memmove(cand, dot + 1, strlen(dot + 1) + 1);
+    }
 }
 
 /* Add or update a zone. Returns its index or -1 on error. */
@@ -5048,7 +5103,6 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
 static int stored_rdata(uint16_t type, char *pipe, uint8_t *rd, int rdcap) {
     switch (type) {
         case DNS_TYPE_CNAME:
-        case DNS_TYPE_NS:
         case DNS_TYPE_PTR:
         case DNS_TYPE_DNAME: {
             int n = name_to_wire(pipe, rd, rdcap);
@@ -5366,6 +5420,33 @@ static int emit_addr_rrset(uint8_t *resp, int off, int resp_len, const char *nam
         uint8_t rd[16];
         if (inet_pton(af, ip, rd) == 1)
             off = emit_rr(resp, off, resp_len, name, type, ttl, rd, addrlen, dnssec_ok, answers);
+    }
+    return off;
+}
+
+/* Emit a multi-value NS RRset from a stored "ttl|ns1|ns2|..." value (mirrors
+ * emit_addr_rrset's split-and-emit-per-value shape, without the LB/health
+ * logic which is meaningless for nameserver names). `val` is mutated
+ * (tokenised) in place. `dnssec_ok` should be 0 for a referral (delegation NS
+ * is never signed — RFC 4035 §2.2) and the caller's normal value at the zone
+ * apex (an ordinary, signed NS RRset). */
+static int emit_ns_rrset(uint8_t *resp, int off, int resp_len, const char *name, char *val,
+                         int dnssec_ok, int *count) {
+    uint32_t ttl = DEFAULT_TTL;
+    char *pipe = strchr(val, '|');
+    if (pipe) {
+        ttl = (uint32_t) atoi(val);
+        pipe++;
+    } else {
+        pipe = val;
+    }
+    char *sp = NULL;
+    for (char *ns = strtok_r(pipe, "|", &sp); ns; ns = strtok_r(NULL, "|", &sp)) {
+        uint8_t rd[300];
+        int rl = name_to_wire(ns, rd, sizeof(rd));
+        if (rl > 0)
+            off = emit_rr(resp, off, resp_len, name, DNS_TYPE_NS, ttl, rd, (uint16_t) rl,
+                          dnssec_ok, count);
     }
     return off;
 }
@@ -5836,6 +5917,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     int any_minimal = 0; /* RFC 8482: limit ANY responses */
     if (qtype == DNS_TYPE_ANY)
         any_minimal = 1;
+    int is_referral = 0; /* set below, after the zone's DNSSEC keys are in scope */
     /* RFC 6303: locally served zones — answer authoritatively with NXDOMAIN+SOA */
     if (is_local_zone(qname) && qtype != DNS_TYPE_SOA && qtype != DNS_TYPE_NS) {
         /* These zones are authoritative here: return SOA for them, NXDOMAIN for children */
@@ -5879,6 +5961,56 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     uint16_t g_ksk_ed_next_tag = t_zone ? t_zone->ksk_ed_next_tag : 0;
     int cds_old = (ksk_phase != KROLL_RETIRE); /* advertise current KSK's DS */
     int cds_new = (ksk_phase != KROLL_NONE);   /* advertise incoming KSK's DS */
+    /* RFC 9471 / delegation support: a qname at or below a configured NS
+     * delegation point gets a non-authoritative referral, not an ordinary
+     * in-zone answer — dnsd is not authoritative for content below a cut it
+     * delegates away. Only applies within a real configured zone (t_zone;
+     * RFC 6303 locally-served zones return above and never reach here).
+     * Exception: a DS query exactly at the cut is answered by the PARENT
+     * (RFC 4035 §3.1.4) — that per-child DS store doesn't exist yet
+     * (zone:<zone>:DS:<name>, Phase 2), so it falls through unchanged to the
+     * existing (zone's-own-KSK-based) DS logic below rather than referring. */
+    if (t_zone) {
+        char cut[256], cutval[512];
+        if (zone_delegation_cut(t_zone, qname, cut, sizeof(cut), cutval, sizeof(cutval)) &&
+            !(qtype == DNS_TYPE_DS && streq_ci(qname, cut))) {
+            is_referral = 1;
+            found = 1;
+            rh->flags = htons(DNS_QR | DNS_RCODE_NOERROR); /* AA cleared: non-authoritative */
+            /* emit_ns_rrset tokenises its `val` argument in place (strtok_r),
+             * so it must run on a disposable copy — cutval is read again
+             * below for the glue loop and must survive intact. */
+            char ns_emit_buf[512];
+            safe_strcpy(ns_emit_buf, cutval, sizeof(ns_emit_buf));
+            off = emit_ns_rrset(resp, off, resp_len, cut, ns_emit_buf, 0 /* unsigned at a cut */,
+                                &auth_count);
+            rh->nscount = htons((uint16_t) auth_count);
+            /* In-bailiwick glue (RFC 9471): A/AAAA for any NS target this zone
+             * can itself answer for — the only glue eppd's publish pipeline
+             * can ever have written, since it only owns zone:<parent>:*. */
+            int glue_count = 0;
+            char nslist[512];
+            safe_strcpy(nslist, cutval, sizeof(nslist));
+            char *gpipe = strchr(nslist, '|');
+            char *sp = NULL;
+            for (char *ns = strtok_r(gpipe ? gpipe + 1 : nslist, "|", &sp); ns;
+                 ns = strtok_r(NULL, "|", &sp)) {
+                if (!name_in_zone(ns, t_zone->name))
+                    continue; /* out of bailiwick — not ours to glue */
+                char gk[900], gval[128];
+                snprintf(gk, sizeof(gk), "zone:%s:A:%s", t_zone->name, ns);
+                if (vk_get(gk, gval, sizeof(gval)))
+                    off = emit_addr_rrset(resp, off, resp_len, ns, DNS_TYPE_A, gval,
+                                          0 /* unsigned */, &glue_count);
+                snprintf(gk, sizeof(gk), "zone:%s:AAAA:%s", t_zone->name, ns);
+                if (vk_get(gk, gval, sizeof(gval)))
+                    off = emit_addr_rrset(resp, off, resp_len, ns, DNS_TYPE_AAAA, gval,
+                                          0 /* unsigned */, &glue_count);
+            }
+            rh->arcount = htons((uint16_t) glue_count);
+            goto finish_answer;
+        }
+    }
     /* RFC 5782 DNSxL synthesis: before the record-lookup path so a listed IP
      * gets its synthesized A/TXT; not-listed falls through to NXDOMAIN. */
     if (dnsxl_try(resp, &off, resp_len, qname, qtype, dnssec_ok, &answers)) {
@@ -6153,6 +6285,18 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         if (any_minimal && answers > 0)
             goto finish_answer;
     }
+    /* NS — multi-value ("ttl|ns1|ns2|..."), mirrors the A/AAAA emit_addr_rrset
+     * shape via emit_ns_rrset. At the zone apex this is an ordinary signed
+     * RRset; below the apex it is a delegation cut, handled non-authoritatively
+     * by the referral check earlier in this function (RFC 9471). */
+    if (qtype == DNS_TYPE_NS || qtype == DNS_TYPE_ANY) {
+        char val[512], k[768];
+        zkey(k, sizeof(k), "NS", qname);
+        if (vk_get(k, val, sizeof(val))) {
+            found = 1;
+            off = emit_ns_rrset(resp, off, resp_len, qname, val, dnssec_ok, &answers);
+        }
+    }
     /* Dynamic A */
     if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
         char val[128], k[768];
@@ -6327,7 +6471,6 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         uint16_t pts[] = {DNS_TYPE_CNAME,
                           DNS_TYPE_MX,
                           DNS_TYPE_TXT,
-                          DNS_TYPE_NS,
                           DNS_TYPE_SRV,
                           DNS_TYPE_CAA,
                           DNS_TYPE_SSHFP,
@@ -6547,7 +6690,7 @@ finish_answer:
      * branches). */
     int ede_code = -1;
     const char *ede_text = NULL;
-    if (answers == 0) {
+    if (answers == 0 && !is_referral) {
         /* RFC 2308: add SOA in authority for NXDOMAIN / NODATA */
         if (!found) {
             rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NXDOMAIN);
@@ -8417,6 +8560,24 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                     if (rl > 0)
                         axfr_emit_one(fd, ssl, qid, name, T, (uint32_t) tl, rd, (uint16_t) rl, mac,
                                       maclen);
+                } else if (T == DNS_TYPE_NS) { /* zone: ttl|ns1|ns2|... (P0b: multi-value) */
+                    uint32_t ttl = DEFAULT_TTL;
+                    char *pipe = strchr(val, '|');
+                    if (pipe) {
+                        ttl = (uint32_t) atoi(val);
+                        pipe++;
+                    } else {
+                        pipe = val;
+                    }
+                    char *sp = NULL;
+                    for (char *nsname = strtok_r(pipe, "|", &sp); nsname;
+                         nsname = strtok_r(NULL, "|", &sp)) {
+                        uint8_t rd[300];
+                        int rl = name_to_wire(nsname, rd, sizeof(rd));
+                        if (rl > 0)
+                            axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, (uint16_t) rl, mac,
+                                          maclen);
+                    }
                 } else { /* rich provisioned types via the shared encoder */
                     uint32_t ttl = DEFAULT_TTL;
                     char *pipe = strchr(val, '|');
@@ -8583,7 +8744,8 @@ static void xfr_apply(const char *zone, xfr_rec_t *recs, int n, uint32_t serial)
         char key[900], val[1024];
         snprintf(key, sizeof(key), "zone:%.255s:%.16s:%.255s", zone, type2str(recs[i].type),
                  recs[i].name);
-        if (recs[i].type == DNS_TYPE_A || recs[i].type == DNS_TYPE_AAAA) {
+        if (recs[i].type == DNS_TYPE_A || recs[i].type == DNS_TYPE_AAAA ||
+            recs[i].type == DNS_TYPE_NS) { /* P0b: NS grouped like A/AAAA */
             int off = snprintf(val, sizeof(val), "%u", recs[i].ttl);
             for (int j = i; j < n; j++) {
                 if (!written[j] && recs[j].type == recs[i].type &&
@@ -8617,14 +8779,15 @@ static uint32_t xfr_get_serial(const char *zone) {
 }
 
 /* Apply one incremental (IXFR) change to the local zone:<zone>:* store. A/AAAA
- * records are grouped per owner as "ttl|ip|ip…": an add appends the IP (if not
- * already present), a delete removes it (deleting the key when the last IP
- * goes). Other types: add overwrites, delete removes the key. */
+ * and NS (P0b) records are grouped per owner as "ttl|val|val…": an add appends
+ * the value (if not already present), a delete removes it (deleting the key
+ * when the last value goes). Other types: add overwrites, delete removes the
+ * key. */
 static void xfr_apply_one_diff(const char *zone, char op, const char *name, uint16_t type,
                                uint32_t ttl, const char *val) {
     char key[900];
     snprintf(key, sizeof(key), "zone:%.255s:%.16s:%.255s", zone, type2str(type), name);
-    if (type != DNS_TYPE_A && type != DNS_TYPE_AAAA) {
+    if (type != DNS_TYPE_A && type != DNS_TYPE_AAAA && type != DNS_TYPE_NS) {
         if (op == 'A') {
             char v[1024];
             snprintf(v, sizeof(v), "%u|%s", ttl, val);
@@ -8634,45 +8797,47 @@ static void xfr_apply_one_diff(const char *zone, char op, const char *name, uint
         }
         return;
     }
-    /* A/AAAA: rebuild the grouped "ttl|ip|ip…" value. */
+    /* A/AAAA/NS: rebuild the grouped "ttl|val|val…" value. NS names can be up
+     * to 255 bytes, wider than an IPv6 text address, so size the slot for the
+     * larger of the two rather than adding a second parallel array. */
     char cur[1024] = "";
     vk_get(key, cur, sizeof(cur));
     uint32_t out_ttl = ttl ? ttl : DEFAULT_TTL;
-    char ips[64][INET6_ADDRSTRLEN];
-    int nip = 0;
+    char vals[64][256];
+    int nv = 0;
     if (cur[0]) {
         char *sp = NULL;
         char *tok = strtok_r(cur, "|", &sp);
         if (tok) {
             out_ttl = (uint32_t) strtoul(tok, NULL, 10); /* first field is the TTL */
-            for (tok = strtok_r(NULL, "|", &sp); tok && nip < 64; tok = strtok_r(NULL, "|", &sp))
-                safe_strcpy(ips[nip++], tok, sizeof(ips[0]));
+            for (tok = strtok_r(NULL, "|", &sp); tok && nv < 64; tok = strtok_r(NULL, "|", &sp))
+                safe_strcpy(vals[nv++], tok, sizeof(vals[0]));
         }
     }
     int present = 0;
-    for (int i = 0; i < nip; i++)
-        if (strcasecmp(ips[i], val) == 0) {
+    for (int i = 0; i < nv; i++)
+        if (strcasecmp(vals[i], val) == 0) {
             present = i + 1;
             break;
         }
     if (op == 'A') {
         if (ttl)
             out_ttl = ttl;
-        if (!present && nip < 64)
-            safe_strcpy(ips[nip++], val, sizeof(ips[0]));
-    } else if (present) { /* delete: drop the matching IP */
-        for (int i = present - 1; i < nip - 1; i++)
-            safe_strcpy(ips[i], ips[i + 1], sizeof(ips[0]));
-        nip--;
+        if (!present && nv < 64)
+            safe_strcpy(vals[nv++], val, sizeof(vals[0]));
+    } else if (present) { /* delete: drop the matching value */
+        for (int i = present - 1; i < nv - 1; i++)
+            safe_strcpy(vals[i], vals[i + 1], sizeof(vals[0]));
+        nv--;
     }
-    if (nip == 0) {
+    if (nv == 0) {
         vk_del(key);
         return;
     }
     char v[1024];
     int off = snprintf(v, sizeof(v), "%u", out_ttl);
-    for (int i = 0; i < nip && off < (int) sizeof(v) - 1; i++)
-        off += snprintf(v + off, sizeof(v) - off, "|%s", ips[i]);
+    for (int i = 0; i < nv && off < (int) sizeof(v) - 1; i++)
+        off += snprintf(v + off, sizeof(v) - off, "|%s", vals[i]);
     vk_set(key, v, 0);
 }
 

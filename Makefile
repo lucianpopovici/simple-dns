@@ -126,8 +126,8 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq fuzz-wire fuzz-response fuzz-tlv fuzz-doq gen-signing-key help ossl-sanity doqd-ossl-sanity \
-        certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug
+        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
 # instead of a wall of confusing compiler/linker errors.
@@ -280,6 +280,27 @@ resolverd: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.
 resolverd_debug: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.h object_graph.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(DEBUG_FLAGS) $(VERSION_FLAGS) \
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
+	@echo ""
+	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
+	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
+
+# =============================================================================
+# eppd — EPP (RFC 5730/5734) registry front-end sidecar. Phase 1 (see
+# CLAUDE-eppd.md): registrar mTLS + Valkey wiring + sandbox skeleton, with the
+# EPP session/publish-pipeline work landing as a follow-up. Links SANDBOX_SRC
+# (the first non-dnsd/resolverd daemon to use libsandbox) but not POG_SRC —
+# eppd has no cache tier.
+# =============================================================================
+eppd: eppd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [PROD]  $@"
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
+	strip --strip-unneeded $@
+
+eppd_debug: eppd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [DEBUG] $@"
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
 	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
@@ -1007,6 +1028,21 @@ fuzz-doq: fuzz/fuzz_doq.c doqd.c $(WIRE_SRC) dns_wire.h | doqd-ossl-sanity
 	      -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB)
 	mkdir -p fuzz/corpus_doq
 	./fuzz/fuzz_doq -max_total_time=60 fuzz/corpus_doq
+
+# libFuzzer over eppd's RFC 5734 frame validator + hand-rolled XML tokenizer
+# (xml_next_tag/xml_skip_to_close/xml_find_child/xml_text_decode) — the only
+# structured parsing eppd does on unauthenticated registrar bytes. #includes
+# eppd.c (same pattern as fuzz-doq/fuzz-response) so -DUNIT_TEST drops eppd's
+# own main(). Links SANDBOX_SRC since eppd.c references sandbox_apply.
+fuzz-eppd: fuzz/fuzz_eppd.c eppd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [FUZZ]  fuzz_eppd (RFC 5734 framing + XML tokenizer; clang, ASan+UBSan+libFuzzer)"
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -DUNIT_TEST -I. -I$(OSSL_INC) \
+	      $(SECCOMP_CFLAGS) -Wno-unused-function \
+	      -o fuzz/fuzz_eppd \
+	      fuzz/fuzz_eppd.c $(WIRE_SRC) $(SANDBOX_SRC) \
+	      -L$(OSSL_LIB) -lssl -lcrypto -lpthread -Wl,-rpath,$(OSSL_LIB) $(SECCOMP_LIBS)
+	mkdir -p fuzz/corpus_eppd
+	./fuzz/fuzz_eppd -max_total_time=60 fuzz/corpus_eppd
 
 # =============================================================================
 # Smoke test
@@ -2415,6 +2451,78 @@ check-doq: $(BIN_DEBUG) doqd_debug
 	 test "$$DOQRC" -ne 0 || { echo "  FAIL  doqd started despite config:doq_enabled=0"; exit 1; }; \
 	 test "$$NOTBOUND" = "0" || { echo "  FAIL  doqd bound :18853/udp while disabled"; exit 1; }; \
 	 echo "  OK  DoQ resolves correctly, _853._udp TLSA published, doqd refuses to start/bind when disabled"
+
+# eppd Phase 1 (RFC 5730/5734/5731/5732/5733): registrar mTLS session shell +
+# the domain/host/contact publish pipeline, end to end. Three parts:
+#   (1) KAT for epp_frame_next's accept/reject/need-more-data boundary and
+#       the XML tokenizer's correctness (tests/test_eppd.c; memory safety of
+#       the same functions is covered separately by fuzz-eppd).
+#   (2) tests/epp_client.py drives a live EPP session (login/create/info/
+#       duplicate-reject/logout) against a real eppd instance.
+#   (3) dig verifies the resulting NS+glue delegation is actually served by
+#       dnsd — the real point of the publish pipeline, not just that eppd
+#       answered the right EPP result codes.
+check-eppd: $(BIN_DEBUG) eppd_debug
+	@echo "  CC [TEST]  tests/test_eppd"
+	@clang -std=c99 -D_GNU_SOURCE -g -fsanitize=address,undefined -DUNIT_TEST -I. \
+	      $(SECCOMP_CFLAGS) -Wno-unused-function -o tests/test_eppd tests/test_eppd.c \
+	      $(WIRE_SRC) $(SANDBOX_SRC) -lssl -lcrypto -lpthread $(SECCOMP_LIBS)
+	./tests/test_eppd
+	@echo "  CHECK  eppd Phase 1: EPP session + zone:* publish pipeline (requires Valkey + dig + openssl + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
+	 command -v openssl >/dev/null 2>&1 || { echo "  SKIP  no openssl on PATH"; exit 0; }; \
+	 D=$$(mktemp -d); \
+	 EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"; \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=eppd-test-ca" >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=eppd.test" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=registrar1" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 SAVE_ZN=$$($$VC get config:zone_name); \
+	 SAVE_EN=$$($$VC get config:eppd_enabled); SAVE_PT=$$($$VC get config:eppd_port); \
+	 SAVE_CERT=$$($$VC get config:eppd_tls_cert_pem); SAVE_KEY=$$($$VC get config:eppd_tls_key_pem); \
+	 SAVE_CA=$$($$VC get config:eppd_mtls_ca_pem); SAVE_PW=$$($$VC get config:eppd_registrar_pw:registrar1); \
+	 SAVE_CUR=$$($$VC get cert:current); \
+	 $$VC set config:zone_name example.local >/dev/null; \
+	 $$VC set config:eppd_enabled 1 >/dev/null; \
+	 $$VC set config:eppd_port 17700 >/dev/null; \
+	 $$VC set config:eppd_tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null; \
+	 $$VC set config:eppd_tls_key_pem "$$(cat $$D/srv.key)" >/dev/null; \
+	 $$VC set config:eppd_mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null; \
+	 $$VC set config:eppd_registrar_pw:registrar1 "test-pw-correct" >/dev/null; \
+	 $$VC del cert:current >/dev/null; \
+	 $$VC del epp:contact:EPPTC1 >/dev/null; \
+ for k in $$($$VC --scan --pattern "epp:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
+	 for k in $$($$VC --scan --pattern "zone:example.local:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_eppd.log 2>&1 & DNS=$$!; \
+	 sleep 1.5; \
+	 ASAN_OPTIONS=detect_leaks=0 ./eppd_debug > /tmp/eppd_check.log 2>&1 & EPPD=$$!; \
+	 sleep 1.5; \
+	 python3 tests/epp_client.py 127.0.0.1 17700 $$D/ca.pem $$D/cli.pem $$D/cli.key registrar1 test-pw-correct \
+	     > /tmp/epp_client.log 2>&1; CLIENTRC=$$?; \
+	 NS=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local NS +noall +authority | awk '{print $$5}'); \
+	 GLUE=$$(dig @127.0.0.1 -p $(TPORT) epptest.example.local NS +noall +additional | grep -c "192.0.2.77"); \
+	 kill $$EPPD $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_EN" ]; then $$VC set config:eppd_enabled "$$SAVE_EN" >/dev/null; else $$VC del config:eppd_enabled >/dev/null; fi; \
+	 if [ -n "$$SAVE_PT" ]; then $$VC set config:eppd_port "$$SAVE_PT" >/dev/null; else $$VC del config:eppd_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_CERT" ]; then $$VC set config:eppd_tls_cert_pem "$$SAVE_CERT" >/dev/null; else $$VC del config:eppd_tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_KEY" ]; then $$VC set config:eppd_tls_key_pem "$$SAVE_KEY" >/dev/null; else $$VC del config:eppd_tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_CA" ]; then $$VC set config:eppd_mtls_ca_pem "$$SAVE_CA" >/dev/null; else $$VC del config:eppd_mtls_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_PW" ]; then $$VC set config:eppd_registrar_pw:registrar1 "$$SAVE_PW" >/dev/null; else $$VC del config:eppd_registrar_pw:registrar1 >/dev/null; fi; \
+	 if [ -n "$$SAVE_CUR" ]; then $$VC set cert:current "$$SAVE_CUR" >/dev/null; else $$VC del cert:current >/dev/null; fi; \
+	 $$VC del epp:contact:EPPTC1 >/dev/null; \
+ for k in $$($$VC --scan --pattern "epp:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
+	 for k in $$($$VC --scan --pattern "zone:example.local:*epptest*"); do $$VC del "$$k" >/dev/null; done; \
+	 rm -rf $$D; \
+	 echo "  --- epp_client.py output ---"; cat /tmp/epp_client.log; \
+	 echo "  delegation NS=[$$NS] glue-192.0.2.77-present=[$$GLUE]"; \
+	 test "$$CLIENTRC" -eq 0 || { echo "  FAIL  EPP session/protocol assertions failed"; cat /tmp/eppd_check.log; exit 1; }; \
+	 test "$$NS" = "ns1.epptest.example.local." || { echo "  FAIL  dnsd is not serving the published NS delegation"; exit 1; }; \
+	 test "$$GLUE" -ge 1 || { echo "  FAIL  dnsd did not serve the published glue A record"; exit 1; }; \
+	 echo "  OK  EPP session (login/create/info/duplicate-reject/logout) + zone:* publish pipeline verified by dig"
 
 # =============================================================================
 # Clean

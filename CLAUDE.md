@@ -81,12 +81,14 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
 | `object_graph.{c,h}` | Vendored **objectdb** engine (pinned — see file headers; fix upstream, never here) backing `resolverd`'s optional embedded cache tier (ADR-008 pilot, `RESOLVERD_CACHE_BACKEND=objectdb`). |
-| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd` and `resolverd`. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
+| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd`, `resolverd`, and `eppd`. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
 | `dns_server.c` | **`dnsd`** — the authoritative core (~3600 lines). ACME/EST extracted in Step 2, mDNS in Step 3, the HTTP/DoH/portal surface in Step 4. Now: DNS/DoT + localhost `/health`+`/metrics` only. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |
 | `apid.c` | **`apid`** — HTTP/HTTPS front for DoH + management (migration Step 4, done). Forwards DoH to `dnsd`; all writes go to Valkey. |
 | `resolverd.c` | **`resolverd`** — recursive/forwarding resolver + cache + DNSSEC **validation** (the recursive role; formerly `dns_client.c`). Distinct daemon from `dnsd`; own `make resolverd` target + `make check-resolverd`. |
+| `doqd.c` | **`doqd`** — DNS-over-QUIC sidecar (RFC 9250, done). Relays framed messages to `dnsd`'s loopback DNS port; writes nothing. |
+| `eppd.c` | **`eppd`** — EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1 in progress). Registrar mTLS sessions; writes `epp:*` + delegation `zone:*` records. Own `make eppd`/`make check-eppd`/`make fuzz-eppd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
 | `fuzz/` | libFuzzer harness + corpus: `make fuzz-wire` (60s smoke; needs clang). |
@@ -187,14 +189,31 @@ Source-of-truth specs — ground protocol decisions in these, do not guess:
  clients                           forwards the framed message to dnsd's
                                     loopback DNS port, same relay pattern
                                     apid uses for DoH. Writes nothing.
+
+   ▲
+   │ EPP (700/tcp, RFC 5734, mTLS mandatory — no plain-TLS fallback)
+   └──────────────────── eppd ──── registrar provisioning (Phase 1: domain/
+registrars                         host/contact check+create+info). Writes
+                                    epp:* (its own object store) and, on a
+                                    domain's NS delegation, zone:<parent>:
+                                    NS/A/AAAA — the same publish-to-Valkey
+                                    pattern certd uses for challenge TXT.
 ```
 
 Shared code: **`libdnswire`** (`dns_wire.c` / `dns_wire.h`) linked by `dnsd`,
-`mdnsd`, and `resolverd`. `doqd` also links it but does **not** share
+`mdnsd`, `resolverd`, and `eppd`. `doqd` also links it but does **not** share
 `dns_wire.c`'s TLS helper (`tls_server_ctx_from_pem`) — that would force an
 unconditional `#include <openssl/quic.h>` into a file every other daemon
 compiles against the lower OpenSSL 3.0+ floor, so `doqd` carries its own
 small QUIC-specific context constructor instead (documented in `doqd.c`).
+`eppd` *does* use `tls_server_ctx_from_pem` directly (RFC 5734's transport is
+plain TLS, no QUIC floor issue) and is also the first caller of the shared
+Valkey RESP client + keyspace-notification watcher (`vkc_*` /
+`keyspace_watch_loop`, `dns_wire.{c,h}`) — hoisted out of what were
+previously five-plus near-identical per-daemon copies (`certd`/`apid`/
+`mdnsd`/`doqd`/`resolverd`/`dns_server.c` each still carry their own; only
+`eppd` was written against the shared version). Repointing the others is an
+explicit, still-open follow-up, not assumed done by this hoist.
 
 ---
 
@@ -368,6 +387,66 @@ listener.
 `_853._tcp` — `dnsd` still owns TLSA-on-cert-change per the ownership table,
 `doqd` publishes nothing.
 
+### `eppd` — EPP registry front-end (RFC 5730/5734/5731/5732/5733)
+
+**Phase 1 in progress.** `eppd.c`. Accepts registrar EPP sessions over
+TCP/700 with **mandatory** mutual TLS (RFC 5734 §5.1) — unlike `apid`'s
+optional mTLS split between DoH and management, there is no plain-TLS
+fallback: `config:eppd_mtls_ca_pem` is a hard startup requirement, and `eppd`
+refuses to open its listener at all without it. Implemented: the RFC 5730
+session shell (unprompted greeting, `<hello>`, `<login>`/`<logout>`,
+clTRID/svTRID plumbing) and RFC 5731/5732/5733 domain/host/contact
+`check`/`create`/`info` (update/delete remain unimplemented — RFC 3915 grace
+periods are explicitly Phase 2, per `CLAUDE-eppd.md`).
+
+`eppd` never serves DNS and `dnsd` never speaks EPP — they meet only through
+Valkey, the same pattern every other sidecar uses. Its own `epp:*` object
+store (domain/host/contact records, TLV-encoded per ADR-003, hex-encoded
+before storing — the shared RESP client's argument encoding is
+`strlen()`-based text, so a raw binary blob with an embedded NUL would
+silently truncate, the same reason ZONEMD/SVCB hex-encode their TLV blobs)
+is `eppd`'s alone to write. On a domain's NS delegation it publishes into
+the parent zone exactly the way `certd` publishes challenge TXT records:
+`zone:<parent>:NS:<domain>` (multi-value) and, for each in-bailiwick
+nameserver, `zone:<parent>:A/AAAA:<ns>` glue, then bumps the parent's SOA
+serial — mirroring `apid`'s own `serial_bump_zone` exactly, including its
+`config:zone_name` fallback for the primary zone (which has no
+`zone_table:<name>` key of its own; **operators must set `config:zone_name`
+explicitly in Valkey** for `eppd` — or `apid` — to resolve it, even though
+`dnsd` itself tolerates it being unset via a compiled-in default).
+
+No IXFR-journal entry or NOTIFY is written by the publish step — secondaries
+converge via the normal periodic-refresh → IXFR-gap → AXFR-fallback path,
+identical to how `apid`'s own zone-record writes already propagate; this is
+existing, accepted precedent, not a limitation `eppd` introduces.
+
+This is the first daemon anywhere in the fleet with an actual delegation
+concept behind it: **RFC 9471 (glue in referrals)**, previously parked as a
+dormant "forward requirement... when delegation support is added"
+(`CLAUDE-rfc-additions-batch3.md`), is now implemented in `dnsd` itself — a
+qname at or below a configured NS delegation point gets a non-authoritative
+referral (AA=0, unsigned NS in Authority, in-bailiwick glue in Additional,
+TC=1 if glue overflows UDP) rather than an ordinary in-zone answer. `dnsd`'s
+NS storage (`zone:<zone>:NS:<name>`) is correspondingly multi-value now
+(`"ttl|ns1|ns2|..."`), matching how A/AAAA already worked — both prerequisite
+changes for `eppd` to have anything real to publish into.
+
+`eppd` is also the first daemon besides `dnsd`/`resolverd` to call
+`sandbox_apply()` (`libsandbox`); seccomp starts in `audit` mode pending a
+strace harvest (no inbound-TLS-listener whitelist exists yet, unlike
+`resolverd`'s upstream-transport harvest).
+
+Config (Valkey): `config:eppd_enabled` (must be `"1"`, default off — never
+on by accident, same convention as `doqd`), `config:eppd_port` (RFC 5734
+default 700), `config:eppd_mtls_ca_pem` (required), `config:eppd_registrar_
+pw:<clID>` (per-registrar EPP login password — plaintext, gated by the same
+`config:*` trust boundary as `ddns_secret`/`tsig_secret`), `config:eppd_
+{chroot_dir,isolation_mode,privdrop_user,privdrop_group,seccomp_mode}`
+(sandbox knobs, resolverd-style, own prefix since `eppd`'s filesystem/
+syscall profile differs — inbound TLS only, no outbound network). TLS
+material: `cert:current`, falling back to `config:eppd_tls_{cert,key}_pem` —
+same hot-reload contract as `dnsd`/`apid`/`doqd`.
+
 ### `libdnswire` — shared wire-format library
 
 Factor the duplicated primitives (`name_from_wire`, `name_to_wire`,
@@ -391,18 +470,19 @@ HTTP front-ends. Define and enforce this.
 
 | Namespace | Writer | Readers | Purpose |
 |---|---|---|---|
-| `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid, doqd | Runtime configuration |
-| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
+| `config:*` | dashboard, apid (mgmt API) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | Runtime configuration |
+| `zone:*` | dashboard, apid (mgmt API), certd (challenge TXT only), dnsd (TLSA on cert change; apex ZONEMD digest, RFC 8976), eppd (NS/A/AAAA delegation only, from its own `epp:*` object store) | dnsd, mdnsd (shared records, read-only) | Authoritative records |
 | `ddns:*` | dnsd (RFC 2136 UPDATE), apid (HTTP `/update`, `ddns_secret`-gated) | dnsd | Dynamic records |
 | `srp:*` | dnsd (RFC 9665 SRP UPDATE, SIG(0)-authenticated, `config:srp_enabled`-gated) | dnsd (mdnsd read-only in a future add) | Service-registration records + FCFS ownership + lease/key-lease expiry (RFC 9664) |
 | `ixfr:*` | dnsd (records each A/AAAA change) | dnsd | RFC 1995 IXFR journal (incremental diff; gap → AXFR fallback) |
 | `mdns:*` | dashboard | mdnsd | mDNS/DNS-SD records |
 | `dnssec:*` | dnsd / key tooling | dnsd | ZSK/KSK material |
-| `cert:current` | certd | dnsd, apid, doqd (hot-reload) | Active TLS cert + key |
+| `cert:current` | certd | dnsd, apid, doqd, eppd (hot-reload) | Active TLS cert + key |
 | `acme:*` | certd | certd | ACME account key, order state |
 | `cache:*` | resolverd | resolverd | Persisted resolver cache. ADR-008 pilot: with `RESOLVERD_CACHE_BACKEND=objectdb` this namespace moves out of Valkey into resolverd's embedded objectdb store (`object_graph.{c,h}`, vendored+pinned) — same single-owner contract, no bus change |
+| `epp:*` | eppd | eppd | RFC 5731/5732/5733 domain/host/contact object store (TLV-encoded, ADR-003; hex-encoded before storing) |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
-| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid, doqd | ADR-003 schema-version contract (`major.minor`) |
+| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | ADR-003 schema-version contract (`major.minor`) |
 
 **Live reload (done — migration Step 6):** each daemon runs a subscriber on a
 dedicated Valkey connection, enables keyspace notifications
@@ -412,7 +492,10 @@ no more SIGHUP / `POST /config`. `dnsd` watches `config:*`, `cert:current`,
 `zone_table:*`, and `dnssec:*` (reloads that zone's key state live — current set
 plus any rollover/next set); `apid` watches
 `cert:current` + the TLS config keys; `mdnsd` watches `mdns:*` + `config:mdns_*`
-and re-announces. zone/ddns records are already read live per query.
+and re-announces; `eppd` watches `cert:current` + its own TLS/CA config keys,
+via the same shared `keyspace_watch_loop` (`dns_wire.h`) every future adopter
+of the hoisted Valkey client would use. zone/ddns records are already read
+live per query.
 Subscribers re-run a full catch-up after every reconnect and use capped
 backoff, so a Valkey restart causes neither missed updates nor a reconnect
 storm.
@@ -451,8 +534,8 @@ The Valkey bus is a **versioned contract**, not an ad-hoc set of strings
 ## Trust boundaries
 
 - **Internet-facing, untrusted input:** `dnsd` (DNS wire), `resolverd`
-  (upstream responses), the reverse proxy (HTTP/TLS). These get the strongest
-  sandboxing.
+  (upstream responses), `eppd` (registrar EPP/XML sessions, mTLS-gated), the
+  reverse proxy (HTTP/TLS). These get the strongest sandboxing.
 - **Outbound network:** only `certd` (to the CA / EST server) and `resolverd`
   (to upstreams). `dnsd` should reach nothing but Valkey.
 - **Link-local:** `mdnsd` only.
@@ -566,6 +649,18 @@ extended to `resolverd` and **factored into the shared `libsandbox`**
 to `enforce` (resolverd's whitelist was harvest-validated across all upstream
 transports on glibc/Fedora); re-harvest with `seccomp_mode=audit` only when
 porting to a different libc/kernel.
+
+`eppd` (EPP registry front-end, RFC 5730/5734/5731/5732/5733) — the one
+remaining roadmap item — is now **Phase 1 in progress**: the session shell,
+domain/host/contact check/create/info, and the zone:* publish pipeline are
+done (`make check-eppd`, `make fuzz-eppd`); update/delete and RFC 5910 DS
+mapping are Phase 2. Landing it required two prerequisite `dnsd` changes,
+both done: **RFC 9471** delegation/referral support (`dnsd` had no zone-cut
+concept at all before this) and multi-value NS storage. `eppd` is also the
+third daemon on `libsandbox` (after `dnsd`/`resolverd`) and the first caller
+of a newly-hoisted shared Valkey RESP client (`vkc_*`/`keyspace_watch_loop`,
+`dns_wire.{c,h}`) that the other daemons still have their own pre-hoist
+copies of.
 
 ---
 

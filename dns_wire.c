@@ -10,6 +10,12 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <stdio.h>
+#include <stdarg.h>  /* vkc_cmd/vkc_send_cmd varargs */
+#include <unistd.h>  /* close, sleep */
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <netdb.h>        /* getaddrinfo — vkc_connect_to */
 #include <arpa/inet.h>    /* inet_pton — RFC 9460 ipv4hint/ipv6hint */
 #include <openssl/evp.h>  /* nsec3_hash_raw */
 #include <openssl/x509.h> /* tls_server_ctx_from_pem */
@@ -1619,6 +1625,325 @@ int cert_current_split(const char *blob, char *cert_out, size_t cert_sz, char *k
     if (!strstr(cert_out, "-----BEGIN CERTIFICATE-----"))
         return -1;
     return 0;
+}
+
+/* ── Valkey RESP client + keyspace-notification watcher ──────────────────────
+ * Canonical body ported verbatim (behavior-for-behavior) from certd.c's copy,
+ * the simplest of the pre-existing per-daemon versions, then extended with
+ * vkc_send_cmd/vkc_connect_to/vkc_ensure_to (present in apid/mdnsd/doqd's and
+ * dns_server.c's copies respectively) so this one version covers every
+ * existing use. See dns_wire.h for why the vkc_ prefix. */
+
+int vkc_fill(vkc_conn_t *c) {
+    if (c->rpos > 0 && c->rlen > c->rpos) {
+        memmove(c->rbuf, c->rbuf + c->rpos, c->rlen - c->rpos);
+        c->rlen -= c->rpos;
+        c->rpos = 0;
+    } else if (c->rpos >= c->rlen) {
+        c->rlen = c->rpos = 0;
+    }
+    int room = VKC_BUF - c->rlen - 1;
+    if (room <= 0)
+        return -1;
+    int n = (int) recv(c->fd, c->rbuf + c->rlen, room, 0);
+    if (n <= 0)
+        return -1;
+    c->rlen += n;
+    c->rbuf[c->rlen] = 0;
+    return n;
+}
+
+int vkc_readline(vkc_conn_t *c, char *out, int olen) {
+    for (;;) {
+        char *p = (char *) memchr(c->rbuf + c->rpos, '\n', c->rlen - c->rpos);
+        if (p) {
+            int len = (int) (p - (c->rbuf + c->rpos));
+            if (len > 0 && *(p - 1) == '\r')
+                len--;
+            if (len >= olen)
+                len = olen - 1;
+            memcpy(out, c->rbuf + c->rpos, len);
+            out[len] = 0;
+            c->rpos = (int) (p - c->rbuf) + 1;
+            return len;
+        }
+        if (vkc_fill(c) < 0)
+            return -1;
+    }
+}
+
+int vkc_readbytes(vkc_conn_t *c, char *out, int n) {
+    int got = 0;
+    while (got < n) {
+        int have = c->rlen - c->rpos;
+        if (have <= 0) {
+            if (vkc_fill(c) < 0)
+                return -1;
+            continue;
+        }
+        int take = (n - got < have) ? (n - got) : have;
+        memcpy(out + got, c->rbuf + c->rpos, take);
+        c->rpos += take;
+        got += take;
+    }
+    while (c->rlen - c->rpos < 2) {
+        if (vkc_fill(c) < 0)
+            return -1;
+    }
+    c->rpos += 2;
+    out[n] = 0;
+    return n;
+}
+
+int vkc_parse(vkc_conn_t *c, vkc_reply_t *r) {
+    char line[512];
+    if (vkc_readline(c, line, sizeof(line)) < 0)
+        return -1;
+    memset(r, 0, sizeof(*r));
+    switch (line[0]) {
+        case '+':
+            r->type = 0;
+            safe_strcpy(r->str, line + 1, sizeof(r->str));
+            return 0;
+        case '-':
+            r->type = 1;
+            safe_strcpy(r->str, line + 1, sizeof(r->str));
+            return 0;
+        case ':':
+            r->type = 3;
+            r->integer = atol(line + 1);
+            return 0;
+        case '$': {
+            int bl = atoi(line + 1);
+            if (bl < 0) {
+                r->type = 4;
+                return 0;
+            }
+            r->type = 2;
+            int take = bl < (int) sizeof(r->str) - 1 ? bl : (int) sizeof(r->str) - 1;
+            if (vkc_readbytes(c, r->str, take) < 0)
+                return -1;
+            int excess = bl - take;
+            while (excess > 0) {
+                char drain[257];
+                int d = excess > (int) (sizeof(drain) - 1) ? (int) (sizeof(drain) - 1) : excess;
+                if (vkc_readbytes(c, drain, d) < 0)
+                    return -1;
+                excess -= d;
+            }
+            r->str[take] = 0;
+            return 0;
+        }
+        case '*':
+            r->type = 5;
+            r->count = atoi(line + 1);
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+int vkc_send(vkc_conn_t *c, const char *cmd, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = (int) send(c->fd, cmd + sent, len - sent, MSG_NOSIGNAL);
+        if (n <= 0)
+            return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+int vkc_cmd(vkc_conn_t *c, vkc_reply_t *r, int argc, ...) {
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        const char *a = va_arg(ap, const char *);
+        int al = (int) strlen(a);
+        if (pos < 0 || pos >= (int) sizeof(buf)) {
+            va_end(ap);
+            return -1;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
+    }
+    va_end(ap);
+    if (pos < 0 || pos >= (int) sizeof(buf))
+        return -1;
+    if (vkc_send(c, buf, pos) < 0)
+        return -1;
+    return vkc_parse(c, r);
+}
+
+int vkc_send_cmd(vkc_conn_t *c, int argc, ...) {
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        const char *a = va_arg(ap, const char *);
+        int al = (int) strlen(a);
+        if (pos < 0 || pos >= (int) sizeof(buf)) {
+            va_end(ap);
+            return -1;
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
+    }
+    va_end(ap);
+    if (pos < 0 || pos >= (int) sizeof(buf))
+        return -1;
+    return vkc_send(c, buf, pos);
+}
+
+int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass) {
+    if (c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+    c->rlen = c->rpos = 0;
+    c->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (c->fd < 0)
+        return -1;
+    struct timeval tv = {.tv_sec = 4};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        struct addrinfo hints = {0}, *res;
+        char ps[8];
+        snprintf(ps, sizeof(ps), "%d", port);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, ps, &hints, &res) != 0) {
+            close(c->fd);
+            c->fd = -1;
+            return -1;
+        }
+        memcpy(&sa, res->ai_addr, res->ai_addrlen);
+        freeaddrinfo(res);
+    }
+    if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
+        close(c->fd);
+        c->fd = -1;
+        return -1;
+    }
+    vkc_reply_t r;
+    if (pass && pass[0]) {
+        if (vkc_cmd(c, &r, 2, "AUTH", pass) < 0 || r.type == 1) {
+            close(c->fd);
+            c->fd = -1;
+            return -1;
+        }
+    }
+    vkc_cmd(c, &r, 2, "SELECT", "0");
+    return 0;
+}
+
+int vkc_ensure_to(vkc_conn_t *c, const char *host, int port, const char *pass) {
+    if (c->fd < 0)
+        return vkc_connect_to(c, host, port, pass);
+    vkc_reply_t r;
+    if (vkc_cmd(c, &r, 1, "PING") < 0)
+        return vkc_connect_to(c, host, port, pass);
+    return 0;
+}
+
+/* Generic keyspace-notification subscriber loop — the shape shared by every
+ * pre-existing per-daemon keyspace_watch_thread (connect, enable notify-
+ * keyspace-events, catch up, PSUBSCRIBE each prefix, dispatch each pmessage,
+ * capped-backoff reconnect on any drop), parameterized via cfg->on_reconnect
+ * / cfg->on_key instead of a hardcoded per-daemon reload function. */
+void *keyspace_watch_loop(void *arg) {
+    const keyspace_watch_config_t *cfg = (const keyspace_watch_config_t *) arg;
+    vkc_conn_t sub;
+    int backoff = 1;
+    for (;;) {
+        memset(&sub, 0, sizeof(sub));
+        sub.fd = -1;
+        if (vkc_connect_to(&sub, cfg->host, cfg->port, cfg->pass) < 0) {
+            sleep((unsigned) backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
+        }
+        /* A subscriber blocks waiting for events, so drop the connect-time
+         * read timeout — else recv would time out and look like a
+         * disconnect, causing a reconnect storm. */
+        struct timeval no_to = {0};
+        setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
+
+        vkc_reply_t r;
+        if (vkc_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
+            r.type == 1) {
+            if (cfg->log)
+                cfg->log(4 /* LOG_WARNING */,
+                         "[%s] could not enable keyspace notifications — "
+                         "boot/reconnect catch-up only\n",
+                         cfg->tag ? cfg->tag : "keyspace");
+        }
+        if (cfg->on_reconnect)
+            cfg->on_reconnect(cfg->ctx);
+
+        int subok = 1;
+        for (int i = 0; cfg->prefixes && cfg->prefixes[i]; i++) {
+            char pat[160];
+            snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", cfg->db, cfg->prefixes[i]);
+            if (vkc_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
+                subok = 0;
+                break;
+            }
+        }
+        if (!subok) {
+            close(sub.fd);
+            sleep((unsigned) backoff);
+            if (backoff < 30)
+                backoff *= 2;
+            continue;
+        }
+        backoff = 1;
+        if (cfg->log)
+            cfg->log(5 /* LOG_NOTICE */, "[%s] live reload active (keyspace notifications)\n",
+                     cfg->tag ? cfg->tag : "keyspace");
+
+        for (;;) {
+            vkc_reply_t hdr;
+            if (vkc_parse(&sub, &hdr) < 0)
+                break;
+            if (hdr.type != 5 || hdr.count < 1)
+                continue;
+            char kind[16] = "";
+            char key[512] = "";
+            int rderr = 0;
+            for (int i = 0; i < hdr.count; i++) {
+                vkc_reply_t el;
+                if (vkc_parse(&sub, &el) < 0) {
+                    rderr = 1;
+                    break;
+                }
+                if (i == 0)
+                    safe_strcpy(kind, el.str, sizeof(kind));
+                /* pmessage array is [kind, pattern, channel, payload]; the
+                 * channel (index 2) is "__keyspace@<db>__:<key>". */
+                else if (i == 2) {
+                    const char *sep = strstr(el.str, "__:");
+                    safe_strcpy(key, sep ? sep + 3 : el.str, sizeof(key));
+                }
+            }
+            if (rderr)
+                break;
+            if (strcmp(kind, "pmessage") == 0 && cfg->on_key)
+                cfg->on_key(key, cfg->ctx);
+        }
+        if (cfg->log)
+            cfg->log(4 /* LOG_WARNING */, "[%s] keyspace connection lost — reconnecting\n",
+                     cfg->tag ? cfg->tag : "keyspace");
+        close(sub.fd);
+        sleep((unsigned) backoff);
+        if (backoff < 30)
+            backoff *= 2;
+    }
+    return NULL;
 }
 
 /* ── Schema version contract (ADR-003) ───────────────────────────────────────
