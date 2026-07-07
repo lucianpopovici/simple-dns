@@ -1754,26 +1754,29 @@ int vkc_send(vkc_conn_t *c, const char *cmd, int len) {
     return 0;
 }
 
-int vkc_cmd(vkc_conn_t *c, vkc_reply_t *r, int argc, ...) {
+int vkc_cmd_v(vkc_conn_t *c, vkc_reply_t *r, int argc, va_list ap) {
     char buf[8192];
     int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
     for (int i = 0; i < argc; i++) {
         const char *a = va_arg(ap, const char *);
         int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
+        if (pos < 0 || pos >= (int) sizeof(buf))
             return -1;
-        }
         pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
     }
-    va_end(ap);
     if (pos < 0 || pos >= (int) sizeof(buf))
         return -1;
     if (vkc_send(c, buf, pos) < 0)
         return -1;
     return vkc_parse(c, r);
+}
+
+int vkc_cmd(vkc_conn_t *c, vkc_reply_t *r, int argc, ...) {
+    va_list ap;
+    va_start(ap, argc);
+    int rc = vkc_cmd_v(c, r, argc, ap);
+    va_end(ap);
+    return rc;
 }
 
 int vkc_send_cmd(vkc_conn_t *c, int argc, ...) {
@@ -1794,6 +1797,112 @@ int vkc_send_cmd(vkc_conn_t *c, int argc, ...) {
     if (pos < 0 || pos >= (int) sizeof(buf))
         return -1;
     return vkc_send(c, buf, pos);
+}
+
+void vkc_txn_begin(vkc_txn_t *t, vkc_conn_t *c) {
+    memset(t, 0, sizeof(*t));
+    t->c = c;
+    vkc_reply_t r;
+    int rc = vkc_cmd(c, &r, 1, "MULTI");
+    if (rc < 0) {
+        c->fd = -1;
+        t->err = 1;
+    } else if (r.type != 0) {
+        t->err = 1;
+    }
+}
+
+void vkc_txn_queue(vkc_txn_t *t, int argc, ...) {
+    if (t->err)
+        return;
+    va_list ap;
+    va_start(ap, argc);
+    vkc_reply_t r;
+    int rc = vkc_cmd_v(t->c, &r, argc, ap);
+    va_end(ap);
+    if (rc < 0) {
+        t->c->fd = -1;
+        t->err = 1;
+    } else if (r.type != 0) { /* expect +QUEUED */
+        t->err = 1;
+    } else {
+        t->n++;
+    }
+}
+
+int vkc_txn_commit(vkc_txn_t *t, vkc_reply_t *out) {
+    if (t->err) {
+        if (t->c->fd >= 0) {
+            vkc_reply_t d;
+            vkc_cmd(t->c, &d, 1, "DISCARD");
+        }
+        return -1;
+    }
+    vkc_reply_t r;
+    if (vkc_cmd(t->c, &r, 1, "EXEC") < 0) {
+        t->c->fd = -1;
+        return -1;
+    }
+    if (r.type != 5 || r.count != t->n)
+        return -1; /* nil (aborted by the server) or reply-count mismatch */
+    for (int i = 0; i < t->n; i++) {
+        if (vkc_parse(t->c, &out[i]) < 0) {
+            t->c->fd = -1;
+            return -1;
+        }
+    }
+    return t->n;
+}
+
+/* Bounded copy identical in effect to safe_strcpy, written out longhand here
+ * (rather than calling safe_strcpy) because a same-translation-unit call with
+ * a small fixed dst against vkc_reply_t's large str[VKC_BUF] triggers a GCC
+ * -Wstringop-truncation false positive once safe_strcpy is inlined; a
+ * strlen-bounded memcpy does not. */
+static void vkc_bounded_copy(char *dst, size_t dstsz, const char *src) {
+    size_t len = strlen(src);
+    if (len >= dstsz)
+        len = dstsz - 1;
+    memcpy(dst, src, len);
+    dst[len] = 0;
+}
+
+int vkc_scan_keys(vkc_conn_t *c, const char *pattern, char out[][256], int maxkeys) {
+    int n = 0;
+    char cursor[32] = "0";
+    for (;;) {
+        vkc_reply_t r;
+        if (vkc_cmd(c, &r, 6, "SCAN", cursor, "MATCH", pattern, "COUNT", "500") < 0 ||
+            r.type != 5 || r.count != 2) {
+            c->fd = -1;
+            return -1;
+        }
+        vkc_reply_t cr;
+        if (vkc_parse(c, &cr) < 0 || cr.type != 2) {
+            c->fd = -1;
+            return -1;
+        }
+        vkc_bounded_copy(cursor, sizeof(cursor), cr.str);
+        vkc_reply_t kr_arr;
+        if (vkc_parse(c, &kr_arr) < 0 || kr_arr.type != 5) {
+            c->fd = -1;
+            return -1;
+        }
+        for (int i = 0; i < kr_arr.count; i++) {
+            vkc_reply_t kr;
+            if (vkc_parse(c, &kr) < 0) {
+                c->fd = -1;
+                return -1;
+            }
+            if (kr.type == 2 && n < maxkeys) {
+                vkc_bounded_copy(out[n], 256, kr.str);
+                n++;
+            }
+        }
+        if (strcmp(cursor, "0") == 0)
+            break;
+    }
+    return n;
 }
 
 int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass) {

@@ -139,11 +139,19 @@ when their trigger arrives.
   `libdnswire`) as the structured encoding (unit-tested via `make check-wire`,
   fuzzed via `make fuzz-tlv`); **format registry** added to `CLAUDE.md`. New
   Phase-2 complex record types must land on TLV, not pipe.
-- **ADR-004 — Accepted (decision only): A (MULTI/EXEC writes) + C
-  (journal-anchored AXFR snapshot) + SCAN-not-KEYS.** Implementation is a
-  **separate follow-up PR** (security-sensitive zone-write/AXFR path; independent
-  of the encoding foundation). It does **not** gate Phase 2 record formats —
-  ADR-003 does — so Phase 2 is unblocked now.
+- **ADR-004 — Implemented (2026-07-07).** Write atomicity (A): every
+  zone-record write + its SOA serial bump across `dnsd`/`apid`/`eppd` now
+  commits as one Valkey MULTI/EXEC (new `resp_txn_t`/`vkc_txn_t` helpers) —
+  found and fixed a real bug along the way (apid's `/reverse/classless` was
+  double-bumping the serial on the delegate path). AXFR consistency landed as
+  a **native MULTI/EXEC snapshot read**, not journal-replay (option C) — the
+  IXFR journal doesn't cover every record type, so replay-only couldn't have
+  given full consistency; `axfr_send_runtime` now fetches each record type's
+  keys inside one transaction instead of reading live. KEYS → SCAN done
+  everywhere. See `CLAUDE-architecture.md` ADR-004's "Implementation" section
+  for the full writeup, and `make check-txn-atomicity` / `check-rollover-txn`
+  / `check-classless-atomic` / `check-axfr-concurrency` / `check-scan-
+  equivalence` for the regression coverage.
 
 ---
 

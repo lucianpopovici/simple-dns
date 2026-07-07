@@ -356,6 +356,7 @@ static void notify_send(void);
 static int vk_set(const char *, const char *, uint32_t);
 static int vk_get(const char *, char *, int);
 static int vk_list_keys_strict(const char *, char ***);
+static int vk_list_keys(const char *, char ***);
 static int emit_rr(uint8_t *, int, int, const char *, uint16_t, uint32_t, const uint8_t *, uint16_t,
                    int, int *);
 
@@ -1741,26 +1742,30 @@ static int resp_send(resp_conn_t *c, const char *cmd, int len) {
     }
     return 0;
 }
-static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
+/* va_list body shared by resp_cmd() and resp_txn_queue() (ADR-004) — encodes
+ * one RESP array command, sends it, and reads exactly one reply. */
+static int resp_cmd_v(resp_conn_t *c, resp_reply_t *r, int argc, va_list ap) {
     char buf[8192];
     int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
     for (int i = 0; i < argc; i++) {
         const char *a = va_arg(ap, const char *);
         int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
+        if (pos < 0 || pos >= (int) sizeof(buf))
             return -1;
-        }
         pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
     }
-    va_end(ap);
     if (pos < 0 || pos >= (int) sizeof(buf))
         return -1;
     if (resp_send(c, buf, pos) < 0)
         return -1;
     return resp_parse(c, r);
+}
+static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
+    va_list ap;
+    va_start(ap, argc);
+    int rc = resp_cmd_v(c, r, argc, ap);
+    va_end(ap);
+    return rc;
 }
 /* Send a command but do NOT read a reply — for (P)SUBSCRIBE, whose multi-bulk
  * replies and subsequent messages are consumed by the subscriber read loop
@@ -1783,6 +1788,78 @@ static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
     if (pos < 0 || pos >= (int) sizeof(buf))
         return -1;
     return resp_send(c, buf, pos);
+}
+
+/* ── MULTI/EXEC transactions (ADR-004: atomic zone writes + SOA serial bump)
+ * ──────────────────────────────────────────────────────────────────────────
+ * Caller must already hold g_vk_mutex and have called valkey_ensure(&vk) for
+ * the WHOLE begin..commit sequence — the same precondition every vk_set/
+ * vk_del/vk_incr call already has today, just widened from "per command" to
+ * "per transaction" so a reader can never observe some queued writes applied
+ * and others not (a torn zone). */
+typedef struct {
+    resp_conn_t *c;
+    int n;   /* commands successfully QUEUED so far */
+    int err; /* sticky: MULTI or a QUEUE send/parse failed */
+} resp_txn_t;
+
+static void resp_txn_begin(resp_txn_t *t, resp_conn_t *c) {
+    memset(t, 0, sizeof(*t));
+    t->c = c;
+    resp_reply_t r;
+    int rc = resp_cmd(c, &r, 1, "MULTI");
+    if (rc < 0) {
+        c->fd = -1;
+        t->err = 1;
+    } else if (r.type != 0) {
+        t->err = 1;
+    }
+}
+static void resp_txn_queue(resp_txn_t *t, int argc, ...) {
+    if (t->err)
+        return;
+    va_list ap;
+    va_start(ap, argc);
+    resp_reply_t r;
+    int rc = resp_cmd_v(t->c, &r, argc, ap);
+    va_end(ap);
+    if (rc < 0) {
+        t->c->fd = -1;
+        t->err = 1;
+    } else if (r.type != 0) { /* expect +QUEUED */
+        t->err = 1;
+    } else {
+        t->n++;
+    }
+}
+/* EXEC. On success returns the number of queued commands (== t->n) and fills
+ * out[0..t->n) with each queued command's real reply, in queue order — out
+ * must be sized >= t->n by the caller (every call site knows its own fixed
+ * command count). Returns -1 on any failure (MULTI/a queued command failed,
+ * EXEC itself failed, or a reply-count mismatch) — the caller must not trust
+ * out[] and must assume nothing in the transaction was applied. */
+static int resp_txn_commit(resp_txn_t *t, resp_reply_t *out) {
+    if (t->err) {
+        if (t->c->fd >= 0) {
+            resp_reply_t d;
+            resp_cmd(t->c, &d, 1, "DISCARD");
+        }
+        return -1;
+    }
+    resp_reply_t r;
+    if (resp_cmd(t->c, &r, 1, "EXEC") < 0) {
+        t->c->fd = -1;
+        return -1;
+    }
+    if (r.type != 5 || r.count != t->n)
+        return -1; /* nil (aborted by the server) or reply-count mismatch */
+    for (int i = 0; i < t->n; i++) {
+        if (resp_parse(t->c, &out[i]) < 0) {
+            t->c->fd = -1;
+            return -1;
+        }
+    }
+    return t->n;
 }
 
 static int valkey_connect_to(resp_conn_t *c, const char *host, int port, const char *pass) {
@@ -2109,39 +2186,24 @@ static long vk_ttl(const char *key) {
 }
 
 /* Load all zone_table:* keys from Valkey into the zone table.
- * Uses inline KEYS scan (no vk_keys_scan wrapper needed). */
+ * Uses vk_list_keys (SCAN cursor loop, ADR-004 — never blocks on a large
+ * keyspace the way a single KEYS call would). */
 static void zones_load_from_valkey(void) {
-    pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return;
-    }
-    resp_reply_t r;
-    resp_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
-    if (r.type != 5) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return;
-    }
-    int count = r.count;
-    /* Collect key names first (KEYS returns an array) */
-    char zkeys[MAX_ZONES][512];
-    int nk = 0;
-    for (int i = 0; i < count; i++) {
-        resp_reply_t kr;
-        if (resp_parse(&vk, &kr) < 0)
-            break;
-        if (kr.type == 2 && nk < MAX_ZONES) {
-            safe_strcpy(zkeys[nk], kr.str, sizeof(zkeys[nk]));
-            nk++;
-        }
-    }
-    pthread_mutex_unlock(&g_vk_mutex);
+    char **zkeys;
+    int total = vk_list_keys("zone_table:*", &zkeys);
+    int nk = total > MAX_ZONES ? MAX_ZONES : total;
     /* Now fetch each zone entry */
-    for (int i = 0; i < nk; i++) {
+    for (int i = 0; i < total; i++) {
+        if (i >= nk) {
+            free(zkeys[i]);
+            continue;
+        }
         const char *zname = zkeys[i] + 11; /* skip "zone_table:" */
         char val[2048] = "";
-        if (!vk_get(zkeys[i], val, sizeof(val)))
+        if (!vk_get(zkeys[i], val, sizeof(val))) {
+            free(zkeys[i]);
             continue;
+        }
         char buf[2048];
         safe_strcpy(buf, val, sizeof(buf));
         /* mname|rname|serial|refresh|retry|expire|minimum|axfr_allow|notify_targets
@@ -2162,7 +2224,9 @@ static void zones_load_from_valkey(void) {
                     f[3] ? (uint32_t) atoi(f[3]) : 3600, f[4] ? (uint32_t) atoi(f[4]) : 900,
                     f[5] ? (uint32_t) atoi(f[5]) : 604800, f[6] ? (uint32_t) atoi(f[6]) : 300,
                     f[9] ? (uint32_t) atoi(f[9]) : 0, f[7] ? f[7] : NULL, f[8] ? f[8] : NULL);
+        free(zkeys[i]);
     }
+    free(zkeys);
 }
 /* Atomically increment and return new integer value */
 static long vk_incr(const char *key) {
@@ -2537,6 +2601,149 @@ static uint32_t serial_bump(zone_entry_t *z) {
     return nv;
 }
 
+/* ADR-004: queue the SOA-serial INCR for `z` into an already-open
+ * transaction — the transactional sibling of serial_bump(), so a record
+ * write and its serial bump commit as one atomic unit (no reader can ever
+ * observe one without the other). The caller must call
+ * serial_bump_txn_apply() with resp_txn_commit()'s reply for this command
+ * (positionally) once the whole transaction has committed; queuing alone
+ * changes no in-memory state. IXFR journal bookkeeping (ixfr_journal_append)
+ * is deliberately NOT part of this transaction: a journal entry needs the
+ * INCR's real committed value, which isn't known until after commit, so it
+ * stays a separate step exactly as before — a journal write missed because
+ * of a crash between the two is indistinguishable from today's existing
+ * non-journaled-type gaps, already handled by ixfr_journal_fetch's
+ * fall-back-to-AXFR. */
+static void serial_bump_txn_queue(resp_txn_t *t, zone_entry_t *z) {
+    char ikey[320];
+    int primary = (!z || strcasecmp(z->name, g_zone_name) == 0);
+    if (primary)
+        safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
+    else
+        snprintf(ikey, sizeof(ikey), "config:zone:%s:serial", z->name);
+    resp_txn_queue(t, 2, "INCR", ikey);
+}
+/* Apply a committed serial INCR reply — mirrors serial_bump()'s success tail
+ * (in-memory serial update + ZONEMD recompute). Returns the new serial, or 0
+ * if the reply wasn't the expected integer (should not happen once commit()
+ * itself returned success) — fails closed by leaving state untouched. */
+static uint32_t serial_bump_txn_apply(zone_entry_t *z, resp_reply_t *r) {
+    if (r->type != 3)
+        return 0;
+    uint32_t ns = (uint32_t) r->integer;
+    int primary = (!z || strcasecmp(z->name, g_zone_name) == 0);
+    pthread_mutex_lock(&g_soa_mutex);
+    if (z)
+        z->soa_serial = ns;
+    if (primary)
+        g_soa_serial = ns;
+    pthread_mutex_unlock(&g_soa_mutex);
+    zonemd_update(z, ns);
+    return ns;
+}
+
+/* ADR-004: SET (or SET+EX) `key`=`val` and bump z's serial as one atomic
+ * transaction — a reader can never observe the new serial without the new
+ * value, or vice versa. Returns the new serial on success (always > 0 —
+ * Valkey serials start counting from 1), or 0 if the transaction failed
+ * (already logged at LOG_ERR under `log_ctx`; caller must treat the whole
+ * write as not applied). */
+static uint32_t txn_set_and_bump(zone_entry_t *z, const char *key, const char *val, uint32_t ttl,
+                                  const char *log_ctx) {
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[UPDATE] %s: Valkey unreachable — not applied\n", log_ctx);
+        return 0;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    if (ttl > 0) {
+        char ts[16];
+        snprintf(ts, sizeof(ts), "%u", ttl);
+        resp_txn_queue(&t, 5, "SET", key, val, "EX", ts);
+    } else {
+        resp_txn_queue(&t, 3, "SET", key, val);
+    }
+    serial_bump_txn_queue(&t, z);
+    resp_reply_t out[2];
+    int ok = resp_txn_commit(&t, out) == 2;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[UPDATE] %s: transaction failed — not applied\n", log_ctx);
+        return 0;
+    }
+    return serial_bump_txn_apply(z, &out[1]);
+}
+
+/* ADR-004: DEL 1..n keys and bump z's serial as one atomic transaction.
+ * Returns the new serial on success, 0 on failure (already logged). */
+static uint32_t txn_del_and_bump(zone_entry_t *z, const char *const *keys, int n,
+                                  const char *log_ctx) {
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[UPDATE] %s: Valkey unreachable — not applied\n", log_ctx);
+        return 0;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    for (int i = 0; i < n; i++)
+        resp_txn_queue(&t, 2, "DEL", keys[i]);
+    serial_bump_txn_queue(&t, z);
+    resp_reply_t out[9]; /* worst case 4 DELs (TXT/CNAME/MX/SRV via ANY) + 1 INCR */
+    int ok = resp_txn_commit(&t, out) == n + 1;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[UPDATE] %s: transaction failed — not applied\n", log_ctx);
+        return 0;
+    }
+    return serial_bump_txn_apply(z, &out[n]);
+}
+
+/* ADR-004: a compact reply drain for bulk (potentially large-N) transactions
+ * like AXFR's per-type GET batch — resp_reply_t's str[MAX_PEM] (64KB) makes
+ * an array of N of them impractical once N reaches the thousands, so this
+ * copies each reply into a small fixed 768-byte buffer (the same size AXFR's
+ * own per-record value buffer already uses) instead. Mirrors
+ * resp_txn_commit's success/failure contract. */
+typedef struct {
+    int type; /* resp_reply_t.type: 2=bulk-string, 3=integer, 4=nil, ... */
+    long integer;
+    char str[768];
+} axfr_reply_t;
+
+static int resp_txn_commit_compact(resp_txn_t *t, axfr_reply_t *out, int n) {
+    if (t->err) {
+        if (t->c->fd >= 0) {
+            resp_reply_t d;
+            resp_cmd(t->c, &d, 1, "DISCARD");
+        }
+        return 0;
+    }
+    resp_reply_t r;
+    if (resp_cmd(t->c, &r, 1, "EXEC") < 0) {
+        t->c->fd = -1;
+        return 0;
+    }
+    if (r.type != 5 || r.count != n)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        resp_reply_t item;
+        if (resp_parse(t->c, &item) < 0) {
+            t->c->fd = -1;
+            return 0;
+        }
+        out[i].type = item.type;
+        out[i].integer = item.integer;
+        if (item.type == 2)
+            safe_strcpy(out[i].str, item.str, sizeof(out[i].str));
+        else
+            out[i].str[0] = 0;
+    }
+    return 1;
+}
+
 /* ==========================================================================
  * TLS contexts from in-memory PEM
  *
@@ -2650,20 +2857,43 @@ static void cert_publish_tlsa(const char *cert_pem) {
         snprintf(owner, sizeof(owner), "_443._tcp.%s", domain);
         zone_entry_t *z = zone_for_qname(owner);
         const char *zn = z ? z->name : g_zone_name;
-        char tkey[700], tval[128];
+        char tval[128];
         snprintf(tval, sizeof(tval), "3600|3|1|1|%s", hex);
-        snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_443._tcp.%s", zn, domain);
-        vk_set(tkey, tval, 0);
-        snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_853._tcp.%s", zn, domain);
-        vk_set(tkey, tval, 0);
+        char tkey_443[700], tkey_dot[700], tkey_doq[700];
+        snprintf(tkey_443, sizeof(tkey_443), "zone:%s:TLSA:_443._tcp.%s", zn, domain);
+        snprintf(tkey_dot, sizeof(tkey_dot), "zone:%s:TLSA:_853._tcp.%s", zn, domain);
         /* DoQ (RFC 9250) is UDP-transported; _853._udp is its TLSA owner
          * name by analogy to DoT's _853._tcp — doqd terminates the same
          * cert:current material, so the SPKI hash is identical. */
-        snprintf(tkey, sizeof(tkey), "zone:%s:TLSA:_853._udp.%s", zn, domain);
-        vk_set(tkey, tval, 0);
-        dns_log(LOG_NOTICE, "[PKI] TLSA 3 1 1 published for %s (zone %s)\n", domain, zn);
-        serial_bump(z);
-        notify_send();
+        snprintf(tkey_doq, sizeof(tkey_doq), "zone:%s:TLSA:_853._udp.%s", zn, domain);
+        /* ADR-004: the 3 TLSA writes + the serial bump commit as one atomic
+         * unit — a reader can never see the serial advance without all three
+         * TLSA records already in place, or vice versa. */
+        pthread_mutex_lock(&g_vk_mutex);
+        if (valkey_ensure(&vk) >= 0) {
+            resp_txn_t t;
+            resp_txn_begin(&t, &vk);
+            resp_txn_queue(&t, 3, "SET", tkey_443, tval);
+            resp_txn_queue(&t, 3, "SET", tkey_dot, tval);
+            resp_txn_queue(&t, 3, "SET", tkey_doq, tval);
+            serial_bump_txn_queue(&t, z);
+            resp_reply_t out[4];
+            if (resp_txn_commit(&t, out) == 4) {
+                pthread_mutex_unlock(&g_vk_mutex);
+                serial_bump_txn_apply(z, &out[3]);
+                dns_log(LOG_NOTICE, "[PKI] TLSA 3 1 1 published for %s (zone %s)\n", domain, zn);
+                notify_send();
+            } else {
+                pthread_mutex_unlock(&g_vk_mutex);
+                dns_log(LOG_ERR, "[PKI] TLSA publish transaction failed for %s (zone %s) — "
+                                 "Valkey unreachable? Not published.\n",
+                        domain, zn);
+            }
+        } else {
+            pthread_mutex_unlock(&g_vk_mutex);
+            dns_log(LOG_ERR, "[PKI] TLSA publish for %s (zone %s): Valkey unreachable\n", domain,
+                    zn);
+        }
     }
     X509_free(cert);
 }
@@ -3523,25 +3753,46 @@ static void zone_str_cfg(const char *zone, const char *suffix, char *out, size_t
 
 /* Begin a rollover: generate + store the incoming ZSK set, enter `publish`. */
 static void rollover_start(zone_entry_t *z) {
-    char pem[MAX_PEM], k[360];
-    if (dnssec_generate_pem(DNS_ALG_ECDSAP256SHA256, pem, sizeof(pem)) != 0) {
+    char pem1[MAX_PEM], pem2[MAX_PEM], k1[360], k2[360], k3[360];
+    if (dnssec_generate_pem(DNS_ALG_ECDSAP256SHA256, pem1, sizeof(pem1)) != 0) {
         dns_log(LOG_ERR, "[Rollover] %s: P-256 keygen failed\n", z->name);
         return;
     }
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_next", z->name);
-    vk_set(k, pem, 0);
-    if (dnssec_generate_pem(DNS_ALG_ED25519, pem, sizeof(pem)) != 0) {
+    if (dnssec_generate_pem(DNS_ALG_ED25519, pem2, sizeof(pem2)) != 0) {
         dns_log(LOG_ERR, "[Rollover] %s: Ed25519 keygen failed\n", z->name);
         return;
     }
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_ed25519_next", z->name);
-    vk_set(k, pem, 0);
+    snprintf(k1, sizeof(k1), "dnssec:%.255s:zsk_next", z->name);
+    snprintf(k2, sizeof(k2), "dnssec:%.255s:zsk_ed25519_next", z->name);
+    snprintf(k3, sizeof(k3), "dnssec:%.255s:zsk_rollover", z->name);
     char st[64];
     snprintf(st, sizeof(st), "publish|%lld", (long long) time(NULL));
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
-    vk_set(k, st, 0);
+    /* ADR-004: both next-keys, the phase marker, and the serial bump commit
+     * as one atomic unit — no reader ever sees a phase change without the
+     * keys it refers to (or vice versa). The read-back below (zone_rollover_
+     * load) moves to after commit, since a read inside a MULTI cannot see
+     * its own not-yet-executed queued writes. */
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — not started\n", z->name);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    resp_txn_queue(&t, 3, "SET", k1, pem1);
+    resp_txn_queue(&t, 3, "SET", k2, pem2);
+    resp_txn_queue(&t, 3, "SET", k3, st);
+    serial_bump_txn_queue(&t, z);
+    resp_reply_t out[4];
+    int ok = resp_txn_commit(&t, out) == 4;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[Rollover] %s: start transaction failed — not started\n", z->name);
+        return;
+    }
     zone_rollover_load(z); /* bring the next keys + phase into memory */
-    serial_bump(z);        /* DNSKEY RRset changed */
+    serial_bump_txn_apply(z, &out[3]);
     notify_send();
     dns_log(LOG_NOTICE, "[Rollover] %s: started — publish (new ZSK tags %u/%u)\n", z->name,
             z->zsk_next_tag, z->zsk_ed_next_tag);
@@ -3552,9 +3803,25 @@ static void rollover_to_commit(zone_entry_t *z) {
     char k[360], st[64];
     snprintf(st, sizeof(st), "commit|%lld", (long long) time(NULL));
     snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
-    vk_set(k, st, 0);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — commit phase not advanced\n", z->name);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    resp_txn_queue(&t, 3, "SET", k, st);
+    serial_bump_txn_queue(&t, z);
+    resp_reply_t out[2];
+    int ok = resp_txn_commit(&t, out) == 2;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[Rollover] %s: commit-phase transaction failed\n", z->name);
+        return;
+    }
     zone_rollover_load(z);
-    serial_bump(z);
+    serial_bump_txn_apply(z, &out[1]);
     notify_send();
     dns_log(LOG_NOTICE, "[Rollover] %s: commit — now signing with ZSK tags %u/%u\n", z->name,
             z->zsk_next_tag, z->zsk_ed_next_tag);
@@ -3562,29 +3829,57 @@ static void rollover_to_commit(zone_entry_t *z) {
 
 /* commit -> done: promote `next` to current, drop the retired key. */
 static void rollover_finish(zone_entry_t *z) {
-    char k[360], pem[MAX_PEM];
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_next", z->name);
-    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
-        char ck[360];
-        snprintf(ck, sizeof(ck), "dnssec:%.255s:zsk", z->name);
-        vk_set(ck, pem, 0);
-    }
-    vk_del(k);
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_ed25519_next", z->name);
-    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
-        char ck[360];
-        snprintf(ck, sizeof(ck), "dnssec:%.255s:zsk_ed25519", z->name);
-        vk_set(ck, pem, 0);
-    }
-    vk_del(k);
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_rollover", z->name);
-    vk_del(k);
-    char now_s[32];
+    char k1[360], k2[360], k3[360], pem1[MAX_PEM] = "", pem2[MAX_PEM] = "";
+    snprintf(k1, sizeof(k1), "dnssec:%.255s:zsk_next", z->name);
+    snprintf(k2, sizeof(k2), "dnssec:%.255s:zsk_ed25519_next", z->name);
+    /* Pre-checks: read the two incoming keys (outside the transaction — a
+     * read cannot see its own not-yet-committed writes anyway, and these
+     * decide WHAT to write, same as every other pre-check in this pass). */
+    int have1 = vk_get(k1, pem1, sizeof(pem1)) && pem1[0];
+    int have2 = vk_get(k2, pem2, sizeof(pem2)) && pem2[0];
+    char ck1[360], ck2[360];
+    snprintf(ck1, sizeof(ck1), "dnssec:%.255s:zsk", z->name);
+    snprintf(ck2, sizeof(ck2), "dnssec:%.255s:zsk_ed25519", z->name);
+    snprintf(k3, sizeof(k3), "dnssec:%.255s:zsk_rollover", z->name);
+    char now_s[32], k4[360];
     snprintf(now_s, sizeof(now_s), "%lld", (long long) time(NULL));
-    snprintf(k, sizeof(k), "dnssec:%.255s:zsk_created", z->name);
-    vk_set(k, now_s, 0);
+    snprintf(k4, sizeof(k4), "dnssec:%.255s:zsk_created", z->name);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — not finished\n", z->name);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    int n = 0;
+    if (have1) {
+        resp_txn_queue(&t, 3, "SET", ck1, pem1);
+        n++;
+    }
+    resp_txn_queue(&t, 2, "DEL", k1);
+    n++;
+    if (have2) {
+        resp_txn_queue(&t, 3, "SET", ck2, pem2);
+        n++;
+    }
+    resp_txn_queue(&t, 2, "DEL", k2);
+    n++;
+    resp_txn_queue(&t, 2, "DEL", k3);
+    n++;
+    resp_txn_queue(&t, 3, "SET", k4, now_s);
+    n++;
+    serial_bump_txn_queue(&t, z);
+    n++;
+    resp_reply_t out[8];
+    int ok = resp_txn_commit(&t, out) == n;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[Rollover] %s: finish transaction failed\n", z->name);
+        return;
+    }
     zone_dnssec_reload(z); /* current = promoted key; next/phase cleared */
-    serial_bump(z);
+    serial_bump_txn_apply(z, &out[n - 1]);
     notify_send();
     dns_log(LOG_NOTICE, "[Rollover] %s: complete — active ZSK tags %u/%u\n", z->name, z->zsk_tag,
             z->zsk_ed_tag);
@@ -3608,25 +3903,41 @@ static void rollover_finish(zone_entry_t *z) {
 
 /* Begin a KSK rollover: generate + store the incoming KSK set, enter `double`. */
 static void ksk_rollover_start(zone_entry_t *z) {
-    char pem[MAX_PEM], k[360];
-    if (dnssec_generate_pem(DNS_ALG_ECDSAP256SHA256, pem, sizeof(pem)) != 0) {
+    char pem1[MAX_PEM], pem2[MAX_PEM], k1[360], k2[360], k3[360];
+    if (dnssec_generate_pem(DNS_ALG_ECDSAP256SHA256, pem1, sizeof(pem1)) != 0) {
         dns_log(LOG_ERR, "[Rollover] %s: KSK P-256 keygen failed\n", z->name);
         return;
     }
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_next", z->name);
-    vk_set(k, pem, 0);
-    if (dnssec_generate_pem(DNS_ALG_ED25519, pem, sizeof(pem)) != 0) {
+    if (dnssec_generate_pem(DNS_ALG_ED25519, pem2, sizeof(pem2)) != 0) {
         dns_log(LOG_ERR, "[Rollover] %s: KSK Ed25519 keygen failed\n", z->name);
         return;
     }
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_ed25519_next", z->name);
-    vk_set(k, pem, 0);
+    snprintf(k1, sizeof(k1), "dnssec:%.255s:ksk_next", z->name);
+    snprintf(k2, sizeof(k2), "dnssec:%.255s:ksk_ed25519_next", z->name);
+    snprintf(k3, sizeof(k3), "dnssec:%.255s:ksk_rollover", z->name);
     char st[64];
     snprintf(st, sizeof(st), "double|%lld", (long long) time(NULL));
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
-    vk_set(k, st, 0);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — KSK not started\n", z->name);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    resp_txn_queue(&t, 3, "SET", k1, pem1);
+    resp_txn_queue(&t, 3, "SET", k2, pem2);
+    resp_txn_queue(&t, 3, "SET", k3, st);
+    serial_bump_txn_queue(&t, z);
+    resp_reply_t out[4];
+    int ok = resp_txn_commit(&t, out) == 4;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[Rollover] %s: KSK start transaction failed\n", z->name);
+        return;
+    }
     zone_rollover_load(z); /* bring the next KSK set + phase into memory */
-    serial_bump(z);        /* DNSKEY + CDS/CDNSKEY RRsets changed */
+    serial_bump_txn_apply(z, &out[3]);
     notify_send();
     /* RFC 9859: tell a configured parent (registry/registrar) directly rather
      * than waiting for its own DS-polling interval — the CDS/CDNSKEY RRset
@@ -3644,9 +3955,25 @@ static void ksk_rollover_to_retire(zone_entry_t *z) {
     char k[360], st[64];
     snprintf(st, sizeof(st), "retire|%lld", (long long) time(NULL));
     snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
-    vk_set(k, st, 0);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — KSK retire not advanced\n", z->name);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    resp_txn_queue(&t, 3, "SET", k, st);
+    serial_bump_txn_queue(&t, z);
+    resp_reply_t out[2];
+    int ok = resp_txn_commit(&t, out) == 2;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[Rollover] %s: KSK retire transaction failed\n", z->name);
+        return;
+    }
     zone_rollover_load(z);
-    serial_bump(z);
+    serial_bump_txn_apply(z, &out[1]);
     notify_send();
     /* RFC 9859: CDS/CDNSKEY just shrank to {new} — tell the parent to re-pull. */
     notify_parent(z, DNS_TYPE_CDS);
@@ -3657,29 +3984,54 @@ static void ksk_rollover_to_retire(zone_entry_t *z) {
 
 /* retire -> done: promote the new KSK to current, drop the old one. */
 static void ksk_rollover_finish(zone_entry_t *z) {
-    char k[360], pem[MAX_PEM];
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_next", z->name);
-    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
-        char ck[360];
-        snprintf(ck, sizeof(ck), "dnssec:%.255s:ksk", z->name);
-        vk_set(ck, pem, 0);
-    }
-    vk_del(k);
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_ed25519_next", z->name);
-    if (vk_get(k, pem, sizeof(pem)) && pem[0]) {
-        char ck[360];
-        snprintf(ck, sizeof(ck), "dnssec:%.255s:ksk_ed25519", z->name);
-        vk_set(ck, pem, 0);
-    }
-    vk_del(k);
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_rollover", z->name);
-    vk_del(k);
-    char now_s[32];
+    char k1[360], k2[360], k3[360], pem1[MAX_PEM] = "", pem2[MAX_PEM] = "";
+    snprintf(k1, sizeof(k1), "dnssec:%.255s:ksk_next", z->name);
+    snprintf(k2, sizeof(k2), "dnssec:%.255s:ksk_ed25519_next", z->name);
+    int have1 = vk_get(k1, pem1, sizeof(pem1)) && pem1[0];
+    int have2 = vk_get(k2, pem2, sizeof(pem2)) && pem2[0];
+    char ck1[360], ck2[360];
+    snprintf(ck1, sizeof(ck1), "dnssec:%.255s:ksk", z->name);
+    snprintf(ck2, sizeof(ck2), "dnssec:%.255s:ksk_ed25519", z->name);
+    snprintf(k3, sizeof(k3), "dnssec:%.255s:ksk_rollover", z->name);
+    char now_s[32], k4[360];
     snprintf(now_s, sizeof(now_s), "%lld", (long long) time(NULL));
-    snprintf(k, sizeof(k), "dnssec:%.255s:ksk_created", z->name);
-    vk_set(k, now_s, 0);
+    snprintf(k4, sizeof(k4), "dnssec:%.255s:ksk_created", z->name);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — KSK not finished\n", z->name);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    int n = 0;
+    if (have1) {
+        resp_txn_queue(&t, 3, "SET", ck1, pem1);
+        n++;
+    }
+    resp_txn_queue(&t, 2, "DEL", k1);
+    n++;
+    if (have2) {
+        resp_txn_queue(&t, 3, "SET", ck2, pem2);
+        n++;
+    }
+    resp_txn_queue(&t, 2, "DEL", k2);
+    n++;
+    resp_txn_queue(&t, 2, "DEL", k3);
+    n++;
+    resp_txn_queue(&t, 3, "SET", k4, now_s);
+    n++;
+    serial_bump_txn_queue(&t, z);
+    n++;
+    resp_reply_t out[8];
+    int ok = resp_txn_commit(&t, out) == n;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[Rollover] %s: KSK finish transaction failed\n", z->name);
+        return;
+    }
     zone_dnssec_reload(z); /* current = promoted KSK; next/phase cleared */
-    serial_bump(z);
+    serial_bump_txn_apply(z, &out[n - 1]);
     notify_send();
     dns_log(LOG_NOTICE, "[Rollover] %s: KSK complete — active KSK tags %u/%u\n", z->name,
             z->ksk_tag, z->ksk_ed_tag);
@@ -3873,50 +4225,33 @@ static int catalog_is_catalog_zone(const char *cat) {
 static int catalog_members(const char *cat, char out[][256], int max) {
     char pat[768];
     snprintf(pat, sizeof(pat), "zone:%.255s:PTR:*.zones.%.255s", cat, cat);
-    pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "KEYS", pat) < 0 || r.type != 5) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
-    char keys[MAX_ZONES * 4][768];
-    int maxk = (int) (sizeof(keys) / sizeof(keys[0]));
-    int nk = 0;
-    for (int i = 0; i < r.count; i++) {
-        resp_reply_t kr;
-        if (resp_parse(&vk, &kr) < 0)
-            break;
-        if (kr.type == 2 && nk < maxk)
-            safe_strcpy(keys[nk++], kr.str, sizeof(keys[0]));
-    }
-    pthread_mutex_unlock(&g_vk_mutex);
+    char **keys;
+    int nk = vk_list_keys(pat, &keys); /* SCAN cursor loop, ADR-004 */
     int n = 0;
-    for (int i = 0; i < nk && n < max; i++) {
+    for (int i = 0; i < nk; i++) {
         char v[512] = "";
-        if (!vk_get(keys[i], v, sizeof(v)) || !v[0])
-            continue;
-        const char *p = strchr(v, '|'); /* strip optional ttl| prefix */
-        p = p ? p + 1 : v;
-        char m[256];
-        safe_strcpy(m, p, sizeof(m));
-        size_t ml = strlen(m);
-        if (ml && m[ml - 1] == '.')
-            m[ml - 1] = 0; /* drop trailing dot */
-        if (!m[0])
-            continue;
-        int dup = 0; /* a member listed twice is provisioned once */
-        for (int j = 0; j < n; j++)
-            if (strcasecmp(out[j], m) == 0) {
-                dup = 1;
-                break;
+        if (n < max && vk_get(keys[i], v, sizeof(v)) && v[0]) {
+            const char *p = strchr(v, '|'); /* strip optional ttl| prefix */
+            p = p ? p + 1 : v;
+            char m[256];
+            safe_strcpy(m, p, sizeof(m));
+            size_t ml = strlen(m);
+            if (ml && m[ml - 1] == '.')
+                m[ml - 1] = 0; /* drop trailing dot */
+            if (m[0]) {
+                int dup = 0; /* a member listed twice is provisioned once */
+                for (int j = 0; j < n; j++)
+                    if (strcasecmp(out[j], m) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                if (!dup)
+                    safe_strcpy(out[n++], m, sizeof(out[0]));
             }
-        if (!dup)
-            safe_strcpy(out[n++], m, sizeof(out[0]));
+        }
+        free(keys[i]);
     }
+    free(keys);
     return n;
 }
 
@@ -6923,15 +7258,49 @@ static void auto_ptr_apply(const char *fqdn, const char *ipstr, uint32_t ttl, in
         char had[256] = "";
         if (!(vk_get(key, had, sizeof(had)) && had[0]))
             return; /* nothing to retract → no replication event */
-        vk_del(key);
-    } else {
-        vk_set(key, fqdn, ttl ? ttl : DEFAULT_TTL);
     }
-    if (!bump)
+    if (!bump) {
+        /* No serial bump requested (a lease-refresh renewal, no data change)
+         * — the record write alone doesn't need transactional atomicity with
+         * anything else, so keep the original single-command form. */
+        if (del)
+            vk_del(key);
+        else
+            vk_set(key, fqdn, ttl ? ttl : DEFAULT_TTL);
         return;
+    }
+    /* ADR-004: the PTR write and its serial bump commit as one atomic unit. */
     uint32_t prev = rz->soa_serial;
-    uint32_t next = serial_bump(rz);
-    ixfr_journal_append(rz->name, prev, next, del ? 'D' : 'A', rev, fqdn);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[auto-PTR] %s: Valkey unreachable — not applied\n", rev);
+        return;
+    }
+    resp_txn_t t;
+    resp_txn_begin(&t, &vk);
+    if (del) {
+        resp_txn_queue(&t, 2, "DEL", key);
+    } else if (ttl) {
+        char ts[16];
+        snprintf(ts, sizeof(ts), "%u", ttl);
+        resp_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
+    } else {
+        char ts[16];
+        snprintf(ts, sizeof(ts), "%u", DEFAULT_TTL);
+        resp_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
+    }
+    serial_bump_txn_queue(&t, rz);
+    resp_reply_t out[2];
+    int ok = resp_txn_commit(&t, out) == 2;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[auto-PTR] %s: transaction failed — not applied\n", rev);
+        return;
+    }
+    uint32_t next = serial_bump_txn_apply(rz, &out[1]);
+    if (next)
+        ixfr_journal_append(rz->name, prev, next, del ? 'D' : 'A', rev, fqdn);
 }
 
 /* ==========================================================================
@@ -7365,15 +7734,6 @@ static void srp_owner_write(char *out, size_t outsz, int flags, int proto, int a
     snprintf(out, outsz, "%d|%d|%d|%s", flags, proto, alg, hex);
 }
 
-/* Bump the zone serial and journal one servable-record change. OWNER records
- * are deliberately never journaled here — they're primary-only bookkeeping
- * (a secondary never processes UPDATE, so it never needs to know who owns a
- * name), not zone content a secondary must replicate. */
-static void srp_journal(zone_entry_t *z, char op, const char *name, const char *value) {
-    uint32_t prev = z->soa_serial;
-    uint32_t next = serial_bump(z);
-    ixfr_journal_append(z->name, prev, next, op, name, value);
-}
 
 /* The SRP registration handler: validates the whole message read-only first
  * (RFC 2136 §3.8 — no partial application), then applies every write. Called
@@ -7530,13 +7890,19 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
         char k[768];
         skey(k, sizeof(k), "A", host->name);
         if (vk_get(k, ownerval, sizeof(ownerval))) {
-            vk_del(k);
-            srp_journal(t_zone, 'D', host->name, ownerval);
+            uint32_t prev = t_zone->soa_serial;
+            const char *dk = k;
+            uint32_t next = txn_del_and_bump(t_zone, &dk, 1, host->name);
+            if (next)
+                ixfr_journal_append(t_zone->name, prev, next, 'D', host->name, ownerval);
         }
         skey(k, sizeof(k), "AAAA", host->name);
         if (vk_get(k, ownerval, sizeof(ownerval))) {
-            vk_del(k);
-            srp_journal(t_zone, 'D', host->name, ownerval);
+            uint32_t prev = t_zone->soa_serial;
+            const char *dk = k;
+            uint32_t next = txn_del_and_bump(t_zone, &dk, 1, host->name);
+            if (next)
+                ixfr_journal_append(t_zone->name, prev, next, 'D', host->name, ownerval);
         }
         char a_ips[512], aaaa_ips[512];
         int a_len = 0, aaaa_len = 0;
@@ -7566,13 +7932,17 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
         }
         if (a_len > 0) {
             skey(k, sizeof(k), "A", host->name);
-            vk_set(k, a_ips, lease);
-            srp_journal(t_zone, 'A', host->name, a_ips);
+            uint32_t prev = t_zone->soa_serial;
+            uint32_t next = txn_set_and_bump(t_zone, k, a_ips, lease, host->name);
+            if (next)
+                ixfr_journal_append(t_zone->name, prev, next, 'A', host->name, a_ips);
         }
         if (aaaa_len > 0) {
             skey(k, sizeof(k), "AAAA", host->name);
-            vk_set(k, aaaa_ips, lease);
-            srp_journal(t_zone, 'A', host->name, aaaa_ips);
+            uint32_t prev = t_zone->soa_serial;
+            uint32_t next = txn_set_and_bump(t_zone, k, aaaa_ips, lease, host->name);
+            if (next)
+                ixfr_journal_append(t_zone->name, prev, next, 'A', host->name, aaaa_ips);
         }
         skey(k, sizeof(k), "OWNER", host->name);
         vk_set(k, ownerbuf, key_lease);
@@ -7587,8 +7957,11 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
         char k[768];
         skey(k, sizeof(k), "SRV", svc->name);
         if (vk_get(k, ownerval, sizeof(ownerval))) {
-            vk_del(k);
-            srp_journal(t_zone, 'D', svc->name, ownerval);
+            uint32_t prev = t_zone->soa_serial;
+            const char *dk = k;
+            uint32_t next = txn_del_and_bump(t_zone, &dk, 1, svc->name);
+            if (next)
+                ixfr_journal_append(t_zone->name, prev, next, 'D', svc->name, ownerval);
         }
         skey(k, sizeof(k), "TXT", svc->name);
         vk_del(k); /* TXT is a companion of SRV; not independently journaled */
@@ -7608,8 +7981,12 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
             char srvval[600];
             snprintf(srvval, sizeof(srvval), "%u|%u|%u|%u|%s", lease, prio, weight, port, target);
             skey(k, sizeof(k), "SRV", svc->name);
-            vk_set(k, srvval, lease);
-            srp_journal(t_zone, 'A', svc->name, srvval);
+            {
+                uint32_t prev = t_zone->soa_serial;
+                uint32_t next = txn_set_and_bump(t_zone, k, srvval, lease, svc->name);
+                if (next)
+                    ixfr_journal_append(t_zone->name, prev, next, 'A', svc->name, srvval);
+            }
 
             const srp_rr_t *txt = srp_bucket_find(svc, DNS_TYPE_TXT, DNS_CLASS_IN);
             if (txt && txt->rdlen <= 400) {
@@ -7642,11 +8019,17 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
             char k[900];
             snprintf(k, sizeof(k), "srp:%s:PTR:%s:%s", t_zone->name, disc->name, target);
             if (rr->class == DNS_CLASS_IN) {
-                vk_set(k, "1", lease); /* value unused — target lives in the key */
-                srp_journal(t_zone, 'A', disc->name, target);
+                /* value unused — target lives in the key */
+                uint32_t prev = t_zone->soa_serial;
+                uint32_t next = txn_set_and_bump(t_zone, k, "1", lease, disc->name);
+                if (next)
+                    ixfr_journal_append(t_zone->name, prev, next, 'A', disc->name, target);
             } else if (rr->class == DNS_CLASS_NONE) {
-                vk_del(k);
-                srp_journal(t_zone, 'D', disc->name, target);
+                uint32_t prev = t_zone->soa_serial;
+                const char *dk = k;
+                uint32_t next = txn_del_and_bump(t_zone, &dk, 1, disc->name);
+                if (next)
+                    ixfr_journal_append(t_zone->name, prev, next, 'D', disc->name, target);
             }
         }
     }
@@ -7802,19 +8185,23 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                  * fleet refreshing every TTL/2 doesn't churn the serial/IXFR. */
                 char old[64] = "";
                 int changed = !(vk_get(k, old, sizeof(old)) && strcmp(old, ip) == 0);
-                vk_set(k, ip, uttl ? uttl : DEFAULT_TTL);
                 if (changed) {
+                    /* ADR-004: the record write and its serial bump commit as
+                     * one atomic transaction — no reader can ever see one
+                     * without the other. */
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
-                    uint32_t next = serial_bump(t_zone);
-                    ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A', un,
-                                        ip);
+                    uint32_t next = txn_set_and_bump(t_zone, k, ip, uttl ? uttl : DEFAULT_TTL, un);
+                    if (next)
+                        ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A',
+                                            un, ip);
                     /* auto-PTR: retract the previous address's PTR (if the IP moved),
                      * then publish the new one. Both bump the reverse zone. */
                     if (old[0] && strcmp(old, ip) != 0)
                         auto_ptr_apply(un, old, 0, 1, 1);
                     auto_ptr_apply(un, ip, uttl, 0, 1);
                 } else {
-                    auto_ptr_apply(un, ip, uttl, 0, 0); /* renew PTR lease, no churn */
+                    vk_set(k, ip, uttl ? uttl : DEFAULT_TTL); /* TTL renewal only, no bump needed */
+                    auto_ptr_apply(un, ip, uttl, 0, 0);       /* renew PTR lease, no churn */
                 }
                 dns_log(LOG_NOTICE, "[DDNS] A %s->%s%s\n", un, ip, changed ? "" : " (refresh)");
                 STAT_INC(g_stat_ddns);
@@ -7824,16 +8211,17 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 dkey(k, sizeof(k), "AAAA", un);
                 char old[INET6_ADDRSTRLEN] = "";
                 int changed = !(vk_get(k, old, sizeof(old)) && strcmp(old, ip6) == 0);
-                vk_set(k, ip6, uttl ? uttl : DEFAULT_TTL);
                 if (changed) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
-                    uint32_t next = serial_bump(t_zone);
-                    ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A', un,
-                                        ip6);
+                    uint32_t next = txn_set_and_bump(t_zone, k, ip6, uttl ? uttl : DEFAULT_TTL, un);
+                    if (next)
+                        ixfr_journal_append(t_zone ? t_zone->name : g_zone_name, prev, next, 'A',
+                                            un, ip6);
                     if (old[0] && strcmp(old, ip6) != 0)
                         auto_ptr_apply(un, old, 0, 1, 1);
                     auto_ptr_apply(un, ip6, uttl, 0, 1);
                 } else {
+                    vk_set(k, ip6, uttl ? uttl : DEFAULT_TTL);
                     auto_ptr_apply(un, ip6, uttl, 0, 0); /* renew PTR lease, no churn */
                 }
                 dns_log(LOG_NOTICE, "[DDNS] AAAA %s->%s%s\n", un, ip6, changed ? "" : " (refresh)");
@@ -7848,8 +8236,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 char val[320];
                 snprintf(val, sizeof(val), "%u|%s", uttl ? uttl : DEFAULT_TTL, txt);
                 zkey(k, sizeof(k), "TXT", un);
-                vk_set(k, val, 0);
-                serial_bump(t_zone);
+                txn_set_and_bump(t_zone, k, val, 0, un);
                 dns_log(LOG_NOTICE, "[UPDATE] TXT %s = %.60s%s\n", un, txt, sl > 60 ? "..." : "");
             } else if (ut == DNS_TYPE_CNAME && rdlen >= 1) {
                 char target[256];
@@ -7859,8 +8246,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 char val[320];
                 snprintf(val, sizeof(val), "%u|%s", uttl ? uttl : DEFAULT_TTL, target);
                 zkey(k, sizeof(k), "CNAME", un);
-                vk_set(k, val, 0);
-                serial_bump(t_zone);
+                txn_set_and_bump(t_zone, k, val, 0, un);
                 dns_log(LOG_NOTICE, "[UPDATE] CNAME %s -> %s\n", un, target);
             } else if (ut == DNS_TYPE_MX && rdlen >= 3) {
                 uint16_t pref = (rd[0] << 8) | rd[1];
@@ -7872,8 +8258,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 char val[384];
                 snprintf(val, sizeof(val), "%u|%u|%s", uttl ? uttl : DEFAULT_TTL, pref, target);
                 zkey(k, sizeof(k), "MX", un);
-                vk_set(k, val, 0);
-                serial_bump(t_zone);
+                txn_set_and_bump(t_zone, k, val, 0, un);
                 dns_log(LOG_NOTICE, "[UPDATE] MX %s -> %u %s\n", un, pref, target);
             } else if (ut == DNS_TYPE_SRV && rdlen >= 7) {
                 uint16_t prio = (rd[0] << 8) | rd[1];
@@ -7888,64 +8273,73 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
                 snprintf(val, sizeof(val), "%u|%u|%u|%u|%s", uttl ? uttl : DEFAULT_TTL, prio,
                          weight, port, target);
                 zkey(k, sizeof(k), "SRV", un);
-                vk_set(k, val, 0);
-                serial_bump(t_zone);
+                txn_set_and_bump(t_zone, k, val, 0, un);
                 dns_log(LOG_NOTICE, "[UPDATE] SRV %s -> %u %u %u %s\n", un, prio, weight, port,
                         target);
             }
         } else if ((uc == DNS_CLASS_ANY || uc == DNS_CLASS_NONE) && rdlen == 0) {
             const char *zn = t_zone ? t_zone->name : g_zone_name;
-            int other = 0; /* a non-journaled type was deleted → single serial bump below */
             /* A/AAAA deletes are journaled (op 'D') so a secondary can apply them
-             * incrementally; capture the old value before removing it. */
+             * incrementally; capture the old value before removing it. Each is
+             * its own atomic DEL+bump transaction (ADR-004). */
             if (ut == DNS_TYPE_A || ut == DNS_TYPE_ANY) {
                 dkey(k, sizeof(k), "A", un);
                 char old[64] = "";
                 int had = vk_get(k, old, sizeof(old)) && old[0];
-                vk_del(k);
                 if (had) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
-                    uint32_t next = serial_bump(t_zone);
-                    ixfr_journal_append(zn, prev, next, 'D', un, old);
-                    auto_ptr_apply(un, old, 0, 1, 1); /* retract the reverse PTR too */
+                    const char *dk = k;
+                    uint32_t next = txn_del_and_bump(t_zone, &dk, 1, un);
+                    if (next) {
+                        ixfr_journal_append(zn, prev, next, 'D', un, old);
+                        auto_ptr_apply(un, old, 0, 1, 1); /* retract the reverse PTR too */
+                    }
+                } else {
+                    vk_del(k); /* nothing there — plain delete, no bump needed */
                 }
             }
             if (ut == DNS_TYPE_AAAA || ut == DNS_TYPE_ANY) {
                 dkey(k, sizeof(k), "AAAA", un);
                 char old[INET6_ADDRSTRLEN] = "";
                 int had = vk_get(k, old, sizeof(old)) && old[0];
-                vk_del(k);
                 if (had) {
                     uint32_t prev = t_zone ? t_zone->soa_serial : g_soa_serial;
-                    uint32_t next = serial_bump(t_zone);
-                    ixfr_journal_append(zn, prev, next, 'D', un, old);
-                    auto_ptr_apply(un, old, 0, 1, 1);
+                    const char *dk = k;
+                    uint32_t next = txn_del_and_bump(t_zone, &dk, 1, un);
+                    if (next) {
+                        ixfr_journal_append(zn, prev, next, 'D', un, old);
+                        auto_ptr_apply(un, old, 0, 1, 1);
+                    }
+                } else {
+                    vk_del(k);
                 }
             }
+            /* Non-journaled types: collect whichever of TXT/CNAME/MX/SRV this
+             * message deletes and DEL them all + bump the serial exactly once,
+             * as one atomic transaction — this intentionally still leaves a
+             * gap in the IXFR chain (these types are never journaled) so those
+             * serials force an AXFR fallback, same as before ADR-004. */
+            char kt[768], kc[768], km[768], ks[768];
+            const char *other_keys[4];
+            int nother = 0;
             if (ut == DNS_TYPE_TXT || ut == DNS_TYPE_ANY) {
-                zkey(k, sizeof(k), "TXT", un);
-                vk_del(k);
-                other = 1;
+                zkey(kt, sizeof(kt), "TXT", un);
+                other_keys[nother++] = kt;
             }
             if (ut == DNS_TYPE_CNAME || ut == DNS_TYPE_ANY) {
-                zkey(k, sizeof(k), "CNAME", un);
-                vk_del(k);
-                other = 1;
+                zkey(kc, sizeof(kc), "CNAME", un);
+                other_keys[nother++] = kc;
             }
             if (ut == DNS_TYPE_MX || ut == DNS_TYPE_ANY) {
-                zkey(k, sizeof(k), "MX", un);
-                vk_del(k);
-                other = 1;
+                zkey(km, sizeof(km), "MX", un);
+                other_keys[nother++] = km;
             }
             if (ut == DNS_TYPE_SRV || ut == DNS_TYPE_ANY) {
-                zkey(k, sizeof(k), "SRV", un);
-                vk_del(k);
-                other = 1;
+                zkey(ks, sizeof(ks), "SRV", un);
+                other_keys[nother++] = ks;
             }
-            /* Non-journaled types bump the serial once; this intentionally leaves
-             * a gap in the IXFR chain so those serials force an AXFR fallback. */
-            if (other)
-                serial_bump(t_zone);
+            if (nother)
+                txn_del_and_bump(t_zone, other_keys, nother, un);
         }
     }
     /* Append TSIG to response */
@@ -8108,72 +8502,96 @@ static int tcp_send_msg(int fd, SSL *ssl, const uint8_t *msg, int len) {
     return 0;
 }
 
-/* Collect all Valkey keys matching `pattern` (KEYS) into a freshly malloc'd
- * array of malloc'd strings. Returns the count; the caller frees each element
- * and the array. *out is NULL on error/empty. Keys are gathered under the lock
- * and returned, so the (slow) per-key fetch + network send happens unlocked. */
-static int vk_list_keys(const char *pattern, char ***out) {
+/* Collect all Valkey keys matching `pattern` into a freshly malloc'd array of
+ * malloc'd strings, via a SCAN cursor loop (ADR-004) instead of a single
+ * blocking KEYS — SCAN never stalls the server even over a very large
+ * keyspace. Returns the count found so far, or -1 on a connection/protocol
+ * error (distinct from "0 matches"); the caller (vk_list_keys) treats -1 the
+ * same as 0, vk_list_keys_strict propagates the distinction. *out is left
+ * NULL on error/empty; on any count > 0 the caller owns arr and every strdup'd
+ * element. Keys are gathered under the lock and returned, so the (slow)
+ * per-key fetch + network send that follows happens unlocked, same contract
+ * as before. Result set matches KEYS' except SCAN may (per its own contract)
+ * revisit a key if the scanned keyspace is mutated concurrently — every
+ * existing caller already tolerated KEYS being a point-in-time snapshot that
+ * could be stale by the time it acted on it. */
+static int vk_keys_scan_impl(const char *pattern, char ***out) {
     *out = NULL;
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
+        return -1;
     }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5 || r.count <= 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
-    char **arr = malloc((size_t) r.count * sizeof(char *));
-    int n = 0;
-    for (int i = 0; i < r.count; i++) {
-        resp_reply_t kr;
-        if (resp_parse(&vk, &kr) < 0)
+    char **arr = NULL;
+    int cap = 0, n = 0, ok = 1;
+    char cursor[32] = "0";
+    do {
+        resp_reply_t r;
+        if (resp_cmd(&vk, &r, 6, "SCAN", cursor, "MATCH", pattern, "COUNT", "500") < 0 ||
+            r.type != 5 || r.count != 2) {
+            vk.fd = -1;
+            ok = 0;
             break;
-        if (kr.type == 2 && arr)
+        }
+        resp_reply_t cr;
+        if (resp_parse(&vk, &cr) < 0 || cr.type != 2) {
+            vk.fd = -1;
+            ok = 0;
+            break;
+        }
+        safe_strcpy(cursor, cr.str, sizeof(cursor));
+        resp_reply_t kr_arr;
+        if (resp_parse(&vk, &kr_arr) < 0 || kr_arr.type != 5) {
+            vk.fd = -1;
+            ok = 0;
+            break;
+        }
+        for (int i = 0; i < kr_arr.count; i++) {
+            resp_reply_t kr;
+            if (resp_parse(&vk, &kr) < 0) {
+                vk.fd = -1;
+                ok = 0;
+                break;
+            }
+            if (kr.type != 2)
+                continue;
+            if (n == cap) {
+                cap = cap ? cap * 2 : 64;
+                char **na = realloc(arr, (size_t) cap * sizeof(char *));
+                if (!na) {
+                    ok = 0;
+                    break;
+                }
+                arr = na;
+            }
             arr[n++] = strdup(kr.str);
-    }
+        }
+    } while (ok && strcmp(cursor, "0") != 0);
     pthread_mutex_unlock(&g_vk_mutex);
-    if (!arr)
-        return 0;
-    *out = arr;
+    if (!ok) {
+        for (int i = 0; i < n; i++)
+            free(arr[i]);
+        free(arr);
+        return -1;
+    }
+    if (n > 0)
+        *out = arr;
+    else
+        free(arr);
     return n;
+}
+static int vk_list_keys(const char *pattern, char ***out) {
+    int n = vk_keys_scan_impl(pattern, out);
+    return n < 0 ? 0 : n;
 }
 
 /* Like vk_list_keys but distinguishes a genuinely empty match (returns 0,
  * *out=NULL) from a Valkey connection/protocol error (returns -1). The sweeper
- * needs this: treating a transient KEYS failure as "every lease vanished" would
- * falsely replay deletes for records that still exist, diverging secondaries. */
+ * needs this: treating a transient SCAN failure as "every lease vanished"
+ * would falsely replay deletes for records that still exist, diverging
+ * secondaries. */
 static int vk_list_keys_strict(const char *pattern, char ***out) {
-    *out = NULL;
-    pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    if (r.count <= 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0; /* genuinely no matching keys */
-    }
-    char **arr = malloc((size_t) r.count * sizeof(char *));
-    int n = 0;
-    for (int i = 0; i < r.count; i++) {
-        resp_reply_t kr;
-        if (resp_parse(&vk, &kr) < 0)
-            break;
-        if (kr.type == 2 && arr)
-            arr[n++] = strdup(kr.str);
-    }
-    pthread_mutex_unlock(&g_vk_mutex);
-    if (!arr)
-        return -1;
-    *out = arr;
-    return n;
+    return vk_keys_scan_impl(pattern, out);
 }
 
 /* Send one AXFR record message (one RR, with TSIG MAC chaining). Each message
@@ -8586,18 +9004,59 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
             int pl = snprintf(prefix, sizeof(prefix), "%s:%s:%s:", ns, zname, tt[ti].ts);
             snprintf(pat, sizeof(pat), "%s*", prefix);
             char **keys = NULL;
-            int nk = vk_list_keys(pat, &keys);
+            int nk = vk_list_keys(pat, &keys); /* SCAN discovery — racy, matches today */
+            if (nk <= 0) {
+                free(keys);
+                continue;
+            }
+            /* ADR-004: fetch this type's values (and, for ddns leases, the
+             * remaining TTL) inside ONE MULTI/EXEC transaction, so every key
+             * of this type reflects one consistent Valkey instant — a
+             * concurrent UPDATE can no longer make this type's transfer
+             * straddle two different zone states. Compact reply buffers
+             * (axfr_reply_t, 768B) rather than an array of full resp_reply_t
+             * (64KB each) — this type can have thousands of keys. */
+            int per_key = (pass == 1) ? 2 : 1;
+            axfr_reply_t *replies = calloc((size_t) nk * (size_t) per_key, sizeof(*replies));
+            int fetched = 0;
+            if (replies) {
+                pthread_mutex_lock(&g_vk_mutex);
+                if (valkey_ensure(&vk) >= 0) {
+                    resp_txn_t t;
+                    resp_txn_begin(&t, &vk);
+                    for (int i = 0; i < nk; i++) {
+                        resp_txn_queue(&t, 2, "GET", keys[i]);
+                        if (pass == 1)
+                            resp_txn_queue(&t, 2, "TTL", keys[i]);
+                    }
+                    fetched = resp_txn_commit_compact(&t, replies, nk * per_key);
+                }
+                pthread_mutex_unlock(&g_vk_mutex);
+            }
+            if (!fetched) {
+                dns_log(LOG_WARNING,
+                        "[AXFR] %s: %s:%s fetch transaction failed — skipping this type\n", zname,
+                        ns, tt[ti].ts);
+                free(replies);
+                for (int i = 0; i < nk; i++)
+                    free(keys[i]);
+                free(keys);
+                continue;
+            }
             for (int i = 0; i < nk; i++) {
                 const char *name = keys[i] + pl; /* strip "ns:zname:TYPE:" */
-                char val[768];
-                if (!vk_get(keys[i], val, sizeof(val)) || !val[0])
+                axfr_reply_t *vr = &replies[i * per_key];
+                if (vr->type != 2 || !vr->str[0])
                     continue;
+                char val[768];
+                safe_strcpy(val, vr->str, sizeof(val));
                 uint16_t T = tt[ti].t;
                 if (T == DNS_TYPE_A || T == DNS_TYPE_AAAA) {
                     const int af = (T == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
                     const uint16_t alen = (T == DNS_TYPE_AAAA) ? 16 : 4;
                     if (pass == 1) { /* ddns: bare IP, TTL = remaining lease */
-                        long tl = vk_ttl(keys[i]);
+                        axfr_reply_t *tr = &replies[i * per_key + 1];
+                        long tl = (tr->type == 3) ? tr->integer : -1;
                         if (tl < 1)
                             tl = 1;
                         uint8_t rd[16];
@@ -8622,7 +9081,8 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                         }
                     }
                 } else if (pass == 1) { /* ddns PTR lease: bare target, TTL = remaining lease */
-                    long tl = vk_ttl(keys[i]);
+                    axfr_reply_t *tr = &replies[i * per_key + 1];
+                    long tl = (tr->type == 3) ? tr->integer : -1;
                     if (tl < 1)
                         tl = 1;
                     uint8_t rd[300];
@@ -8697,6 +9157,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                         axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, (uint16_t) rl, mac, maclen);
                 }
             }
+            free(replies);
             for (int i = 0; i < nk; i++)
                 free(keys[i]);
             free(keys);
@@ -9512,6 +9973,12 @@ static void *axfr_thread(void *arg) {
 
     uint8_t soa_rd[512];
     int soa_len = build_soa_rdata(soa_rd, sizeof(soa_rd));
+    /* ADR-004: the serial this transfer's envelope claims — compared after
+     * axfr_send_runtime() completes so a concurrent UPDATE landing mid-
+     * transfer is at least visible in the log, even though each record
+     * TYPE's own fetch is already a consistent snapshot (see
+     * axfr_send_runtime's per-type MULTI/EXEC). */
+    uint32_t axfr_envelope_serial = t_zone->soa_serial;
 
     /* ── IXFR path (RFC 1995) ──
      * Response framing: SOA(current), then one difference sequence per journaled
@@ -9736,6 +10203,11 @@ static void *axfr_thread(void *arg) {
      * provisioning / DDNS / discovery data that the static_zone[] loop above
      * does not cover (CLAUDE-discovery.md Gap 1). */
     axfr_send_runtime(c.fd, c.ssl, c.query_id, zname, axfr_mac, &axfr_mac_len);
+    if (t_zone->soa_serial != axfr_envelope_serial)
+        dns_log(LOG_WARNING,
+                "[AXFR] %s: serial changed during transfer (%u -> %u) — a secondary will "
+                "reconverge via its next refresh/IXFR\n",
+                zname, axfr_envelope_serial, t_zone->soa_serial);
 
     /* Send DNSKEY records */
     {

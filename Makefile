@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -765,6 +765,57 @@ check-enum-provision: apid_debug | ossl-sanity
 	 test "$$R2" = "400"                               || { echo "  FAIL  '|' in replacement was not rejected"; exit 1; }; \
 	 echo "  OK  E.164 number -> reversed-digit zone:*:NAPTR:* key; defaults and '|'-in-replacement guardrail correct"
 
+# ADR-004 regression: apid's /reverse/classless used to bump the /24 zone's
+# serial TWICE for one logical request when delegating (once for the CNAME
+# block, once more in the delegate_s branch) — two independent, non-atomic
+# round trips. Drives the real endpoint (mTLS, like check-enum-provision)
+# with delegate_to set and asserts the serial advances by exactly ONE.
+# Needs Valkey + openssl + curl.
+check-classless-atomic: apid_debug | ossl-sanity
+	@echo "  CHECK  ADR-004 /reverse/classless delegate branch bumps the serial exactly once (requires Valkey + openssl + curl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v curl >/dev/null    || { echo "  SKIP  no curl on PATH"; exit 0; };                 \
+	 D=$$(mktemp -d); PORT=18444; EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes";    \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=classless-test-ca" >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1;   \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=mgmt-client" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 REV24=3.0.192.in-addr.arpa;                                                                    \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);              \
+	 SAVE_A=$$($$VC get config:mtls_ca_pem); SAVE_HP=$$($$VC get config:https_port);                \
+	 $$VC set config:tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null;                                 \
+	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                                  \
+	 $$VC set config:mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                                   \
+	 $$VC set config:https_port "$$PORT" >/dev/null;                                                \
+	 $$VC set "zone_table:$$REV24" "ns1.$$REV24|hostmaster.$$REV24|1|3600|900|604800|300||" >/dev/null; \
+	 $$VC set "config:zone:$$REV24:serial" 100 >/dev/null;                                          \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug >/tmp/apid_classless.log 2>&1 & API=$$!;              \
+	 sleep 1.5;                                                                                      \
+	 CURL="curl -sk --cacert $$D/ca.pem --cert $$D/cli.pem --key $$D/cli.key";                      \
+	 R1=$$($$CURL -o /tmp/classless_r1.txt -w '%{http_code}' -X POST "https://127.0.0.1:$$PORT/reverse/classless" \
+	   --data-urlencode "cidr=192.0.3.0/30" --data-urlencode "cohost=0" \
+	   --data-urlencode "delegate_to=ns2.example.com.");                                            \
+	 kill $$API 2>/dev/null; wait $$API 2>/dev/null || true;                                        \
+	 SERIAL_AFTER=$$($$VC get "config:zone:$$REV24:serial");                                        \
+	 NS_VAL=$$($$VC get "zone:$$REV24:NS:0-30.$$REV24");                                             \
+	 CNAME_COUNT=$$($$VC --scan --pattern "zone:$$REV24:CNAME:*" | wc -l);                          \
+	 $$VC del "zone_table:$$REV24" "config:zone:$$REV24:serial" "zone:$$REV24:NS:0-30.$$REV24" >/dev/null 2>&1; \
+	 for k in $$($$VC --scan --pattern "zone:$$REV24:CNAME:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_A" ]; then $$VC set config:mtls_ca_pem "$$SAVE_A" >/dev/null; else $$VC del config:mtls_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_HP" ]; then $$VC set config:https_port "$$SAVE_HP" >/dev/null; else $$VC del config:https_port >/dev/null; fi; \
+	 rm -rf $$D;                                                                                     \
+	 echo "  POST /reverse/classless: http=$$R1   serial 100 -> $$SERIAL_AFTER   NS=[$$NS_VAL]   CNAMEs written=$$CNAME_COUNT"; \
+	 test "$$R1" = "201" || { echo "  FAIL  provisioning did not return 201"; exit 1; }; \
+	 test "$$SERIAL_AFTER" = "101" || { echo "  FAIL  expected exactly one serial bump (100->101), got $$SERIAL_AFTER"; exit 1; }; \
+	 test -n "$$NS_VAL" || { echo "  FAIL  NS delegation record missing"; exit 1; }; \
+	 test "$$CNAME_COUNT" -eq 4 || { echo "  FAIL  expected 4 CNAMEs for a /30, got $$CNAME_COUNT"; exit 1; }; \
+	 echo "  OK  CNAMEs + NS delegation + serial bump all committed as one atomic transaction (exactly one bump)"
+
 # RFC 2317 classless in-addr.arpa delegation. Writes a /24 zone + /27 subzone
 # directly to Valkey (as the apid /reverse/classless endpoint would), then
 # verifies that a PTR query for an address in the block follows the CNAME to the
@@ -903,6 +954,49 @@ check-parent-notify: $(BIN_DEBUG) | ossl-sanity
 	 echo "$$QT" | grep -q "59" || { echo "  FAIL  no NOTIFY(CDS) received by the parent stub"; cat /tmp/notify_parent.err; exit 1; }; \
 	 echo "$$QT" | grep -q "60" || { echo "  FAIL  no NOTIFY(CDNSKEY) received by the parent stub"; exit 1; }; \
 	 echo "  OK  parent stub received generalized NOTIFY(CDS) + NOTIFY(CDNSKEY) on KSK rollover start"
+
+# ADR-004: ZSK rollover phase transitions are now each one MULTI/EXEC
+# transaction (see rollover_start/_to_commit/_finish, dns_server.c) instead of
+# N independent round trips + a separate serial_bump call. Drives a full
+# publish->commit->done cycle with a fast tick and zero holds, then asserts:
+# (1) config:zone:<z>:serial — the counter the transaction's INCR actually
+# targets — advanced by exactly 3 (one per phase; read directly from Valkey,
+# not via a dig'd SOA, since a fresh zone's in-memory serial comes from the
+# zone_table's own literal field until the first bump ever touches the
+# separate config:zone:<z>:serial counter, which would make a dig-based
+# before/after comparison ambiguous), (2) every next-key/phase-marker key the
+# transaction was supposed to clean up on finish is actually gone (no
+# artifact left behind by a transaction that only partially appeared to
+# apply), (3) the zone still answers DNSKEY correctly afterward (the
+# post-commit zone_dnssec_reload — moved after commit precisely because a
+# read inside a MULTI can't see its own queued writes — picked up the
+# promoted key correctly).
+check-rollover-txn: $(BIN_DEBUG) | ossl-sanity
+	@echo "  CHECK  ADR-004 ZSK rollover phases are atomic (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                        \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };               \
+	 Z=rolltxn.test;                                                                                \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null;           \
+	 $$VC set config:rollover_tick_secs 1 >/dev/null;                                               \
+	 $$VC set config:zone:$$Z:rollover_publish_hold 0 >/dev/null;                                   \
+	 $$VC set config:zone:$$Z:rollover_commit_hold 0 >/dev/null;                                    \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_rolltxn.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                     \
+	 $$VC set config:zone:$$Z:zsk_rollover_request $$(date +%s) >/dev/null;                         \
+	 sleep 5;                                                                                        \
+	 DNSKEY_COUNT=$$(dig +short @127.0.0.1 -p $(TPORT) $$Z DNSKEY +time=2 +tries=1 | grep -c .);   \
+	 SERIAL_AFTER=$$($$VC get config:zone:$$Z:serial);                                              \
+	 NEXT_LEFT=$$( { $$VC --scan --pattern "dnssec:$$Z:zsk_next";                                     \
+	                 $$VC --scan --pattern "dnssec:$$Z:zsk_ed25519_next";                             \
+	                 $$VC --scan --pattern "dnssec:$$Z:zsk_rollover"; } );                             \
+	 kill $$DNS 2>/dev/null || true;                                                                 \
+	 $$VC del zone_table:$$Z config:rollover_tick_secs config:zone:$$Z:rollover_publish_hold config:zone:$$Z:rollover_commit_hold >/dev/null; \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "config:zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 echo "  config:zone:$$Z:serial after full cycle: $$SERIAL_AFTER   DNSKEY RRs: $$DNSKEY_COUNT   leftover next/phase keys: [$$NEXT_LEFT]"; \
+	 test "$$SERIAL_AFTER" = "3" || { echo "  FAIL  expected exactly 3 serial bumps (publish+commit+done) on a fresh counter, got $$SERIAL_AFTER"; exit 1; }; \
+	 test -z "$$NEXT_LEFT" || { echo "  FAIL  finish() left a next-key/phase-marker artifact behind: $$NEXT_LEFT"; exit 1; }; \
+	 test "$$DNSKEY_COUNT" -ge 2 || { echo "  FAIL  zone stopped answering DNSKEY after rollover"; exit 1; }; \
+	 echo "  OK  each rollover phase committed as one atomic transaction: exact serial count, no leftover next-keys, DNSKEY still served"
 
 # RFC 9567 DNS Error Reporting: dnsd advertises an EDNS0 Report-Channel option
 # (code 18, AGENT-DOMAIN in uncompressed wire format) carrying
@@ -1592,6 +1686,46 @@ check-srp: $(BIN_DEBUG)
 # nsupdate; clears config:tsig_secret_b64 for the run so the test exercises the
 # ACL/churn logic without TSIG plumbing (both are TSIG-independent). Needs
 # Valkey + dig + nsupdate; restores config afterward.
+# ADR-004: a torn-zone regression guard. Before this change, a DDNS write was
+# `vk_set` followed by a SEPARATE `serial_bump` round trip — a reader polling
+# in a tight loop could in principle observe the bumped SOA serial before the
+# new record was visible. handle_update now commits both in one MULTI/EXEC
+# (txn_set_and_bump). This test hammers a name with concurrent `dig` polling
+# (SOA + the record, back to back, in a tight background loop) while an
+# nsupdate TXT add runs, and asserts NO poll ever observed a bumped serial
+# without the record already present. Needs Valkey + dig + nsupdate.
+check-txn-atomicity: $(BIN_DEBUG)
+	@echo "  CHECK  ADR-004 write+serial-bump atomicity under concurrent polling (requires Valkey + dig + nsupdate)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
+	 Z=example.local; FQDN=txnatomic.$$Z; D=$$(mktemp -d);                             \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64);                                       \
+	 $$VC del config:tsig_secret_b64 >/dev/null;                                        \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_txnatomic.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                         \
+	 S0=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 POLLPIDS="";                                                                        \
+	 for i in $$(seq 1 15); do                                                          \
+	   (for j in $$(seq 1 20); do                                                       \
+	      SOA=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=1 +tries=1 | awk '{print $$3}'); \
+	      TXT=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$FQDN TXT +time=1 +tries=1); \
+	      echo "$$SOA|$$TXT" >> $$D/poll_$$i.out;                                       \
+	    done) & POLLPIDS="$$POLLPIDS $$!";                                              \
+	 done;                                                                               \
+	 printf 'server 127.0.0.1 $(TPORT)\nzone %s\nupdate add %s 60 TXT "hello"\nsend\n' "$$Z" "$$FQDN" | nsupdate >/dev/null 2>&1; \
+	 wait $$POLLPIDS;                                                                    \
+	 kill $$DNS 2>/dev/null || true;                                                     \
+	 $$VC del ddns:$$Z:TXT:$$FQDN zone:$$Z:TXT:$$FQDN >/dev/null 2>&1;                   \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 TOTAL=$$(cat $$D/poll_*.out | wc -l);                                               \
+	 VIOLATIONS=$$(awk -F'|' -v s0="$$S0" '$$1 > s0 && $$2 == "" {c++} END{print c+0}' $$D/poll_*.out); \
+	 rm -rf $$D;                                                                          \
+	 echo "  baseline serial=$$S0   polls observed=$$TOTAL   torn-state observations=$$VIOLATIONS"; \
+	 test "$$TOTAL" -gt 0 || { echo "  FAIL  no polls captured — harness broken"; exit 1; }; \
+	 test "$$VIOLATIONS" -eq 0 || { echo "  FAIL  observed the serial bumped without the new record present ($$VIOLATIONS times) — write+bump not atomic"; exit 1; }; \
+	 echo "  OK  never observed a bumped serial without the new record already present ($$TOTAL polls)"
+
 check-ddns-acl: $(BIN_DEBUG)
 	@echo "  CHECK  DDNS suffix ACL + serial-churn skip (requires Valkey + dig + nsupdate)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
@@ -1804,6 +1938,52 @@ check-dot-mtls: $(BIN_DEBUG)
 	 test "$$OPEN" -ge 1 -a "$$OPEN_ALERT" -eq 0 || { echo "  FAIL  mTLS off: ordinary DoT client was refused (should stay open)"; exit 1; }; \
 	 echo "  OK  mTLS refuses no-cert, accepts CA-signed cert, and stays open when disabled"
 
+# ADR-004 security-gate evidence: axfr_send_runtime now fetches every key of
+# one record TYPE inside a single MULTI/EXEC transaction (instead of a live
+# KEYS-then-GET-per-key loop), so a concurrent RFC 2136 UPDATE landing
+# mid-transfer can no longer make that type's data straddle two different
+# zone states. tests/valkey_txn_flipper.py flips 6000 A records between two
+# "generations" (encoded in the address's last octet) using its OWN real
+# Valkey MULTI/EXEC per flip — so the WRITE side is atomic by construction,
+# isolating this test to ONLY the reader's (AXFR's) atomicity. A slow AXFR
+# client (tests/axfr_slow_client.py, one message every 2ms — 6000 records is
+# enough to fill the OS TCP send buffer and force axfr_send_runtime to block
+# on the client's pace, which is what actually lets a flip land mid-fetch;
+# confirmed this reproduces a mixed-generation read on the pre-ADR-004 code
+# and is clean against the fix) transfers the zone while the flipper churns
+# continuously; every A record captured in ONE transfer must show the SAME
+# generation — a mix would mean AXFR's own GETs landed on both sides of a
+# flip, i.e. not atomic. Repeated 3x. Needs Valkey + python3.
+check-axfr-concurrency: $(BIN_DEBUG)
+	@echo "  CHECK  ADR-004 AXFR per-type snapshot consistency under concurrent writes (requires Valkey + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v python3 >/dev/null || { echo "  SKIP  no python3 on PATH"; exit 0; };               \
+	 Z=axfrconc.test; N=6000;                                                                       \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                                        \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                               \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null;   \
+	 for i in $$(seq 0 $$((N-1))); do HI=$$((i/256)); echo "SET zone:$$Z:A:host$$i.$$Z 3600|10.0.$$HI.1"; done | $$VC --pipe >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_axfrconc.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                      \
+	 python3 tests/valkey_txn_flipper.py 127.0.0.1 6379 $$Z $$N 45 0.05 >/tmp/flipper.log 2>&1 & FLIP=$$!; \
+	 sleep 0.3;                                                                                       \
+	 FAIL=0;                                                                                          \
+	 for run in 1 2 3; do                                                                             \
+	   OUT=$$(python3 tests/axfr_slow_client.py 127.0.0.1 $(TPORT) $$Z 0.002 2>&1);                  \
+	   GENS=$$(echo "$$OUT" | awk '/^GENERATIONS/{print $$2}');                                       \
+	   NREC=$$(echo "$$OUT" | awk '/^RECORDS/{print $$2}');                                           \
+	   echo "  run $$run: records=$$NREC generations=[$$GENS]";                                       \
+	   case "$$GENS" in *,*) echo "$$OUT" | grep MIXED; FAIL=1;; esac;                                 \
+	 done;                                                                                             \
+	 kill $$DNS 2>/dev/null || true; kill $$FLIP 2>/dev/null || true; wait $$FLIP 2>/dev/null || true; \
+	 $$VC --scan --pattern "zone:$$Z:A:*" | sed 's/^/DEL /' | $$VC --pipe >/dev/null;                \
+	 $$VC del zone_table:$$Z config:zone:$$Z:serial >/dev/null 2>&1;                                 \
+	 for k in $$($$VC --scan --pattern "dnssec:$$Z:*") $$($$VC --scan --pattern "ixfr:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 test "$$FAIL" -eq 0 || { echo "  FAIL  AXFR observed a mixed-generation snapshot — a type's GETs were not atomic"; exit 1; }; \
+	 echo "  OK  every transfer's A records showed a single consistent generation (per-type MULTI/EXEC snapshot holds under continuous concurrent writes)"
+
 # AXFR completeness (CLAUDE-discovery.md Gap 1). A full transfer historically
 # carried only the compile-time static_zone[] + DNSKEY + SOA; records
 # provisioned at runtime (zone:<zone>:* from the mgmt API/DDNS, ddns:<zone>:*
@@ -1988,6 +2168,36 @@ check-cds: $(BIN_DEBUG)
 # and then deprovisioned when the PTR is removed. dnsd never writes zone_table:*
 # for the member — provisioning is in-memory, re-derived from the catalog. Needs
 # Valkey + dig + valkey-cli/redis-cli; uses throwaway names and cleans up after.
+# ADR-004: KEYS -> SCAN equivalence. Seed a synthetic 2000-key A-record set
+# under a throwaway zone (large enough that a SCAN cursor loop must actually
+# page — COUNT 500 per round trip means this takes 4+ rounds), AXFR the zone
+# (dnsd's axfr_send_runtime now walks zone:*/ddns:* via vk_list_keys's SCAN
+# cursor loop, not a single blocking KEYS), and confirm the transferred record
+# count matches a `valkey-cli --scan` inventory of the same keyspace exactly
+# (no concurrent mutation during this test, so — unlike SCAN's own live
+# contract — the two counts must agree precisely, not just approximately).
+check-scan-equivalence: $(BIN_DEBUG)
+	@echo "  CHECK  ADR-004 KEYS->SCAN equivalence over a 2000-key zone (requires Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                       \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };              \
+	 Z=scantest.local; N=2000;                                                                    \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                                      \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                             \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 for i in $$(seq 1 $$N); do $$VC set "zone:$$Z:A:host$$i.$$Z" "300|10.0.$$((i/256)).$$((i%256))" >/dev/null; done; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_scan.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                                    \
+	 XFR_COUNT=$$(dig +noall +answer @127.0.0.1 -p $(TPORT) $$Z AXFR +time=10 +tries=1 | grep -c "IN[[:space:]]*A[[:space:]]"); \
+	 kill $$DNS 2>/dev/null || true;                                                               \
+	 SCAN_COUNT=$$($$VC --scan --pattern "zone:$$Z:A:*" | wc -l);                                  \
+	 for i in $$(seq 1 $$N); do $$VC del "zone:$$Z:A:host$$i.$$Z" >/dev/null; done;                \
+	 $$VC del zone_table:$$Z >/dev/null;                                                           \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 echo "  AXFR A-record count (SCAN-based enumeration): $$XFR_COUNT   valkey --scan inventory: $$SCAN_COUNT"; \
+	 test "$$SCAN_COUNT" -eq "$$N" || { echo "  FAIL  seed itself is wrong (harness bug)"; exit 1; }; \
+	 test "$$XFR_COUNT" -eq "$$N" || { echo "  FAIL  AXFR's SCAN-based enumeration found $$XFR_COUNT of $$N seeded records"; exit 1; }; \
+	 echo "  OK  SCAN-based key enumeration found exactly the same $$N records KEYS would have"
+
 check-catalog: $(BIN_DEBUG)
 	@echo "  CHECK  RFC 9432 catalog provision/deprovision (requires Valkey + dig)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
@@ -2803,6 +3013,7 @@ help:
 	@echo "  make uninstall    Remove installed files"
 	@echo "  make check        Quick smoke-test (needs Valkey)"
 	@echo "  make check-catalog   RFC 9432 catalog provision/deprovision (needs Valkey + dig)"
+	@echo "  make check-scan-equivalence  ADR-004 KEYS->SCAN equivalence over a 2000-key zone (needs Valkey + dig)"
 	@echo "  make check-zonemd    RFC 8976 ZONEMD codec KAT + AXFR digest recompute (needs Valkey + python3)"
 	@echo "  make check-csync     RFC 7477 CSYNC codec KAT + dnsd serves type-62 (needs Valkey + dig)"
 	@echo "  make check-dnsxl     RFC 5782 DNSxL synthesis listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN (needs Valkey + dig)"
@@ -2813,12 +3024,16 @@ help:
 	@echo "  make check-zoneversion RFC 9660 ZONEVERSION EDNS option echoes zone SOA serial (needs Valkey + dig)"
 	@echo "  make check-xot       RFC 9103 XoT: 'dot' ALPN actually selected on DoT/XFR listener (needs Valkey + openssl + dig)"
 	@echo "  make check-parent-notify RFC 9859 generalized NOTIFY(CDS/CDNSKEY) to a parent on KSK rollover (needs Valkey + python3)"
+	@echo "  make check-rollover-txn  ADR-004 ZSK rollover phases are atomic transactions (needs Valkey + dig)"
+	@echo "  make check-txn-atomicity ADR-004 write+serial-bump atomicity under concurrent polling (needs Valkey + dig + nsupdate)"
+	@echo "  make check-classless-atomic  ADR-004 /reverse/classless delegate branch bumps serial exactly once (needs Valkey + openssl + curl)"
 	@echo "  make check-error-reporting RFC 9567 EDNS0 Report-Channel option; omitted when unset/subdomain (needs Valkey + dig)"
 	@echo "  make check-id-server RFC 3258/4892 CHAOS id.server/hostname.bind anycast identity (needs Valkey + dig)"
 	@echo "  make check-ari       RFC 9773 ACME Renewal Information drives certd's renewal decision (needs Valkey + openssl + python3)"
 	@echo "  make check-forwarder Out-of-zone forwarding (needs Valkey + dig + python3)"
 	@echo "  make check-lb        A/AAAA load-balancing rotation (needs Valkey + dig)"
 	@echo "  make check-axfr      AXFR transfers runtime records (needs Valkey + dig)"
+	@echo "  make check-axfr-concurrency  ADR-004 AXFR per-type snapshot consistency under concurrent writes (needs Valkey + python3)"
 	@echo "  make check-dot-mtls  mTLS on the DoT/transfer listener (needs Valkey + openssl)"
 	@echo "  make check-ddns-acl  DDNS suffix ACL + serial-churn skip (needs Valkey + nsupdate)"
 	@echo "  make check-role      Secondary role guards: UPDATE→NOTAUTH + no keygen (needs Valkey + nsupdate)"

@@ -58,6 +58,7 @@
 #define DNS_BUF 65535
 #define DEFAULT_TTL 60
 #define MAX_ZONES_LIST 64 /* cap on zones scanned for longest-suffix resolution */
+#define LIST_KEYS_MAX 1024 /* cap on keys collected per prefix by /list and /zone/list */
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 static void dns_log(int level, const char *fmt, ...) {
@@ -155,21 +156,6 @@ static int vk_del(const char *key) {
     pthread_mutex_unlock(&g_vk_mutex);
     return r.type == 3 ? (int) r.integer : 0;
 }
-static long vk_incr(const char *key) {
-    pthread_mutex_lock(&g_vk_mutex);
-    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    vkc_reply_t r;
-    if (vkc_cmd(&vk, &r, 2, "INCR", key) < 0) {
-        vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    pthread_mutex_unlock(&g_vk_mutex);
-    return r.type == 3 ? r.integer : -1;
-}
 
 /* Resolve the most-specific configured zone (zone_table:<z>) that `name`
  * belongs to.  Falls back to config:zone_name.  This is how the management API
@@ -178,26 +164,18 @@ static long vk_incr(const char *key) {
 static void resolve_zone(const char *name, char *out, int outsz) {
     out[0] = 0;
     size_t best = 0, nl = strlen(name);
-    char zns[MAX_ZONES_LIST][256];
+    char keys[MAX_ZONES_LIST][256];
     int nz = 0;
     pthread_mutex_lock(&g_vk_mutex);
     if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
-        vkc_reply_t r;
-        vkc_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
-        if (r.type == 5) {
-            int cnt = r.count;
-            for (int i = 0; i < cnt; i++) {
-                vkc_reply_t kr;
-                if (vkc_parse(&vk, &kr) < 0)
-                    break;
-                if (kr.type == 2 && nz < MAX_ZONES_LIST) {
-                    safe_strcpy(zns[nz], kr.str + 11, sizeof(zns[nz])); /* skip "zone_table:" */
-                    nz++;
-                }
-            }
-        }
+        int n = vkc_scan_keys(&vk, "zone_table:*", keys, MAX_ZONES_LIST); /* SCAN, ADR-004 */
+        if (n > 0)
+            nz = n;
     }
     pthread_mutex_unlock(&g_vk_mutex);
+    char zns[MAX_ZONES_LIST][256];
+    for (int i = 0; i < nz; i++)
+        safe_strcpy(zns[i], keys[i] + 11, sizeof(zns[i])); /* skip "zone_table:" */
     for (int i = 0; i < nz; i++) {
         const char *z = zns[i];
         size_t zl = strlen(z);
@@ -214,19 +192,80 @@ static void resolve_zone(const char *name, char *out, int outsz) {
         vk_get("config:zone_name", out, outsz);
 }
 
-/* SOA serial bump for a zone.  The primary zone (config:zone_name) keeps the
- * legacy config:zone_serial counter; other zones use config:zone:<z>:serial.
- * dnsd picks up the new serial live via keyspace notifications (Step 6). */
-static void serial_bump_zone(const char *zn) {
+
+/* ADR-004: compute the config:zone_serial / config:zone:<z>:serial key for
+ * `zn`, mirroring serial_bump_zone's own primary-vs-named-zone logic — used
+ * by the transactional helpers below so a write and its serial bump can be
+ * queued into the SAME MULTI/EXEC instead of two separate round trips. */
+static void zone_serial_key(const char *zn, char *out, size_t outsz) {
     char primary[256] = "";
     vk_get("config:zone_name", primary, sizeof(primary));
-    char ikey[320];
     if (!zn || !zn[0] || strcasecmp(zn, primary) == 0)
-        safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
+        safe_strcpy(out, "config:zone_serial", outsz);
     else
-        snprintf(ikey, sizeof(ikey), "config:zone:%s:serial", zn);
-    if (vk_incr(ikey) < 0)
-        dns_log(LOG_WARNING, "[apid] serial bump failed (Valkey down?)\n");
+        snprintf(out, outsz, "config:zone:%s:serial", zn);
+}
+
+/* ADR-004: SET (or SET+EX) key=val and bump zn's serial as one atomic
+ * transaction — a management-API client can never observe the new serial
+ * without the new record, or vice versa. Returns 1 on success, 0 on failure
+ * (already logged at LOG_ERR). */
+static int txn_set_and_bump(const char *zn, const char *key, const char *val, uint32_t ttl) {
+    char ikey[320];
+    zone_serial_key(zn, ikey, sizeof(ikey));
+    pthread_mutex_lock(&g_vk_mutex);
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[apid] Valkey unreachable — %s not applied\n", key);
+        return 0;
+    }
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
+    if (ttl > 0) {
+        char ts[16];
+        snprintf(ts, sizeof(ts), "%u", ttl);
+        vkc_txn_queue(&t, 5, "SET", key, val, "EX", ts);
+    } else {
+        vkc_txn_queue(&t, 3, "SET", key, val);
+    }
+    vkc_txn_queue(&t, 2, "INCR", ikey);
+    vkc_reply_t out[2];
+    int ok = vkc_txn_commit(&t, out) == 2;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok)
+        dns_log(LOG_ERR, "[apid] transaction failed for %s — not applied\n", key);
+    return ok;
+}
+
+/* ADR-004: DEL 1..n keys and bump zn's serial as one atomic transaction.
+ * Returns the number of keys actually deleted (summed from each DEL's
+ * integer reply), or -1 on a failed transaction (already logged). */
+static int txn_del_and_bump(const char *zn, const char *const *keys, int n) {
+    char ikey[320];
+    zone_serial_key(zn, ikey, sizeof(ikey));
+    pthread_mutex_lock(&g_vk_mutex);
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[apid] Valkey unreachable — delete not applied\n");
+        return -1;
+    }
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
+    for (int i = 0; i < n; i++)
+        vkc_txn_queue(&t, 2, "DEL", keys[i]);
+    vkc_txn_queue(&t, 2, "INCR", ikey);
+    vkc_reply_t out[16];
+    int ok = vkc_txn_commit(&t, out) == n + 1;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[apid] delete transaction failed — not applied\n");
+        return -1;
+    }
+    int deleted = 0;
+    for (int i = 0; i < n; i++)
+        if (out[i].type == 3)
+            deleted += (int) out[i].integer;
+    return deleted;
 }
 
 /* Record-type name <-> number come from libdnswire (type2str/str2type in
@@ -669,22 +708,17 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         pthread_mutex_lock(&g_vk_mutex);
         if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
             const char *pfxs[] = {"ddns:*", "zone:*", NULL};
+            char keys[LIST_KEYS_MAX][256]; /* per-call stack buffer — not static, handle_api can
+                                               run concurrently on the HTTP and HTTPS threads */
             for (int pi = 0; pfxs[pi]; pi++) {
-                vkc_reply_t r;
-                vkc_cmd(&vk, &r, 2, "KEYS", pfxs[pi]);
-                if (r.type == 5) {
-                    for (int i = 0; i < r.count && bp < (int) sizeof(body) - 256; i++) {
-                        vkc_reply_t kr;
-                        vkc_parse(&vk, &kr);
-                        if (kr.type != 2)
-                            continue;
-                        vkc_reply_t vr;
-                        vkc_cmd(&vk, &vr, 2, "GET", kr.str);
-                        vkc_reply_t tr;
-                        vkc_cmd(&vk, &tr, 2, "TTL", kr.str);
-                        bp += snprintf(body + bp, sizeof(body) - bp, "  %-50s = %s  TTL=%ld\n",
-                                       kr.str, vr.str, tr.type == 3 ? tr.integer : -1L);
-                    }
+                int nk = vkc_scan_keys(&vk, pfxs[pi], keys, LIST_KEYS_MAX); /* SCAN, ADR-004 */
+                for (int i = 0; i < nk && bp < (int) sizeof(body) - 256; i++) {
+                    vkc_reply_t vr;
+                    vkc_cmd(&vk, &vr, 2, "GET", keys[i]);
+                    vkc_reply_t tr;
+                    vkc_cmd(&vk, &tr, 2, "TTL", keys[i]);
+                    bp += snprintf(body + bp, sizeof(body) - bp, "  %-50s = %s  TTL=%ld\n", keys[i],
+                                   vr.str, tr.type == 3 ? tr.integer : -1L);
                 }
             }
         }
@@ -740,8 +774,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
                 return;
             }
             snprintf(vkey, sizeof(vkey), "ddns:%s:A:%s", zn, hostname);
-            vk_set(vkey, ip, ttl);
-            serial_bump_zone(zn);
+            txn_set_and_bump(zn, vkey, ip, ttl);
             snprintf(rbody, sizeof(rbody), "ok: %s A %s TTL=%u\n", hostname, ip, ttl);
             api_send(fd, ssl, 200, rbody);
         } else if (ip6[0]) {
@@ -751,8 +784,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
                 return;
             }
             snprintf(vkey, sizeof(vkey), "ddns:%s:AAAA:%s", zn, hostname);
-            vk_set(vkey, ip6, ttl);
-            serial_bump_zone(zn);
+            txn_set_and_bump(zn, vkey, ip6, ttl);
             snprintf(rbody, sizeof(rbody), "ok: %s AAAA %s TTL=%u\n", hostname, ip6, ttl);
             api_send(fd, ssl, 200, rbody);
         } else
@@ -772,19 +804,20 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         }
         char typestr[16] = {0};
         qs_get(qs, "type", typestr, sizeof(typestr));
-        char vk2[600];
-        int d = 0;
+        char vk2a[600], vk2aaaa[600];
+        const char *dkeys[2];
+        int ndkeys = 0;
         if (!typestr[0] || !strcasecmp(typestr, "A")) {
-            snprintf(vk2, sizeof(vk2), "ddns:%s:A:%s", zn, hostname);
-            d += vk_del(vk2);
+            snprintf(vk2a, sizeof(vk2a), "ddns:%s:A:%s", zn, hostname);
+            dkeys[ndkeys++] = vk2a;
         }
         if (!typestr[0] || !strcasecmp(typestr, "AAAA")) {
-            snprintf(vk2, sizeof(vk2), "ddns:%s:AAAA:%s", zn, hostname);
-            d += vk_del(vk2);
+            snprintf(vk2aaaa, sizeof(vk2aaaa), "ddns:%s:AAAA:%s", zn, hostname);
+            dkeys[ndkeys++] = vk2aaaa;
         }
-        serial_bump_zone(zn);
+        int d = txn_del_and_bump(zn, dkeys, ndkeys);
         char rbody[128];
-        snprintf(rbody, sizeof(rbody), "ok: deleted %d key(s)\n", d);
+        snprintf(rbody, sizeof(rbody), "ok: deleted %d key(s)\n", d > 0 ? d : 0);
         api_send(fd, ssl, 200, rbody);
         return;
     }
@@ -832,8 +865,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             snprintf(vval, sizeof(vval), "%u|%s|%s", ttl, pref[0] ? pref : "10", value);
         else
             snprintf(vval, sizeof(vval), "%u|%s", ttl, value);
-        vk_set(vkey, vval, 0);
-        serial_bump_zone(zn);
+        txn_set_and_bump(zn, vkey, vval, 0);
         dns_log(LOG_NOTICE, "[ZONE] %s %s:%s = %s\n", type2str(rt), zn, name, vval);
         char rb[640];
         snprintf(rb, sizeof(rb), "ok: %s\n", vkey);
@@ -855,28 +887,29 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             api_send(fd, ssl, 400, "no authoritative zone for that name\n");
             return;
         }
-        int d = 0;
+        char keybufs[12][600];
+        const char *dkeys[12];
+        int nd = 0;
         if (type[0]) {
             uint16_t rt = str2type(type);
             if (!rt) {
                 api_send(fd, ssl, 400, "unknown type\n");
                 return;
             }
-            char vkey[600];
-            snprintf(vkey, sizeof(vkey), "zone:%s:%s:%s", zn, type2str(rt), name);
-            d = vk_del(vkey);
+            snprintf(keybufs[0], sizeof(keybufs[0]), "zone:%s:%s:%s", zn, type2str(rt), name);
+            dkeys[nd++] = keybufs[0];
         } else {
             const char *ts[] = {"A",   "AAAA",  "CNAME", "MX",    "TXT", "NS", "SRV",
                                 "CAA", "SSHFP", "TLSA",  "DNAME", "LOC", NULL};
             for (int i = 0; ts[i]; i++) {
-                char vk2[600];
-                snprintf(vk2, sizeof(vk2), "zone:%s:%s:%s", zn, ts[i], name);
-                d += vk_del(vk2);
+                snprintf(keybufs[nd], sizeof(keybufs[nd]), "zone:%s:%s:%s", zn, ts[i], name);
+                dkeys[nd] = keybufs[nd];
+                nd++;
             }
         }
-        serial_bump_zone(zn);
+        int d = txn_del_and_bump(zn, dkeys, nd);
         char rb[128];
-        snprintf(rb, sizeof(rb), "ok: deleted %d record(s)\n", d);
+        snprintf(rb, sizeof(rb), "ok: deleted %d record(s)\n", d > 0 ? d : 0);
         api_send(fd, ssl, 200, rb);
         return;
     }
@@ -911,18 +944,14 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         int bp = 0;
         pthread_mutex_lock(&g_vk_mutex);
         if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
-            vkc_reply_t r;
-            vkc_cmd(&vk, &r, 2, "KEYS", "zone_table:*");
-            if (r.type == 5) {
-                bp += snprintf(body + bp, sizeof(body) - bp, "zones: %d\n", r.count);
-                for (int i = 0; i < r.count && bp < (int) sizeof(body) - 512; i++) {
-                    vkc_reply_t kr;
-                    vkc_parse(&vk, &kr);
-                    if (kr.type != 2)
-                        continue;
+            char keys[LIST_KEYS_MAX][256];
+            int nk = vkc_scan_keys(&vk, "zone_table:*", keys, LIST_KEYS_MAX); /* SCAN, ADR-004 */
+            if (nk >= 0) {
+                bp += snprintf(body + bp, sizeof(body) - bp, "zones: %d\n", nk);
+                for (int i = 0; i < nk && bp < (int) sizeof(body) - 512; i++) {
                     vkc_reply_t vr;
-                    vkc_cmd(&vk, &vr, 2, "GET", kr.str);
-                    bp += snprintf(body + bp, sizeof(body) - bp, "  %-40s = %s\n", kr.str + 11,
+                    vkc_cmd(&vk, &vr, 2, "GET", keys[i]);
+                    bp += snprintf(body + bp, sizeof(body) - bp, "  %-40s = %s\n", keys[i] + 11,
                                    vr.type == 2 ? vr.str : "?");
                 }
             } else
@@ -1066,8 +1095,27 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             api_send(fd, ssl, 400, err);
             return;
         }
-        /* Write one CNAME per address in the block (in the /24 zone).
-         * Buffers sized for zone:<256>:CNAME:<256> worst-case. */
+        /* Write one CNAME per address in the block (in the /24 zone), plus the
+         * NS-delegation record if delegating, plus the serial bump — ALL as
+         * one atomic transaction (ADR-004). This also fixes a real bug: the
+         * delegate branch used to bump the serial a SECOND time independently
+         * of the CNAME-block bump, so a reader could observe the serial
+         * advance twice for one logical request, or see the NS record before
+         * the CNAMEs (or vice versa). Buffers sized for zone:<256>:CNAME:<256>
+         * worst-case. */
+        /* zone_serial_key() itself calls vk_get(), which takes g_vk_mutex —
+         * must be computed BEFORE the lock below, not inside it (that would
+         * self-deadlock on the non-recursive mutex). */
+        char ikey[320];
+        zone_serial_key(rev24_zone, ikey, sizeof(ikey));
+        pthread_mutex_lock(&g_vk_mutex);
+        if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+            pthread_mutex_unlock(&g_vk_mutex);
+            api_send(fd, ssl, 502, "valkey unreachable\n");
+            return;
+        }
+        vkc_txn_t t;
+        vkc_txn_begin(&t, &vk);
         unsigned written = 0;
         for (unsigned off = 0; off < blocksize; off++) {
             unsigned host = o4_start + off;
@@ -1076,11 +1124,31 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             snprintf(target, sizeof(target), "%u.%s", host, subzone);
             snprintf(vkey, sizeof(vkey), "zone:%s:CNAME:%s", rev24_zone, owner);
             snprintf(vval, sizeof(vval), "3600|%s", target);
-            vk_set(vkey, vval, 0);
+            vkc_txn_queue(&t, 3, "SET", vkey, vval);
             written++;
         }
-        serial_bump_zone(rev24_zone);
-        /* Co-host: register the subzone in zone_table so dnsd serves its PTRs */
+        int delegated_ns = (!cohost && delegate_s[0]) ? 1 : 0;
+        if (delegated_ns) {
+            /* Delegated: write NS record in the /24 zone pointing at delegate_to */
+            char nskey[768], nsval[640];
+            snprintf(nskey, sizeof(nskey), "zone:%s:NS:%s", rev24_zone, subzone);
+            snprintf(nsval, sizeof(nsval), "3600|%s", delegate_s);
+            vkc_txn_queue(&t, 3, "SET", nskey, nsval);
+        }
+        vkc_txn_queue(&t, 2, "INCR", ikey);
+        int total_cmds = (int) written + delegated_ns + 1;
+        vkc_reply_t *out = malloc((size_t) total_cmds * sizeof(vkc_reply_t));
+        int ok = out && vkc_txn_commit(&t, out) == total_cmds;
+        pthread_mutex_unlock(&g_vk_mutex);
+        free(out);
+        if (!ok) {
+            api_send(fd, ssl, 502, "reverse/classless transaction failed\n");
+            return;
+        }
+        /* Co-host: register the subzone in zone_table so dnsd serves its PTRs.
+         * A different namespace/zone (the subzone's own zone_table entry, not
+         * the /24 zone's serial) — matches /zone/add's own zone_table write,
+         * which likewise isn't part of any existing zone's serial-bump unit. */
         if (cohost) {
             char subkey[320], subval[768];
             snprintf(subkey, sizeof(subkey), "zone_table:%s", subzone);
@@ -1088,13 +1156,6 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             snprintf(subval, sizeof(subval), "ns1.%s|hostmaster.%s|1|3600|900|604800|300||",
                      rev24_zone, rev24_zone);
             vk_set(subkey, subval, 0);
-        } else if (delegate_s[0]) {
-            /* Delegated: write NS record in the /24 zone pointing at delegate_to */
-            char nskey[768], nsval[640];
-            snprintf(nskey, sizeof(nskey), "zone:%s:NS:%s", rev24_zone, subzone);
-            snprintf(nsval, sizeof(nsval), "3600|%s", delegate_s);
-            vk_set(nskey, nsval, 0);
-            serial_bump_zone(rev24_zone);
         }
         char rb[768];
         snprintf(rb, sizeof(rb), "ok: %u CNAMEs written in %s → subzone %s (%s)\n", written,
@@ -1186,8 +1247,7 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         snprintf(vkey, sizeof(vkey), "zone:%s:NAPTR:%s", zn, revname);
         snprintf(vval, sizeof(vval), "%u|%d|%d|%s|%s|%s|%s", ttl, order, pref, flags, service,
                  regexp, repl);
-        vk_set(vkey, vval, 0);
-        serial_bump_zone(zn);
+        txn_set_and_bump(zn, vkey, vval, 0);
         dns_log(LOG_NOTICE, "[ENUM] provisioned %s -> %s = %s\n", number, vkey, vval);
         char rb[700];
         snprintf(rb, sizeof(rb), "ok: %s\n", vkey);

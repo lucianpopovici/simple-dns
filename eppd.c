@@ -172,9 +172,10 @@ static int vk_del(const char *key) {
     return ok;
 }
 
-/* KEYS (not SCAN) — matches this project's existing convention for bounded,
- * infrequent lookups; zone_table:* is small (one entry per configured
- * zone), never a large keyspace scan. Returns the number of keys found
+/* SCAN cursor loop (ADR-004), not a blocking KEYS — epp:domain:* scans
+ * (epp_host_in_use/epp_contact_in_use/the RGP tick sweep) grow with registry
+ * size, so a single blocking KEYS is no longer a safe assumption here even
+ * though zone_table:* itself stays small. Returns the number of keys found
  * (each copied into out[], caller-owned, bounded by maxkeys), or -1 on
  * error. */
 static int vk_list_keys(const char *pattern, char out[][256], int maxkeys) {
@@ -183,19 +184,7 @@ static int vk_list_keys(const char *pattern, char out[][256], int maxkeys) {
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
     }
-    vkc_reply_t r;
-    if (vkc_cmd(&g_vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    int n = 0;
-    for (int i = 0; i < r.count; i++) {
-        vkc_reply_t kr;
-        if (vkc_parse(&g_vk, &kr) < 0)
-            break;
-        if (kr.type == 2 && n < maxkeys)
-            safe_strcpy(out[n++], kr.str, 256);
-    }
+    int n = vkc_scan_keys(&g_vk, pattern, out, maxkeys);
     pthread_mutex_unlock(&g_vk_mutex);
     return n;
 }
@@ -1567,16 +1556,13 @@ static int find_parent_zone(const char *name, char *zone_out, int cap) {
  * precedent for apid's own zone-record REST writes — secondaries converge
  * via the normal periodic-refresh -> IXFR-gap -> AXFR-fallback path rather
  * than an immediate push. */
-static void epp_serial_bump_zone(const char *zn) {
+static void epp_serial_key(const char *zn, char *out, size_t outsz) {
     char primary[256] = "";
     vk_get("config:zone_name", primary, sizeof(primary));
-    char ikey[320];
     if (!zn[0] || strcasecmp(zn, primary) == 0)
-        safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
+        safe_strcpy(out, "config:zone_serial", outsz);
     else
-        snprintf(ikey, sizeof(ikey), "config:zone:%s:serial", zn);
-    if (vk_incr(ikey) < 0)
-        dns_log(LOG_WARNING, "[eppd] serial bump failed (Valkey down?)\n");
+        snprintf(out, outsz, "config:zone:%s:serial", zn);
 }
 
 /* Publish a domain's delegation into the parent zone dnsd already serves:
@@ -1598,13 +1584,10 @@ static void epp_publish_domain(const char *name, const char ns[][256], int nns, 
     int off = snprintf(nsval, sizeof(nsval), "%d", 3600);
     for (int i = 0; i < nns && off < (int) sizeof(nsval) - 1; i++)
         off += snprintf(nsval + off, sizeof(nsval) - off, "|%s", ns[i]);
-    char key[900];
-    snprintf(key, sizeof(key), "zone:%s:NS:%s", zone, name);
-    vk_set(key, nsval);
 
-    snprintf(key, sizeof(key), "zone:%s:DS:%s", zone, name);
-    if (nds > 0) {
-        char dsval[4096];
+    char dsval[4096];
+    int have_ds = (nds > 0);
+    if (have_ds) {
         int doff = snprintf(dsval, sizeof(dsval), "%d", 3600);
         for (int i = 0; i < nds && doff < (int) sizeof(dsval) - 1; i++) {
             char hexdigest[2 * EPP_DS_MAX_DIGEST + 1];
@@ -1612,11 +1595,14 @@ static void epp_publish_domain(const char *name, const char ns[][256], int nns, 
             doff += snprintf(dsval + doff, sizeof(dsval) - doff, "|%u,%u,%u,%s", ds[i].keytag,
                              ds[i].alg, ds[i].digtype, hexdigest);
         }
-        vk_set(key, dsval);
-    } else {
-        vk_del(key); /* domain went (or stayed) insecure — retract any stale DS */
     }
 
+    /* Pre-checks: look up in-bailiwick glue BEFORE opening the transaction —
+     * a read inside a MULTI can't see anything (queued writes aren't applied
+     * until EXEC), and these decide WHAT to write, same as every other
+     * pre-check in the ADR-004 pass. */
+    char aval[EPP_MAX_ARR][600], aaaaval[EPP_MAX_ARR][900];
+    int have_a[EPP_MAX_ARR] = {0}, have_aaaa[EPP_MAX_ARR] = {0};
     for (int i = 0; i < nns; i++) {
         if (!name_in_zone(ns[i], zone))
             continue; /* out of bailiwick — not ours to glue */
@@ -1631,25 +1617,65 @@ static void epp_publish_domain(const char *name, const char ns[][256], int nns, 
         if (tlen < 0 || epp_host_decode(tlv, tlen, &h) < 0)
             continue;
         if (h.nv4 > 0) {
-            char aval[600];
-            int aoff = snprintf(aval, sizeof(aval), "3600");
-            for (int j = 0; j < h.nv4 && aoff < (int) sizeof(aval) - 1; j++)
-                aoff += snprintf(aval + aoff, sizeof(aval) - aoff, "|%s", h.v4[j]);
-            char gk[900];
-            snprintf(gk, sizeof(gk), "zone:%s:A:%s", zone, ns[i]);
-            vk_set(gk, aval);
+            int aoff = snprintf(aval[i], sizeof(aval[i]), "3600");
+            for (int j = 0; j < h.nv4 && aoff < (int) sizeof(aval[i]) - 1; j++)
+                aoff += snprintf(aval[i] + aoff, sizeof(aval[i]) - aoff, "|%s", h.v4[j]);
+            have_a[i] = 1;
         }
         if (h.nv6 > 0) {
-            char aval[900];
-            int aoff = snprintf(aval, sizeof(aval), "3600");
-            for (int j = 0; j < h.nv6 && aoff < (int) sizeof(aval) - 1; j++)
-                aoff += snprintf(aval + aoff, sizeof(aval) - aoff, "|%s", h.v6[j]);
-            char gk[900];
-            snprintf(gk, sizeof(gk), "zone:%s:AAAA:%s", zone, ns[i]);
-            vk_set(gk, aval);
+            int aoff = snprintf(aaaaval[i], sizeof(aaaaval[i]), "3600");
+            for (int j = 0; j < h.nv6 && aoff < (int) sizeof(aaaaval[i]) - 1; j++)
+                aoff += snprintf(aaaaval[i] + aoff, sizeof(aaaaval[i]) - aoff, "|%s", h.v6[j]);
+            have_aaaa[i] = 1;
         }
     }
-    epp_serial_bump_zone(zone);
+
+    /* ADR-004: NS + DS + every in-bailiwick glue record + the serial bump
+     * commit as one atomic transaction — a reader can never observe a
+     * partially-published delegation. */
+    char ikey[320];
+    epp_serial_key(zone, ikey, sizeof(ikey));
+    pthread_mutex_lock(&g_vk_mutex);
+    if (vkc_ensure_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[eppd] Valkey unreachable — %s not published\n", name);
+        return;
+    }
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &g_vk);
+    char nskey[900];
+    snprintf(nskey, sizeof(nskey), "zone:%s:NS:%s", zone, name);
+    vkc_txn_queue(&t, 3, "SET", nskey, nsval);
+    char dskey[900];
+    snprintf(dskey, sizeof(dskey), "zone:%s:DS:%s", zone, name);
+    if (have_ds)
+        vkc_txn_queue(&t, 3, "SET", dskey, dsval);
+    else
+        vkc_txn_queue(&t, 2, "DEL", dskey); /* domain went (or stayed) insecure */
+    int nglue = 0;
+    for (int i = 0; i < nns; i++) {
+        if (have_a[i]) {
+            char gk[900];
+            snprintf(gk, sizeof(gk), "zone:%s:A:%s", zone, ns[i]);
+            vkc_txn_queue(&t, 3, "SET", gk, aval[i]);
+            nglue++;
+        }
+        if (have_aaaa[i]) {
+            char gk[900];
+            snprintf(gk, sizeof(gk), "zone:%s:AAAA:%s", zone, ns[i]);
+            vkc_txn_queue(&t, 3, "SET", gk, aaaaval[i]);
+            nglue++;
+        }
+    }
+    vkc_txn_queue(&t, 2, "INCR", ikey);
+    int total_cmds = 2 + nglue + 1;
+    vkc_reply_t out[2 + 2 * EPP_MAX_ARR + 1];
+    int ok = vkc_txn_commit(&t, out) == total_cmds;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[eppd] publish transaction failed for %s — not published\n", name);
+        return;
+    }
     dns_log(LOG_NOTICE, "[eppd] published %s NS delegation into zone %s (%d ns, %d ds)\n", name,
             zone, nns, nds);
 }
@@ -1664,12 +1690,29 @@ static void epp_retract_domain(const char *name) {
     char zone[256];
     if (find_parent_zone(name, zone, sizeof(zone)) < 0)
         return;
-    char key[900];
-    snprintf(key, sizeof(key), "zone:%s:NS:%s", zone, name);
-    vk_del(key);
-    snprintf(key, sizeof(key), "zone:%s:DS:%s", zone, name);
-    vk_del(key);
-    epp_serial_bump_zone(zone);
+    char nskey[900], dskey[900], ikey[320];
+    snprintf(nskey, sizeof(nskey), "zone:%s:NS:%s", zone, name);
+    snprintf(dskey, sizeof(dskey), "zone:%s:DS:%s", zone, name);
+    epp_serial_key(zone, ikey, sizeof(ikey));
+    /* ADR-004: both DELs + the serial bump commit as one atomic transaction. */
+    pthread_mutex_lock(&g_vk_mutex);
+    if (vkc_ensure_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        pthread_mutex_unlock(&g_vk_mutex);
+        dns_log(LOG_ERR, "[eppd] Valkey unreachable — %s not retracted\n", name);
+        return;
+    }
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &g_vk);
+    vkc_txn_queue(&t, 2, "DEL", nskey);
+    vkc_txn_queue(&t, 2, "DEL", dskey);
+    vkc_txn_queue(&t, 2, "INCR", ikey);
+    vkc_reply_t out[3];
+    int ok = vkc_txn_commit(&t, out) == 3;
+    pthread_mutex_unlock(&g_vk_mutex);
+    if (!ok) {
+        dns_log(LOG_ERR, "[eppd] retract transaction failed for %s\n", name);
+        return;
+    }
     dns_log(LOG_NOTICE, "[eppd] retracted %s delegation from zone %s\n", name, zone);
 }
 

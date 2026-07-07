@@ -180,25 +180,19 @@ static int vk_get(const char *key, char *out, int olen) {
  * the unicast zone's records, so we glob the zone segment.  qname is fully
  * qualified, so at most one key matches. */
 static int zone_glob_get(const char *tname, const char *qname, char *out, int olen) {
-    char pat[600], key[600] = "";
+    char pat[600];
     snprintf(pat, sizeof(pat), "zone:*:%s:%s", tname, qname);
+    char keys[4][256]; /* qname is fully qualified — at most one match expected */
+    int nk;
     pthread_mutex_lock(&g_vk_mutex);
-    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0) {
-        vkc_reply_t r;
-        if (vkc_cmd(&vk, &r, 2, "KEYS", pat) >= 0 && r.type == 5) {
-            for (int i = 0; i < r.count; i++) {
-                vkc_reply_t kr;
-                if (vkc_parse(&vk, &kr) < 0)
-                    break;
-                if (kr.type == 2 && !key[0])
-                    safe_strcpy(key, kr.str, sizeof(key));
-            }
-        }
-    }
+    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0)
+        nk = vkc_scan_keys(&vk, pat, keys, 4); /* SCAN, ADR-004 */
+    else
+        nk = -1;
     pthread_mutex_unlock(&g_vk_mutex);
-    if (!key[0])
+    if (nk <= 0)
         return 0;
-    return vk_get(key, out, olen);
+    return vk_get(keys[0], out, olen);
 }
 
 /* ── Wire-format helpers specific to mDNS ────────────────────────────────── */
@@ -275,41 +269,36 @@ static void mdns_send(const uint8_t *msg, int len) {
  * Scans Valkey for mdns:PTR:_*._*._*.local keys and returns the unique
  * service types as PTR records.
  */
+#define SD_BROWSE_MAX 512 /* cap on mdns:PTR:_* keys collected per browse query */
 static int mdns_append_sd_browse(uint8_t *buf, int off, int blen, int *ancount) {
+    char keys[SD_BROWSE_MAX][256]; /* not static — may run concurrently with DSO/DP threads */
+    int nk;
     pthread_mutex_lock(&g_vk_mutex);
     if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return off;
     }
-    vkc_reply_t r;
-    vkc_cmd(&vk, &r, 2, "KEYS", "mdns:PTR:_*");
-    if (r.type == 5) {
-        for (int i = 0; i < r.count; i++) {
-            vkc_reply_t kr;
-            vkc_parse(&vk, &kr);
-            if (kr.type != 2)
-                continue;
-            /* key = "mdns:PTR:<service-instance-or-type>" */
-            const char *svcname = kr.str + 9; /* skip "mdns:PTR:" */
-            /* only include pure service type PTRs like "_http._tcp.local" */
-            if (svcname[0] != '_')
-                continue;
-            /* rdata = service type name in wire format */
-            uint8_t rd[256];
-            int roff = 0;
-            roff = name_to_wire(svcname, rd, sizeof(rd));
-            if (roff < 0)
-                continue;
-            off = mdns_put_rr(buf, off, blen, DNSSD_SERVICES, DNS_TYPE_PTR, DNS_CLASS_IN,
-                              MDNS_TTL_SERVICE, rd, (uint16_t) roff);
-            if (off < 0) {
-                off = 0;
-                break;
-            }
-            (*ancount)++;
-        }
-    }
+    nk = vkc_scan_keys(&vk, "mdns:PTR:_*", keys, SD_BROWSE_MAX); /* SCAN, ADR-004 */
     pthread_mutex_unlock(&g_vk_mutex);
+    for (int i = 0; i < nk; i++) {
+        /* key = "mdns:PTR:<service-instance-or-type>" */
+        const char *svcname = keys[i] + 9; /* skip "mdns:PTR:" */
+        /* only include pure service type PTRs like "_http._tcp.local" */
+        if (svcname[0] != '_')
+            continue;
+        /* rdata = service type name in wire format */
+        uint8_t rd[256];
+        int roff = name_to_wire(svcname, rd, sizeof(rd));
+        if (roff < 0)
+            continue;
+        off = mdns_put_rr(buf, off, blen, DNSSD_SERVICES, DNS_TYPE_PTR, DNS_CLASS_IN,
+                          MDNS_TTL_SERVICE, rd, (uint16_t) roff);
+        if (off < 0) {
+            off = 0;
+            break;
+        }
+        (*ancount)++;
+    }
     return off;
 }
 
@@ -596,6 +585,7 @@ static void mdns_probe(void) {
  * mdns_announce — RFC 6762 §8.3
  * Send unsolicited (gratuitous) mDNS responses for all our records.
  */
+#define MDNS_ANNOUNCE_MAX 2048 /* cap on keys scanned per pattern (cold/periodic path) */
 static void mdns_announce(void) {
     uint8_t pkt[MDNS_MAX_MSG];
     int off = 12;
@@ -608,23 +598,19 @@ static void mdns_announce(void) {
     /* Announce all mdns:* and shared zone:*:A:* records.  Keys are
      * mdns:<TYPE>:<name> (3 parts) and zone:<zone>:<TYPE>:<name> (4 parts). */
     const char *patterns[2] = {"mdns:*", "zone:*:A:*"};
+    char keys[MDNS_ANNOUNCE_MAX][256];
     for (int pi = 0; pi < 2; pi++) {
         pthread_mutex_lock(&g_vk_mutex);
         if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
             pthread_mutex_unlock(&g_vk_mutex);
             continue;
         }
-        vkc_reply_t r;
-        vkc_cmd(&vk, &r, 2, "KEYS", patterns[pi]);
-        if (r.type == 5) {
-            for (int i = 0; i < r.count; i++) {
-                vkc_reply_t kr;
-                vkc_parse(&vk, &kr);
-                if (kr.type != 2)
-                    continue;
+        int nk = vkc_scan_keys(&vk, patterns[pi], keys, MDNS_ANNOUNCE_MAX); /* SCAN, ADR-004 */
+        {
+            for (int i = 0; i < nk; i++) {
                 /* parse key: mdns:TYPE:name OR zone:<zone>:TYPE:name */
                 char kbuf[512];
-                safe_strcpy(kbuf, kr.str, sizeof(kbuf));
+                safe_strcpy(kbuf, keys[i], sizeof(kbuf));
                 char *p1 = strchr(kbuf, ':');
                 if (!p1)
                     continue;
@@ -646,7 +632,7 @@ static void mdns_announce(void) {
                 if (!rt)
                     continue;
                 vkc_reply_t vr;
-                vkc_cmd(&vk, &vr, 2, "GET", kr.str);
+                vkc_cmd(&vk, &vr, 2, "GET", keys[i]);
                 if (vr.type != 2)
                     continue;
                 char *vptr = vr.str;

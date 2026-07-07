@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <openssl/ssl.h> /* tls_server_ctx_from_pem / dot_alpn_select_cb */
 
 /* ── DNS type constants (RFC 1035 and later) ─────────────────────────────── */
@@ -560,10 +561,47 @@ int vkc_send(vkc_conn_t *c, const char *cmd, int len);
  * form), send it, and parse the one reply Valkey sends back. */
 int vkc_cmd(vkc_conn_t *c, vkc_reply_t *r, int argc, ...);
 
+/* va_list body shared by vkc_cmd() and vkc_txn_queue() (ADR-004). */
+int vkc_cmd_v(vkc_conn_t *c, vkc_reply_t *r, int argc, va_list ap);
+
 /* Same encoding as vkc_cmd but does not read a reply — for (P)SUBSCRIBE,
  * whose reply and subsequent push messages are consumed by a read loop
  * instead of a single vkc_parse call. */
 int vkc_send_cmd(vkc_conn_t *c, int argc, ...);
+
+/* ── MULTI/EXEC transactions (ADR-004: atomic zone writes + SOA serial bump)
+ * ──────────────────────────────────────────────────────────────────────────
+ * Caller must already hold its own Valkey mutex and have called
+ * vkc_ensure_to() for the WHOLE begin..commit sequence — the same
+ * precondition a single vkc_cmd call already has today, just widened from
+ * "per command" to "per transaction" so a reader can never observe some
+ * queued writes applied and others not (a torn zone). Shared by apid.c and
+ * eppd.c — one implementation, not two copies. */
+typedef struct {
+    vkc_conn_t *c;
+    int n;   /* commands successfully QUEUED so far */
+    int err; /* sticky: MULTI or a QUEUE send/parse failed */
+} vkc_txn_t;
+
+void vkc_txn_begin(vkc_txn_t *t, vkc_conn_t *c);
+void vkc_txn_queue(vkc_txn_t *t, int argc, ...);
+/* EXEC. On success returns the number of queued commands (== t->n) and fills
+ * out[0..t->n) with each queued command's real reply, in queue order — out
+ * must be sized >= t->n by the caller. Returns -1 on any failure (MULTI/a
+ * queued command failed, EXEC itself failed, or a reply-count mismatch) —
+ * the caller must not trust out[] and must assume nothing was applied. */
+int vkc_txn_commit(vkc_txn_t *t, vkc_reply_t *out);
+
+/* Collect all Valkey keys matching `pattern` into out[] (each entry <256
+ * bytes, NUL-terminated), via a SCAN cursor loop (ADR-004) rather than a
+ * single blocking KEYS — SCAN never stalls the server even over a very large
+ * keyspace. Returns the count found (capped at maxkeys), or -1 on a
+ * connection/protocol error. Caller holds the lock and calls vkc_ensure_to()
+ * first, matching vkc_cmd's own contract. Result set matches KEYS' except
+ * SCAN may (per its own contract) revisit a key if the scanned keyspace is
+ * mutated concurrently — every existing caller already tolerated KEYS being
+ * a point-in-time snapshot that could be stale by the time it acted on it. */
+int vkc_scan_keys(vkc_conn_t *c, const char *pattern, char out[][256], int maxkeys);
 
 /* Open a fresh connection to host:port (closing any existing c->fd first),
  * AUTH if pass is non-empty, then SELECT db 0. -1 on any failure (socket,

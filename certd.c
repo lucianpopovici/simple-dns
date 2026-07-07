@@ -261,26 +261,15 @@ static int vk_del(const char *key) {
     return r.type == 3 ? (int) r.integer : 0;
 }
 /* Only needed for the CAA pre-flight check's zone_table:* scan — mirrors
- * eppd's own vk_list_keys exactly (same shared vkc_ client, same shape). */
+ * eppd's own vk_list_keys exactly (same shared vkc_ client, same shape).
+ * SCAN cursor loop (ADR-004), not a blocking KEYS. */
 static int vk_list_keys(const char *pattern, char out[][256], int maxkeys) {
     pthread_mutex_lock(&g_vk_mutex);
     if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
     }
-    vkc_reply_t r;
-    if (vkc_cmd(&vk, &r, 2, "KEYS", pattern) < 0 || r.type != 5) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    int n = 0;
-    for (int i = 0; i < r.count; i++) {
-        vkc_reply_t kr;
-        if (vkc_parse(&vk, &kr) < 0)
-            break;
-        if (kr.type == 2 && n < maxkeys)
-            safe_strcpy(out[n++], kr.str, 256);
-    }
+    int n = vkc_scan_keys(&vk, pattern, out, maxkeys);
     pthread_mutex_unlock(&g_vk_mutex);
     return n;
 }

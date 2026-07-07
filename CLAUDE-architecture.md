@@ -2,12 +2,14 @@
 
 The other spec files are protocol/feature-shaped. This one captures the
 **system** properties that decide whether the decomposed design runs in
-production. These are decisions for the repo owner; each ADR is **Proposed**
-with a recommended option and trade-offs, not a fait accompli.
+production. These are decisions for the repo owner; each ADR starts out
+**Proposed** with a recommended option and trade-offs, not a fait accompli —
+individual ADRs below move to Accepted/Implemented as they're settled/built.
 
-Two of them (ADR-003 schema contract, ADR-004 atomicity) should be settled
+Two of them (ADR-003 schema contract, ADR-004 atomicity) needed settling
 **before** the monolith is split, because the split makes the Valkey schema a
-real cross-process API and turns torn-read bugs into multi-writer bugs.
+real cross-process API and turns torn-read bugs into multi-writer bugs. Both
+are now done — ADR-003 Accepted+implemented, ADR-004 Implemented (2026-07-07).
 
 ## How these interlock
 
@@ -88,13 +90,12 @@ fields keep arriving.
 
 # ADR-004: Zone-change atomicity and AXFR snapshot consistency
 
-**Status:** **Accepted (2026-06-26, decision only)** — direction chosen: **A**
-(wrap record writes + `serial_bump` in `MULTI`/`EXEC`) for write atomicity, **C**
-(journal-anchored snapshot, reusing the existing per-zone IXFR journal) for AXFR
-consistency, and replace `KEYS` with `SCAN`. **Implementation is a follow-up PR**
-— it touches the security-sensitive zone-write / AXFR path and is independent of
-the Phase-1 schema/encoding foundation, so it is sequenced separately rather than
-bundled here.
+**Status:** **Implemented (2026-07-07).** Option **A** (write atomicity) landed
+as decided. AXFR consistency landed as a **fourth option the ADR didn't
+enumerate** — a native Valkey MULTI/EXEC snapshot read — rather than **C**
+(journal-anchored replay); see "Implementation" below for why and what that
+means relative to the original Options list. `KEYS` → `SCAN` landed everywhere
+as decided.
 
 ## Context
 
@@ -142,6 +143,71 @@ lean on the journal you already have. Replace `KEYS` with `SCAN` regardless.
   diverge).
 - AXFR threads pin a serial; this interacts with ADR-005 (an in-process zone
   snapshot is the natural place to pin) and ADR-007 (snapshot durability).
+
+## Implementation (2026-07-07)
+
+**Option A (write atomicity) — done as decided.** New transaction helpers wrap
+the shared RESP clients: `resp_txn_t` + `resp_txn_begin/queue/commit` in
+`dns_server.c` (its own client), `vkc_txn_t` + `vkc_txn_begin/queue/commit` in
+`dns_wire.c`/`.h` (shared by `apid.c` and `eppd.c`). Every zone-record write +
+its SOA `serial_bump` now commits as one `MULTI`/`EXEC`: `dns_server.c`'s
+`handle_update` (RFC 2136, all A/AAAA/TXT/CNAME/MX/SRV add and delete
+branches), `auto_ptr_apply`, `srp_handle_update`'s 8 write sites, ZSK/KSK
+rollover phase transitions (`rollover_{start,to_commit,finish}`,
+`ksk_rollover_{start,to_retire,finish}`), and `cert_publish_tlsa`;
+`apid.c`'s `/update`, `/delete`, `/zone` POST/PUT/DELETE, `/reverse/classless`,
+`/enum/provision`; `eppd.c`'s `epp_publish_domain`/`epp_retract_domain`. IXFR
+journal writes (`ixfr_journal_append`) stay a separate step *after* commit,
+since a journal entry needs the transaction's real committed serial, which
+isn't known until `EXEC` returns — a missed journal write on a crash between
+the two is indistinguishable from the pre-existing non-journaled-type gap
+`ixfr_journal_fetch` already falls back to AXFR for.
+
+Fixed one real, previously-undiscovered bug while wiring this up: apid's
+`/reverse/classless` bumped the delegated zone's serial **twice** per request
+(once for the CNAME block, once more in the `delegate_to` branch) — two
+independent, non-atomic round trips. It's now one transaction, one bump;
+regression-guarded by `make check-classless-atomic`.
+
+**AXFR consistency — a fourth option, not B or C.** Investigation found Option
+C as written doesn't actually work standalone: the IXFR journal only records
+A/AAAA/PTR/SRP diffs, so "replay the journal" can't reconstruct
+TXT/MX/SRV/CNAME/TLSA-on-cert-change/DNSSEC-rollover history. Once Option A's
+transaction primitive existed, a cleaner path opened that the ADR's Options
+list didn't consider: **queue every AXFR GET inside one Valkey MULTI/EXEC
+instead of reading live.** Valkey guarantees no other client's writes
+interleave with a queued transaction, so this gives a true per-instant
+snapshot for *every* record type, with no journal-coverage gap and no new
+storage/GC (unlike B). `axfr_send_runtime` (dns_server.c) now does this
+**per record type**: SCAN-discover that type's keys (racy discovery is fine,
+same as before), then queue a GET for every key of that one type inside a
+single transaction, using a compact reply struct (`axfr_reply_t`, 768B) rather
+than an array of full `resp_reply_t` (64KB each) since a type can have
+thousands of keys. This is a deliberate scope reduction from the
+whole-zone-with-per-type-fallback hybrid originally sketched during design:
+per-type batching alone already closes the actual bug (a concurrent UPDATE
+tearing one type's data mid-scan) and is far simpler to get right; the
+residual gap — two different *types'* snapshots can differ by the
+milliseconds between their two transactions — is logged (comparing the
+envelope serial captured at transfer start against the zone's serial after
+`axfr_send_runtime` returns) rather than retried, since a secondary that
+lands on a torn cross-type boundary still reconverges via its next
+refresh/IXFR cycle, same as any other missed-generation gap.
+
+Security-gate evidence: `make check-axfr-concurrency` flips 6000 A records
+between two "generations" using the test harness's *own* real Valkey
+MULTI/EXEC (so the write side is atomic by construction, isolating the test
+to the reader), transfers the zone with a deliberately slow AXFR client
+during continuous flipping, and asserts every record captured in one transfer
+shows the same generation. Verified this reproduces a mixed-generation read
+against the pre-fix code (confirming the test has teeth) and is clean against
+the fix.
+
+**KEYS → SCAN — done everywhere.** New `vk_scan_keys`/`vk_scan_keys_strict`
+(dns_server.c, same malloc'd-array shape as the functions they replaced) and
+a shared `vkc_scan_keys` (dns_wire.c/.h, used by `apid.c`/`certd.c`/
+`eppd.c`/`mdnsd.c`) — cursor loops, mechanical renames at every call site, no
+signature changes. Regression: `make check-scan-equivalence`.
 
 ---
 
