@@ -2084,6 +2084,7 @@ check-xfr-refresh: $(BIN_DEBUG)
 	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
 	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
 	 python3 tests/axfr_master.py 127.0.0.1 $$P $$Z $$CTL >/tmp/axfr_master_r.log 2>&1 & M=$$!; \
+	 for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
 	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|2|1|4|300|127.0.0.1|" >/dev/null; \
 	 for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
 	 $$VC set config:zone_role secondary >/dev/null;                                   \
@@ -2133,6 +2134,7 @@ check-xfr-client: $(BIN_DEBUG)
 	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
 	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
 	 python3 tests/axfr_master.py 127.0.0.1 $$P $$Z >/tmp/axfr_master.log 2>&1 & M=$$!;\
+	 for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
 	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
 	 for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
 	 $$VC set config:zone_role secondary >/dev/null;                                   \
@@ -2815,6 +2817,7 @@ check-ixfr-client: $(BIN_DEBUG)
 	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
 	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
 	 python3 tests/ixfr_master.py 127.0.0.1 $$P $$Z >/tmp/ixfr_master.log 2>&1 & M=$$!;\
+	 for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
 	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
 	 for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
 	 $$VC del config:zone:$$Z:serial >/dev/null;                                       \
