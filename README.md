@@ -230,6 +230,7 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:update_unsigned_allow` | Comma-separated IPv4 addresses/CIDRs allowed to send **unsigned** UPDATEs. Default empty: an UPDATE must carry a valid TSIG or SIG(0), otherwise it is REFUSED. Malformed entries (e.g. `10.0.0.0/x`) match nobody. Do not list `127.0.0.1` on a host running `apid`/`doqd` — DoH/DoQ clients reach dnsd from loopback. |
 | `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
+| `config:tcp_max_conns` | Cap on concurrent TCP + DoT connections (default 256); over the cap new connections are closed and counted in `dns_tcp_rejected_total`. A connection gets 5 s for its TLS handshake and first query, then a 30 s idle timeout. Plain TCP on the DNS port never uses TLS; the DoT port is TLS-only and refuses connections while no certificate is loaded. |
 | `config:notify_targets` | Comma-separated `IP:port` recipients for NOTIFY on zone change. |
 | `config:ddns_auto_ptr` | When set, a forward A/AAAA DDNS registration also maintains the matching reverse PTR lease in the locally-configured `in-addr.arpa` / `ip6.arpa` zone. |
 | `config:ddns_sweep_secs` | Interval (seconds) of the primary's DDNS lease-expiry sweeper (default 30, 0 = off): replays a silently-expired `ddns:*` lease as a serial bump + IXFR delete + NOTIFY so secondaries converge. |

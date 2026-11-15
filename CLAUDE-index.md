@@ -64,8 +64,8 @@ validator and resolver sees, then availability).
 | CSA-DNSSEC-001 | High | KSK key tag from the KSK encoding (+ whole-RRset DNSKEY signature) | **Done** 2026-11-15 | dnssec-denial, Fix 1 |
 | CSA-PROTO-001 | High | Name existence decides NODATA vs NXDOMAIN; empty non-terminals via the dnsd-owned `zidx:*` index | **Done** 2026-11-15 (2a + 2b, D2 = A) | dnssec-denial, Fix 2 |
 | CSA-DNSSEC-002 | High | RFC 9824 compact denial (= dnsd Add 11), NSEC or NSEC3 per `dnssec_nsec_mode` | **Done** 2026-11-15 (D1: keep selector) | dnssec-denial, Fix 3 |
-| CSA-PROTO-002 | High | Listener sets the transport for `dot_thread` | Specced | tcp-transport, Fix 1 |
-| CSA-DOS-002 | Medium | Connection cap, handshake timeout, checked `pthread_create` | Complementary | tcp-transport, Fix 2 |
+| CSA-PROTO-002 | High | Listener sets the transport for `dot_thread` | **Done** 2026-11-15 | tcp-transport, Fix 1 |
+| CSA-DOS-002 | Medium | Connection cap, handshake timeout, checked `pthread_create` | **Done** 2026-11-15 | tcp-transport, Fix 2 |
 | CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | Specced | resolverd-cache, Fix 1 |
 | — | — | TSan build + stress target + CI job | Specced | resolverd-cache, Fix 2 |
 

@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -605,6 +605,69 @@ check-ent: $(BIN_DEBUG)
 	 test "$$SAN" -eq 0      || { echo "  FAIL  sanitizer report"; rc=1; }; \
 	 test $$rc -eq 0 || exit 1;                                                        \
 	 echo "  OK  empty non-terminals answered NODATA (live, expiry, restart reconcile); signed ENT denial validates"
+
+# CSA-PROTO-002 + CSA-DOS-002 (CLAUDE-tcp-transport.md). The accepting
+# listener decides the transport: plain TCP on the DNS port is never TLS (it
+# used to switch to TLS the moment a certificate was loaded, breaking every
+# TC=1 retry), the DoT port is TLS-only (it used to answer in cleartext when
+# no certificate was loaded). Stream connections are bounded: a client that
+# connects and sends nothing is dropped after 5 s, and config:tcp_max_conns
+# caps the thread count while a flood of idle connections drains. Needs
+# Valkey + dig + openssl + python3-dnspython.
+check-tcp-plain: $(BIN_DEBUG)
+	@echo "  CHECK  plain TCP vs DoT per listener + stream connection bounds (Valkey + dig + openssl + python3-dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.query' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
+	 D=$$(mktemp -d); DOT=8853;                                                        \
+	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes        \
+	   -keyout $$D/tp.key -out $$D/tp.crt -subj /CN=ns1.example.local -days 2         \
+	   -addext "subjectAltName=DNS:ns1.example.local" >/dev/null 2>&1;                 \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);  \
+	 SAVE_CC=$$($$VC get cert:current); SAVE_MX=$$($$VC get config:tcp_max_conns);     \
+	 $$VC del config:tls_cert_pem config:tls_key_pem cert:current config:tcp_max_conns >/dev/null; \
+	 tcpq() { dig +tcp +nocookie +short @127.0.0.1 -p $$1 example.local A +time=2 +tries=1 2>/dev/null | grep -c '^192\.168\.1\.10$$'; }; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_tcpp.log 2>&1 & DNS=$$!; \
+	 sleep 2;                                                                          \
+	 N1=$$(tcpq $(TPORT)); N2=$$(tcpq $$DOT);                                          \
+	 $$VC -x set config:tls_cert_pem < $$D/tp.crt >/dev/null;                          \
+	 $$VC -x set config:tls_key_pem < $$D/tp.key >/dev/null; sleep 2;                  \
+	 C1=$$(tcpq $(TPORT));                                                             \
+	 TC=$$(dig +nocookie +dnssec +bufsize=512 @127.0.0.1 -p $(TPORT) example.local DNSKEY +time=2 +tries=1 2>&1); \
+	 TCR=$$(echo "$$TC" | grep -c 'Truncated, retrying in TCP'); TCS=$$(echo "$$TC" | grep -c 'RRSIG'); \
+	 C2=$$(python3 tests/dot_query.py 127.0.0.1 $$DOT $$D/tp.crt ns1.example.local example.local); \
+	 C3=$$(tcpq $$DOT);                                                                \
+	 HS=$$(python3 tests/tcp_idle_flood.py 127.0.0.1 $$DOT 1 9);                       \
+	 $$VC set config:tcp_max_conns 8 >/dev/null; sleep 1;                              \
+	 BASE=$$(awk '/^Threads:/{print $$2}' /proc/$$DNS/status);                         \
+	 python3 tests/tcp_idle_flood.py 127.0.0.1 $(TPORT) 60 9 > $$D/flood.out & FL=$$!; \
+	 sleep 1.5; PEAK=$$(awk '/^Threads:/{print $$2}' /proc/$$DNS/status);              \
+	 sleep 5; C4=$$(tcpq $(TPORT));                                                    \
+	 wait $$FL 2>/dev/null; FLOOD=$$(cat $$D/flood.out);                               \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 SAN=$$(grep -c 'AddressSanitizer\|runtime error' /tmp/dnsd_tcpp.log);             \
+	 rm -rf $$D;                                                                       \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_CC" ]; then $$VC set cert:current "$$SAVE_CC" >/dev/null; fi;    \
+	 if [ -n "$$SAVE_MX" ]; then $$VC set config:tcp_max_conns "$$SAVE_MX" >/dev/null; else $$VC del config:tcp_max_conns >/dev/null; fi; \
+	 echo "  no cert:   plain TCP answers=$$N1  cleartext on DoT port answers=$$N2";   \
+	 echo "  with cert: plain TCP answers=$$C1  TC retry (truncated=$$TCR, signed answer=$$TCS)  DoT=[$$C2]  cleartext on DoT port answers=$$C3"; \
+	 echo "  silent DoT client: $$HS";                                                 \
+	 echo "  cap=8, 60 idle conns: threads base=$$BASE peak=$$PEAK | $$FLOOD | new client after drain answers=$$C4"; \
+	 rc=0;                                                                             \
+	 test "$$N1" = 1 || { echo "  FAIL  plain TCP did not answer without a certificate"; rc=1; }; \
+	 test "$$N2" = 0 || { echo "  FAIL  DoT port answered cleartext without a certificate"; rc=1; }; \
+	 test "$$C1" = 1 || { echo "  FAIL  plain TCP stopped answering once a certificate loaded (CSA-PROTO-002)"; rc=1; }; \
+	 test "$$TCR" -ge 1 -a "$$TCS" -ge 1 || { echo "  FAIL  TC=1 retry over TCP did not return the full signed answer"; rc=1; }; \
+	 test "$$C2" = 192.168.1.10 || { echo "  FAIL  DoT over TLS did not answer"; rc=1; }; \
+	 test "$$C3" = 0 || { echo "  FAIL  DoT port answered a cleartext query with a certificate loaded"; rc=1; }; \
+	 echo "$$HS" | grep -q 'closed_by_server=1 ' && test "$$(echo "$$HS" | sed 's/.*first_close=\([0-9.]*\).*/\1/' | cut -d. -f1)" -le 6 || { echo "  FAIL  silent DoT client not dropped within the 5 s handshake window"; rc=1; }; \
+	 test $$((PEAK - BASE)) -le 12 || { echo "  FAIL  idle flood grew $$((PEAK - BASE)) threads past tcp_max_conns=8"; rc=1; }; \
+	 test "$$C4" = 1 || { echo "  FAIL  new client not answered after the idle flood drained"; rc=1; }; \
+	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report"; rc=1; }; \
+	 test $$rc -eq 0 || exit 1;                                                        \
+	 echo "  OK  listener decides TLS vs plain; TC retry works with a cert; silent clients dropped; connection cap holds"
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -3350,6 +3413,7 @@ help:
 	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
 	@echo "  make check-dnssec-validate  Independent DNSSEC validation (dnspython): KSK tags, NODATA, RFC 9824 compact denial"
 	@echo "  make check-ent       Empty non-terminals: zidx index, NODATA not NXDOMAIN, signed ENT denial"
+	@echo "  make check-tcp-plain plain TCP vs DoT per listener, stream connection cap + handshake timeout"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"

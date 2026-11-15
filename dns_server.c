@@ -131,6 +131,12 @@
  *   config:nsid                NSID string             (default: hostname)
  *   config:cookie_secret       16-byte hex cookie secret
  *   config:axfr_allow          Comma-separated IPs/CIDRs allowed to do AXFR
+ *   config:tcp_max_conns       Cap on concurrent TCP + DoT connections (default
+ *                              256; over the cap new connections are closed).
+ *                              Each connection must finish its TLS handshake and
+ *                              first query within 5 s, then idles out after 30 s.
+ *                              Plain TCP on the DNS port is never TLS; the DoT
+ *                              port is TLS-only (closed when no cert is loaded).
  *   config:notify_targets      Comma-separated IP:port targets for NOTIFY
  *   config:forward_enabled     "1" to forward out-of-zone queries (default: 0).
  *                              OFF + ACL-gated: an open resolver is an abuse
@@ -1407,11 +1413,16 @@ static pthread_mutex_t g_zsk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_soa_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Query statistics (Prometheus) */
-static uint64_t g_stat_queries = 0;       /* total queries received */
-static uint64_t g_stat_noerror = 0;       /* NOERROR responses */
-static uint64_t g_stat_nxdomain = 0;      /* NXDOMAIN responses */
-static uint64_t g_stat_refused = 0;       /* REFUSED (out-of-zone) */
-static uint64_t g_stat_servfail = 0;      /* SERVFAIL responses */
+static uint64_t g_stat_queries = 0;  /* total queries received */
+static uint64_t g_stat_noerror = 0;  /* NOERROR responses */
+static uint64_t g_stat_nxdomain = 0; /* NXDOMAIN responses */
+static uint64_t g_stat_refused = 0;  /* REFUSED (out-of-zone) */
+static uint64_t g_stat_servfail = 0; /* SERVFAIL responses */
+/* CSA-DOS-002: stream (TCP/DoT) connections are one detached thread each;
+ * bound them. config:tcp_max_conns (default 256). */
+static atomic_int g_tcp_conns = 0;
+static int g_tcp_max_conns = 256;
+static uint64_t g_stat_tcp_rejected = 0;
 static uint64_t g_stat_rrl_drop = 0;      /* RRL: dropped */
 static uint64_t g_stat_rrl_tc = 0;        /* RRL: truncated */
 static uint64_t g_stat_axfr = 0;          /* AXFR transfers completed */
@@ -2597,6 +2608,10 @@ static void config_load_from_valkey(void) {
     /* RFC 1794 per-name round-robin rotation (config:rr_rotate, default 0). */
     g_rr_rotate = 0;
     GI("rr_rotate", g_rr_rotate);
+    g_tcp_max_conns = 256;
+    GI("tcp_max_conns", g_tcp_max_conns);
+    if (g_tcp_max_conns < 1)
+        g_tcp_max_conns = 1;
     /* RFC 6116 ENUM apex (config:enum_apex, e.g. "e164.arpa", empty = not set). */
     g_enum_apex[0] = 0;
     G("enum_apex", g_enum_apex);
@@ -11879,29 +11894,93 @@ static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len
 typedef struct {
     int fd;
     struct sockaddr_in addr;
+    /* Set by the accepting listener (CSA-PROTO-002): 1 = DoT port, 0 = plain
+     * TCP on the DNS port. dot_thread used to wrap EVERY stream connection
+     * in TLS as soon as a certificate was loaded, so plain TCP/53 (every
+     * TC=1 retry) broke, and without a certificate the DoT port answered in
+     * cleartext. The listener knows; nothing is sniffed. */
+    int is_tls;
 } dot_conn_t;
+
+#define STREAM_HANDSHAKE_SECS 5 /* TLS handshake + first query */
+#define STREAM_IDLE_SECS 30     /* between queries afterwards */
+
+static void stream_set_timeouts(int fd, int secs) {
+    struct timeval tv = {.tv_sec = secs};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+        dns_log(LOG_WARNING, "[TCP] setsockopt timeout failed: %s\n", strerror(errno));
+}
+
+static void dot_thread_body(dot_conn_t *cp);
 static void *dot_thread(void *arg) {
     dot_conn_t c;
     memcpy(&c, arg, sizeof(c));
     free(arg);
-    SSL *ssl = NULL;
-    pthread_mutex_lock(&g_tls_mutex);
-    SSL_CTX *ctx = g_dot_ctx;
-    if (ctx) {
-        ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, c.fd);
+    dot_thread_body(&c); /* every exit path, incl. the AXFR hand-off, returns here */
+    atomic_fetch_sub(&g_tcp_conns, 1);
+    return NULL;
+}
+
+/* Hand an accepted stream connection to its own thread, bounded by
+ * config:tcp_max_conns (CSA-DOS-002). The fd gets the short handshake/first-
+ * query timeout before the thread starts, so a client that connects and
+ * sends nothing — over TLS or not — is dropped after STREAM_HANDSHAKE_SECS. */
+static void stream_accept(int cfd, const struct sockaddr_in *addr, int is_tls) {
+    if (atomic_fetch_add(&g_tcp_conns, 1) >= g_tcp_max_conns) {
+        atomic_fetch_sub(&g_tcp_conns, 1);
+        STAT_INC(g_stat_tcp_rejected);
+        close(cfd);
+        return;
     }
-    pthread_mutex_unlock(&g_tls_mutex);
-    if (ssl && SSL_accept(ssl) <= 0) {
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        close(c.fd);
-        return NULL;
+    stream_set_timeouts(cfd, STREAM_HANDSHAKE_SECS);
+    dot_conn_t *c = malloc(sizeof(dot_conn_t));
+    if (!c) {
+        close(cfd);
+        atomic_fetch_sub(&g_tcp_conns, 1);
+        return;
+    }
+    c->fd = cfd;
+    c->addr = *addr;
+    c->is_tls = is_tls;
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, dot_thread, c) != 0) {
+        dns_log(LOG_WARNING, "[TCP] pthread_create failed — connection dropped\n");
+        free(c);
+        close(cfd);
+        atomic_fetch_sub(&g_tcp_conns, 1);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+static void dot_thread_body(dot_conn_t *cp) {
+    dot_conn_t c = *cp;
+    SSL *ssl = NULL;
+    if (c.is_tls) {
+        pthread_mutex_lock(&g_tls_mutex);
+        SSL_CTX *ctx = g_dot_ctx;
+        if (ctx)
+            ssl = SSL_new(ctx);
+        pthread_mutex_unlock(&g_tls_mutex); /* never held across SSL_accept */
+        if (!ssl) {
+            /* DoT port with no certificate loaded: refuse rather than speak
+             * cleartext on a port clients expect to be private. */
+            close(c.fd);
+            return;
+        }
+        if (SSL_set_fd(ssl, c.fd) != 1 || SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(c.fd);
+            return;
+        }
     }
     char cip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &c.addr.sin_addr, cip, sizeof(cip));
-    struct timeval tv = {.tv_sec = 30};
-    setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int first_msg = 1;
     for (;;) {
         uint8_t lb[2];
         int got = 0;
@@ -11923,6 +12002,13 @@ static void *dot_thread(void *arg) {
                 goto dot_done;
             got += n;
         }
+        if (first_msg) {
+            /* Past the handshake / first-query window: normal idle timeout. A
+             * transfer in progress is not idle (each send gets its own
+             * STREAM_IDLE_SECS budget). */
+            stream_set_timeouts(c.fd, STREAM_IDLE_SECS);
+            first_msg = 0;
+        }
         /* Check for AXFR */
         uint16_t qtype = 0;
         char axfr_qn[256] = "";
@@ -11939,7 +12025,7 @@ static void *dot_thread(void *arg) {
                     SSL_free(ssl);
                 }
                 close(c.fd);
-                return NULL;
+                return;
             }
             ac->fd = c.fd;
             ac->ssl = ssl;
@@ -11986,7 +12072,7 @@ static void *dot_thread(void *arg) {
              * step 7); called to stash a verified request MAC for response signing. */
             (void) tsig_verify(pkt, ml, NULL);
             axfr_thread(ac);
-            return NULL;
+            return;
         }
         char qn[256] = "?";
         uint16_t qt = 0;
@@ -12027,7 +12113,7 @@ dot_done:
         SSL_free(ssl);
     }
     close(c.fd);
-    return NULL;
+    return;
 }
 
 /* pki_spki_sha256 — SHA-256 of SubjectPublicKeyInfo (for TLSA 3 1 1) */
@@ -12101,7 +12187,7 @@ static void handle_metrics(int fd) {
     uint64_t sq = g_stat_queries, sn = g_stat_noerror, snx = g_stat_nxdomain, sr = g_stat_refused,
              ss = g_stat_servfail, rd = g_stat_rrl_drop, rt = g_stat_rrl_tc, ax = g_stat_axfr,
              dd = g_stat_ddns, si = g_stat_signed, fw = g_stat_forwarded, ff = g_stat_forward_fail,
-             lbd = g_stat_lb_down_skips;
+             lbd = g_stat_lb_down_skips, tcr = g_stat_tcp_rejected;
     pthread_mutex_unlock(&g_stat_mutex);
     snprintf(body, sizeof(body),
              "# HELP dns_queries_total Total DNS queries received\n"
@@ -12144,13 +12230,20 @@ static void handle_metrics(int fd) {
              "dns_lb_down_skips_total %llu\n"
              "# HELP dns_lb_health_enabled Whether load-balancing health checks are active\n"
              "# TYPE dns_lb_health_enabled gauge\n"
-             "dns_lb_health_enabled %d\n",
+             "dns_lb_health_enabled %d\n"
+             "# HELP dns_tcp_rejected_total Stream connections refused at tcp_max_conns\n"
+             "# TYPE dns_tcp_rejected_total counter\n"
+             "dns_tcp_rejected_total %llu\n"
+             "# HELP dns_tcp_connections Open TCP/DoT connections\n"
+             "# TYPE dns_tcp_connections gauge\n"
+             "dns_tcp_connections %d\n",
              (unsigned long long) sq, (unsigned long long) sn, (unsigned long long) snx,
              (unsigned long long) sr, (unsigned long long) ss, (unsigned long long) rd,
              (unsigned long long) rt, (unsigned long long) ax, (unsigned long long) dd,
              (unsigned long long) si, (unsigned long long) fw, (unsigned long long) ff,
              g_soa_serial, g_rrl_enabled, (g_forward_enabled && g_forward_allow[0]) ? 1 : 0,
-             (unsigned long long) lbd, g_lb_health_enabled ? 1 : 0);
+             (unsigned long long) lbd, g_lb_health_enabled ? 1 : 0, (unsigned long long) tcr,
+             atomic_load(&g_tcp_conns));
     metrics_send(fd, 200, "text/plain; version=0.0.4", body);
 }
 
@@ -12745,8 +12838,12 @@ int main(int argc, char **argv) {
     dns_log(LOG_INFO, "\n╔═══════════════════════════════════════════════════════════════════╗\n");
     dns_log(LOG_INFO, "║  DNS  UDP plain + RFC2136 UPDATE + NOTIFY  :%d                   ║\n",
             g_dns_port);
-    dns_log(LOG_INFO, "║  DoT  TCP DNS-over-TLS + AXFR              :%d  %s           ║\n",
+    dns_log(LOG_INFO, "║  TCP  plain DNS (TC retry) + AXFR          :%d                   ║\n",
+            g_dns_port);
+    dns_log(LOG_INFO, "║  DoT  TCP DNS-over-TLS + XoT               :%d  %s           ║\n",
             g_dot_port, g_dot_ctx ? "TLS " : "----");
+    dns_log(LOG_INFO, "║  Stream connection cap (tcp_max_conns)      %-6d                     ║\n",
+            g_tcp_max_conns);
     dns_log(LOG_INFO, "║  DoT client-cert (mTLS) required            %-20s       ║\n",
             (g_dot_require_client_cert && g_mtls_ca_pem[0]) ? "yes" : "no");
     dns_log(LOG_INFO, "║  Zone role                                  %-20s       ║\n",
@@ -12971,22 +13068,8 @@ int main(int argc, char **argv) {
             struct sockaddr_in cli;
             socklen_t clen = sizeof(cli);
             int cfd = accept(tcp_dns_sock, (struct sockaddr *) &cli, &clen);
-            if (cfd >= 0) {
-                dot_conn_t *c = malloc(sizeof(dot_conn_t));
-                if (!c) {
-                    close(cfd);
-                } else {
-                    c->fd = cfd;
-                    c->addr = cli;
-                    /* dot_thread handles ssl==NULL via plain send/recv */
-                    pthread_t tid;
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                    pthread_create(&tid, &attr, dot_thread, c);
-                    pthread_attr_destroy(&attr);
-                }
-            }
+            if (cfd >= 0)
+                stream_accept(cfd, &cli, 0); /* plain listener: is_tls = 0, never TLS */
         }
 
         /* IPv4 DoT */
@@ -12994,21 +13077,8 @@ int main(int argc, char **argv) {
             struct sockaddr_in cli;
             socklen_t clen = sizeof(cli);
             int cfd = accept(dot_sock, (struct sockaddr *) &cli, &clen);
-            if (cfd >= 0) {
-                dot_conn_t *c = malloc(sizeof(dot_conn_t));
-                if (!c) {
-                    close(cfd);
-                } else {
-                    c->fd = cfd;
-                    c->addr = cli;
-                    pthread_t tid;
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                    pthread_create(&tid, &attr, dot_thread, c);
-                    pthread_attr_destroy(&attr);
-                }
-            }
+            if (cfd >= 0)
+                stream_accept(cfd, &cli, 1); /* DoT listener: TLS only */
         }
 
         /* IPv6 DoT */
@@ -13017,23 +13087,13 @@ int main(int argc, char **argv) {
             socklen_t cl6 = sizeof(cli6);
             int cfd6 = accept(dot6_sock, (struct sockaddr *) &cli6, &cl6);
             if (cfd6 >= 0) {
-                dot_conn_t *c6 = malloc(sizeof(dot_conn_t));
-                if (!c6) {
-                    close(cfd6);
-                } else {
-                    c6->fd = cfd6;
-                    memset(&c6->addr, 0, sizeof(c6->addr));
-                    c6->addr.sin_family = AF_INET;
-                    if (IN6_IS_ADDR_V4MAPPED(&cli6.sin6_addr))
-                        memcpy(&c6->addr.sin_addr, ((uint8_t *) &cli6.sin6_addr) + 12, 4);
-                    c6->addr.sin_port = cli6.sin6_port;
-                    pthread_t tid6;
-                    pthread_attr_t attr6;
-                    pthread_attr_init(&attr6);
-                    pthread_attr_setdetachstate(&attr6, PTHREAD_CREATE_DETACHED);
-                    pthread_create(&tid6, &attr6, dot_thread, c6);
-                    pthread_attr_destroy(&attr6);
-                }
+                struct sockaddr_in a4;
+                memset(&a4, 0, sizeof(a4));
+                a4.sin_family = AF_INET;
+                if (IN6_IS_ADDR_V4MAPPED(&cli6.sin6_addr))
+                    memcpy(&a4.sin_addr, ((uint8_t *) &cli6.sin6_addr) + 12, 4);
+                a4.sin_port = cli6.sin6_port;
+                stream_accept(cfd6, &a4, 1); /* DoT listener: TLS only */
             }
         }
 

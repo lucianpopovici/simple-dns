@@ -12,8 +12,17 @@ grep -n "} dot_conn_t;\|static void \*dot_thread\|SSL_CTX \*ctx = g_dot_ctx;\|ac
 
 | Fix | Finding | Status |
 |----:|---------|--------|
-| 1 | CSA-PROTO-002 — plain TCP/53 speaks TLS once a certificate is loaded | Specced |
-| 2 | CSA-DOS-002 — no connection cap, no handshake timeout, unchecked `pthread_create` | Complementary |
+| 1 | CSA-PROTO-002 — plain TCP/53 speaks TLS once a certificate is loaded | **Done** 2026-11-15 (`make check-tcp-plain`) |
+| 2 | CSA-DOS-002 — no connection cap, no handshake timeout, unchecked `pthread_create` | **Done** 2026-11-15 (`make check-tcp-plain`) |
+
+Implementation notes: the three accept sites now call one `stream_accept()`
+(cap check, 5 s RCV+SND timeouts before the thread starts, checked
+`pthread_create`); `dot_thread` decrements the counter after
+`dot_thread_body()` returns, which covers every exit including the AXFR
+hand-off. The timeout moves to 30 s after the first full query. New metrics:
+`dns_tcp_rejected_total`, `dns_tcp_connections`. The check fails every case
+against the pre-fix dnsd (cleartext on the DoT port, plain TCP dead once a
+cert loads, silent client never dropped, 60 idle connections → 60 threads).
 
 ---
 

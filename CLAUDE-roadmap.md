@@ -155,7 +155,8 @@ availability, then defense-in-depth.
    flake). CI blockers (cppcheck, clang-format) cleared in their own commits.
 4. **Transport confusion** — `CLAUDE-tcp-transport.md` Fix 1 (CSA-PROTO-002,
    *High*, plain TCP/53 speaks TLS once a cert loads) + Fix 2 (CSA-DOS-002,
-   connection cap / handshake timeout / checked `pthread_create`). *Specced.*
+   connection cap / handshake timeout / checked `pthread_create`). **DONE
+   2026-11-15** — `make check-tcp-plain` (in CI).
 5. **resolverd cache UAF** — `CLAUDE-resolverd-cache.md` Fix 1 (CSA-CONC-001,
    *High*, reproduced) + Fix 2 (TSan build + stress target in CI). *Specced.*
 6. **Client identity** — CSA-NET-003 (*High*, IPv6 client address collapses to

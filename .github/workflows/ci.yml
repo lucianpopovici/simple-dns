@@ -357,6 +357,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-ent OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: Plain TCP vs DoT per listener + stream connection bounds (CSA-PROTO-002, CSA-DOS-002)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-tcp-plain OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: RFC 9665 SRP + RFC 9664 Update Leases (register/refresh/conflict/expiry)
         env:
           DNS_VALKEY_HOST: 127.0.0.1
