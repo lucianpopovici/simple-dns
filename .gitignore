@@ -52,3 +52,6 @@ fuzz/fuzz_doq
 .claude/settings.local.json
 .claude/*.lock
 bench/out/dns_server_*
+resolverd_tsan
+dns_server_tsan
+tests/udp_stress
