@@ -1507,7 +1507,7 @@ check-zoneversion: $(BIN_DEBUG) | ossl-sanity
 	 OUT_NOOPT=$$(dig +nocookie @127.0.0.1 -p $(TPORT) "$$ZN" A +time=2 +tries=1);                \
 	 OUT_REFUSED=$$(dig +ednsopt=19 +nocookie @127.0.0.1 -p $(TPORT) not-our-zone.example A +time=2 +tries=1); \
 	 kill $$DNS 2>/dev/null || true;                                                               \
-	 ZVLINE=$$(echo "$$OUT" | grep "OPT=19:");                                                    \
+	 ZVLINE=$$(echo "$$OUT" | grep -E "OPT=19:|ZONEVERSION:");                                                    \
 	 LABELS=$$(echo "$$ZVLINE" | awk '{print $$3}');                                              \
 	 TYPE=$$(echo "$$ZVLINE" | awk '{print $$4}');                                                \
 	 SERIALHEX=$$(echo "$$ZVLINE" | awk '{print $$5 $$6 $$7 $$8}');                               \
@@ -1518,8 +1518,8 @@ check-zoneversion: $(BIN_DEBUG) | ossl-sanity
 	 test "$$LABELS" = "$$NLABELS_HEX" || { echo "  FAIL  LABELCOUNT $$LABELS != expected $$NLABELS_HEX"; exit 1; }; \
 	 test "$$TYPE" = "00" || { echo "  FAIL  TYPE $$TYPE != 00 (SOA-SERIAL)"; exit 1; };           \
 	 test "$$GOTSERIAL" = "$$SERIAL" || { echo "  FAIL  echoed serial $$GOTSERIAL != actual $$SERIAL"; exit 1; }; \
-	 echo "$$OUT_NOOPT" | grep -q "OPT=19:" && { echo "  FAIL  ZONEVERSION emitted without client request"; exit 1; }; \
-	 echo "$$OUT_REFUSED" | grep -q "OPT=19:" && { echo "  FAIL  ZONEVERSION emitted on REFUSED/out-of-zone"; exit 1; }; \
+	 echo "$$OUT_NOOPT" | grep -qE "OPT=19:|ZONEVERSION:" && { echo "  FAIL  ZONEVERSION emitted without client request"; exit 1; }; \
+	 echo "$$OUT_REFUSED" | grep -qE "OPT=19:|ZONEVERSION:" && { echo "  FAIL  ZONEVERSION emitted on REFUSED/out-of-zone"; exit 1; }; \
 	 echo "  OK  ZONEVERSION echoes zone label count + SOA serial; opt-in only; omitted when not authoritative"
 
 # RFC 9103 Zone Transfer over TLS (XoT) conformance: §7.1 MUSTs the "dot" ALPN
@@ -1656,13 +1656,13 @@ check-error-reporting: $(BIN_DEBUG) | ossl-sanity
 	 SUBDOM=$$(dig +nocookie @127.0.0.1 -p $(TPORT) example.local A +time=2 +tries=1);              \
 	 kill $$DNS 2>/dev/null || true;                                                                \
 	 if [ -n "$$SAVE_A" ]; then $$VC set config:error_report_agent "$$SAVE_A" >/dev/null; else $$VC del config:error_report_agent >/dev/null; fi; \
-	 echo "  agent set:    $$(echo "$$SET"    | grep -o 'OPT=18:.*')";                              \
-	 echo "  agent unset:  $$(echo "$$UNSET"  | grep -c 'OPT=18') occurrences";                     \
-	 echo "  subdomain:    $$(echo "$$SUBDOM" | grep -c 'OPT=18') occurrences";                     \
-	 echo "$$SET" | grep -q "OPT=18" || { echo "  FAIL  Report-Channel option missing when configured"; ss -lunp 2>/dev/null | grep ":$(TPORT) "; echo "$$SET" | sed 's/^/    | /'; exit 1; }; \
+	 echo "  agent set:    $$(echo "$$SET"    | grep -oE '(OPT=18|Report-Channel):.*')";                              \
+	 echo "  agent unset:  $$(echo "$$UNSET"  | grep -cE 'OPT=18|Report-Channel') occurrences";                     \
+	 echo "  subdomain:    $$(echo "$$SUBDOM" | grep -cE 'OPT=18|Report-Channel') occurrences";                     \
+	 echo "$$SET" | grep -qE "OPT=18|Report-Channel" || { echo "  FAIL  Report-Channel option missing when configured"; ss -lunp 2>/dev/null | grep ":$(TPORT) "; echo "$$SET" | sed 's/^/    | /'; exit 1; }; \
 	 echo "$$SET" | grep -q "report.example.net" || { echo "  FAIL  agent domain not correctly wire-encoded"; exit 1; }; \
-	 echo "$$UNSET"  | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted with no agent configured"; exit 1; }; \
-	 echo "$$SUBDOM" | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted for a subdomain-of-zone agent (RFC 9567 §4 MUST NOT)"; exit 1; }; \
+	 echo "$$UNSET"  | grep -qE "OPT=18|Report-Channel" && { echo "  FAIL  Report-Channel emitted with no agent configured"; exit 1; }; \
+	 echo "$$SUBDOM" | grep -qE "OPT=18|Report-Channel" && { echo "  FAIL  Report-Channel emitted for a subdomain-of-zone agent (RFC 9567 §4 MUST NOT)"; exit 1; }; \
 	 echo "  OK  Report-Channel option present with the configured agent; omitted when unset or when agent is a subdomain of the zone"
 
 # RFC 3258 anycast deployment note (CLAUDE-rfc-additions-batch4.md): the note
@@ -2046,8 +2046,9 @@ check-xfr-tsig: $(BIN_DEBUG)
 	   python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" $$MODE >/tmp/xtsig_m.log 2>&1 & M=$$!; \
 	   for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
 	   ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/xtsig_s.log 2>&1 & DNS=$$!;    \
-	   sleep 2.2;                                                                       \
-	   W=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=2 +tries=1);        \
+	   W=""; for w in $$(seq 1 16); do sleep 0.5;                                        \
+	     W=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=1 +tries=1);      \
+	     test -n "$$W" -o $$MODE != ok -a $$w -ge 5 && break; done;                       \
 	   kill $$DNS $$M 2>/dev/null || true; sleep 0.3;                                   \
 	   RES="$$RES $$MODE=[$$W]";                                                         \
 	   eval "R_$$MODE=\"$$W\"";                                                          \
