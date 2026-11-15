@@ -351,6 +351,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-dnssec-validate OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: Empty non-terminals — zidx name index, NODATA not NXDOMAIN (CSA-PROTO-001 Fix 2b)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-ent OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: RFC 9665 SRP + RFC 9664 Update Leases (register/refresh/conflict/expiry)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

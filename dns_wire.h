@@ -682,8 +682,8 @@ void *keyspace_watch_loop(void *arg);
  * major.minor: a major bump is a breaking change (incompatible — fail closed); a
  * minor bump is additive (compatible — warn). */
 #define SCHEMA_VERSION_MAJOR 1
-#define SCHEMA_VERSION_MINOR 0
-#define SCHEMA_VERSION_STR "1.0"
+#define SCHEMA_VERSION_MINOR 1 /* 1.1: zidx:<zone> name index (additive) */
+#define SCHEMA_VERSION_STR "1.1"
 
 enum {
     SCHEMA_OK = 0,          /* stored == compiled */

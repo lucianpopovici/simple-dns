@@ -570,15 +570,17 @@ HTTP front-ends. Define and enforce this.
 | `cache:*` | resolverd | resolverd | Persisted resolver cache. ADR-008 pilot: with `RESOLVERD_CACHE_BACKEND=objectdb` this namespace moves out of Valkey into resolverd's embedded objectdb store (`object_graph.{c,h}`, vendored+pinned) — same single-owner contract, no bus change |
 | `epp:*` | eppd | eppd | RFC 5731/5732/5733 domain/host/contact object store (TLV-encoded, ADR-003; hex-encoded before storing) |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
-| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | ADR-003 schema-version contract (`major.minor`) |
+| `schema:version` | dnsd (seeds on absent; raises an older minor) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | ADR-003 schema-version contract (`major.minor`) |
+| `zidx:*` | dnsd (from zone:/ddns:/srp: keyspace events; reconciled on reconnect) | dnsd | Zone name index (schema 1.1): empty non-terminals answered NODATA (RFC 8020), wildcard never applied to an existing name (RFC 4592). Other writers do **not** maintain it — dnsd derives it from their writes |
 
 **Live reload (done — migration Step 6):** each daemon runs a subscriber on a
 dedicated Valkey connection, enables keyspace notifications
 (`notify-keyspace-events KEA`) and PSUBSCRIBEs to the prefixes it owns, so
 dashboard edits and `cert:current` updates take effect without a restart —
 no more SIGHUP / `POST /config`. `dnsd` watches `config:*`, `cert:current`,
-`zone_table:*`, and `dnssec:*` (reloads that zone's key state live — current set
-plus any rollover/next set); `apid` watches
+`zone_table:*`, `dnssec:*` (reloads that zone's key state live — current set
+plus any rollover/next set), and `zone:*`/`ddns:*`/`srp:*` (record-cache
+invalidation + the `zidx:*` name index); `apid` watches
 `cert:current` + the TLS config keys; `mdnsd` watches `mdns:*` + `config:mdns_*`
 and re-announces; `eppd` watches `cert:current` + its own TLS/CA config keys,
 via the same shared `keyspace_watch_loop` (`dns_wire.h`) every future adopter
@@ -593,7 +595,8 @@ storm.
 The Valkey bus is a **versioned contract**, not an ad-hoc set of strings
 (`CLAUDE-architecture.md` ADR-003, Accepted option C):
 
-- **Version key.** `schema:version` holds `major.minor` (current **1.0**). Every
+- **Version key.** `schema:version` holds `major.minor` (current **1.1** — adds
+  the dnsd-owned `zidx:*` name index). Every
   daemon compares it against its compiled `SCHEMA_VERSION` at startup via
   `schema_version_check()` (in `libdnswire`): a **major** mismatch is fatal —
   the daemon refuses to start; a **minor** mismatch warns and continues

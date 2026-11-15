@@ -145,7 +145,8 @@ availability, then defense-in-depth.
    NXDOMAIN), CSA-DNSSEC-002 (invalid denial proof → RFC 9824 compact denial,
    promotes batch3 Add 11). **DONE 2026-11-15** (Fix 1, 2a, 3; D1 = keep
    the `dnssec_nsec_mode` selector, both forms implemented) —
-   `make check-dnssec-validate` (in CI). Fix 2b still waits on **D2**.
+   `make check-dnssec-validate` (in CI). Fix 2b **DONE 2026-11-15** (D2 = A:
+   dnsd-owned `zidx:*` name index, schema 1.1, `make check-ent`).
    Verifying surfaced pre-existing defects, all fixed in the follow-up
    commit: multi-RR RRsets signed per record, DNSKEY/CDS/DS answered at any
    name, resolverd picking the first DNSKEY for every RRSIG (now SECURE
@@ -202,7 +203,7 @@ inputs. PERF-006 (thread per forwarded query) is standalone.
 
 **Decision (sequencing):** Phase 0b blocks the remaining Phase 2 items (ENUM
 deployment/ops, ADR-005/006/007, `vkc_` repoint of dnsd/resolverd). Open
-owner decisions: D1, D2 (step 3).
+owner decisions: none (D1 = keep the NSEC/NSEC3 selector, D2 = Option A — both done).
 
 ---
 

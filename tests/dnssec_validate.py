@@ -18,6 +18,9 @@ CHECK:
                           T,.. (+ RRSIG [+ NSEC]); TYPE absent; sigs valid
                           (LABEL "@" = the apex)
   rcode LABEL TYPE RCODE  without DO: that rcode, no NSEC/NSEC3/RRSIG
+  ent LABEL [TYPE]        empty non-terminal: NOERROR (also with CO), one
+                          compact-denial record with bitmap RRSIG NSEC (nsec)
+                          or empty (nsec3) — never NXNAME; sigs valid
   qtype128                QTYPE NXNAME -> FORMERR with EDE 30
   positive LABEL TYPE N   answer RRset has N records; every RRSIG over the
                           WHOLE RRset validates (one RRSIG per algorithm)
@@ -262,6 +265,24 @@ def main():
             fail("no SOA in authority")
         n = validate_section(r.authority, zone, keyset, qname)
         print(f"OK {check} {qname} rcode={dns.rcode.to_text(r.rcode())} bitmap={sorted(bm)} "
+              f"{n} signatures valid")
+        return 0
+
+    if check == "ent":
+        qname = f"{args[0]}.{zone}"
+        qtype = args[1] if len(args) > 1 else "A"
+        for co in (False, True):
+            r = ask(server, port, qname, qtype, co=co)
+            if r.rcode() != dns.rcode.NOERROR or r.answer:
+                fail(f"{qname} {qtype} (CO={co}) rcode {dns.rcode.to_text(r.rcode())} answers "
+                     f"{len(r.answer)} (want NOERROR/NODATA for an empty non-terminal)")
+            rr, rd = denial_record(r, zone, qname, denial)
+            bm = bitmap_types(rd)
+            want_bm = set() if denial == "nsec3" else {dns.rdatatype.RRSIG, dns.rdatatype.NSEC}
+            if bm != want_bm:
+                fail(f"ENT bitmap {sorted(bm)} != {sorted(want_bm)} (CO={co})")
+            n = validate_section(r.authority, zone, keyset, qname)
+        print(f"OK ent {qname} {qtype} NODATA bitmap={sorted(bm)} (with and without CO), "
               f"{n} signatures valid")
         return 0
 

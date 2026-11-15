@@ -14,7 +14,7 @@ grep -n "static void dnssec_init_key\|static int nsec_rdata\|static int add_nsec
 | Fix | Finding | Status |
 |----:|---------|--------|
 | 1 | CSA-DNSSEC-001 — KSK key tag computed with ZSK flags | **Done** 2026-11-15 (+ DNSKEY RRset now signed as a whole) |
-| 2 | CSA-PROTO-001 — NODATA answered as NXDOMAIN | 2a **Done** 2026-11-15; 2b still Conditional (D2 open) |
+| 2 | CSA-PROTO-001 — NODATA answered as NXDOMAIN | 2a **Done** 2026-11-15; 2b **Done** 2026-11-15 (D2 = Option A, `make check-ent`) |
 | 3 | CSA-DNSSEC-002 — signed negative answers are not a valid proof | **Done** 2026-11-15 — D1 decided: keep the NSEC/NSEC3 selector |
 
 Guarded by `make check-dnssec-validate` (independent dnspython validator, in
@@ -52,6 +52,39 @@ CI), `make check-aggressive-nsec` (resolverd compact-denial spans) and
   which the aggressive cache would have read as a wrap to the end of the
   zone and used to synthesize NXDOMAIN for every later name — and an NXNAME
   span is never used for owner NODATA either.
+
+### Fix 2b — empty non-terminals (D2 = Option A), how it was built
+
+- **Index:** `zidx:<zone>`, a sorted set with one member per record key,
+  `rev(owner) \x01 <key>` (labels reversed, joined by `\x02`). "Exists or is
+  an empty non-terminal" is one `ZRANGEBYLEX [rev\x01 (rev\x03 LIMIT 0 1`,
+  sent in the same pipelined burst as Fix 2a's `EXISTS` probes. ENTs answer
+  NODATA; the compact-denial bitmap is RRSIG NSEC (NSEC) / empty (NSEC3),
+  never NXNAME, and NOERROR also with CO.
+- **Deviation from the option text — who maintains it.** Option A said every
+  writer updates the index in the same MULTI/EXEC as its record write.
+  Implemented instead: **dnsd is the only writer**, deriving the index from
+  the `zone:*`/`ddns:*`/`srp:*` keyspace events it now always subscribes to
+  (per event: `EXISTS` the key, then `ZADD` or `ZREM` its member), plus a
+  full reconcile on every subscriber (re)connect and zone-table change.
+  Reasons: ddns/srp leases disappear by Valkey TTL expiry, which no writer
+  can act on (only the `expired` event sees it); one owner instead of six
+  writers in three languages; no change to apid, eppd, certd or the
+  dashboard. Cost: a few milliseconds after a write before an ancestor
+  becomes an ENT (eventual, not transactional); a member left stale while
+  dnsd was down only turns an NXDOMAIN into NODATA until the reconcile.
+- **Schema 1.1** (additive, no migration tool — dnsd builds the index at
+  startup); dnsd raises a stored `1.0` to `1.1`.
+- **RFC 4592 wildcard rule** fixed with it: a wildcard was applied to any
+  qname whose queried type was missing, including names that exist with
+  other types and ENTs. The index is now consulted (lazily, only when a
+  wildcard owner is found) and an existing name gets NODATA.
+- `prereq_name_exists` (RFC 2136 "name is in use") does not count ENTs,
+  per RFC 2136 §2.4.4.
+- `make check-ent`: startup indexing, live add/delete, ddns lease expiry,
+  srp, look-alike sibling, restart reconcile, wildcard vs existing names,
+  signed ENT denial in both modes (independent validator). Fails against
+  the pre-change dnsd.
 
 ### Found while verifying — fixed in the follow-up commit (2026-11-15)
 

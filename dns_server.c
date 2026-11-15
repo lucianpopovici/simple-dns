@@ -236,8 +236,16 @@
  *                              soa_ttl is an optional additive trailing field
  *                              (ADR-003); absent → soa_minimum (RFC 9077).
  *   schema:version             ADR-003 inter-daemon schema contract "major.minor"
- *                              (current 1.0; dnsd seeds it, every daemon checks it
- *                              at startup — major mismatch is fatal, minor warns).
+ *                              (current 1.1; dnsd seeds it — and raises an older
+ *                              minor to its own — every daemon checks it at
+ *                              startup: major mismatch is fatal, minor warns).
+ *   zidx:<zone>                Zone name index (schema 1.1, written ONLY by dnsd):
+ *                              sorted set, one member per zone:/ddns:/srp: record
+ *                              key, "rev(owner)\x01<key>" (rev = labels reversed,
+ *                              joined by \x02). Answers "does anything exist at or
+ *                              below this name?" for empty non-terminals (NODATA,
+ *                              RFC 8020) and the RFC 4592 wildcard rule. Maintained
+ *                              from keyspace events + reconciled on (re)connect.
  *                              Simple values stay pipe-delimited; complex/extensible
  *                              values (SVCB, NAPTR, ZONEMD, ENUM, EPP) use the
  *                              versioned TLV codec (tlv_* in libdnswire). See the
@@ -3076,6 +3084,273 @@ static void cert_current_reload(void) {
  * while it was disconnected are not missed; reconnects use capped backoff so a
  * Valkey restart cannot cause a reconnect storm. */
 #define KEYSPACE_DB 0
+/* ==========================================================================
+ * Zone name index — zidx:<zone> (CSA-PROTO-001 Fix 2b, owner decision D2 = A)
+ *
+ * Empty non-terminals: "_tcp.example.com" has no records but
+ * "_sip._tcp.example.com" does, so it EXISTS (RFC 8020) and must be answered
+ * NODATA, never NXDOMAIN — a resolver applying RFC 8020 would otherwise
+ * treat everything below it (SRV, DKIM "_domainkey", ...) as nonexistent.
+ * The record schema can only answer "is anything below this name?" with a
+ * keyspace SCAN, so dnsd keeps an index:
+ *
+ *   zidx:<zone>   sorted set, every score 0, one member per record key:
+ *                   rev(owner) \x01 <record key>
+ *                 rev(owner) = the owner's labels, lowercased, in reverse
+ *                 order, joined by \x02 ("_sip._tcp.example.com" ->
+ *                 "com\x02example\x02_tcp\x02_sip").
+ *
+ * A name exists or is an empty non-terminal iff some member starts with
+ * rev(name)\x01 (records at the name) or rev(name)\x02 (records below it):
+ * one ZRANGEBYLEX [rev\x01 (rev\x03 LIMIT 0 1, sent in the same pipelined
+ * burst as the EXISTS probes. \x01/\x02 never occur in a label.
+ *
+ * Maintenance: dnsd is the only writer. It watches zone:*, ddns:* and srp:*
+ * keyspace events and, per event, re-checks EXISTS on that key and ZADDs or
+ * ZREMs its member — so every writer (apid, eppd, certd, the dashboard,
+ * dnsd's own UPDATE/SRP/XFR paths) and Valkey's own TTL expiry of ddns/srp
+ * leases are covered without any of them knowing the index exists. A full
+ * reconcile (zidx_rebuild_all) runs on every subscriber (re)connect and
+ * zone-table change, so missed events while disconnected self-heal.
+ * ======================================================================= */
+#define ZIDX_EXACT "\x01"
+#define ZIDX_CHILD '\x02'
+#define ZIDX_END "\x03"
+
+/* rev(name) as above. Returns its length, or -1 if it does not fit. */
+static int zidx_rev(const char *name, char *out, size_t cap) {
+    char tmp[256];
+    safe_strcpy(tmp, name, sizeof(tmp));
+    strlower(tmp);
+    size_t tl = strlen(tmp);
+    if (tl > 0 && tmp[tl - 1] == '.')
+        tmp[--tl] = 0;
+    size_t pos = 0;
+    int end = (int) tl;
+    while (end > 0) {
+        int start = end;
+        while (start > 0 && tmp[start - 1] != '.')
+            start--;
+        size_t ll = (size_t) (end - start);
+        if (pos + ll + 2 > cap)
+            return -1;
+        if (pos > 0)
+            out[pos++] = ZIDX_CHILD;
+        memcpy(out + pos, tmp + start, ll);
+        pos += ll;
+        end = start - 1;
+    }
+    if (pos >= cap)
+        return -1;
+    out[pos] = 0;
+    return (int) pos;
+}
+
+/* Split an indexable record key "zone|ddns|srp:<zone>:<TYPE>:<name>[:...]"
+ * into zone + owner. Returns 0 for keys that are not served records
+ * (srp OWNER bookkeeping, KEY trust anchors) or are malformed. */
+static int zidx_parse_key(const char *key, char *zone, size_t zc, char *owner, size_t oc) {
+    int is_srp = 0;
+    const char *p;
+    if (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0) {
+        p = key + 5;
+    } else if (strncmp(key, "srp:", 4) == 0) {
+        p = key + 4;
+        is_srp = 1;
+    } else {
+        return 0;
+    }
+    const char *c1 = strchr(p, ':');
+    if (!c1 || (size_t) (c1 - p) >= zc || c1 == p)
+        return 0;
+    memcpy(zone, p, (size_t) (c1 - p));
+    zone[c1 - p] = 0;
+    const char *t = c1 + 1;
+    const char *c2 = strchr(t, ':');
+    if (!c2 || c2 == t)
+        return 0;
+    size_t tlen = (size_t) (c2 - t);
+    if ((tlen == 3 && strncmp(t, "KEY", 3) == 0) || (tlen == 5 && strncmp(t, "OWNER", 5) == 0))
+        return 0;
+    const char *n = c2 + 1;
+    size_t nl = strlen(n);
+    if (is_srp && tlen == 3 && strncmp(t, "PTR", 3) == 0) {
+        const char *c3 = strchr(n, ':'); /* srp:<z>:PTR:<browse>:<instance> */
+        if (c3)
+            nl = (size_t) (c3 - n);
+    }
+    if (nl == 0 || nl >= oc)
+        return 0;
+    memcpy(owner, n, nl);
+    owner[nl] = 0;
+    strlower(owner);
+    return name_in_zone(owner, zone);
+}
+
+static int zidx_zone_configured(const char *zone) {
+    int found = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && !found; i++)
+        if (strcasecmp(g_zones[i].name, zone) == 0)
+            found = 1;
+    pthread_mutex_unlock(&g_zones_mutex);
+    return found;
+}
+
+/* Bring one record key's index member in line with whether the key exists
+ * right now. Idempotent; safe to call for any key. */
+static void zidx_apply_key(const char *key) {
+    char zone[256];
+    char owner[256];
+    if (!zidx_parse_key(key, zone, sizeof(zone), owner, sizeof(owner)))
+        return;
+    if (!zidx_zone_configured(zone))
+        return;
+    char rev[300];
+    if (zidx_rev(owner, rev, sizeof(rev)) < 0)
+        return;
+    char member[1200];
+    char zk[300];
+    int ml = snprintf(member, sizeof(member), "%s" ZIDX_EXACT "%s", rev, key);
+    if (ml < 0 || ml >= (int) sizeof(member))
+        return;
+    snprintf(zk, sizeof(zk), "zidx:%s", zone);
+    strlower(zk);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) >= 0) {
+        resp_reply_t r;
+        if (resp_cmd(&vk, &r, 2, "EXISTS", key) < 0) {
+            vk.fd = -1;
+        } else if (r.type == 3) {
+            if (r.integer > 0) {
+                if (resp_cmd(&vk, &r, 4, "ZADD", zk, "0", member) < 0)
+                    vk.fd = -1;
+            } else {
+                if (resp_cmd(&vk, &r, 3, "ZREM", zk, member) < 0)
+                    vk.fd = -1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+}
+
+/* Reconcile zidx:<zone> with the keyspace: index every existing record key,
+ * then drop members whose key no longer exists. */
+static void zidx_rebuild_zone(const char *zone) {
+    static const char *nss[] = {"zone", "ddns", "srp"};
+    int added = 0;
+    for (int ni = 0; ni < 3; ni++) {
+        char pat[320];
+        snprintf(pat, sizeof(pat), "%s:%s:*", nss[ni], zone);
+        char **keys = NULL;
+        int nk = vk_list_keys(pat, &keys);
+        for (int i = 0; i < nk; i++) {
+            zidx_apply_key(keys[i]);
+            free(keys[i]);
+        }
+        free(keys);
+        added += nk;
+    }
+    char zk[300];
+    snprintf(zk, sizeof(zk), "zidx:%s", zone);
+    strlower(zk);
+    /* Collect members first (ZREM while walking ranges would shift indexes). */
+    char **mem = NULL;
+    int nm = 0;
+    int cap = 0;
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) >= 0) {
+        resp_reply_t r;
+        if (resp_cmd(&vk, &r, 4, "ZRANGE", zk, "0", "-1") < 0) {
+            vk.fd = -1;
+        } else if (r.type == 5) {
+            int total = r.count;
+            for (int i = 0; i < total; i++) {
+                resp_reply_t el;
+                if (resp_parse(&vk, &el) < 0) {
+                    vk.fd = -1;
+                    break;
+                }
+                if (el.type != 2)
+                    continue;
+                if (nm == cap) {
+                    int ncap = cap ? cap * 2 : 256;
+                    char **nmem = realloc(mem, (size_t) ncap * sizeof(*mem));
+                    if (!nmem)
+                        continue;
+                    mem = nmem;
+                    cap = ncap;
+                }
+                mem[nm] = strdup(el.str);
+                if (mem[nm])
+                    nm++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    int stale = 0;
+    for (int i = 0; i < nm; i++) {
+        const char *sep = strchr(mem[i], ZIDX_EXACT[0]);
+        if (sep)
+            zidx_apply_key(sep + 1); /* ZREMs if the key is gone */
+        else
+            stale++;
+        free(mem[i]);
+    }
+    free(mem);
+    dns_log(LOG_DEBUG, "[ZIDX] %s reconciled: %d record keys, %d members checked\n", zone, added,
+            nm);
+    (void) stale;
+}
+
+static void zidx_rebuild_all(void) {
+    char names[MAX_ZONES][256];
+    int n = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && n < MAX_ZONES; i++)
+        safe_strcpy(names[n++], g_zones[i].name, sizeof(names[0]));
+    pthread_mutex_unlock(&g_zones_mutex);
+    for (int i = 0; i < n; i++)
+        zidx_rebuild_zone(names[i]);
+}
+
+/* Does `name` (in zone `zone`) own a record or have one below it? 1 / 0;
+ * -1 if Valkey could not be asked. Used on the query path before wildcard
+ * synthesis: RFC 4592 §2.2.1 — a wildcard never applies to a name that
+ * exists, empty non-terminals included. */
+static int zidx_name_exists(const char *zone, const char *name) {
+    char rev[300];
+    if (zidx_rev(name, rev, sizeof(rev)) < 0)
+        return -1;
+    char zk[300];
+    char lo[320];
+    char hi[320];
+    snprintf(zk, sizeof(zk), "zidx:%s", zone);
+    strlower(zk);
+    snprintf(lo, sizeof(lo), "[%s" ZIDX_EXACT, rev);
+    snprintf(hi, sizeof(hi), "(%s" ZIDX_END, rev);
+    resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
+    if (!t_vk_conn)
+        pthread_mutex_lock(&g_vk_mutex);
+    int rc = -1;
+    resp_reply_t r;
+    if (valkey_ensure(c) >= 0 &&
+        resp_cmd(c, &r, 7, "ZRANGEBYLEX", zk, lo, hi, "LIMIT", "0", "1") >= 0 && r.type == 5) {
+        rc = r.count > 0;
+        for (int i = 0; i < r.count; i++) {
+            resp_reply_t el;
+            if (resp_parse(c, &el) < 0) {
+                rc = -1;
+                c->fd = -1;
+                break;
+            }
+        }
+    }
+    if (!t_vk_conn)
+        pthread_mutex_unlock(&g_vk_mutex);
+    return rc;
+}
+
 static void keyspace_apply(const char *key) {
     if (strncmp(key, "cert:current", 12) == 0) {
         cert_current_reload();
@@ -3091,6 +3366,7 @@ static void keyspace_apply(const char *key) {
         zones_load_from_valkey();
         zones_post_load();  /* apply per-zone config + load keys for any new zone */
         catalog_scan_all(); /* a new/removed zone_table entry may be a catalog */
+        zidx_rebuild_all(); /* a new zone's existing records join the name index */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
     } else if (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0) {
         /* Record cache invalidation: a dynamic UPDATE or dashboard/apid edit to a
@@ -3098,6 +3374,9 @@ static void keyspace_apply(const char *key) {
          * eviction (the event carries the precise key). No-op if cache disabled.
          * Note: "zone_table:" does not match "zone:" (5th char differs). */
         rcache_invalidate(key);
+        zidx_apply_key(key); /* set, del and TTL expiry alike */
+    } else if (strncmp(key, "srp:", 4) == 0) {
+        zidx_apply_key(key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         /* dnssec:<zone>:... — reload that zone's key state live (current set +
          * rollover/next set). Legacy un-prefixed keys (dnssec:zsk) belong to the
@@ -3156,13 +3435,10 @@ static void *keyspace_watch_thread(void *arg) {
 
         /* zone:* / ddns:* are watched only to invalidate the record cache, so
          * subscribe to them only when it is active (else they add no value). */
-        static const char *prefixes[] = {
-            "config:*", "cert:current", "zone_table:*", "dnssec:*", NULL, NULL, NULL};
-        if (g_rcache && g_rcache_ttl > 0) {
-            int n = 4;
-            prefixes[n++] = "zone:*";
-            prefixes[n++] = "ddns:*";
-        }
+        /* zone:* / ddns:* / srp:* feed the zone name index (zidx, always) and
+         * record-cache invalidation (when the cache is on). */
+        static const char *prefixes[] = {"config:*", "cert:current", "zone_table:*", "dnssec:*",
+                                         "zone:*",   "ddns:*",       "srp:*",        NULL};
         int subok = 1;
         for (int i = 0; prefixes[i]; i++) {
             char pat[160];
@@ -3191,6 +3467,7 @@ static void *keyspace_watch_thread(void *arg) {
         config_load_from_valkey();
         zones_load_from_valkey();
         cert_current_reload();
+        zidx_rebuild_all(); /* events missed while disconnected */
         dns_log(LOG_NOTICE, "[Reload] live reload active (keyspace notifications)\n");
 
         /* Each notification is a multi-bulk: ["pmessage", pattern, channel,
@@ -6558,8 +6835,19 @@ static void static_types_at(const char *name, uint16_t *types, int *n, int max) 
  * connection vk_get would use (CSA-PROTO-001 — NODATA vs NXDOMAIN must be
  * decided by name existence, not by whether the queried type was found).
  * Called only for negative answers. */
-static int name_types_present(const char *name, uint16_t *types, int max) {
+static int name_types_present(const char *name, uint16_t *types, int max, int *ent) {
     int n = 0;
+    if (ent) {
+        /* Empty non-terminal in the static zone: a static owner below `name`. */
+        *ent = 0;
+        size_t nl = strlen(name);
+        for (int i = 0; i < static_zone_sz && !*ent; i++) {
+            size_t sl = strlen(static_zone[i].name);
+            if (sl > nl + 1 && static_zone[i].name[sl - nl - 1] == '.' &&
+                strcasecmp(static_zone[i].name + sl - nl, name) == 0)
+                *ent = 1;
+        }
+    }
     static_types_at(name, types, &n, max);
     if (t_zone && streq_ci(name, t_zone->name)) {
         types_add(types, &n, max, DNS_TYPE_SOA);
@@ -6586,6 +6874,26 @@ static int name_types_present(const char *name, uint16_t *types, int max) {
             return -1;
         pos += w;
     }
+    /* D2 / Fix 2b: does any record exist AT or BELOW the name? (zidx) */
+    if (ent) {
+        char rev[300];
+        if (zidx_rev(name, rev, sizeof(rev)) < 0)
+            return -1;
+        char zk[300];
+        char lo[320];
+        char hi[320];
+        int zl = snprintf(zk, sizeof(zk), "zidx:%s", zn);
+        strlower(zk);
+        int ll = snprintf(lo, sizeof(lo), "[%s" ZIDX_EXACT, rev);
+        int hl = snprintf(hi, sizeof(hi), "(%s" ZIDX_END, rev);
+        int w = snprintf(cmds + pos, sizeof(cmds) - (size_t) pos,
+                         "*7\r\n$11\r\nZRANGEBYLEX\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n"
+                         "$5\r\nLIMIT\r\n$1\r\n0\r\n$1\r\n1\r\n",
+                         zl, zk, ll, lo, hl, hi);
+        if (zl < 0 || ll < 0 || hl < 0 || w < 0 || w >= (int) sizeof(cmds) - pos)
+            return -1;
+        pos += w;
+    }
     resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
     if (!t_vk_conn)
         pthread_mutex_lock(&g_vk_mutex);
@@ -6605,6 +6913,26 @@ static int name_types_present(const char *name, uint16_t *types, int max) {
             }
             if (atol(line + 1) > 0)
                 types_add(types, &n, max, k_served_types[i].type);
+        }
+        if (ent && rc == 0) {
+            /* ZRANGEBYLEX reply: "*0" or "*1" + one bulk member. */
+            char line[64];
+            if (resp_readline(c, line, sizeof(line)) < 0 || line[0] != '*') {
+                rc = -1;
+            } else {
+                int cnt = atoi(line + 1);
+                for (int i = 0; i < cnt && rc == 0; i++) {
+                    char bl[64];
+                    char member[1300];
+                    int len = -1;
+                    if (resp_readline(c, bl, sizeof(bl)) < 0 || bl[0] != '$' ||
+                        (len = atoi(bl + 1)) < 0 || len >= (int) sizeof(member) ||
+                        resp_readbytes(c, member, len) < 0)
+                        rc = -1;
+                }
+                if (rc == 0 && cnt > 0)
+                    *ent = 1;
+            }
         }
     }
     if (rc < 0 && c->fd >= 0) {
@@ -7349,7 +7677,14 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         }
     }
 
-    /* RFC 4592: wildcard lookup — if no exact match, try *.<parent> */
+    /* RFC 4592: wildcard lookup — if no exact match, try *.<parent>. A
+     * wildcard never applies to a name that exists (§2.2.1) — one with
+     * records of another type or an empty non-terminal — so the zone name
+     * index is consulted, lazily and only when a wildcard owner is found. */
+    int qname_exists = -1;
+#define QNAME_EXISTS()                                                                             \
+    (qname_exists < 0 ? (qname_exists = (t_zone && zidx_name_exists(t_zone->name, qname) == 1))    \
+                      : qname_exists)
     if (!found) {
         /* Build wildcard name: *.one-label-up */
         char *dot = strchr(qname, '.');
@@ -7361,6 +7696,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 dns_rec_t *r = &static_zone[i];
                 if (!streq_ci(r->name, wname))
                     continue;
+                if (QNAME_EXISTS())
+                    break; /* qname exists: the wildcard does not apply */
                 found = 1; /* wildcard owner exists */
                 if (r->type != qtype && qtype != DNS_TYPE_ANY)
                     continue;
@@ -7418,7 +7755,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
                     zkey(wk, sizeof(wk), "A", wname);
                     char wv[LB_VAL_MAX];
-                    if (vk_get(wk, wv, sizeof(wv))) {
+                    if (vk_get(wk, wv, sizeof(wv)) && !QNAME_EXISTS()) {
                         found = 1;
                         off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, wv, dnssec_ok,
                                               &answers);
@@ -7427,7 +7764,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
                     zkey(wk, sizeof(wk), "AAAA", wname);
                     char wv[LB_VAL_MAX];
-                    if (vk_get(wk, wv, sizeof(wv))) {
+                    if (vk_get(wk, wv, sizeof(wv)) && !QNAME_EXISTS()) {
                         found = 1;
                         off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, wv,
                                               dnssec_ok, &answers);
@@ -7437,6 +7774,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         }
     }
 
+#undef QNAME_EXISTS
 finish_answer:
     off = rrset_flush(resp, off, resp_len);
     rh->ancount = htons((uint16_t) answers);
@@ -7472,7 +7810,8 @@ finish_answer:
          * exists (any type, any namespace, or the apex), not by whether the
          * queried type was found. One pipelined Valkey round trip. */
         uint16_t ptypes[NAME_TYPES_MAX];
-        int np = name_types_present(qname, ptypes, NAME_TYPES_MAX);
+        int ent = 0;
+        int np = name_types_present(qname, ptypes, NAME_TYPES_MAX, &ent);
         if (np < 0) {
             /* Cannot tell whether the name exists: fail closed. */
             rh->flags = htons(DNS_QR | DNS_RCODE_SERVFAIL);
@@ -7491,7 +7830,10 @@ finish_answer:
                 }
             }
             int is_apex = t_zone && streq_ci(qname, t_zone->name);
-            int exists = (np > 0 || found || is_apex);
+            /* An empty non-terminal (D2) exists: NODATA, and its compact-
+             * denial bitmap is RRSIG NSEC (NSEC) / empty (NSEC3), never
+             * NXNAME (RFC 9824 §3.2, §4). */
+            int exists = (np > 0 || found || is_apex || ent);
             int signed_denial = dnssec_ok && t_zone && t_zone->zsk;
             uint16_t rcode = DNS_RCODE_NOERROR;
             if (!exists) {
@@ -7553,7 +7895,9 @@ finish_answer:
  * uses for NODATA vs NXDOMAIN (name_types_present). */
 static int prereq_name_exists(const char *name) {
     uint16_t t[NAME_TYPES_MAX];
-    int n = name_types_present(name, t, NAME_TYPES_MAX);
+    /* RFC 2136 §2.4.4 "name is in use" = an RR exists AT the name; an empty
+     * non-terminal is not in use, so the zidx probe is not asked for. */
+    int n = name_types_present(name, t, NAME_TYPES_MAX, NULL);
     return n < 0 ? -1 : (n > 0);
 }
 /* Returns 1 if at least one RR of type `rtype` exists for `name`. */
@@ -12109,11 +12453,25 @@ static int schema_gate(void) {
     switch (schema_version_check(sv)) {
         case SCHEMA_OK:
             return 0;
-        case SCHEMA_MINOR_DIFF:
+        case SCHEMA_MINOR_DIFF: {
+            /* As the seeder, dnsd raises an OLDER minor to its own: minors are
+             * additive (1.1 adds zidx:*, which dnsd itself builds), so every
+             * other daemon can then stop warning. A NEWER stored minor is left
+             * alone — another component knows something this dnsd does not. */
+            int smaj = 0;
+            int smin = 0;
+            if (sscanf(sv, "%d.%d", &smaj, &smin) == 2 && smaj == SCHEMA_VERSION_MAJOR &&
+                smin < SCHEMA_VERSION_MINOR) {
+                vk_set("schema:version", SCHEMA_VERSION_STR, 0);
+                dns_log(LOG_INFO, "[Schema] upgraded schema:version %s -> %s (additive)\n", sv,
+                        SCHEMA_VERSION_STR);
+                return 0;
+            }
             dns_log(LOG_WARNING,
                     "[Schema] schema:version %s differs in minor from compiled %s — continuing\n",
                     sv, SCHEMA_VERSION_STR);
             return 0;
+        }
         case SCHEMA_ABSENT:
             vk_set("schema:version", SCHEMA_VERSION_STR, 0);
             dns_log(LOG_INFO, "[Schema] seeded schema:version=%s\n", SCHEMA_VERSION_STR);

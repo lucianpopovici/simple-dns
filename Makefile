@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -529,6 +529,82 @@ check-dnssec-validate: $(BIN_DEBUG) resolverd_debug
 	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report in /tmp/dnsd_dv.log"; exit 1; }; \
 	 test $$rc -eq 0 || { echo "  FAIL  independent validation failed (see FAIL lines above)"; exit 1; }; \
 	 echo "  OK  DNSKEY/DS/CDS tags + whole-RRset signatures valid; NODATA by name existence; compact denial (NSEC + NSEC3) validates; resolverd SECURE end-to-end"
+
+# CSA-PROTO-001 Fix 2b / owner decision D2 = A: empty non-terminals. A name
+# with no records of its own but records BELOW it exists (RFC 8020) and must be
+# NODATA, never NXDOMAIN — else an RFC 8020 resolver drops everything under it
+# (SRV under _tcp, DKIM under _domainkey). dnsd keeps zidx:<zone> from
+# keyspace events. Covers: index built at startup for records written while
+# dnsd was down; live add and delete; ddns lease TTL expiry; srp records; a
+# look-alike sibling stays NXDOMAIN; a member left stale while dnsd was down is
+# reconciled on restart; the signed compact-denial record for an ENT (bitmap
+# RRSIG NSEC / empty NSEC3, never NXNAME, NOERROR even with CO) validates
+# with an independent validator. Needs Valkey + dig + python3-dnspython +
+# cryptography.
+check-ent: $(BIN_DEBUG)
+	@echo "  CHECK  empty non-terminals: zidx name index, NODATA not NXDOMAIN (Valkey + dig + python3-dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.dnssec, cryptography' 2>/dev/null || { echo "  SKIP  python3 dnspython/cryptography not installed"; exit 0; }; \
+	 Z=ent.test; V="python3 tests/dnssec_validate.py 127.0.0.1 $(TPORT) $$Z";          \
+	 st() { dig +nocookie +noall +comments @127.0.0.1 -p $(TPORT) $$1 $${2:-A} +time=2 +tries=1 | sed -n 's/.*status: \([A-Z]*\).*/\1/p'; }; \
+	 clean() { for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done; }; \
+	 clean; rc=0;                                                                      \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
+	 $$VC set zone:$$Z:NS:$$Z "300|ns1.$$Z" >/dev/null;                                \
+	 $$VC set zone:$$Z:SRV:_sip._tcp.$$Z "300|10|5|5060|sip.$$Z" >/dev/null;           \
+	 $$VC set zone:$$Z:TXT:gone.later.$$Z "300|stale" >/dev/null;                      \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ent.log 2>&1 & DNS=$$!; \
+	 sleep 2.5;                                                                        \
+	 R1=$$(st _tcp.$$Z); R2=$$(st nope.$$Z); R3=$$(st _tc.$$Z); R4=$$(st later.$$Z);   \
+	 $$VC set zone:$$Z:TXT:x.y.z.$$Z "300|deep" >/dev/null; sleep 0.7;                 \
+	 R5=$$(st y.z.$$Z); R6=$$(st z.$$Z);                                               \
+	 $$VC del zone:$$Z:TXT:x.y.z.$$Z >/dev/null; sleep 0.7;                            \
+	 R7=$$(st y.z.$$Z); R8=$$(st z.$$Z);                                               \
+	 $$VC set ddns:$$Z:A:host.dyn.lab.$$Z 10.0.0.9 EX 2 >/dev/null; sleep 0.7;         \
+	 R9=$$(st lab.$$Z); sleep 2.5; R10=$$(st lab.$$Z);                                 \
+	 $$VC set srp:$$Z:A:printer.srp.$$Z "60|10.0.0.8" >/dev/null; sleep 0.7;           \
+	 R11=$$(st srp.$$Z);                                                               \
+	 $$VC set zone:$$Z:A:*.w.$$Z "60|10.9.9.9" >/dev/null;                             \
+	 $$VC set zone:$$Z:TXT:c.e.w.$$Z "60|x" >/dev/null;                                \
+	 $$VC set zone:$$Z:TXT:t.w.$$Z "60|x" >/dev/null; sleep 0.7;                       \
+	 short() { dig +nocookie +short @127.0.0.1 -p $(TPORT) $$1 A +time=2 +tries=1; };  \
+	 W1=$$(short q.w.$$Z); W2=$$(short e.w.$$Z); W2S=$$(st e.w.$$Z); W3=$$(short t.w.$$Z); \
+	 for M in nsec3 nsec; do                                                           \
+	   $$VC set config:zone:$$Z:dnssec_nsec_mode $$M >/dev/null; sleep 1.2;            \
+	   for C in "ent _tcp SRV" "ent z1 A" "nxname nope"; do                            \
+	     case "$$C" in "ent z1 A") $$VC set zone:$$Z:TXT:leaf.z1.$$Z "300|x" >/dev/null; sleep 0.7;; esac; \
+	     OUT=$$($$V $$M $$C 2>&1) || rc=1; echo "    $$M: $$OUT" | cut -c1-170;         \
+	   done;                                                                           \
+	 done;                                                                             \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC del zone:$$Z:TXT:gone.later.$$Z >/dev/null;                                  \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ent2.log 2>&1 & DNS=$$!; \
+	 sleep 2.5;                                                                        \
+	 R12=$$(st later.$$Z);                                                             \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 SAN=$$(cat /tmp/dnsd_ent.log /tmp/dnsd_ent2.log | grep -c 'AddressSanitizer\|runtime error'); \
+	 clean;                                                                            \
+	 echo "  startup-index: _tcp=$$R1 nope=$$R2 lookalike(_tc)=$$R3 later=$$R4";      \
+	 echo "  live add: y.z=$$R5 z=$$R6 | live delete: y.z=$$R7 z=$$R8";               \
+	 echo "  ddns lease: live=$$R9 expired=$$R10 | srp: $$R11 | stale member reconciled on restart: later=$$R12"; \
+	 echo "  wildcard *.w: q=[$$W1] ENT e=[$$W2]/$$W2S  TXT-only t=[$$W3]";          \
+	 test "$$W1" = 10.9.9.9  || { echo "  FAIL  wildcard did not synthesize for a nonexistent name"; rc=1; }; \
+	 test -z "$$W2" -a "$$W2S" = NOERROR || { echo "  FAIL  wildcard applied to an empty non-terminal (RFC 4592 2.2.1)"; rc=1; }; \
+	 test -z "$$W3" || { echo "  FAIL  wildcard applied to a name that exists with another type"; rc=1; }; \
+	 test "$$R1" = NOERROR   || { echo "  FAIL  ENT _tcp (indexed at startup) not NODATA"; rc=1; }; \
+	 test "$$R2" = NXDOMAIN  || { echo "  FAIL  nonexistent name not NXDOMAIN"; rc=1; }; \
+	 test "$$R3" = NXDOMAIN  || { echo "  FAIL  look-alike sibling _tc matched _tcp's subtree"; rc=1; }; \
+	 test "$$R4" = NOERROR   || { echo "  FAIL  ENT later. not NODATA"; rc=1; }; \
+	 test "$$R5" = NOERROR -a "$$R6" = NOERROR || { echo "  FAIL  live-added record did not make its ancestors ENTs"; rc=1; }; \
+	 test "$$R7" = NXDOMAIN -a "$$R8" = NXDOMAIN || { echo "  FAIL  deleting the only descendant left the ancestors as ENTs"; rc=1; }; \
+	 test "$$R9" = NOERROR   || { echo "  FAIL  ddns lease did not make lab. an ENT"; rc=1; }; \
+	 test "$$R10" = NXDOMAIN || { echo "  FAIL  expired ddns lease left lab. as an ENT"; rc=1; }; \
+	 test "$$R11" = NOERROR  || { echo "  FAIL  srp record did not make srp. an ENT"; rc=1; }; \
+	 test "$$R12" = NXDOMAIN || { echo "  FAIL  member stale across a restart was not reconciled"; rc=1; }; \
+	 test "$$SAN" -eq 0      || { echo "  FAIL  sanitizer report"; rc=1; }; \
+	 test $$rc -eq 0 || exit 1;                                                        \
+	 echo "  OK  empty non-terminals answered NODATA (live, expiry, restart reconcile); signed ENT denial validates"
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -3273,6 +3349,7 @@ help:
 	@echo "  make check-dns0x20   resolverd RFC 5452 0x20 QNAME case randomization (needs dig + python3)"
 	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
 	@echo "  make check-dnssec-validate  Independent DNSSEC validation (dnspython): KSK tags, NODATA, RFC 9824 compact denial"
+	@echo "  make check-ent       Empty non-terminals: zidx index, NODATA not NXDOMAIN, signed ENT denial"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"
