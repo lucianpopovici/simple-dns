@@ -1,0 +1,22 @@
+DNS Resolution Performance Testing Tool
+Version 2.15.0
+
+[Status] Command line: resperf -s 127.0.0.1 -p 5399 -d bench/q/hot.txt -R -m 100000 -r 30 -c 0 -L 5
+[Status] Sending
+[Status] Reached 65536 outstanding queries
+[Status] Waiting for more responses
+[Status] Testing complete
+
+Statistics:
+
+  Queries sent:         278802
+  Queries completed:    213452
+  Queries lost:         65350
+  Response codes:       NOERROR 213452 (100.00%)
+
+  Run time (s):         57.932819
+  Maximum throughput:   21722.000000 qps
+  Lost at that point:   3.46%
+
+  Connection attempts:  0 (0 successful, 0.00%)
+

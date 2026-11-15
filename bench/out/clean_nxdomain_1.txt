@@ -1,0 +1,22 @@
+DNS Resolution Performance Testing Tool
+Version 2.15.0
+
+[Status] Command line: resperf -s 127.0.0.1 -p 5399 -d bench/q/nxdomain.txt -R -m 100000 -r 30 -c 0 -L 5
+[Status] Sending
+[Status] Reached 65536 outstanding queries
+[Status] Waiting for more responses
+[Status] Testing complete
+
+Statistics:
+
+  Queries sent:         225988
+  Queries completed:    160632
+  Queries lost:         65356
+  Response codes:       NXDOMAIN 160632 (100.00%)
+
+  Run time (s):         56.644433
+  Maximum throughput:   17376.000000 qps
+  Lost at that point:   0.71%
+
+  Connection attempts:  0 (0 successful, 0.00%)
+
