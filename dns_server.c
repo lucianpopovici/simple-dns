@@ -354,6 +354,13 @@
 #define HTTP_PORT_DEFAULT 8053
 #define HTTPS_PORT_DEFAULT 8443
 #define DEFAULT_TTL 60
+/* TTL a ddns: lease carries in zone CONTENT views — AXFR and the ZONEMD
+ * digest — matching what IXFR already emits for journalled lease changes.
+ * The query path serves the remaining lease lifetime instead, but that
+ * value decays every second: a digest over it never matched a transfer
+ * taken a moment later (RFC 8976 covers TTLs), so check-zonemd failed
+ * whenever a lease was live. */
+#define DDNS_ZONE_TTL DEFAULT_TTL
 #define DEFAULT_NEG_TTL 300
 #define DNSSEC_SIG_VALIDITY (7 * 86400)
 #define MAX_PEM 65536
@@ -735,7 +742,12 @@ static lb_mode_t g_lb_mode = LB_NONE; /* config:lb_mode: none|rr|random */
 /* One shared round-robin cursor across all names still yields a uniform
  * per-name distribution; atomic so concurrent workers stay race-free. */
 static _Atomic uint32_t g_lb_counter = 0;
-#define LB_MAX_ADDRS 32 /* cap addresses rotated per RRset (values are <=256 B) */
+#define LB_MAX_ADDRS 32 /* cap addresses rotated per RRset */
+/* Read buffer for a stored "ttl|ip|ip|..." A/AAAA value: LB_MAX_ADDRS full-
+ * length IPv6 literals (39 chars + '|') plus the TTL. The old 128/256-byte
+ * buffers silently dropped every address past ~7 (A) / ~17 (AAAA) and could
+ * cut the last one in half. */
+#define LB_VAL_MAX (LB_MAX_ADDRS * 40 + 32)
 
 /* Load-balancing health checks (CLAUDE-loadbalance.md Gap 2). When enabled, a
  * background thread TCP-probes the addresses behind configured names and the
@@ -2275,7 +2287,21 @@ static void zones_load_from_valkey(void) {
             *n = 0;
             p = n + 1;
         }
-        zone_upsert(zname, f[0] ? f[0] : "", f[1] ? f[1] : "", f[2] ? (uint32_t) atoi(f[2]) : 1,
+        /* The live serial is the persisted counter config:zone:<z>:serial
+         * (bumped by UPDATE/apid/eppd/XFR); zone_table's field is only the
+         * initial value. Reading zone_table alone reset the in-memory serial
+         * on every zone_table:* change and every subscriber catch-up — a
+         * secondary served serial 1 after transferring serial 100
+         * (check-ixfr-client). The catalog member path already did this. */
+        uint32_t zserial = f[2] ? (uint32_t) atoi(f[2]) : 1;
+        {
+            char sk[600];
+            char sv[64] = "";
+            snprintf(sk, sizeof(sk), "config:zone:%.255s:serial", zname);
+            if (strcasecmp(zname, g_zone_name) != 0 && vk_get(sk, sv, sizeof(sv)) && sv[0])
+                zserial = (uint32_t) strtoul(sv, NULL, 10);
+        }
+        zone_upsert(zname, f[0] ? f[0] : "", f[1] ? f[1] : "", zserial,
                     f[3] ? (uint32_t) atoi(f[3]) : 3600, f[4] ? (uint32_t) atoi(f[4]) : 900,
                     f[5] ? (uint32_t) atoi(f[5]) : 604800, f[6] ? (uint32_t) atoi(f[6]) : 300,
                     f[9] ? (uint32_t) atoi(f[9]) : 0, f[7] ? f[7] : NULL, f[8] ? f[8] : NULL);
@@ -2817,13 +2843,13 @@ static uint32_t txn_del_and_bump(zone_entry_t *z, const char *const *keys, int n
 /* ADR-004: a compact reply drain for bulk (potentially large-N) transactions
  * like AXFR's per-type GET batch — resp_reply_t's str[MAX_PEM] (64KB) makes
  * an array of N of them impractical once N reaches the thousands, so this
- * copies each reply into a small fixed 768-byte buffer (the same size AXFR's
+ * copies each reply into a small fixed LB_VAL_MAX buffer (the same size AXFR's
  * own per-record value buffer already uses) instead. Mirrors
  * resp_txn_commit's success/failure contract. */
 typedef struct {
     int type; /* resp_reply_t.type: 2=bulk-string, 3=integer, 4=nil, ... */
     long integer;
-    char str[768];
+    char str[LB_VAL_MAX]; /* a full A/AAAA RRset value (LB_VAL_MAX) */
 } axfr_reply_t;
 
 static int resp_txn_commit_compact(resp_txn_t *t, axfr_reply_t *out, int n) {
@@ -3128,12 +3154,6 @@ static void *keyspace_watch_thread(void *arg) {
             dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications "
                                  "(CONFIG SET denied?) — boot/reconnect catch-up only\n");
 
-        /* Catch up on anything changed before (re)subscribing, then subscribe.
-         * Catch-up uses the shared `vk` connection, not `sub`. */
-        config_load_from_valkey();
-        zones_load_from_valkey();
-        cert_current_reload();
-
         /* zone:* / ddns:* are watched only to invalidate the record cache, so
          * subscribe to them only when it is active (else they add no value). */
         static const char *prefixes[] = {
@@ -3161,6 +3181,16 @@ static void *keyspace_watch_thread(void *arg) {
             continue;
         }
         backoff = 1; /* connected + subscribed cleanly */
+        /* Catch up AFTER subscribing (on the shared `vk` connection, not
+         * `sub`), so there is no window in which a change is neither seen by
+         * the catch-up nor notified. Catching up first lost the secondary's
+         * own serial write when its boot-time AXFR finished between the
+         * catch-up and the PSUBSCRIBE (check-ixfr-client flake: served
+         * serial 1 after transferring serial 100). A change that lands during
+         * the catch-up is now also notified, so a stale read is re-applied. */
+        config_load_from_valkey();
+        zones_load_from_valkey();
+        cert_current_reload();
         dns_log(LOG_NOTICE, "[Reload] live reload active (keyspace notifications)\n");
 
         /* Each notification is a multi-bulk: ["pmessage", pattern, channel,
@@ -3281,11 +3311,7 @@ static int dnskey_rdata_for(EVP_PKEY *k, int alg, int is_ksk, uint8_t *rd, int r
 }
 
 static uint16_t keytag(const uint8_t *rd, int rdlen) {
-    uint32_t ac = 0;
-    for (int i = 0; i < rdlen; i++)
-        ac += (i & 1) ? rd[i] : (uint32_t) rd[i] << 8;
-    ac += (ac >> 16) & 0xFFFF;
-    return (uint16_t) (ac & 0xFFFF);
+    return dnskey_keytag(rd, rdlen); /* one implementation, in libdnswire */
 }
 
 /* Build DS-format rdata (RFC 4034 §5.1.1) for a KSK: keytag(2) | alg(1) |
@@ -3369,7 +3395,7 @@ static int ecdsa_der_to_raw(const uint8_t *der, int dl, uint8_t raw[64]) {
  * single member of a multi-RR set does not validate (the DNSKEY RRset was
  * signed one key at a time — found with an independent validator while
  * fixing CSA-DNSSEC-001). Returns the RRSIG rdata length or -1. */
-#define RRSET_SIGN_MAX 16
+#define RRSET_SIGN_MAX 32 /* >= LB_MAX_ADDRS: a whole A/AAAA RRset is one signed set */
 static int make_rrsig_set(const char *owner, const char *signer, uint16_t rrtype, uint32_t ttl,
                           const uint8_t *const *rdatas, const uint16_t *lens, int n, EVP_PKEY *zsk,
                           uint8_t alg, uint16_t tag, uint8_t *outbuf) {
@@ -3580,15 +3606,6 @@ static int make_rrsig_set(const char *owner, const char *signer, uint16_t rrtype
     free(der);
     memcpy(outbuf + hp, raw, 64);
     return hp + 64;
-}
-
-/* Sign a single-RR RRset. */
-static int make_rrsig(const char *owner, const char *signer, uint16_t rrtype, uint32_t ttl,
-                      const uint8_t *rrdata, uint16_t rrdata_len, EVP_PKEY *zsk, uint8_t alg,
-                      uint16_t tag, uint8_t *outbuf) {
-    const uint8_t *rds[1] = {rrdata};
-    uint16_t lns[1] = {rrdata_len};
-    return make_rrsig_set(owner, signer, rrtype, ttl, rds, lns, 1, zsk, alg, tag, outbuf);
 }
 
 /* Load or generate a DNSSEC key from Valkey.
@@ -5685,61 +5702,107 @@ static int add_compact_denial(uint8_t *resp, int off, int resp_len, const char *
 /* ==========================================================================
  * Query response builder
  * ======================================================================= */
+/* ── RRset-level signing ──────────────────────────────────────────────────
+ * An RRSIG covers a whole RRset (RFC 4034 §3.1.8.1), so signed RRs are not
+ * signed one at a time: emit_rr appends each RR immediately but holds its
+ * rdata in a per-thread pending set; consecutive RRs with the same owner,
+ * type and section counter join the set, and the set is signed once per ZSK
+ * when it is flushed — on the next RR of a different RRset, or explicitly
+ * before a direct append_rr / before a section's count is written into the
+ * header. Previously every member of a multi-RR RRset (multi-address A/AAAA,
+ * multi-value NS, two-key DS/CDS, ...) got its own RRSIG, none of which a
+ * validator accepts. */
+#define PEND_RD_MAX 600
+typedef struct {
+    int active;
+    char name[256];
+    uint16_t type;
+    uint32_t ttl;
+    int *counter;
+    int n;
+    uint16_t len[RRSET_SIGN_MAX];
+    uint8_t rd[RRSET_SIGN_MAX][PEND_RD_MAX];
+} pending_rrset_t;
+static __thread pending_rrset_t t_pend;
+
+static int rrset_flush(uint8_t *resp, int off, int resp_len) {
+    if (!t_pend.active)
+        return off;
+    t_pend.active = 0;
+    if (!t_zone || t_pend.n == 0)
+        return off;
+    /* During a rollover's commit phase the incoming ("next") ZSK set is the
+     * active signer (RFC 6781 Pre-Publish); otherwise the current set signs. */
+    int use_next = (t_zone->roll_phase == ROLL_COMMIT && t_zone->zsk_next);
+    const uint8_t *rds[RRSET_SIGN_MAX];
+    for (int i = 0; i < t_pend.n; i++)
+        rds[i] = t_pend.rd[i];
+    STAT_INC(g_stat_signed);
+    for (int k = 0; k < 2; k++) { /* ECDSA P-256 (alg 13), then Ed25519 (alg 15) */
+        pthread_mutex_lock(&g_zsk_mutex);
+        EVP_PKEY *zsk;
+        uint16_t tag;
+        if (k == 0) {
+            zsk = use_next ? t_zone->zsk_next : t_zone->zsk;
+            tag = use_next ? t_zone->zsk_next_tag : t_zone->zsk_tag;
+        } else {
+            zsk = use_next ? t_zone->zsk_ed_next : t_zone->zsk_ed;
+            tag = use_next ? t_zone->zsk_ed_next_tag : t_zone->zsk_ed_tag;
+        }
+        pthread_mutex_unlock(&g_zsk_mutex);
+        if (!zsk)
+            continue;
+        uint8_t sig[512];
+        int sl = make_rrsig_set(t_pend.name, t_zone->name, t_pend.type, t_pend.ttl, rds, t_pend.len,
+                                t_pend.n, zsk, k == 0 ? DNS_ALG_ECDSAP256SHA256 : DNS_ALG_ED25519,
+                                tag, sig);
+        if (sl <= 0)
+            continue;
+        int so = append_rr(resp, off, resp_len, t_pend.name, DNS_TYPE_RRSIG, DNS_CLASS_IN,
+                           t_pend.ttl, sig, (uint16_t) sl);
+        if (so > 0) {
+            off = so;
+            (*t_pend.counter)++;
+        }
+    }
+    return off;
+}
+
 static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint16_t type,
                    uint32_t ttl, const uint8_t *rdata, uint16_t rdlen, int dnssec_ok,
                    int *answers) {
     ttl = ttl_clamp(ttl); /* RFC 2181 §8 */
+    int sign = dnssec_ok && t_zone && t_zone->zsk;
+    /* Close the pending RRset unless this RR belongs to it. */
+    if (t_pend.active &&
+        (!sign || t_pend.counter != answers || t_pend.type != type ||
+         !streq_ci(t_pend.name, name) || t_pend.n >= RRSET_SIGN_MAX || rdlen > PEND_RD_MAX))
+        off = rrset_flush(resp, off, resp_len);
     int noff = append_rr(resp, off, resp_len, name, type, DNS_CLASS_IN, ttl, rdata, rdlen);
     if (noff < 0)
         return off;
     (*answers)++;
     off = noff;
-    if (!dnssec_ok || !t_zone || !t_zone->zsk)
+    if (!sign)
         return off;
-    /* During a rollover's commit phase the incoming ("next") ZSK set is the
-     * active signer (RFC 6781 Pre-Publish); otherwise the current set signs. */
-    int use_next = (t_zone->roll_phase == ROLL_COMMIT && t_zone->zsk_next);
-    /* Add RRSIG for ECDSA P-256 (Alg 13) */
-    STAT_INC(g_stat_signed);
-    {
-        pthread_mutex_lock(&g_zsk_mutex);
-        EVP_PKEY *zsk = use_next ? t_zone->zsk_next : t_zone->zsk;
-        uint16_t tag = use_next ? t_zone->zsk_next_tag : t_zone->zsk_tag;
-        pthread_mutex_unlock(&g_zsk_mutex);
-        if (zsk) {
-            uint8_t sig[512];
-            int sl = make_rrsig(name, t_zone->name, type, ttl, rdata, rdlen, zsk,
-                                DNS_ALG_ECDSAP256SHA256, tag, sig);
-            if (sl > 0) {
-                int so = append_rr(resp, off, resp_len, name, DNS_TYPE_RRSIG, DNS_CLASS_IN, ttl,
-                                   sig, (uint16_t) sl);
-                if (so > 0) {
-                    off = so;
-                    (*answers)++;
-                }
-            }
-        }
+    if (rdlen > PEND_RD_MAX) {
+        /* Unreachable today: every rdata buffer the query path passes here
+         * is <= 512 octets. Logged loudly if that ever changes. */
+        dns_log(LOG_WARNING, "[DNSSEC] %u-octet rdata exceeds the RRset buffer — not signed\n",
+                rdlen);
+        return off;
     }
-    /* Add RRSIG for Ed25519 (Alg 15) */
-    {
-        pthread_mutex_lock(&g_zsk_mutex);
-        EVP_PKEY *zsk = use_next ? t_zone->zsk_ed_next : t_zone->zsk_ed;
-        uint16_t tag = use_next ? t_zone->zsk_ed_next_tag : t_zone->zsk_ed_tag;
-        pthread_mutex_unlock(&g_zsk_mutex);
-        if (zsk) {
-            uint8_t sig[512];
-            int sl = make_rrsig(name, t_zone->name, type, ttl, rdata, rdlen, zsk, DNS_ALG_ED25519,
-                                tag, sig);
-            if (sl > 0) {
-                int so = append_rr(resp, off, resp_len, name, DNS_TYPE_RRSIG, DNS_CLASS_IN, ttl,
-                                   sig, (uint16_t) sl);
-                if (so > 0) {
-                    off = so;
-                    (*answers)++;
-                }
-            }
-        }
+    if (!t_pend.active) {
+        t_pend.active = 1;
+        safe_strcpy(t_pend.name, name, sizeof(t_pend.name));
+        t_pend.type = type;
+        t_pend.ttl = ttl;
+        t_pend.counter = answers;
+        t_pend.n = 0;
     }
+    memcpy(t_pend.rd[t_pend.n], rdata, rdlen);
+    t_pend.len[t_pend.n] = rdlen;
+    t_pend.n++;
     return off;
 }
 
@@ -6558,6 +6621,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     if (qlen < 12)
         return -1;
     compress_reset();
+    t_pend.active = 0;
     t_zone = NULL; /* selected after the qname is parsed (see below) */
     const dns_hdr_t *qh = (const dns_hdr_t *) query;
     dns_hdr_t *rh = (dns_hdr_t *) resp;
@@ -6710,6 +6774,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         if (lsigned)
             off =
                 add_compact_denial(resp, off, resp_len, qname, NULL, 0, 1, dnssec_ok, &auth_count);
+        off = rrset_flush(resp, off, resp_len);
         rh->nscount = htons((uint16_t) auth_count);
         /* A locally-served RFC 6303 blackhole zone answering NXDOMAIN is a
          * normal, correct authoritative answer, not an error — EDE isn't for
@@ -6780,6 +6845,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
             safe_strcpy(ns_emit_buf, cutval, sizeof(ns_emit_buf));
             off = emit_ns_rrset(resp, off, resp_len, cut, ns_emit_buf, 0 /* unsigned at a cut */,
                                 &auth_count);
+            off = rrset_flush(resp, off, resp_len);
             rh->nscount = htons((uint16_t) auth_count);
             /* In-bailiwick glue (RFC 9471): A/AAAA for any NS target this zone
              * can itself answer for — the only glue eppd's publish pipeline
@@ -6793,7 +6859,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                  ns = strtok_r(NULL, "|", &sp)) {
                 if (!name_in_zone(ns, t_zone->name))
                     continue; /* out of bailiwick — not ours to glue */
-                char gk[900], gval[128];
+                char gk[900], gval[LB_VAL_MAX];
                 snprintf(gk, sizeof(gk), "zone:%s:A:%s", t_zone->name, ns);
                 if (vk_get(gk, gval, sizeof(gval)))
                     off = emit_addr_rrset(resp, off, resp_len, ns, DNS_TYPE_A, gval,
@@ -6816,7 +6882,11 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     /* DNSKEY — the whole RRset (ZSKs flag 256, KSKs flag 257, plus the incoming
      * set during a ZSK Pre-Publish / KSK Double-Signature rollover, RFC 6781)
      * is emitted, then EACH KSK signs the WHOLE RRset (RFC 4034 §3.1.8.1). */
-    if ((qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
+    /* DNSKEY, CDS, CDNSKEY and the zone's own DS exist only at the zone apex
+     * (they used to be answered at ANY owner name in the zone). */
+    int at_apex = t_zone && streq_ci(qname, t_zone->name);
+    if (at_apex && (qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
+        off = rrset_flush(resp, off, resp_len); /* direct append_rr below */
         uint8_t dk[8][68];
         const uint8_t *dkp[8];
         uint16_t dkl[8];
@@ -6878,7 +6948,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
      * matches the DS answer below. During a KSK rollover this advertises the old
      * KSK (phase != RETIRE) and/or the new KSK (phase != NONE), driving the
      * parent's DS swap (cds_old / cds_new computed above). */
-    if (qtype == DNS_TYPE_CDS || qtype == DNS_TYPE_ANY) {
+    if (at_apex && (qtype == DNS_TYPE_CDS || qtype == DNS_TYPE_ANY)) {
         int before = off;
         if (cds_old) {
             off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_CDS, g_ksk,
@@ -6897,7 +6967,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* RFC 7344: CDNSKEY — the DNSKEY the child wants the parent to publish a DS
      * for: the KSK(s), in DNSKEY rdata format. Same old/new phase logic as CDS. */
-    if (qtype == DNS_TYPE_CDNSKEY || qtype == DNS_TYPE_ANY) {
+    if (at_apex && (qtype == DNS_TYPE_CDNSKEY || qtype == DNS_TYPE_ANY)) {
         int before = off;
         if (cds_old) {
             off = emit_cdnskey(resp, off, resp_len, qname, g_ksk, DNS_ALG_ECDSAP256SHA256,
@@ -6916,7 +6986,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* RFC 4034 §5: DS — Delegation Signer over the zone's KSK(s). Kept identical
      * to CDS (same emit_ds_like + old/new phase logic) so CDS == DS always. */
-    if (qtype == DNS_TYPE_DS || qtype == DNS_TYPE_ANY) {
+    if (at_apex && (qtype == DNS_TYPE_DS || qtype == DNS_TYPE_ANY)) {
         int before = off;
         if (cds_old) {
             off = emit_ds_like(resp, off, resp_len, qname, DNS_TYPE_DS, g_ksk,
@@ -7017,7 +7087,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Dynamic A */
     if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
-        char val[128], k[768];
+        char val[LB_VAL_MAX], k[768];
         dkey(k, sizeof(k), "A", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
@@ -7045,7 +7115,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
     /* Dynamic AAAA */
     if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
-        char val[256], k[768];
+        char val[LB_VAL_MAX], k[768];
         dkey(k, sizeof(k), "AAAA", qname);
         if (vk_get(k, val, sizeof(val))) {
             found = 1;
@@ -7347,7 +7417,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 char wk[768];
                 if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
                     zkey(wk, sizeof(wk), "A", wname);
-                    char wv[128];
+                    char wv[LB_VAL_MAX];
                     if (vk_get(wk, wv, sizeof(wv))) {
                         found = 1;
                         off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, wv, dnssec_ok,
@@ -7356,7 +7426,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 }
                 if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
                     zkey(wk, sizeof(wk), "AAAA", wname);
-                    char wv[256];
+                    char wv[LB_VAL_MAX];
                     if (vk_get(wk, wv, sizeof(wv))) {
                         found = 1;
                         off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, wv,
@@ -7368,6 +7438,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     }
 
 finish_answer:
+    off = rrset_flush(resp, off, resp_len);
     rh->ancount = htons((uint16_t) answers);
     /* RFC 4035 §3.1.6: set AD bit when DO=1 and we returned signed answers */
     if (dnssec_ok && answers > 0 && g_zsk)
@@ -7440,6 +7511,7 @@ finish_answer:
             if (signed_denial)
                 off = add_compact_denial(resp, off, resp_len, qname, ptypes, np, !exists, dnssec_ok,
                                          &auth_count);
+            off = rrset_flush(resp, off, resp_len);
             rh->nscount = htons((uint16_t) auth_count);
         }
     }
@@ -9185,15 +9257,12 @@ static int zonemd_compute(zone_entry_t *z, uint32_t serial, uint8_t *out_digest)
             int nk = vk_list_keys(pat, &keys);
             for (int i = 0; i < nk; i++) {
                 const char *name = keys[i] + pl;
-                char val[768];
+                char val[LB_VAL_MAX];
                 if (!vk_get(keys[i], val, sizeof(val)) || !val[0])
                     continue;
                 if (T == DNS_TYPE_A || T == DNS_TYPE_AAAA) {
-                    if (pass == 1) { /* ddns: bare IP, TTL = remaining lease */
-                        long tl = vk_ttl(keys[i]);
-                        if (tl < 1)
-                            tl = 1;
-                        zmd_add_addr(&arr, &n, &cap, name, T, (uint32_t) tl, val);
+                    if (pass == 1) { /* ddns: bare IP, stable zone TTL */
+                        zmd_add_addr(&arr, &n, &cap, name, T, DDNS_ZONE_TTL, val);
                     } else { /* zone: ttl|ip|ip|... */
                         uint32_t ttl = DEFAULT_TTL;
                         char *pipe = strchr(val, '|');
@@ -9205,14 +9274,11 @@ static int zonemd_compute(zone_entry_t *z, uint32_t serial, uint8_t *out_digest)
                         }
                         zmd_add_addr(&arr, &n, &cap, name, T, ttl, pipe);
                     }
-                } else if (pass == 1) { /* ddns PTR lease: bare target */
-                    long tl = vk_ttl(keys[i]);
-                    if (tl < 1)
-                        tl = 1;
+                } else if (pass == 1) { /* ddns PTR lease: bare target, stable zone TTL */
                     uint8_t rd[300];
                     int rl = name_to_wire(val, rd, sizeof(rd));
                     if (rl > 0)
-                        zmd_add(&arr, &n, &cap, name, T, (uint32_t) tl, rd, rl);
+                        zmd_add(&arr, &n, &cap, name, T, DDNS_ZONE_TTL, rd, rl);
                 } else { /* rich provisioned types via the shared encoder */
                     uint32_t ttl = DEFAULT_TTL;
                     char *pipe = strchr(val, '|');
@@ -9336,10 +9402,10 @@ static void zonemd_seed_if_stale(zone_entry_t *z) {
 
 /* Append every runtime record of `zname` to an in-progress AXFR: the
  * zone:<zname>:* records (every provisioned type) and the ddns:<zname>:A/AAAA
- * dynamic leases (TTL = remaining lease). These are served locally but were
- * historically omitted from transfers, leaving a secondary with a near-empty
- * zone (CLAUDE-discovery.md Gap 1). Reuses stored_rdata() so the wire encoding
- * matches the live query path exactly. */
+ * dynamic leases (TTL = DDNS_ZONE_TTL, the same value IXFR and ZONEMD use). These are served
+ * locally but were historically omitted from transfers, leaving a secondary with a near-empty zone
+ * (CLAUDE-discovery.md Gap 1). Reuses stored_rdata() so the wire encoding matches the live query
+ * path exactly. */
 static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname, uint8_t mac[64],
                               int *maclen) {
     typedef struct {
@@ -9377,14 +9443,14 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                 free(keys);
                 continue;
             }
-            /* ADR-004: fetch this type's values (and, for ddns leases, the
-             * remaining TTL) inside ONE MULTI/EXEC transaction, so every key
+            /* ADR-004: fetch this type's values inside ONE MULTI/EXEC
+             * transaction, so every key
              * of this type reflects one consistent Valkey instant — a
              * concurrent UPDATE can no longer make this type's transfer
              * straddle two different zone states. Compact reply buffers
              * (axfr_reply_t, 768B) rather than an array of full resp_reply_t
              * (64KB each) — this type can have thousands of keys. */
-            int per_key = (pass == 1) ? 2 : 1;
+            int per_key = 1; /* GET only: ddns leases carry DDNS_ZONE_TTL */
             axfr_reply_t *replies = calloc((size_t) nk * (size_t) per_key, sizeof(*replies));
             int fetched = 0;
             if (replies) {
@@ -9394,8 +9460,6 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                     resp_txn_begin(&t, &vk);
                     for (int i = 0; i < nk; i++) {
                         resp_txn_queue(&t, 2, "GET", keys[i]);
-                        if (pass == 1)
-                            resp_txn_queue(&t, 2, "TTL", keys[i]);
                     }
                     fetched = resp_txn_commit_compact(&t, replies, nk * per_key);
                 }
@@ -9416,20 +9480,16 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                 axfr_reply_t *vr = &replies[i * per_key];
                 if (vr->type != 2 || !vr->str[0])
                     continue;
-                char val[768];
+                char val[LB_VAL_MAX];
                 safe_strcpy(val, vr->str, sizeof(val));
                 uint16_t T = tt[ti].t;
                 if (T == DNS_TYPE_A || T == DNS_TYPE_AAAA) {
                     const int af = (T == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
                     const uint16_t alen = (T == DNS_TYPE_AAAA) ? 16 : 4;
-                    if (pass == 1) { /* ddns: bare IP, TTL = remaining lease */
-                        axfr_reply_t *tr = &replies[i * per_key + 1];
-                        long tl = (tr->type == 3) ? tr->integer : -1;
-                        if (tl < 1)
-                            tl = 1;
+                    if (pass == 1) { /* ddns: bare IP, stable zone TTL (as IXFR) */
                         uint8_t rd[16];
                         if (inet_pton(af, val, rd) == 1)
-                            axfr_emit_one(fd, ssl, qid, name, T, (uint32_t) tl, rd, alen, mac,
+                            axfr_emit_one(fd, ssl, qid, name, T, DDNS_ZONE_TTL, rd, alen, mac,
                                           maclen);
                     } else { /* zone: ttl|ip|ip|... */
                         uint32_t ttl = DEFAULT_TTL;
@@ -9448,15 +9508,11 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
                                 axfr_emit_one(fd, ssl, qid, name, T, ttl, rd, alen, mac, maclen);
                         }
                     }
-                } else if (pass == 1) { /* ddns PTR lease: bare target, TTL = remaining lease */
-                    axfr_reply_t *tr = &replies[i * per_key + 1];
-                    long tl = (tr->type == 3) ? tr->integer : -1;
-                    if (tl < 1)
-                        tl = 1;
+                } else if (pass == 1) { /* ddns PTR lease: bare target, stable zone TTL */
                     uint8_t rd[300];
                     int rl = name_to_wire(val, rd, sizeof(rd));
                     if (rl > 0)
-                        axfr_emit_one(fd, ssl, qid, name, T, (uint32_t) tl, rd, (uint16_t) rl, mac,
+                        axfr_emit_one(fd, ssl, qid, name, T, DDNS_ZONE_TTL, rd, (uint16_t) rl, mac,
                                       maclen);
                 } else if (T == DNS_TYPE_NS) { /* zone: ttl|ns1|ns2|... (P0b: multi-value) */
                     uint32_t ttl = DEFAULT_TTL;

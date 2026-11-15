@@ -444,16 +444,22 @@ check-conformance: tests/test_conformance.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 # RFC 9715 / Flag Day 2020: UDP responses must not exceed the fragmentation-safe
 # size even when the client advertises a larger EDNS buffer — cap to 1232 and set
 # TC so the client retries over TCP, where the full answer is returned. The probe
-# is a DNSSEC-signed AAAA RRset (the canonical fragmentation case): the full
-# response (~2.3 KB) sits between 1232 and the client's advertised 4096, so a TC
-# bit proves the 1232 cap fired rather than the 4096 buffer.
+# is a DNSSEC-signed 32-address AAAA RRset in a throwaway zone with a long apex
+# (the canonical fragmentation case): the full UDP response (~1.3 KB) sits
+# between 1232 and the client's advertised 4096, so a TC bit proves the 1232
+# cap fired rather than the 4096 buffer. (The RRset is signed ONCE per
+# algorithm since the RRset-signing fix, so it takes 32 addresses and a long
+# signer name — not 8 addresses with 16 per-record RRSIGs — to exceed 1232.)
 check-frag: $(BIN_DEBUG)
 	@echo "  CHECK  RFC 9715 UDP fragmentation avoidance (1232 cap + TC fallback)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
-	 Z=example.local; BIGN=big.$$Z;                                                    \
-	 VAL=30; for i in 1 2 3 4 5 6 7 8; do VAL="$$VAL|2001:db8:$$i::$$i"; done;          \
+	 Z=rfc9715-fragmentation-avoidance-probe.test; BIGN=big.$$Z;                       \
+	 clean() { for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done; }; \
+	 clean;                                                                            \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
+	 VAL=30; for i in $$(seq 1 32); do VAL="$$VAL|2001:db8:$$i::$$i"; done;          \
 	 $$VC set zone:$$Z:AAAA:$$BIGN "$$VAL" >/dev/null;                                 \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_frag.log 2>&1 & DNS=$$!; \
 	 sleep 1.5;                                                                        \
@@ -462,13 +468,13 @@ check-frag: $(BIN_DEBUG)
 	 TCPSIZE=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +tcp +dnssec $$BIGN AAAA +time=3 +tries=1 | awk '/MSG SIZE/{print $$NF}'); \
 	 TCPAAAA=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +tcp +dnssec $$BIGN AAAA +time=3 +tries=1 +short | grep -c '^2001:db8:'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
-	 $$VC del zone:$$Z:AAAA:$$BIGN >/dev/null;                                         \
+	 clean;                                                                            \
 	 echo "  udp_flags=[$$UDPFLAGS] opt_udp=[$$OPT] tcp_size=[$$TCPSIZE] tcp_aaaa=[$$TCPAAAA]"; \
 	 test -n "$$TCPSIZE" && test "$$TCPSIZE" -gt 1232 || { echo "  FAIL  probe response not >1232 over TCP (size=$$TCPSIZE) — cannot exercise the UDP cap"; exit 1; }; \
 	 echo "$$UDPFLAGS" | grep -qw tc || { echo "  FAIL  UDP answer >1232 not truncated (TC unset) despite bufsize=4096"; exit 1; }; \
 	 test "$$OPT" = "1232" || { echo "  FAIL  response OPT advertises [$$OPT], expected 1232"; exit 1; }; \
-	 test "$$TCPAAAA" -eq 8 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 8)"; exit 1; }; \
-	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 8 AAAA)"
+	 test "$$TCPAAAA" -eq 32 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 32)"; exit 1; }; \
+	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 32 AAAA)"
 
 # CSA-DNSSEC-001 / CSA-PROTO-001 / CSA-DNSSEC-002 (CLAUDE-dnssec-denial.md).
 # Validates dnsd's answers with an INDEPENDENT validator (dnspython +
@@ -482,7 +488,7 @@ check-frag: $(BIN_DEBUG)
 # EDE 30. Runs both config:zone:<z>:dnssec_nsec_mode values on a throwaway
 # non-.local zone. check-dnssec-live only counts RRSIGs and caught none of
 # these. Needs Valkey + python3 with dnspython + cryptography.
-check-dnssec-validate: $(BIN_DEBUG)
+check-dnssec-validate: $(BIN_DEBUG) resolverd_debug
 	@echo "  CHECK  independent DNSSEC validation: KSK tags, NODATA vs NXDOMAIN, RFC 9824 compact denial (Valkey + python3-dnspython + cryptography)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
@@ -491,7 +497,8 @@ check-dnssec-validate: $(BIN_DEBUG)
 	 clean() { for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done; }; \
 	 clean;                                                                            \
 	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
-	 $$VC set zone:$$Z:NS:$$Z "300|ns1.$$Z" >/dev/null;                                \
+	 $$VC set zone:$$Z:NS:$$Z "300|ns1.$$Z|ns2.$$Z" >/dev/null;                        \
+	 $$VC set zone:$$Z:A:multi.$$Z "60|10.0.0.5|10.0.0.6|10.0.0.7" >/dev/null;           \
 	 $$VC set zone:$$Z:A:www.$$Z "60|10.0.0.1" >/dev/null;                             \
 	 $$VC set ddns:$$Z:A:dyn.$$Z "10.0.0.2" >/dev/null;                                \
 	 $$VC set srp:$$Z:A:srp.$$Z "60|10.0.0.3" >/dev/null;                              \
@@ -503,8 +510,17 @@ check-dnssec-validate: $(BIN_DEBUG)
 	   for C in "dnskey" "ds-tags" "nxname nope" "nxname-co nope" "nodata www AAAA A"   \
 	            "nodata @ AAAA NS,SOA,DNSKEY,CDS,CDNSKEY" "nodata dyn AAAA A"           \
 	            "nodata srp TXT A" "qtype128" "rcode nope A NXDOMAIN"                   \
-	            "rcode www AAAA NOERROR" "rcode @ AAAA NOERROR" "rcode dyn TXT NOERROR"; do \
+	            "rcode www AAAA NOERROR" "rcode @ AAAA NOERROR" "rcode dyn TXT NOERROR"   \
+	            "positive multi A 3" "positive @ NS 2" "positive www A 1" "apex-only www"; do \
 	     OUT=$$($$V $$M $$C 2>&1) || rc=1; echo "    $$OUT" | cut -c1-200;             \
+	   done;                                                                           \
+	   TA=$$($$V $$M anchors);                                                         \
+	   for Q in "nope A" "www AAAA" "www A" "multi A" "dyn A" "$$Z NS"; do               \
+	     set -- $$Q; QN=$$1; case $$QN in *.*) ;; *) QN=$$QN.$$Z;; esac;              \
+	     ST=$$(ASAN_OPTIONS=detect_leaks=0 DNSSEC_TRUST_ANCHORS=$$TA ./resolverd_debug \
+	           --upstream 127.0.0.1:$(TPORT) --no-mdns --no-valkey $$QN $$2 2>&1 | sed -n 's/^;; DNSSEC: \([A-Z]*\).*/\1/p'); \
+	     echo "    resolverd $$QN $$2: $$ST";                                           \
+	     test "$$ST" = SECURE || rc=1;                                                 \
 	   done;                                                                           \
 	 done;                                                                             \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
@@ -512,7 +528,7 @@ check-dnssec-validate: $(BIN_DEBUG)
 	 clean;                                                                            \
 	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report in /tmp/dnsd_dv.log"; exit 1; }; \
 	 test $$rc -eq 0 || { echo "  FAIL  independent validation failed (see FAIL lines above)"; exit 1; }; \
-	 echo "  OK  DNSKEY/DS/CDS tags + signatures valid; NODATA by name existence; compact denial (NSEC and NSEC3) validates"
+	 echo "  OK  DNSKEY/DS/CDS tags + whole-RRset signatures valid; NODATA by name existence; compact denial (NSEC + NSEC3) validates; resolverd SECURE end-to-end"
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -600,14 +616,15 @@ check-zonemd: tests/test_zonemd.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wi
 	 $$VC set config:zone:$$Z:zonemd 1 >/dev/null;                                     \
 	 $$VC set zone:$$Z:A:web.$$Z "120|10.1.2.3|10.1.2.4" >/dev/null;                   \
 	 $$VC set zone:$$Z:TXT:info.$$Z "120|hello-zonemd" >/dev/null;                     \
+	 $$VC set ddns:$$Z:A:lease.$$Z 10.1.2.9 EX 300 >/dev/null;                         \
 	 $$VC del zone:$$Z:ZONEMD:$$Z >/dev/null;                                          \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_zonemd.log 2>&1 & DNS=$$!; \
-	 sleep 1.5;                                                                        \
+	 sleep 2.5; # > 1 s after the digest: a live ddns lease must not make it drift   \
 	 DIGO=$$(dig +nocookie +noall +answer @127.0.0.1 -p $(TPORT) $$Z ZONEMD +time=2 +tries=1); \
 	 VER=$$(python3 tests/zonemd_verify.py 127.0.0.1 $(TPORT) $$Z 2>&1);               \
 	 RC=$$?;                                                                            \
 	 kill $$DNS 2>/dev/null || true;                                                   \
-	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z zone:$$Z:ZONEMD:$$Z >/dev/null; \
+	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z zone:$$Z:ZONEMD:$$Z ddns:$$Z:A:lease.$$Z >/dev/null; \
 	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
 	 if [ -n "$$SAVE_ZM" ]; then $$VC set config:zone:$$Z:zonemd "$$SAVE_ZM" >/dev/null; else $$VC del config:zone:$$Z:zonemd >/dev/null; fi; \
 	 echo "  dig: $$(echo "$$DIGO" | tr -s ' ')";                                      \
@@ -1806,6 +1823,7 @@ check-sig0: $(BIN_DEBUG)
 	 R_EXP=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad2.example.local expired); \
 	 A_EXP=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad2.example.local A +time=2 +tries=1); \
 	 $$VC del zone:example.local:KEY:$$SIGNER >/dev/null; \
+	 $$VC del ddns:example.local:A:good1.example.local >/dev/null; \
 	 R_NOKEY=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad3.example.local none); \
 	 A_NOKEY=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad3.example.local A +time=2 +tries=1); \
 	 kill $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \

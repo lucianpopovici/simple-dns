@@ -53,34 +53,51 @@ CI), `make check-aggressive-nsec` (resolverd compact-denial spans) and
   zone and used to synthesize NXDOMAIN for every later name — and an NXNAME
   span is never used for owner NODATA either.
 
-### Found while verifying, NOT fixed here (pre-existing; need their own spec)
+### Found while verifying — fixed in the follow-up commit (2026-11-15)
 
-1. **Multi-RR RRsets are signed one record at a time.** `emit_rr` signs
-   each RR it emits, so a multi-address A/AAAA (`emit_addr_rrset`), a
-   multi-value NS (`emit_ns_rrset`), and CDS/DS with two keys each get one
-   RRSIG per record, none of which validates (verified with dnspython on
-   `zone:<z>:A:<n> = "60|10.0.0.5|10.0.0.6"`: 4 RRSIGs, all "verify
-   failure"). `make_rrsig_set` is the building block for the fix.
-2. **DNSKEY and CDS/CDNSKEY are answered at any owner name**, not only at
-   the apex (`qtype == DNS_TYPE_DNSKEY` has no apex check).
-3. **resolverd's validator uses the first DNSKEY for every RRSIG** (and the
-   first RRSIG only on the positive path, and fetches DNSKEY at the qname
-   rather than the signer name), so any zone with two algorithms is
-   reported BOGUS — the acceptance item "resolverd logs no DNSSEC BOGUS"
-   fails identically before and after this change (checked against the
-   pre-fix dnsd).
+1. **Multi-RR RRsets were signed one record at a time** (`emit_rr` signed
+   each RR it emitted), so multi-address A/AAAA, multi-value NS and
+   two-key DS/CDS each got one RRSIG per record, none valid. Now `emit_rr`
+   appends the RR at once but defers the signature: consecutive RRs with the
+   same owner, type and section join a per-thread pending RRset that is
+   signed once per ZSK with `make_rrsig_set` when the set is flushed (next
+   RRset, a direct `append_rr`, or before a section count is written).
+2. **DNSKEY, CDS, CDNSKEY and the zone's own DS were answered at any owner
+   name**; now only at the apex.
+3. **resolverd's validator used the first DNSKEY (fetched at the QNAME) for
+   every RRSIG** and only the first RRSIG of a positive answer, so two-key /
+   two-algorithm zones were BOGUS. Now each RRSIG's key is selected by
+   (signer, algorithm, key tag) — from the response itself, else the
+   signer's DNSKEY RRset upstream, cached per (signer, alg, tag); every
+   answer RRset is judged over all of its RRSIGs (SECURE if one verifies
+   with a trusted key, BOGUS only if every usable one fails); the negative
+   validator groups the same way. The key tag moved to libdnswire
+   (`dnskey_keytag`) so dnsd and resolverd compute it identically.
+   `check-dnssec-validate` now runs resolverd end-to-end (trust anchors =
+   the zone's keys) and requires SECURE for NXNAME, NODATA, single- and
+   multi-RR positive answers, in both denial modes.
 
+Also found and fixed while getting the full suite green:
 
-Build order: 1 → 2a → 3. Fix 3 depends on the helper Fix 2a introduces.
-
-**What was observed (so the agent can reproduce before changing anything):**
-
-```
-example.local DNSKEY: KSK tags 20791 (alg 13), 25129 (alg 15)
-RRSIG(DNSKEY) key tags: 20790, 25128        DS answer key tags: 20790, 25128
-www.example.test A exists; www.example.test AAAA -> NXDOMAIN; example.test AAAA -> NXDOMAIN
-nope.example.test A +DO -> NXDOMAIN with ONE NSEC3: owner = H(nope.example.test), bitmap "A"
-```
+- **ZONEMD drifted with a live ddns lease**: AXFR and the digest used the
+  lease's remaining lifetime as the TTL, which changes every second, so the
+  published digest never matched a later transfer. AXFR and ZONEMD now use
+  `DDNS_ZONE_TTL` (= the TTL IXFR already emits); `check-zonemd` seeds a
+  lease to cover it. `check-sig0` no longer leaks its lease.
+- **Non-primary zones lost their serial on reload**: `zones_load_from_valkey`
+  took the serial from `zone_table:<z>` (the initial value) and ignored the
+  persisted counter `config:zone:<z>:serial`, so any zone_table change or
+  subscriber catch-up reset it — the `check-ixfr-client` flake (secondary
+  served serial 1 after transferring 100; 4/10 runs → 0/10). The subscriber
+  also catches up after PSUBSCRIBE now, not before.
+- **A/AAAA RRsets were silently truncated**: the query path read stored
+  `ttl|ip|ip|...` values into 128/256-byte buffers (AXFR/ZONEMD: 768), so
+  an RRset was cut at ~7 A / ~17 AAAA addresses (and could cut the last one
+  mid-literal) even though `LB_MAX_ADDRS` is 32. Buffers are now
+  `LB_VAL_MAX`; RRSET_SIGN_MAX (dnsd) and DNSSEC_MAX_RRS (resolverd) are 32
+  so a full RRset is one signed set. `check-frag` now probes with 32
+  signed AAAA in a long-apex zone (8 records with 16 per-record RRSIGs no
+  longer exceed 1232 octets once the RRset is signed once).
 
 ---
 

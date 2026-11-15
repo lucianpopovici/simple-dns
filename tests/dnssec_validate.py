@@ -19,6 +19,12 @@ CHECK:
                           (LABEL "@" = the apex)
   rcode LABEL TYPE RCODE  without DO: that rcode, no NSEC/NSEC3/RRSIG
   qtype128                QTYPE NXNAME -> FORMERR with EDE 30
+  positive LABEL TYPE N   answer RRset has N records; every RRSIG over the
+                          WHOLE RRset validates (one RRSIG per algorithm)
+  apex-only LABEL         DNSKEY, CDS, CDNSKEY and DS are NOT answered at a
+                          non-apex name
+  anchors                 print SHA-256(DNSKEY rdata) of every published key,
+                          comma-separated (resolverd DNSSEC_TRUST_ANCHORS)
 
 Prints "OK <check> ..." and exits 0, or "FAIL <reason>" and exits 1.
 """
@@ -178,6 +184,35 @@ def main():
     ksk_tags = {(k.algorithm, dns.dnssec.key_id(k)) for k in keyset if k.flags == 257}
     if not ksk_tags:
         fail("no flags-257 DNSKEY published")
+
+    if check == "anchors":
+        print(",".join(hashlib.sha256(k.to_wire()).hexdigest() for k in keyset))
+        return 0
+
+    if check == "positive":
+        label, qtype, want_n = args
+        qname = zone if label == "@" else f"{label}.{zone}"
+        r = ask(server, port, qname, qtype)
+        rt = dns.rdatatype.from_text(qtype)
+        rs = [x for x in r.answer if x.rdtype == rt]
+        if not rs or len(rs[0]) != int(want_n):
+            fail(f"{qname} {qtype}: want {want_n} records, got {len(rs[0]) if rs else 0}")
+        sigs = [x for x in r.answer if x.rdtype == dns.rdatatype.RRSIG and x.covers == rt]
+        if not sigs or len(sigs[0]) != 2:
+            fail(f"{qname} {qtype}: want exactly one RRSIG per algorithm (2), got "
+                 f"{len(sigs[0]) if sigs else 0}")
+        n = validate_section(r.answer, zone, keyset, qname)
+        print(f"OK positive {qname} {qtype} {want_n} records, {n} signatures valid")
+        return 0
+
+    if check == "apex-only":
+        qname = f"{args[0]}.{zone}"
+        for t in ("DNSKEY", "CDS", "CDNSKEY", "DS"):
+            r = ask(server, port, qname, t)
+            if any(x.rdtype == dns.rdatatype.from_text(t) for x in r.answer):
+                fail(f"{qname} {t} answered below the apex")
+        print(f"OK apex-only {qname}: no DNSKEY/CDS/CDNSKEY/DS below the apex")
+        return 0
 
     if check == "dnskey":
         n = validate_section([keyset, keysigs], zone, keyset, "DNSKEY")

@@ -69,7 +69,7 @@ validator and resolver sees, then availability).
 | CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | Specced | resolverd-cache, Fix 1 |
 | — | — | TSan build + stress target + CI job | Specced | resolverd-cache, Fix 2 |
 
-Found while fixing, not in the ledger yet: multi-RR RRsets signed per record; DNSKEY/CDS answered at any name; resolverd validator picks the first DNSKEY for every RRSIG (see `CLAUDE-dnssec-denial.md` implementation notes).
+Found while fixing, not in the ledger, **fixed 2026-11-15**: multi-RR RRsets signed per record; DNSKEY/CDS/DS answered at any name; resolverd validator picked the first DNSKEY for every RRSIG; ZONEMD drift with live ddns leases; non-primary zone serial reset on reload (see `CLAUDE-dnssec-denial.md` implementation notes).
 
 Not yet specced (open in the ledger): CSA-AUTH-006/-007, CSA-NET-003,
 CSA-DOS-003..006, CSA-INJ-001/-002, CSA-SBX-001/-002, CSA-WEB-001/-002,

@@ -493,6 +493,11 @@ int csync_encode_rdata(uint32_t serial, uint16_t flags, const char *types_csv, u
  * Returns the encoded length, or -1 on overflow / bad arguments. */
 int type_bitmap_encode(const uint16_t *types, int ntypes, uint8_t *out, int outlen);
 
+/* RFC 4034 Appendix B key tag over a DNSKEY rdata (flags|proto|alg|key) as
+ * published. Shared by dnsd (signing, SIG(0)) and resolverd (selecting the
+ * key an RRSIG names), so both sides compute it the same way. */
+uint16_t dnskey_keytag(const uint8_t *rd, int rdlen);
+
 /* ── TLS server helpers (DNS-over-TLS, RFC 7858) ─────────────────────────────
  * Shared by dnsd (authoritative DoT/XoT listener) and resolverd (stub-facing
  * DoT listener, RFC 9462 DDR) so the cert-loading and ALPN-selection code —

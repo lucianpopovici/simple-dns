@@ -1272,6 +1272,14 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
     }
 }
 
+uint16_t dnskey_keytag(const uint8_t *rd, int rdlen) {
+    uint32_t ac = 0;
+    for (int i = 0; i < rdlen; i++)
+        ac += (i & 1) ? rd[i] : (uint32_t) rd[i] << 8;
+    ac += (ac >> 16) & 0xFFFF;
+    return (uint16_t) (ac & 0xFFFF);
+}
+
 int type_bitmap_encode(const uint16_t *types, int ntypes, uint8_t *out, int outlen) {
     if (ntypes < 0 || ntypes > 64 || (ntypes > 0 && !types) || !out || outlen < 0)
         return -1;

@@ -270,6 +270,10 @@ static int build_rr(uint8_t *out, const char *owner, uint16_t type, uint32_t ttl
 
 /* RRSIG rdata up to (and including) the signer name; sig_off_out receives
  * the offset of the 64-byte signature that follows. */
+/* Key tag of the test DNSKEY: resolverd selects the verifying key by
+ * (algorithm, key tag), so the RRSIGs must carry the real tag. */
+static uint16_t g_neg_tag;
+
 static int build_rrsig_rdata(uint8_t *out, uint16_t covered, uint8_t alg, uint8_t labels,
                              uint32_t origttl, const char *signer, const uint8_t sig64[64],
                              int *sig_off_out) {
@@ -284,8 +288,8 @@ static int build_rrsig_rdata(uint8_t *out, uint16_t covered, uint8_t alg, uint8_
     o += 4; /* expiration: not checked here */
     put32(out, o, 0);
     o += 4; /* inception: not checked here */
-    put16(out, o, 0);
-    o += 2; /* key tag: not checked here */
+    put16(out, o, g_neg_tag);
+    o += 2; /* key tag: names the test DNSKEY */
     o += name_to_wire(signer, out + o, 256);
     if (sig_off_out)
         *sig_off_out = o;
@@ -442,6 +446,7 @@ static void test_validate_negative(void) {
     dnskey_rd[2] = 3;
     dnskey_rd[3] = 15;
     memcpy(dnskey_rd + 4, pub, 32);
+    g_neg_tag = dnskey_keytag(dnskey_rd, 36);
 
     uint8_t hash[32];
     char hex[65];

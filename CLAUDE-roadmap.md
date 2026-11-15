@@ -146,9 +146,12 @@ availability, then defense-in-depth.
    promotes batch3 Add 11). **DONE 2026-11-15** (Fix 1, 2a, 3; D1 = keep
    the `dnssec_nsec_mode` selector, both forms implemented) —
    `make check-dnssec-validate` (in CI). Fix 2b still waits on **D2**.
-   Verifying surfaced three pre-existing defects to schedule next: multi-RR
-   RRsets signed per record, DNSKEY/CDS answered at any name, resolverd
-   picking the first DNSKEY for every RRSIG.
+   Verifying surfaced pre-existing defects, all fixed in the follow-up
+   commit: multi-RR RRsets signed per record, DNSKEY/CDS/DS answered at any
+   name, resolverd picking the first DNSKEY for every RRSIG (now SECURE
+   end-to-end in `check-dnssec-validate`), ZONEMD drift with live ddns
+   leases, non-primary zone serial reset on reload (`check-ixfr-client`
+   flake). CI blockers (cppcheck, clang-format) cleared in their own commits.
 4. **Transport confusion** — `CLAUDE-tcp-transport.md` Fix 1 (CSA-PROTO-002,
    *High*, plain TCP/53 speaks TLS once a cert loads) + Fix 2 (CSA-DOS-002,
    connection cap / handshake timeout / checked `pthread_create`). *Specced.*
