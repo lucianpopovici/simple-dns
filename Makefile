@@ -832,7 +832,7 @@ check-qlog-escape: $(BIN_DEBUG)
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 python3 -c 'import dns.message' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
-	 D=$$(mktemp -d); SAVE_QL=$$($$VC get config:query_log_path);                      \
+	 D=$$(mktemp -d); chmod 1777 $$D; SAVE_QL=$$($$VC get config:query_log_path);       \
 	 $$VC set config:query_log_path $$D/q.log >/dev/null;                              \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_qle.log 2>&1 & DNS=$$!; \
 	 sleep 2;                                                                          \
@@ -2043,9 +2043,9 @@ check-xfr-tsig: $(BIN_DEBUG)
 	 RES="";                                                                           \
 	 for MODE in ok badresp unsigned; do                                              \
 	   for k in $$($$VC --scan --pattern "zone:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
-	   python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" $$MODE >/tmp/xtsig_m.log 2>&1 & M=$$!; \
+	   python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" $$MODE >/tmp/xtsig_m_$$MODE.log 2>&1 & M=$$!; \
 	   for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
-	   ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/xtsig_s.log 2>&1 & DNS=$$!;    \
+	   ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/xtsig_s_$$MODE.log 2>&1 & DNS=$$!; \
 	   W=""; for w in $$(seq 1 16); do sleep 0.5;                                        \
 	     W=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) www.$$Z A +time=1 +tries=1);      \
 	     test -n "$$W" -o $$MODE != ok -a $$w -ge 5 && break; done;                       \
@@ -2062,7 +2062,7 @@ check-xfr-tsig: $(BIN_DEBUG)
 	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
 	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
 	 echo "  results:$$RES"; \
-	 test "$$R_ok" = "10.20.0.1" || { echo "  FAIL  valid TSIG transfer not applied"; tail -n 30 /tmp/xtsig_s.log /tmp/xtsig_m.log; exit 1; }; \
+	 test "$$R_ok" = "10.20.0.1" || { echo "  FAIL  valid TSIG transfer not applied"; grep -h 'XFR\|TSIG' /tmp/xtsig_s_ok.log; cat /tmp/xtsig_m_ok.log; exit 1; }; \
 	 test -z "$$R_badresp" || { echo "  FAIL  response with wrong key was NOT rejected"; exit 1; }; \
 	 test -z "$$R_unsigned" || { echo "  FAIL  unsigned response was NOT rejected (TSIG required)"; exit 1; }; \
 	 echo "  OK  valid TSIG applied; wrong-key + unsigned responses rejected"

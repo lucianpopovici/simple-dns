@@ -151,6 +151,10 @@ def tsig_rr(keyname, time_signed, fudge, mac, orig_id):
     return enc_name(keyname) + struct.pack(">HHIH", 250, 255, 0, len(rd)) + rd
 
 
+def log(msg):
+    print(f"[axfr_master_tsig] {msg}", file=sys.stderr, flush=True)
+
+
 def main():
     global ZONE
     bind_ip, port = sys.argv[1], int(sys.argv[2])
@@ -184,16 +188,20 @@ def main():
             # the default example.local — refuse that so we never transfer foreign
             # records into another zone (which would pollute the shared Valkey).
             if parse_qname(query) != ZONE.rstrip(".").lower():
+                log(f"refused: query for {parse_qname(query)!r}, not our zone")
                 conn.close(); continue
             parsed = parse_tsig(query)
             if not parsed:
+                log("refused: request carries no TSIG")
                 conn.close(); continue
             minus, keyname, qtime, qfudge, qmac = parsed
             # Verify the client's request signature (proves the client signed right).
             reqvars = tsig_vars(keyname, qtime, qfudge)
             expect = hmac.new(secret, dec_arcount(query[:minus]) + reqvars, hashlib.sha256).digest()
             if expect != qmac:
+                log(f"refused: bad request MAC (key={keyname!r} time={qtime} fudge={qfudge})")
                 conn.close(); continue  # bad client MAC -> refuse
+            log(f"serving {ZONE} mode={mode}")
 
             recs, n = records()
             body = struct.pack(">HHHHHH", qid, 0x8400, 0, n, 0, 0) + recs

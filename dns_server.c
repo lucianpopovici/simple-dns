@@ -878,14 +878,26 @@ static void qlog_write(const char *client_ip, const char *qname, uint16_t qtype,
     pthread_mutex_unlock(&g_qlog_mutex);
 }
 
+static void dns_log(int priority, const char *fmt, ...); /* defined below */
+
+/* Open the new file before closing the old one: if the open fails (e.g. the
+ * path is not writable by the unprivileged service user after the privilege
+ * drop) the current log stays in use instead of silently falling back to
+ * stderr. */
 static void qlog_open(void) {
-    pthread_mutex_lock(&g_qlog_mutex);
-    if (g_query_log_fp) {
-        fclose(g_query_log_fp);
-        g_query_log_fp = NULL;
+    FILE *nfp = NULL;
+    if (g_query_log_path[0] && strcmp(g_query_log_path, "stderr") != 0) {
+        nfp = fopen(g_query_log_path, "a");
+        if (!nfp) {
+            dns_log(LOG_ERR, "[QLog] cannot open query log %s: %s — keeping the current one\n",
+                    g_query_log_path, strerror(errno));
+            return;
+        }
     }
-    if (g_query_log_path[0] && strcmp(g_query_log_path, "stderr") != 0)
-        g_query_log_fp = fopen(g_query_log_path, "a");
+    pthread_mutex_lock(&g_qlog_mutex);
+    if (g_query_log_fp)
+        fclose(g_query_log_fp);
+    g_query_log_fp = nfp;
     pthread_mutex_unlock(&g_qlog_mutex);
 }
 
@@ -2538,7 +2550,11 @@ static void config_load_from_valkey(void) {
     /* Query log */
     {
         char qlpath[512];
-        if (vk_get("config:query_log_path", qlpath, sizeof(qlpath)) && qlpath[0]) {
+        /* Reopen only when the path changes: config_load runs on every serial
+         * bump, and a reopen after the privilege drop could fail on a file the
+         * root-started daemon created (the log then went to stderr). */
+        if (vk_get("config:query_log_path", qlpath, sizeof(qlpath)) && qlpath[0] &&
+            strcmp(qlpath, g_query_log_path) != 0) {
             safe_strcpy(g_query_log_path, qlpath, sizeof(g_query_log_path));
             qlog_open();
         }
