@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -469,6 +469,50 @@ check-frag: $(BIN_DEBUG)
 	 test "$$OPT" = "1232" || { echo "  FAIL  response OPT advertises [$$OPT], expected 1232"; exit 1; }; \
 	 test "$$TCPAAAA" -eq 8 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 8)"; exit 1; }; \
 	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 8 AAAA)"
+
+# CSA-DNSSEC-001 / CSA-PROTO-001 / CSA-DNSSEC-002 (CLAUDE-dnssec-denial.md).
+# Validates dnsd's answers with an INDEPENDENT validator (dnspython +
+# cryptography), not with dnsd's or resolverd's own code: the DNSKEY RRset
+# validates under each KSK (tags = published flags-257 keys, whole RRset
+# signed); DS/CDS tags match; NODATA vs NXDOMAIN is decided by name existence
+# (zone:, ddns:, srp:, apex); every negative answer carries ONE RFC 9824
+# compact-denial record (NSEC: owner=qname, next=\000.qname; NSEC3: owner=
+# H(qname), next=H+1) with the exact type bitmap, NXNAME for a nonexistent
+# name, NOERROR unless Compact Answers OK, CO echoed; QTYPE NXNAME -> FORMERR +
+# EDE 30. Runs both config:zone:<z>:dnssec_nsec_mode values on a throwaway
+# non-.local zone. check-dnssec-live only counts RRSIGs and caught none of
+# these. Needs Valkey + python3 with dnspython + cryptography.
+check-dnssec-validate: $(BIN_DEBUG)
+	@echo "  CHECK  independent DNSSEC validation: KSK tags, NODATA vs NXDOMAIN, RFC 9824 compact denial (Valkey + python3-dnspython + cryptography)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.dnssec, cryptography' 2>/dev/null || { echo "  SKIP  python3 dnspython/cryptography not installed"; exit 0; }; \
+	 Z=dv.test; V="python3 tests/dnssec_validate.py 127.0.0.1 $(TPORT) $$Z";           \
+	 clean() { for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done; }; \
+	 clean;                                                                            \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
+	 $$VC set zone:$$Z:NS:$$Z "300|ns1.$$Z" >/dev/null;                                \
+	 $$VC set zone:$$Z:A:www.$$Z "60|10.0.0.1" >/dev/null;                             \
+	 $$VC set ddns:$$Z:A:dyn.$$Z "10.0.0.2" >/dev/null;                                \
+	 $$VC set srp:$$Z:A:srp.$$Z "60|10.0.0.3" >/dev/null;                              \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dv.log 2>&1 & DNS=$$!; \
+	 sleep 2.5; rc=0;                                                                  \
+	 for M in nsec3 nsec; do                                                           \
+	   $$VC set config:zone:$$Z:dnssec_nsec_mode $$M >/dev/null; sleep 1.2;            \
+	   echo "  -- dnssec_nsec_mode=$$M";                                               \
+	   for C in "dnskey" "ds-tags" "nxname nope" "nxname-co nope" "nodata www AAAA A"   \
+	            "nodata @ AAAA NS,SOA,DNSKEY,CDS,CDNSKEY" "nodata dyn AAAA A"           \
+	            "nodata srp TXT A" "qtype128" "rcode nope A NXDOMAIN"                   \
+	            "rcode www AAAA NOERROR" "rcode @ AAAA NOERROR" "rcode dyn TXT NOERROR"; do \
+	     OUT=$$($$V $$M $$C 2>&1) || rc=1; echo "    $$OUT" | cut -c1-200;             \
+	   done;                                                                           \
+	 done;                                                                             \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 SAN=$$(grep -c 'AddressSanitizer\|runtime error' /tmp/dnsd_dv.log);               \
+	 clean;                                                                            \
+	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report in /tmp/dnsd_dv.log"; exit 1; }; \
+	 test $$rc -eq 0 || { echo "  FAIL  independent validation failed (see FAIL lines above)"; exit 1; }; \
+	 echo "  OK  DNSKEY/DS/CDS tags + signatures valid; NODATA by name existence; compact denial (NSEC and NSEC3) validates"
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -3211,6 +3255,7 @@ help:
 	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"
 	@echo "  make check-dns0x20   resolverd RFC 5452 0x20 QNAME case randomization (needs dig + python3)"
 	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
+	@echo "  make check-dnssec-validate  Independent DNSSEC validation (dnspython): KSK tags, NODATA, RFC 9824 compact denial"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"

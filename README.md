@@ -131,8 +131,12 @@ glance:
   when `eppd` has published one, falling back to the ordinary unsigned
   referral for an insecure delegation.
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
-  and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
-  authenticated denial. Validation (in `resolverd.c`) covers the full
+  and algorithm 15 (Ed25519, RFC 8080). Authenticated denial is RFC 9824
+  compact denial of existence (dnsd signs on the fly): one NSEC (4034) or
+  NSEC3 (5155) record matching the query name — selected per zone with
+  `config:[zone:<zone>:]dnssec_nsec_mode` (`nsec3`, the default, or `nsec`) —
+  with NXNAME in the bitmap for a nonexistent name; NOERROR unless the client
+  sets the Compact Answers OK EDNS flag, then NXDOMAIN. Validation (in `resolverd.c`) covers the full
   canonical RRset per RFC 4034 §3.1.8.1. Automated per-zone ZSK rollover
   follows RFC 6781 §4.1.1.1 (Pre-Publish): the incoming key is published
   alongside the current one before the signer switches, and the old key is
@@ -233,7 +237,8 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
 | `config:lb_mode` | A/AAAA RRset rotation: `none` (default), `rr` (round-robin), `random`. Local serving policy — not zone data. |
 | `config:lb_health_enabled` / `_targets` / `_interval` / `_timeout_ms` | TCP health checks for load-balanced addresses: probe the addresses behind `_targets` (`name[:port],...`, port default 80) every `_interval`s (default 10) with a `_timeout_ms` connect timeout (default 1000); down addresses are dropped from answers, with fail-open when all are down. |
-| `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
+| `config:dnssec_nsec_mode` | Denial record type for signed negative answers: `nsec3` (default) or `nsec`. Both use RFC 9824 compact denial. Per-zone override: `config:zone:<zone>:dnssec_nsec_mode`. |
+| `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters (default 0 extra iterations, empty salt — RFC 9276 / RFC 9824 §4). |
 | `config:zsk_validity` (or `config:zone:<zone>:zsk_validity`) | ZSK lifetime in seconds; `dnsd` auto-starts a rollover when the active ZSK is older. `0`/unset = no automatic rollover. |
 | `config:zone:<zone>:zsk_rollover_request` | Manual trigger: set to a fresh value (e.g. an epoch) to start a ZSK rollover for that zone now. Edge-triggered. |
 | `config:rollover_publish_hold` / `config:rollover_commit_hold` | Hold times (seconds) for the publish and commit phases (defaults 3600 each; per-zone overridable via `config:zone:<zone>:*`). Size publish ≥ DNSKEY TTL and commit ≥ max record TTL. |

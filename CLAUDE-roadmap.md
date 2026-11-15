@@ -143,9 +143,12 @@ availability, then defense-in-depth.
 3. **DNSSEC / response correctness** — `CLAUDE-dnssec-denial.md`, build order
    Fix 1 → 2a → 3: CSA-DNSSEC-001 (KSK key tag), CSA-PROTO-001 (NODATA vs
    NXDOMAIN), CSA-DNSSEC-002 (invalid denial proof → RFC 9824 compact denial,
-   promotes batch3 Add 11). *Specced; blocked on owner decisions **D1**
-   (NSEC-only vs NSEC3 variant) for Fix 3 and **D2** (empty non-terminals) for
-   Fix 2b.* Fix 1 and 2a are not blocked — start them while D1/D2 are open.
+   promotes batch3 Add 11). **DONE 2026-11-15** (Fix 1, 2a, 3; D1 = keep
+   the `dnssec_nsec_mode` selector, both forms implemented) —
+   `make check-dnssec-validate` (in CI). Fix 2b still waits on **D2**.
+   Verifying surfaced three pre-existing defects to schedule next: multi-RR
+   RRsets signed per record, DNSKEY/CDS answered at any name, resolverd
+   picking the first DNSKEY for every RRSIG.
 4. **Transport confusion** — `CLAUDE-tcp-transport.md` Fix 1 (CSA-PROTO-002,
    *High*, plain TCP/53 speaks TLS once a cert loads) + Fix 2 (CSA-DOS-002,
    connection cap / handshake timeout / checked `pthread_create`). *Specced.*

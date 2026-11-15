@@ -1217,6 +1217,8 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
              * flags field at off+6 — NOT off+4 (that is the extended RCODE). */
             ei->version = pkt[off + 5];
             ei->do_bit = (pkt[off + 6] & 0x80) ? 1 : 0;
+            /* RFC 9824 §5.1: Compact Answers OK is the next flag bit (0x4000). */
+            ei->co_bit = (pkt[off + 6] & 0x40) ? 1 : 0;
             uint16_t rdlen = get16(pkt, off + 8);
             int rp = off + 10;
             int rend = off + 10 + (int) rdlen;
@@ -1268,6 +1270,52 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
         uint16_t rdlen = get16(pkt, off + 8);
         off += 10 + (int) rdlen;
     }
+}
+
+int type_bitmap_encode(const uint16_t *types, int ntypes, uint8_t *out, int outlen) {
+    if (ntypes < 0 || ntypes > 64 || (ntypes > 0 && !types) || !out || outlen < 0)
+        return -1;
+    uint16_t t[64];
+    int n = 0;
+    for (int i = 0; i < ntypes; i++) { /* insertion sort + dedupe */
+        uint16_t v = types[i];
+        int j = n;
+        int dup = 0;
+        for (int k = 0; k < n; k++)
+            if (t[k] == v)
+                dup = 1;
+        if (dup)
+            continue;
+        while (j > 0 && t[j - 1] > v) {
+            t[j] = t[j - 1];
+            j--;
+        }
+        t[j] = v;
+        n++;
+    }
+    int pos = 0;
+    int i = 0;
+    while (i < n) {
+        int window = t[i] >> 8;
+        uint8_t bits[32];
+        memset(bits, 0, sizeof(bits));
+        int maxoct = 0;
+        while (i < n && (t[i] >> 8) == window) {
+            int lo = t[i] & 0xFF;
+            bits[lo / 8] |= (uint8_t) (0x80 >> (lo % 8));
+            if (lo / 8 > maxoct)
+                maxoct = lo / 8;
+            i++;
+        }
+        int blen = maxoct + 1;
+        if (pos + 2 + blen > outlen)
+            return -1;
+        out[pos++] = (uint8_t) window;
+        out[pos++] = (uint8_t) blen;
+        memcpy(out + pos, bits, (size_t) blen);
+        pos += blen;
+    }
+    return pos;
 }
 
 /* ── EDNS(0) response building ───────────────────────────────────────────── */

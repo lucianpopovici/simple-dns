@@ -13,9 +13,63 @@ grep -n "static void dnssec_init_key\|static int nsec_rdata\|static int add_nsec
 
 | Fix | Finding | Status |
 |----:|---------|--------|
-| 1 | CSA-DNSSEC-001 — KSK key tag computed with ZSK flags | Specced |
-| 2 | CSA-PROTO-001 — NODATA answered as NXDOMAIN | Specced (2a) / Conditional (2b, needs an owner decision) |
-| 3 | CSA-DNSSEC-002 — signed negative answers are not a valid proof | Specced; one owner decision (D1) |
+| 1 | CSA-DNSSEC-001 — KSK key tag computed with ZSK flags | **Done** 2026-11-15 (+ DNSKEY RRset now signed as a whole) |
+| 2 | CSA-PROTO-001 — NODATA answered as NXDOMAIN | 2a **Done** 2026-11-15; 2b still Conditional (D2 open) |
+| 3 | CSA-DNSSEC-002 — signed negative answers are not a valid proof | **Done** 2026-11-15 — D1 decided: keep the NSEC/NSEC3 selector |
+
+Guarded by `make check-dnssec-validate` (independent dnspython validator, in
+CI), `make check-aggressive-nsec` (resolverd compact-denial spans) and
+`make check-wire` (`type_bitmap_encode`).
+
+## Implementation notes (2026-11-15) — where the code differs from the text below
+
+- **D1 = keep both, selectable.** The owner chose a parameter instead of
+  Option A. The existing `config:[zone:<z>:]dnssec_nsec_mode` (`nsec3`
+  default, `nsec`) now selects which record carries the RFC 9824 compact
+  denial: NSEC (owner = qname, next = `\000.qname`, bitmap = types + RRSIG
+  NSEC, or RRSIG NSEC NXNAME) or the RFC 9824 §4 NSEC3 form (owner =
+  H(qname), next hashed owner = H(qname)+1, flags 0, bitmap = types + RRSIG,
+  or NXNAME only). `nsec3_iters` now defaults to 0 (RFC 9276 / 9824 §4).
+  `add_nsec3_denial`, the old `nsec3_rdata`, `nsec3_hash_name` and `sha1()`
+  are gone.
+- **CO is echoed** in the response OPT when the query carried it
+  (RFC 9824 §5.1); NXDOMAIN is returned to a DO client only with CO.
+- **DNSKEY RRset signing.** Fixing the tag exposed a second defect: each KSK
+  signed only its own DNSKEY record, so RRSIG(DNSKEY) never validated even
+  with the right tag. New `make_rrsig_set` signs a whole RRset in RFC 4034
+  §6.3 canonical order; the DNSKEY answer uses it.
+- **Fail closed.** If the existence probe cannot reach Valkey the answer is
+  SERVFAIL (EDE 23), not a guessed NXDOMAIN/NODATA. UPDATE prerequisites
+  that need name existence answer SERVFAIL in the same case.
+- **Unsigned zones** (no ZSK) and **RFC 6303 locally-served names** outside a
+  keyed zone get no NSEC/NSEC3 at all (nothing to prove for an insecure
+  answer); RFC 6303 names inside a keyed zone get compact denial.
+- **Served-type table** (`k_served_types`) does not include srp PTR (keyed
+  by browse name + instance; only a SCAN could find it) or KEY (SIG(0) trust
+  anchors are never answered).
+- **resolverd** (step 8): `nsec_parse_rdata` marks a compact-denial span
+  exact-only — `name_from_wire` renders the `\000.qname` successor as `""`,
+  which the aggressive cache would have read as a wrap to the end of the
+  zone and used to synthesize NXDOMAIN for every later name — and an NXNAME
+  span is never used for owner NODATA either.
+
+### Found while verifying, NOT fixed here (pre-existing; need their own spec)
+
+1. **Multi-RR RRsets are signed one record at a time.** `emit_rr` signs
+   each RR it emits, so a multi-address A/AAAA (`emit_addr_rrset`), a
+   multi-value NS (`emit_ns_rrset`), and CDS/DS with two keys each get one
+   RRSIG per record, none of which validates (verified with dnspython on
+   `zone:<z>:A:<n> = "60|10.0.0.5|10.0.0.6"`: 4 RRSIGs, all "verify
+   failure"). `make_rrsig_set` is the building block for the fix.
+2. **DNSKEY and CDS/CDNSKEY are answered at any owner name**, not only at
+   the apex (`qtype == DNS_TYPE_DNSKEY` has no apex check).
+3. **resolverd's validator uses the first DNSKEY for every RRSIG** (and the
+   first RRSIG only on the positive path, and fetches DNSKEY at the qname
+   rather than the signer name), so any zone with two algorithms is
+   reported BOGUS — the acceptance item "resolverd logs no DNSSEC BOGUS"
+   fails identically before and after this change (checked against the
+   pre-fix dnsd).
+
 
 Build order: 1 → 2a → 3. Fix 3 depends on the helper Fix 2a introduces.
 

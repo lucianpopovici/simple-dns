@@ -52,6 +52,11 @@
  *              (existing path). NAPTR parser fixed to allow '|' in regexp field.
  *   5001       NSID – Name Server Identifier EDNS option
  *   5155       NSEC3 – hashed authenticated denial of existence
+ *   9824       Compact Denial of Existence – one NSEC or NSEC3 (per
+ *              config:[zone:<z>:]dnssec_nsec_mode, nsec3 default) matching
+ *              the qname; NXNAME for nonexistent names; NOERROR unless the
+ *              Compact Answers OK EDNS flag is set (then NXDOMAIN, CO echoed);
+ *              QTYPE NXNAME -> FORMERR + EDE 30.
  *   5936       AXFR – Full Zone Transfer over TCP
  *   6672       DNAME – whole-subtree redirection
  *   6698/7671  DANE/TLSA records
@@ -248,6 +253,7 @@
  *   config:zone:<zone>:serial  Per-zone SOA serial counter (primary keeps config:zone_serial)
  *   config:zone:<zone>:nsec3_iters / :nsec3_salt / :dnssec_nsec_mode
  *                              Per-zone denial config (defaults from the global config:* values)
+ *                              dnssec_nsec_mode: nsec3 (default) | nsec; nsec3_iters default 0.
  *   config:[zone:<zone>:]zonemd  RFC 8976 opt-in (1 = publish apex ZONEMD; default off).
  *                              dnsd writes the digest to zone:<zone>:ZONEMD:<apex> as
  *                              ttl|hex(TLV) — server-generated, recomputed on each serial bump.
@@ -1364,7 +1370,7 @@ static char g_axfr_allow[1024] = "127.0.0.1";
 static char g_notify_targets[1024] = "";
 
 /* NSEC3 params */
-static int g_nsec3_iters = 1;
+static int g_nsec3_iters = 0; /* RFC 9276 §3.1 / RFC 9824 §4: 0 extra iterations */
 static char g_nsec3_salt[64] = "";
 static int g_dnssec_use_nsec3 = 1; /* 1=NSEC3 (default), 0=NSEC (plain) */
 
@@ -1554,16 +1560,6 @@ static void sha256(const uint8_t *in, int n, uint8_t out[32]) {
         return;
     unsigned int dl = 32;
     EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-    EVP_DigestUpdate(ctx, in, n);
-    EVP_DigestFinal_ex(ctx, out, &dl);
-    EVP_MD_CTX_free(ctx);
-}
-static void sha1(const uint8_t *in, int n, uint8_t out[20]) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    if (!ctx)
-        return;
-    unsigned int dl = 20;
-    EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
     EVP_DigestUpdate(ctx, in, n);
     EVP_DigestFinal_ex(ctx, out, &dl);
     EVP_MD_CTX_free(ctx);
@@ -3272,6 +3268,17 @@ static int dnskey_rdata_ksk_ed25519(EVP_PKEY *k, uint8_t *rd, int rdlen) {
     return 36;
 }
 
+/* DNSKEY rdata exactly as published: KSKs carry flags 257 (SEP), ZSKs 256.
+ * The key tag MUST be computed over this encoding — the one helper both the
+ * generate/load path and the rollover path use, so they cannot diverge
+ * again (CSA-DNSSEC-001: KSK tags were computed over the ZSK encoding). */
+static int dnskey_rdata_for(EVP_PKEY *k, int alg, int is_ksk, uint8_t *rd, int rdlen) {
+    int ed = (alg == DNS_ALG_ED25519);
+    if (is_ksk)
+        return ed ? dnskey_rdata_ksk_ed25519(k, rd, rdlen) : dnskey_rdata_ksk_ecdsa(k, rd, rdlen);
+    return ed ? dnskey_rdata_ed25519(k, rd, rdlen) : dnskey_rdata_ecdsa(k, rd, rdlen);
+}
+
 static uint16_t keytag(const uint8_t *rd, int rdlen) {
     uint32_t ac = 0;
     for (int i = 0; i < rdlen; i++)
@@ -3354,10 +3361,18 @@ static int ecdsa_der_to_raw(const uint8_t *der, int dl, uint8_t raw[64]) {
 }
 
 /* Build RRSIG rdata for one RR, using given ZSK key + algorithm */
-static int make_rrsig(const char *owner, const char *signer, uint16_t rrtype, uint32_t ttl,
-                      const uint8_t *rrdata, uint16_t rrdata_len, EVP_PKEY *zsk, uint8_t alg,
-                      uint16_t tag, uint8_t *outbuf) {
-    if (!zsk)
+/* Sign a whole RRset (RFC 4034 §3.1.8.1): the signed data is the RRSIG
+ * rdata header followed by EVERY RR of the set in canonical form and
+ * canonical order (§6.3: sorted by canonical rdata, duplicates removed).
+ * `rdatas`/`lens` hold the `n` rdatas exactly as emitted. A signature over a
+ * single member of a multi-RR set does not validate (the DNSKEY RRset was
+ * signed one key at a time — found with an independent validator while
+ * fixing CSA-DNSSEC-001). Returns the RRSIG rdata length or -1. */
+#define RRSET_SIGN_MAX 16
+static int make_rrsig_set(const char *owner, const char *signer, uint16_t rrtype, uint32_t ttl,
+                          const uint8_t *const *rdatas, const uint16_t *lens, int n, EVP_PKEY *zsk,
+                          uint8_t alg, uint16_t tag, uint8_t *outbuf) {
+    if (!zsk || n < 1 || n > RRSET_SIGN_MAX)
         return -1;
     uint8_t hdr[512];
     int hp = 0;
@@ -3429,40 +3444,76 @@ static int make_rrsig(const char *owner, const char *signer, uint16_t rrtype, ui
         }
         own_w[ow++] = 0;
     }
-    int rr_need = ow + 10 + rrdata_len;
-    uint8_t *rr = malloc(rr_need);
-    if (!rr)
-        return -1;
-    int rp = 0;
-    memcpy(rr, own_w, ow);
-    rp += ow;
-    rr[rp++] = rrtype >> 8;
-    rr[rp++] = rrtype & 0xFF;
-    rr[rp++] = 0;
-    rr[rp++] = DNS_CLASS_IN;
-    rr[rp++] = ttl >> 24;
-    rr[rp++] = (ttl >> 16) & 0xFF;
-    rr[rp++] = (ttl >> 8) & 0xFF;
-    rr[rp++] = ttl & 0xFF;
-    /* Canonicalize the rdata via the shared libdnswire codec (RFC 4034 §6.2)
+    /* Canonicalize each rdata via the shared libdnswire codec (RFC 4034 §6.2)
      * so the signer's bytes match what a validator (resolverd) reconstructs:
      * name-bearing rdata (NS/MX/SOA/SRV/CNAME/PTR/DNAME) must be lowercased and
      * decompressed identically on both sides or the signature fails to verify
-     * across the daemon boundary. canon_rdata copies all other rdata verbatim,
-     * so A/AAAA/TXT/DNSKEY/NSEC output is unchanged. rrdata is a standalone,
-     * already-uncompressed buffer, so it is its own "packet" (off 0, plen =
-     * rrdata_len); the canonical length never exceeds rrdata_len here, so the
-     * rr buffer (sized ow+10+rrdata_len) always has room. */
-    int rdlen_pos = rp; /* RDLENGTH (2 bytes), back-patched after canon */
-    rp += 2;
-    int clen = canon_rdata(rrdata, rrdata_len, 0, rrdata_len, rrtype, rr + rp, rr_need - rp);
-    if (clen < 0) {
-        free(rr);
-        return -1;
+     * across the daemon boundary. canon_rdata copies all other rdata verbatim.
+     * Each rdata is a standalone, already-uncompressed buffer, so it is its
+     * own "packet" (off 0, plen = len); the canonical length never exceeds
+     * the input length. */
+    uint8_t *crd[RRSET_SIGN_MAX];
+    int clen[RRSET_SIGN_MAX];
+    int total = 0;
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        crd[i] = malloc(lens[i] > 0 ? lens[i] : 1);
+        clen[i] = -1;
+        if (!crd[i]) {
+            ok = 0;
+            continue;
+        }
+        clen[i] = canon_rdata(rdatas[i], lens[i], 0, lens[i], rrtype, crd[i], lens[i]);
+        if (clen[i] < 0)
+            ok = 0;
+        else
+            total += ow + 10 + clen[i];
     }
-    rr[rdlen_pos] = (uint8_t) (clen >> 8);
-    rr[rdlen_pos + 1] = (uint8_t) (clen & 0xFF);
-    rp += clen;
+    /* §6.3 canonical order: insertion sort on (rdata octets, then length). */
+    int ord[RRSET_SIGN_MAX];
+    for (int i = 0; i < n; i++) {
+        int j = i;
+        while (ok && j > 0) {
+            int a = ord[j - 1];
+            int ml = clen[a] < clen[i] ? clen[a] : clen[i];
+            int c = memcmp(crd[a], crd[i], (size_t) ml);
+            if (c < 0 || (c == 0 && clen[a] <= clen[i]))
+                break;
+            ord[j] = a;
+            j--;
+        }
+        ord[j] = i;
+    }
+    uint8_t *rr = ok ? malloc((size_t) (total > 0 ? total : 1)) : NULL;
+    int rp = 0;
+    if (rr) {
+        for (int k = 0; k < n; k++) {
+            int i = ord[k];
+            if (k > 0) {
+                int pi = ord[k - 1];
+                if (clen[pi] == clen[i] && memcmp(crd[pi], crd[i], (size_t) clen[i]) == 0)
+                    continue; /* duplicate RR: counted once (§6.3) */
+            }
+            memcpy(rr + rp, own_w, ow);
+            rp += ow;
+            rr[rp++] = rrtype >> 8;
+            rr[rp++] = rrtype & 0xFF;
+            rr[rp++] = 0;
+            rr[rp++] = DNS_CLASS_IN;
+            rr[rp++] = ttl >> 24;
+            rr[rp++] = (ttl >> 16) & 0xFF;
+            rr[rp++] = (ttl >> 8) & 0xFF;
+            rr[rp++] = ttl & 0xFF;
+            rr[rp++] = (uint8_t) (clen[i] >> 8);
+            rr[rp++] = (uint8_t) (clen[i] & 0xFF);
+            memcpy(rr + rp, crd[i], (size_t) clen[i]);
+            rp += clen[i];
+        }
+    }
+    for (int i = 0; i < n; i++)
+        free(crd[i]);
+    if (!rr)
+        return -1;
     /* Sign. All OpenSSL return values are checked — fail closed on any error
      * rather than emit a bogus signature. */
     EVP_MD_CTX *mc = EVP_MD_CTX_new();
@@ -3530,12 +3581,21 @@ static int make_rrsig(const char *owner, const char *signer, uint16_t rrtype, ui
     return hp + 64;
 }
 
+/* Sign a single-RR RRset. */
+static int make_rrsig(const char *owner, const char *signer, uint16_t rrtype, uint32_t ttl,
+                      const uint8_t *rrdata, uint16_t rrdata_len, EVP_PKEY *zsk, uint8_t alg,
+                      uint16_t tag, uint8_t *outbuf) {
+    const uint8_t *rds[1] = {rrdata};
+    uint16_t lns[1] = {rrdata_len};
+    return make_rrsig_set(owner, signer, rrtype, ttl, rds, lns, 1, zsk, alg, tag, outbuf);
+}
+
 /* Load or generate a DNSSEC key from Valkey.
  * Reads vk_key first; if absent and legacy_key is given, adopts the legacy
  * key under vk_key (eases migration of pre-multi-zone single-zone keys);
  * only generates + stores a fresh key when neither exists. */
 static void dnssec_init_key(const char *vk_key, const char *legacy_key, EVP_PKEY **out,
-                            uint16_t *tag, int alg, const char *label) {
+                            uint16_t *tag, int alg, int is_ksk, const char *label) {
     char pem[MAX_PEM] = {0};
     int have = (vk_get(vk_key, pem, sizeof(pem)) && strlen(pem) > 10);
     if (!have && legacy_key && vk_get(legacy_key, pem, sizeof(pem)) && strlen(pem) > 10) {
@@ -3588,8 +3648,7 @@ static void dnssec_init_key(const char *vk_key, const char *legacy_key, EVP_PKEY
         dns_log(LOG_INFO, "[DNSSEC] %s generated and stored\n", label);
     }
     uint8_t dkrd[68];
-    int dklen = (alg == DNS_ALG_ED25519) ? dnskey_rdata_ed25519(*out, dkrd, sizeof(dkrd))
-                                         : dnskey_rdata_ecdsa(*out, dkrd, sizeof(dkrd));
+    int dklen = dnskey_rdata_for(*out, alg, is_ksk, dkrd, sizeof(dkrd));
     if (dklen > 0)
         *tag = keytag(dkrd, dklen);
     dns_log(LOG_INFO, "[DNSSEC] %s key tag: %u\n", label, *tag);
@@ -3604,19 +3663,19 @@ static void zone_dnssec_init(zone_entry_t *z) {
     snprintf(k, sizeof(k), "dnssec:%s:zsk", z->name);
     snprintf(lbl, sizeof(lbl), "%s ZSK-P256", z->name);
     dnssec_init_key(k, primary ? "dnssec:zsk" : NULL, &z->zsk, &z->zsk_tag, DNS_ALG_ECDSAP256SHA256,
-                    lbl);
+                    0, lbl);
     snprintf(k, sizeof(k), "dnssec:%s:zsk_ed25519", z->name);
     snprintf(lbl, sizeof(lbl), "%s ZSK-Ed25519", z->name);
     dnssec_init_key(k, primary ? "dnssec:zsk_ed25519" : NULL, &z->zsk_ed, &z->zsk_ed_tag,
-                    DNS_ALG_ED25519, lbl);
+                    DNS_ALG_ED25519, 0, lbl);
     snprintf(k, sizeof(k), "dnssec:%s:ksk", z->name);
     snprintf(lbl, sizeof(lbl), "%s KSK-P256", z->name);
     dnssec_init_key(k, primary ? "dnssec:ksk" : NULL, &z->ksk, &z->ksk_tag, DNS_ALG_ECDSAP256SHA256,
-                    lbl);
+                    1, lbl);
     snprintf(k, sizeof(k), "dnssec:%s:ksk_ed25519", z->name);
     snprintf(lbl, sizeof(lbl), "%s KSK-Ed25519", z->name);
     dnssec_init_key(k, primary ? "dnssec:ksk_ed25519" : NULL, &z->ksk_ed, &z->ksk_ed_tag,
-                    DNS_ALG_ED25519, lbl);
+                    DNS_ALG_ED25519, 1, lbl);
     zone_rollover_load(z);
 }
 
@@ -3637,14 +3696,7 @@ static int dnssec_load_existing(const char *vk_key, EVP_PKEY **out, uint16_t *ta
     /* Key tag must be computed over the rdata as published — KSK rdata carries
      * the SEP flag (257), ZSK carries 256 — so pick the matching encoder. */
     uint8_t dkrd[68];
-    int ed = (alg == DNS_ALG_ED25519);
-    int dklen;
-    if (is_ksk)
-        dklen = ed ? dnskey_rdata_ksk_ed25519(k, dkrd, sizeof(dkrd))
-                   : dnskey_rdata_ksk_ecdsa(k, dkrd, sizeof(dkrd));
-    else
-        dklen = ed ? dnskey_rdata_ed25519(k, dkrd, sizeof(dkrd))
-                   : dnskey_rdata_ecdsa(k, dkrd, sizeof(dkrd));
+    int dklen = dnskey_rdata_for(k, alg, is_ksk, dkrd, sizeof(dkrd));
     if (dklen > 0)
         *tag = keytag(dkrd, dklen);
     return 1;
@@ -4509,92 +4561,64 @@ static void catalog_scan_all(void) {
 
 /* RFC 5155 Sec 5: base32hex encoding */
 
-/* Compute NSEC3 owner name for a given qname. The SHA-1 iteration itself
- * lives once in libdnswire's nsec3_hash_raw (shared with resolverd's RFC 8198
- * aggressive-cache gap matching) so the two can never diverge. */
-static void nsec3_hash_name(const char *name, const uint8_t *salt, int saltlen, int iters,
-                            char *out_b32hex, int out_len) {
-    uint8_t h[20];
-    nsec3_hash_raw(name, salt, saltlen, iters, h);
-    base32hex_enc(h, 20, out_b32hex, out_len);
-}
-
-/* Build NSEC3 RDATA for a name, covering given type bitmap */
-static int nsec3_rdata(const char *name, uint16_t covered_type, uint8_t *out, int outlen) {
+/* RFC 9824 §4 compact NSEC3: owner = base32hex(H(qname)).<zone>, Next Hashed
+ * Owner Name = H(qname) + 1 (the immediate successor of the hash, so the
+ * record covers no other name), flags 0. Bitmap: NXNAME only for a name that
+ * does not exist; otherwise the types present plus RRSIG. Uses the zone's
+ * configured salt/iterations (RFC 9824/9276 recommend 0 iterations and an
+ * empty salt — the defaults). Returns the rdata length or -1. */
+static int nsec3_compact_rdata(const char *qname, const uint16_t *types, int ntypes, int nxname,
+                               uint8_t *out, int outlen, char *owner, size_t ownersz) {
     const char *zsalt = t_zone ? t_zone->nsec3_salt : g_nsec3_salt;
     int ziters = t_zone ? t_zone->nsec3_iters : g_nsec3_iters;
     const char *zname = t_zone ? t_zone->name : g_zone_name;
     uint8_t salt[16];
     int saltlen = 0;
-    if (zsalt[0])
+    if (zsalt[0]) {
         saltlen = hex_dec(zsalt, salt, sizeof(salt));
-    /* Compute next-closer hash (we use the same name hash as next for simplicity) */
-    char hash[64];
-    nsec3_hash_name(name, salt, saltlen, ziters, hash, sizeof(hash));
-    /* Build RDATA: alg(1)|flags(1)|iters(2)|saltlen(1)|salt|hashlen(1)|nexthash|bitmap */
-    uint8_t nexthash[20];
-    /* Next hash = hash of the zone apex (simplified — in production use sorted order) */
-    uint8_t zone_wire[257];
-    int zw = 0;
-    {
-        char *sp4 = NULL;
-        char ztmp[256];
-        safe_strcpy(ztmp, zname, sizeof(ztmp));
-        char *zl = strtok_r(ztmp, ".", &sp4);
-        while (zl) {
-            int ll = (int) strlen(zl);
-            if (ll > 63 || zw + ll + 1 > 255)
-                break;
-            zone_wire[zw++] = (uint8_t) ll;
-            memcpy(zone_wire + zw, zl, ll);
-            zw += ll;
-            zl = strtok_r(NULL, ".", &sp4);
-        }
-        if (zw < 256)
-            zone_wire[zw++] = 0;
+        if (saltlen < 0)
+            return -1;
     }
-    {
-        uint8_t ib[256 + 64];
-        int ib_len = zw;
-        memcpy(ib, zone_wire, zw);
-        if (saltlen) {
-            memcpy(ib + zw, salt, saltlen);
-            ib_len += saltlen;
-        }
-        sha1(ib, ib_len, nexthash);
-        for (int i = 0; i < ziters; i++) {
-            uint8_t ib2[256 + 64];
-            memcpy(ib2, nexthash, 20);
-            if (saltlen) {
-                memcpy(ib2 + 20, salt, saltlen);
-            }
-            sha1(ib2, 20 + saltlen, nexthash);
-        }
-    }
-    if (outlen < 25)
+    uint8_t h[20];
+    nsec3_hash_raw(qname, salt, saltlen, ziters, h);
+    char b32[64];
+    base32hex_enc(h, 20, b32, sizeof(b32));
+    int on = snprintf(owner, ownersz, "%s.%s", b32, zname);
+    if (on < 0 || (size_t) on >= ownersz)
+        return -1;
+    strlower(owner);
+    uint8_t next[20];
+    memcpy(next, h, 20);
+    for (int i = 19; i >= 0; i--) /* 160-bit big-endian increment (wraps) */
+        if (++next[i] != 0)
+            break;
+    if (outlen < 6 + saltlen + 21)
         return -1;
     int op = 0;
     out[op++] = NSEC3_ALG_SHA1;
-    out[op++] = 0; /* flags: opt-out=0 */
-    out[op++] = (uint16_t) ziters >> 8;
-    out[op++] = (uint16_t) ziters & 0xFF;
+    out[op++] = 0; /* flags: no opt-out */
+    out[op++] = (uint8_t) ((ziters >> 8) & 0xFF);
+    out[op++] = (uint8_t) (ziters & 0xFF);
     out[op++] = (uint8_t) saltlen;
-    memcpy(out + op, salt, saltlen);
+    memcpy(out + op, salt, (size_t) saltlen);
     op += saltlen;
     out[op++] = 20;
-    memcpy(out + op, nexthash, 20);
+    memcpy(out + op, next, 20);
     op += 20;
-    /* Type bitmap: Window 0, block covering covered_type */
-    if (covered_type < 256 && op + 4 < outlen) {
-        uint8_t bmap[32] = {0};
-        bmap[covered_type / 8] |= (0x80 >> (covered_type % 8));
-        int blen = covered_type / 8 + 1;
-        out[op++] = 0;
-        out[op++] = (uint8_t) blen;
-        memcpy(out + op, bmap, blen);
-        op += blen;
+    uint16_t bt[64];
+    int nb = 0;
+    if (nxname) {
+        bt[nb++] = DNS_TYPE_NXNAME;
+    } else {
+        for (int i = 0; i < ntypes && nb < 62; i++)
+            bt[nb++] = types[i];
+        if (nb > 0)
+            bt[nb++] = DNS_TYPE_RRSIG;
     }
-    return op;
+    int bl = type_bitmap_encode(bt, nb, out + op, outlen - op);
+    if (bl < 0)
+        return -1;
+    return op + bl;
 }
 
 /* ==========================================================================
@@ -5538,9 +5562,16 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
     const char *report_agent = g_error_report_agent[0] ? g_error_report_agent : NULL;
     if (report_agent && t_zone && report_agent_is_subdomain_of(report_agent, t_zone->name))
         report_agent = NULL; /* fail closed on the RFC 9567 §4 MUST NOT */
-    return edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei, g_nsid[0] ? g_nsid : NULL,
-                           (ei && ei->has_client_cookie) ? sc : NULL, ede_code, ede_text, zv_labels,
-                           zv_serial, report_agent, 0, 0, 0, 0);
+    int start = off;
+    int end = edns_append_opt(buf, off, blen, is_tcp, do_bit, rcode_ext, ei,
+                              g_nsid[0] ? g_nsid : NULL, (ei && ei->has_client_cookie) ? sc : NULL,
+                              ede_code, ede_text, zv_labels, zv_serial, report_agent, 0, 0, 0, 0);
+    /* RFC 9824 §5.1: this server implements compact denial + its signaling,
+     * so it sets Compact Answers OK in responses to queries that carried it.
+     * OPT layout: root(1) type(2) class(2) ext-rcode(1) version(1) flags(2). */
+    if (ei && ei->co_bit && end >= start + 11)
+        buf[start + 7] |= 0x40;
+    return end;
 }
 
 /* ==========================================================================
@@ -5578,49 +5609,75 @@ static int emit_rr(uint8_t *resp, int off, int resp_len, const char *name, uint1
                    uint32_t ttl, const uint8_t *rdata, uint16_t rdlen, int dnssec_ok, int *answers);
 
 /* ==========================================================================
- * NSEC plain denial (RFC 4034) — alternative to NSEC3
+ * Authenticated denial — RFC 9824 Compact Denial of Existence
  *
- * Simple NSEC: owner name = qname, next name = next label in zone (we use
- * zone apex as a simplification for a single-zone server).
- * Bitmap covers the types we actually serve.
+ * dnsd signs on the fly, so instead of a precomputed NSEC/NSEC3 chain every
+ * negative answer carries ONE record that matches the query name:
+ *   - name exists, type absent (NODATA): bitmap = the types at the name;
+ *   - name does not exist: bitmap = NXNAME (+ RRSIG, NSEC for NSEC), and the
+ *     rcode is NOERROR unless the client set Compact Answers OK (CO), in
+ *     which case NXDOMAIN (RFC 9824 §5.1).
+ * NSEC or NSEC3 is selected per zone by config:[zone:<z>:]dnssec_nsec_mode
+ * (CSA-DNSSEC-002: the previous builders emitted records that did not prove
+ * what the rcode claimed — a fixed bitmap / next name, or an NSEC3 matching
+ * the qname with an NXDOMAIN rcode).
  * ======================================================================= */
-static int nsec_rdata(const char *qname, uint8_t *rd, int rdlen) {
-    (void) qname;
-    /* Next owner name = zone apex */
-    int pos = name_to_wire(t_zone ? t_zone->name : g_zone_name, rd, rdlen);
-    if (pos < 0)
+
+/* NSEC rdata: Next Domain Name = the immediate successor of qname ("\000."
+ * prepended, RFC 9824 §3.1), then the type bitmap. Returns length, or -1 when
+ * the successor does not fit in 255 octets (RFC 9824 gives no rule for that
+ * case; the caller then emits no NSEC rather than an unprovable one). */
+static int nsec_rdata(const char *qname, const uint16_t *types, int ntypes, int nxname, uint8_t *rd,
+                      int rdlen) {
+    uint8_t qw[256];
+    int ql = name_to_wire(qname, qw, sizeof(qw));
+    if (ql <= 0 || ql + 2 > 255 || ql + 2 > rdlen)
         return -1;
-    /* Type bitmap window 0: build bitmap for common types */
-    uint8_t bitmap[32] = {0};
-    uint16_t types[] = {DNS_TYPE_A,      DNS_TYPE_NS,   DNS_TYPE_CNAME, DNS_TYPE_SOA,
-                        DNS_TYPE_MX,     DNS_TYPE_TXT,  DNS_TYPE_AAAA,  DNS_TYPE_SRV,
-                        DNS_TYPE_DNSKEY, DNS_TYPE_NSEC, DNS_TYPE_RRSIG, 0};
-    int max_bit = 0;
-    for (int i = 0; types[i]; i++) {
-        int b = types[i] & 0xFF;
-        bitmap[b / 8] |= (1 << (7 - (b % 8)));
-        if (b > max_bit)
-            max_bit = b;
-    }
-    int blen = (max_bit / 8) + 1;
-    if (pos + 2 + blen > rdlen)
+    int pos = 0;
+    rd[pos++] = 1; /* one-octet label ... */
+    rd[pos++] = 0; /* ... containing \000 */
+    memcpy(rd + pos, qw, (size_t) ql);
+    pos += ql;
+    uint16_t bt[64];
+    int nb = 0;
+    if (!nxname)
+        for (int i = 0; i < ntypes && nb < 60; i++)
+            bt[nb++] = types[i];
+    bt[nb++] = DNS_TYPE_RRSIG;
+    bt[nb++] = DNS_TYPE_NSEC;
+    if (nxname)
+        bt[nb++] = DNS_TYPE_NXNAME;
+    int bl = type_bitmap_encode(bt, nb, rd + pos, rdlen - pos);
+    if (bl < 0)
         return -1;
-    rd[pos++] = 0; /* window block 0 */
-    rd[pos++] = (uint8_t) blen;
-    memcpy(rd + pos, bitmap, blen);
-    pos += blen;
-    return pos;
+    return pos + bl;
 }
 
-static int add_nsec_denial(uint8_t *resp, int off, int resp_len, const char *qname, int dnssec_ok,
-                           int *auth_count) {
+/* Emit the single compact-denial record (NSEC or NSEC3 per the zone's mode)
+ * for qname. `types` are the RR types present at qname (ignored if nxname). */
+static int nsec3_compact_rdata(const char *qname, const uint16_t *types, int ntypes, int nxname,
+                               uint8_t *out, int outlen, char *owner, size_t ownersz);
+static int add_compact_denial(uint8_t *resp, int off, int resp_len, const char *qname,
+                              const uint16_t *types, int ntypes, int nxname, int dnssec_ok,
+                              int *auth_count) {
     uint8_t rd[512];
-    int rdlen = nsec_rdata(qname, rd, sizeof(rd));
-    if (rdlen < 0)
+    int use_nsec3 = t_zone ? t_zone->dnssec_use_nsec3 : g_dnssec_use_nsec3;
+    if (use_nsec3) {
+        char owner[320];
+        int rl =
+            nsec3_compact_rdata(qname, types, ntypes, nxname, rd, sizeof(rd), owner, sizeof(owner));
+        if (rl < 0)
+            return off;
+        return emit_rr(resp, off, resp_len, owner, DNS_TYPE_NSEC3, zone_negative_ttl(), rd,
+                       (uint16_t) rl, dnssec_ok, auth_count);
+    }
+    int rl = nsec_rdata(qname, types, ntypes, nxname, rd, sizeof(rd));
+    if (rl < 0) {
+        dns_log(LOG_DEBUG, "[DNSSEC] no NSEC successor fits for a 254/255-octet name\n");
         return off;
-    off = emit_rr(resp, off, resp_len, qname, DNS_TYPE_NSEC, zone_negative_ttl(), rd,
-                  (uint16_t) rdlen, dnssec_ok, auth_count);
-    return off;
+    }
+    return emit_rr(resp, off, resp_len, qname, DNS_TYPE_NSEC, zone_negative_ttl(), rd,
+                   (uint16_t) rl, dnssec_ok, auth_count);
 }
 
 /* ==========================================================================
@@ -6098,31 +6155,6 @@ static int add_soa_authority(uint8_t *resp, int off, int resp_len, int dnssec_ok
     return off;
 }
 
-/* Add NSEC3 to authority for authenticated denial */
-static int add_nsec3_denial(uint8_t *resp, int off, int resp_len, const char *qname, uint16_t qtype,
-                            int dnssec_ok, int *auth_count) {
-    uint8_t n3rd[256];
-    int n3len = nsec3_rdata(qname, qtype, n3rd, sizeof(n3rd));
-    if (n3len > 0) {
-        /* NSEC3 owner name = base32hex_hash.zone */
-        const char *zsalt = t_zone ? t_zone->nsec3_salt : g_nsec3_salt;
-        int ziters = t_zone ? t_zone->nsec3_iters : g_nsec3_iters;
-        uint8_t salt[16];
-        int saltlen = 0;
-        if (zsalt[0])
-            saltlen = hex_dec(zsalt, salt, sizeof(salt));
-        char hash[64];
-        nsec3_hash_name(qname, salt, saltlen, ziters, hash, sizeof(hash));
-        char nsec3_owner[512];
-        snprintf(nsec3_owner, sizeof(nsec3_owner), "%s.%s", hash,
-                 t_zone ? t_zone->name : g_zone_name);
-        strlower(nsec3_owner);
-        off = emit_rr(resp, off, resp_len, nsec3_owner, DNS_TYPE_NSEC3, zone_negative_ttl(), n3rd,
-                      (uint16_t) n3len, dnssec_ok, auth_count);
-    }
-    return off;
-}
-
 /* ==========================================================================
  * Out-of-zone forwarder (CLAUDE-forwarder.md) — relay queries we are not
  * authoritative for to one or more upstream resolvers. OFF by default and
@@ -6418,6 +6450,107 @@ static int dnsxl_try(uint8_t *resp, int *offp, int resp_len, const char *qname, 
     return 0;
 }
 
+/* Every RR type the query path answers from Valkey, with the namespace it is
+ * read from (derived from build_query_resp's lookups: the provisioned-type
+ * loop, NS/DS/PTR/A/AAAA, ddns:, srp:). Not listed: KEY (SIG(0) trust
+ * anchors, never answered) and srp PTR (keyed by browse name + instance, so
+ * only a SCAN could find it). Keep in sync when a served type is added. */
+#define NAME_TYPES_MAX 48 /* > |k_served_types| + static + apex types */
+static const struct {
+    const char *ns;
+    uint16_t type;
+} k_served_types[] = {
+    {"zone", DNS_TYPE_A},      {"zone", DNS_TYPE_AAAA},  {"zone", DNS_TYPE_CNAME},
+    {"zone", DNS_TYPE_MX},     {"zone", DNS_TYPE_TXT},   {"zone", DNS_TYPE_SRV},
+    {"zone", DNS_TYPE_CAA},    {"zone", DNS_TYPE_SSHFP}, {"zone", DNS_TYPE_TLSA},
+    {"zone", DNS_TYPE_DNAME},  {"zone", DNS_TYPE_LOC},   {"zone", DNS_TYPE_URI},
+    {"zone", DNS_TYPE_NAPTR},  {"zone", DNS_TYPE_SVCB},  {"zone", DNS_TYPE_HTTPS},
+    {"zone", DNS_TYPE_ZONEMD}, {"zone", DNS_TYPE_CSYNC}, {"zone", DNS_TYPE_NS},
+    {"zone", DNS_TYPE_PTR},    {"zone", DNS_TYPE_DS},    {"ddns", DNS_TYPE_A},
+    {"ddns", DNS_TYPE_AAAA},   {"ddns", DNS_TYPE_PTR},   {"srp", DNS_TYPE_A},
+    {"srp", DNS_TYPE_AAAA},    {"srp", DNS_TYPE_SRV},    {"srp", DNS_TYPE_TXT},
+};
+
+static void types_add(uint16_t *types, int *n, int max, uint16_t t) {
+    for (int i = 0; i < *n; i++)
+        if (types[i] == t)
+            return;
+    if (*n < max)
+        types[(*n)++] = t;
+}
+
+/* Types present at `name` in the compiled-in static zone. */
+static void static_types_at(const char *name, uint16_t *types, int *n, int max) {
+    for (int i = 0; i < static_zone_sz; i++)
+        if (streq_ci(static_zone[i].name, name))
+            types_add(types, n, max, static_zone[i].type);
+}
+
+/* Which RR types exist at `name` in the current zone (t_zone)? Fills
+ * types[] (distinct) and returns their count; -1 if Valkey could not be
+ * asked (callers fail closed). One round trip: every EXISTS is written in a
+ * single burst, then the integer replies are read back in order on the same
+ * connection vk_get would use (CSA-PROTO-001 — NODATA vs NXDOMAIN must be
+ * decided by name existence, not by whether the queried type was found).
+ * Called only for negative answers. */
+static int name_types_present(const char *name, uint16_t *types, int max) {
+    int n = 0;
+    static_types_at(name, types, &n, max);
+    if (t_zone && streq_ci(name, t_zone->name)) {
+        types_add(types, &n, max, DNS_TYPE_SOA);
+        if (t_zone->zsk)
+            types_add(types, &n, max, DNS_TYPE_DNSKEY);
+        if (t_zone->ksk) {
+            types_add(types, &n, max, DNS_TYPE_CDS);
+            types_add(types, &n, max, DNS_TYPE_CDNSKEY);
+        }
+    }
+    const int nk = (int) (sizeof(k_served_types) / sizeof(k_served_types[0]));
+    const char *zn = t_zone ? t_zone->name : "";
+    char cmds[16384];
+    int pos = 0;
+    for (int i = 0; i < nk; i++) {
+        char key[640];
+        int kl = snprintf(key, sizeof(key), "%s:%s:%s:%s", k_served_types[i].ns, zn,
+                          type2str(k_served_types[i].type), name);
+        if (kl < 0 || kl >= (int) sizeof(key))
+            return -1;
+        int w = snprintf(cmds + pos, sizeof(cmds) - (size_t) pos,
+                         "*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", kl, key);
+        if (w < 0 || w >= (int) sizeof(cmds) - pos)
+            return -1;
+        pos += w;
+    }
+    resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
+    if (!t_vk_conn)
+        pthread_mutex_lock(&g_vk_mutex);
+    int rc = 0;
+    if (valkey_ensure(c) < 0 || resp_send(c, cmds, pos) < 0) {
+        rc = -1;
+    } else {
+        for (int i = 0; i < nk; i++) {
+            char line[64];
+            if (resp_readline(c, line, sizeof(line)) < 0) {
+                rc = -1;
+                break; /* stream lost — valkey_ensure reconnects next time */
+            }
+            if (line[0] != ':') {
+                rc = -1; /* error reply: keep reading so the stream stays in sync */
+                continue;
+            }
+            if (atol(line + 1) > 0)
+                types_add(types, &n, max, k_served_types[i].type);
+        }
+    }
+    if (rc < 0 && c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+    if (!t_vk_conn)
+        pthread_mutex_unlock(&g_vk_mutex);
+    return rc < 0 ? -1 : n;
+}
+
 static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int resp_len, int is_tcp,
                             const struct in_addr *cip) {
     if (qlen < 12)
@@ -6473,6 +6606,14 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         return off;
     }
     int dnssec_ok = ei.do_bit;
+    /* RFC 9824 §3.5: NXNAME is a meta-type, never a valid QTYPE. */
+    if (qtype == DNS_TYPE_NXNAME) {
+        rh->flags = htons(DNS_QR | DNS_RCODE_FORMERR);
+        rh->ancount = rh->nscount = htons(0);
+        off = dnsd_edns_opt(resp, off, resp_len, is_tcp, dnssec_ok, 0, &ei, cip,
+                            EDE_INVALID_QUERY_TYPE, "NXNAME is not a valid QTYPE");
+        return off;
+    }
     /* RFC 4892 / BIND convention: CHAOS-class id.server / hostname.bind TXT
      * query returns this node's identity — the classic anycast/cluster
      * debugging aid (CLAUDE-rfc-additions-batch4.md, RFC 3258 optional add).
@@ -6557,17 +6698,17 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     /* RFC 6303: locally served zones — answer authoritatively with NXDOMAIN+SOA */
     if (is_local_zone(qname) && qtype != DNS_TYPE_SOA && qtype != DNS_TYPE_NS) {
         /* These zones are authoritative here: return SOA for them, NXDOMAIN for children */
-        rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NXDOMAIN);
+        /* Signed only if this name also falls in a configured, keyed zone;
+         * then the RFC 9824 rules apply (NOERROR unless CO). Otherwise it is
+         * an unsigned, insecure answer and carries no NSEC/NSEC3 at all. */
+        int lsigned = dnssec_ok && t_zone && t_zone->zsk;
+        rh->flags = htons(DNS_QR | DNS_AA |
+                          ((lsigned && !ei.co_bit) ? DNS_RCODE_NOERROR : DNS_RCODE_NXDOMAIN));
         off = add_soa_authority(resp, off, resp_len, dnssec_ok, &auth_count);
+        if (lsigned)
+            off =
+                add_compact_denial(resp, off, resp_len, qname, NULL, 0, 1, dnssec_ok, &auth_count);
         rh->nscount = htons((uint16_t) auth_count);
-        if (dnssec_ok) {
-            int ac2 = 0;
-            if (t_zone ? t_zone->dnssec_use_nsec3 : g_dnssec_use_nsec3)
-                off = add_nsec3_denial(resp, off, resp_len, qname, qtype, dnssec_ok, &ac2);
-            else
-                off = add_nsec_denial(resp, off, resp_len, qname, dnssec_ok, &ac2);
-            rh->nscount = htons(ntohs(rh->nscount) + (uint16_t) ac2);
-        }
         /* A locally-served RFC 6303 blackhole zone answering NXDOMAIN is a
          * normal, correct authoritative answer, not an error — EDE isn't for
          * this (see the identical reasoning at the ede_code assignment
@@ -6670,138 +6811,60 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         found = 1;
         goto finish_answer;
     }
-    /* DNSKEY — serve ZSK (flag 256) + KSK (flag 257), KSK signs DNSKEY RRset */
+    /* DNSKEY — the whole RRset (ZSKs flag 256, KSKs flag 257, plus the incoming
+     * set during a ZSK Pre-Publish / KSK Double-Signature rollover, RFC 6781)
+     * is emitted, then EACH KSK signs the WHOLE RRset (RFC 4034 §3.1.8.1). */
     if ((qtype == DNS_TYPE_DNSKEY || qtype == DNS_TYPE_ANY)) {
-        uint8_t dkrd[68];
-        /* ZSK P-256 — emit without RRSIG (ZSK signs other RRsets) */
-        if (g_zsk && dnskey_rdata_ecdsa(g_zsk, dkrd, sizeof(dkrd)) > 0) {
-            found = 1;
+        uint8_t dk[8][68];
+        const uint8_t *dkp[8];
+        uint16_t dkl[8];
+        int ndk = 0;
+        struct {
+            EVP_PKEY *k;
+            int alg;
+            int ksk;
+            uint16_t tag;
+        } pub[8] = {
+            {g_zsk, DNS_ALG_ECDSAP256SHA256, 0, 0},
+            {g_zsk_ed, DNS_ALG_ED25519, 0, 0},
+            {g_zsk_next, DNS_ALG_ECDSAP256SHA256, 0, 0},
+            {g_zsk_ed_next, DNS_ALG_ED25519, 0, 0},
+            {g_ksk, DNS_ALG_ECDSAP256SHA256, 1, g_ksk_tag},
+            {g_ksk_ed, DNS_ALG_ED25519, 1, g_ksk_ed_tag},
+            {g_ksk_next, DNS_ALG_ECDSAP256SHA256, 1, g_ksk_next_tag},
+            {g_ksk_ed_next, DNS_ALG_ED25519, 1, g_ksk_ed_next_tag},
+        };
+        for (int i = 0; i < 8; i++) {
+            if (!pub[i].k)
+                continue;
+            int l = dnskey_rdata_for(pub[i].k, pub[i].alg, pub[i].ksk, dk[ndk], sizeof(dk[ndk]));
+            if (l <= 0)
+                continue;
             int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 68);
+                               dk[ndk], (uint16_t) l);
             if (n2 > 0) {
                 off = n2;
                 answers++;
+                found = 1;
             }
+            dkp[ndk] = dk[ndk];
+            dkl[ndk] = (uint16_t) l;
+            ndk++;
         }
-        /* ZSK Ed25519 */
-        if (g_zsk_ed && dnskey_rdata_ed25519(g_zsk_ed, dkrd, sizeof(dkrd)) > 0) {
-            found = 1;
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 36);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-        }
-        /* Rollover (RFC 6781 Pre-Publish): publish the incoming ZSK set
-         * alongside the current one for the whole rollover, so a validator that
-         * cached the old DNSKEY still sees it and a validator fetching the new
-         * one already has the key the RRSIG keytag points at. */
-        if (g_zsk_next && dnskey_rdata_ecdsa(g_zsk_next, dkrd, sizeof(dkrd)) > 0) {
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 68);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-        }
-        if (g_zsk_ed_next && dnskey_rdata_ed25519(g_zsk_ed_next, dkrd, sizeof(dkrd)) > 0) {
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 36);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-        }
-        /* KSK P-256 — emit then sign DNSKEY RRset with KSK */
-        if (g_ksk && dnskey_rdata_ksk_ecdsa(g_ksk, dkrd, sizeof(dkrd)) > 0) {
-            found = 1;
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 68);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-            /* Sign DNSKEY with KSK */
-            if (dnssec_ok) {
+        if (dnssec_ok && ndk > 0) {
+            for (int i = 4; i < 8; i++) { /* the KSK entries */
+                if (!pub[i].k)
+                    continue;
                 uint8_t sig[512];
-                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 68, g_ksk,
-                                    DNS_ALG_ECDSAP256SHA256, g_ksk_tag, sig);
-                if (sl > 0) {
-                    int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
-                                       3600, sig, (uint16_t) sl);
-                    if (so > 0) {
-                        off = so;
-                        answers++;
-                    }
-                }
-            }
-        }
-        /* KSK Ed25519 */
-        if (g_ksk_ed && dnskey_rdata_ksk_ed25519(g_ksk_ed, dkrd, sizeof(dkrd)) > 0) {
-            found = 1;
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 36);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-            if (dnssec_ok) {
-                uint8_t sig[512];
-                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 36, g_ksk_ed,
-                                    DNS_ALG_ED25519, g_ksk_ed_tag, sig);
-                if (sl > 0) {
-                    int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
-                                       3600, sig, (uint16_t) sl);
-                    if (so > 0) {
-                        off = so;
-                        answers++;
-                    }
-                }
-            }
-        }
-        /* KSK rollover (Double-Signature): publish the incoming KSK set and sign
-         * the DNSKEY RRset with it too, so the RRset validates against the DS of
-         * either KSK while the parent's DS is being swapped. */
-        if (g_ksk_next && dnskey_rdata_ksk_ecdsa(g_ksk_next, dkrd, sizeof(dkrd)) > 0) {
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 68);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-            if (dnssec_ok) {
-                uint8_t sig[512];
-                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 68,
-                                    g_ksk_next, DNS_ALG_ECDSAP256SHA256, g_ksk_next_tag, sig);
-                if (sl > 0) {
-                    int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
-                                       3600, sig, (uint16_t) sl);
-                    if (so > 0) {
-                        off = so;
-                        answers++;
-                    }
-                }
-            }
-        }
-        if (g_ksk_ed_next && dnskey_rdata_ksk_ed25519(g_ksk_ed_next, dkrd, sizeof(dkrd)) > 0) {
-            int n2 = append_rr(resp, off, resp_len, qname, DNS_TYPE_DNSKEY, DNS_CLASS_IN, 3600,
-                               dkrd, 36);
-            if (n2 > 0) {
-                off = n2;
-                answers++;
-            }
-            if (dnssec_ok) {
-                uint8_t sig[512];
-                int sl = make_rrsig(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkrd, 36,
-                                    g_ksk_ed_next, DNS_ALG_ED25519, g_ksk_ed_next_tag, sig);
-                if (sl > 0) {
-                    int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN,
-                                       3600, sig, (uint16_t) sl);
-                    if (so > 0) {
-                        off = so;
-                        answers++;
-                    }
+                int sl = make_rrsig_set(qname, t_zone->name, DNS_TYPE_DNSKEY, 3600, dkp, dkl, ndk,
+                                        pub[i].k, (uint8_t) pub[i].alg, pub[i].tag, sig);
+                if (sl <= 0)
+                    continue;
+                int so = append_rr(resp, off, resp_len, qname, DNS_TYPE_RRSIG, DNS_CLASS_IN, 3600,
+                                   sig, (uint16_t) sl);
+                if (so > 0) {
+                    off = so;
+                    answers++;
                 }
             }
         }
@@ -7332,22 +7395,51 @@ finish_answer:
     int ede_code = -1;
     const char *ede_text = NULL;
     if (answers == 0 && !is_referral) {
-        /* RFC 2308: add SOA in authority for NXDOMAIN / NODATA */
-        if (!found) {
-            rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NXDOMAIN);
-            STAT_INC(g_stat_nxdomain);
-        } else { /* NODATA — name exists, type doesn't */
-            rh->flags = htons(DNS_QR | DNS_AA | DNS_RCODE_NOERROR);
-            STAT_INC(g_stat_noerror);
+        /* CSA-PROTO-001: NODATA vs NXDOMAIN is decided by whether the NAME
+         * exists (any type, any namespace, or the apex), not by whether the
+         * queried type was found. One pipelined Valkey round trip. */
+        uint16_t ptypes[NAME_TYPES_MAX];
+        int np = name_types_present(qname, ptypes, NAME_TYPES_MAX);
+        if (np < 0) {
+            /* Cannot tell whether the name exists: fail closed. */
+            rh->flags = htons(DNS_QR | DNS_RCODE_SERVFAIL);
+            ede_code = EDE_NETWORK_ERROR;
+            ede_text = "zone data unavailable";
+            STAT_INC(g_stat_servfail);
+        } else {
+            if (np == 0 && found) {
+                /* Only a static wildcard owner matched (type absent there):
+                 * RFC 9824 §3.3 — the NODATA bitmap is the wildcard's. */
+                const char *dot = strchr(qname, '.');
+                if (dot) {
+                    char wname[256];
+                    snprintf(wname, sizeof(wname), "*%s", dot);
+                    static_types_at(wname, ptypes, &np, NAME_TYPES_MAX);
+                }
+            }
+            int is_apex = t_zone && streq_ci(qname, t_zone->name);
+            int exists = (np > 0 || found || is_apex);
+            int signed_denial = dnssec_ok && t_zone && t_zone->zsk;
+            uint16_t rcode = DNS_RCODE_NOERROR;
+            if (!exists) {
+                /* RFC 9824 §5.1: a signed compact denial answers a nonexistent
+                 * name NOERROR unless the client set Compact Answers OK. A DO
+                 * client without CO would look for an NXDOMAIN proof that
+                 * compact denial does not provide. */
+                if (!signed_denial || ei.co_bit)
+                    rcode = DNS_RCODE_NXDOMAIN;
+                STAT_INC(g_stat_nxdomain);
+            } else {
+                STAT_INC(g_stat_noerror);
+            }
+            rh->flags = htons(DNS_QR | DNS_AA | rcode);
+            /* RFC 2308: SOA in authority for NXDOMAIN / NODATA */
+            off = add_soa_authority(resp, off, resp_len, dnssec_ok, &auth_count);
+            if (signed_denial)
+                off = add_compact_denial(resp, off, resp_len, qname, ptypes, np, !exists, dnssec_ok,
+                                         &auth_count);
+            rh->nscount = htons((uint16_t) auth_count);
         }
-        off = add_soa_authority(resp, off, resp_len, dnssec_ok, &auth_count);
-        if (dnssec_ok) {
-            if (t_zone ? t_zone->dnssec_use_nsec3 : g_dnssec_use_nsec3)
-                off = add_nsec3_denial(resp, off, resp_len, qname, qtype, dnssec_ok, &auth_count);
-            else
-                off = add_nsec_denial(resp, off, resp_len, qname, dnssec_ok, &auth_count);
-        }
-        rh->nscount = htons((uint16_t) auth_count);
     }
     /* RFC 8482: set HINFO hint for ANY minimal responses */
     if (any_minimal && answers > 0) {
@@ -7382,24 +7474,13 @@ finish_answer:
 /* ==========================================================================
  * RFC 2136 §2.4 prerequisite helpers
  * ======================================================================= */
-/* Returns 1 if at least one RR exists for `name` (any type, any namespace). */
+/* Returns 1 if at least one RR exists for `name` (any type, any namespace),
+ * 0 if none, -1 if Valkey could not be asked. Same answer the query path
+ * uses for NODATA vs NXDOMAIN (name_types_present). */
 static int prereq_name_exists(const char *name) {
-    char vk[768];
-    char tmp[8];
-    const char *types[] = {"A",   "AAAA",  "CNAME", "MX",    "TXT", "NS", "SRV",
-                           "CAA", "SSHFP", "TLSA",  "DNAME", "LOC", NULL};
-    for (int ti = 0; types[ti]; ti++) {
-        dkey(vk, sizeof(vk), types[ti], name);
-        if (vk_get(vk, tmp, sizeof(tmp)))
-            return 1;
-        zkey(vk, sizeof(vk), types[ti], name);
-        if (vk_get(vk, tmp, sizeof(tmp)))
-            return 1;
-    }
-    for (int i = 0; i < static_zone_sz; i++)
-        if (streq_ci(static_zone[i].name, name))
-            return 1;
-    return 0;
+    uint16_t t[NAME_TYPES_MAX];
+    int n = name_types_present(name, t, NAME_TYPES_MAX);
+    return n < 0 ? -1 : (n > 0);
 }
 /* Returns 1 if at least one RR of type `rtype` exists for `name`. */
 static int prereq_rrset_exists(const char *name, uint16_t rtype) {
@@ -8411,13 +8492,19 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const stru
             goto formerr;
         uint16_t prereq_fail = 0;
         if (rclass == DNS_CLASS_ANY && rtype == DNS_TYPE_ANY && rdlen == 0) {
-            if (!prereq_name_exists(nm))
+            int pe = prereq_name_exists(nm);
+            if (pe < 0)
+                prereq_fail = DNS_RCODE_SERVFAIL;
+            else if (!pe)
                 prereq_fail = DNS_RCODE_NXDOMAIN;
         } else if (rclass == DNS_CLASS_ANY && rtype != DNS_TYPE_ANY && rdlen == 0) {
             if (!prereq_rrset_exists(nm, rtype))
                 prereq_fail = DNS_RCODE_NXRRSET;
         } else if (rclass == DNS_CLASS_NONE && rtype == DNS_TYPE_ANY && rdlen == 0) {
-            if (prereq_name_exists(nm))
+            int pe = prereq_name_exists(nm);
+            if (pe < 0)
+                prereq_fail = DNS_RCODE_SERVFAIL;
+            else if (pe)
                 prereq_fail = DNS_RCODE_YXDOMAIN;
         } else if (rclass == DNS_CLASS_NONE && rtype != DNS_TYPE_ANY && rdlen == 0) {
             if (prereq_rrset_exists(nm, rtype))

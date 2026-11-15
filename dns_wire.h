@@ -42,6 +42,9 @@
 #define DNS_TYPE_NSEC 47
 #define DNS_TYPE_DNSKEY 48
 #define DNS_TYPE_NSEC3 50
+/* RFC 9824 §2: NXNAME meta-type — set in a compact-denial NSEC/NSEC3 bitmap
+ * to say "this name does not exist"; never a valid QTYPE (FORMERR, EDE 30). */
+#define DNS_TYPE_NXNAME 128
 #define DNS_TYPE_NSEC3PARAM 51
 #define DNS_TYPE_TLSA 52
 #define DNS_TYPE_CDS 59     /* RFC 7344 — child DS */
@@ -136,6 +139,7 @@
 #define EDE_NO_REACHABLE_AUTHORITY 22
 #define EDE_NETWORK_ERROR 23
 #define EDE_INVALID_DATA 24
+#define EDE_INVALID_QUERY_TYPE 30 /* RFC 9824 §3.5 (NXNAME as QTYPE) */
 
 /* ── DNS Cookie constants (RFC 9018) ─────────────────────────────────────── */
 
@@ -167,6 +171,7 @@ typedef struct {
     uint16_t max_udp;
     uint8_t version;
     int do_bit;
+    int co_bit; /* RFC 9824 §5.1 Compact Answers OK: EDNS flags bit 1 (0x4000) */
     uint8_t client_cookie[DNS_COOKIE_CLIENT_LEN];
     int has_client_cookie;
     uint8_t server_cookie[DNS_COOKIE_SERVER_LEN];
@@ -479,6 +484,14 @@ int canon_name_cmp(const char *a, const char *b);
  * Returns rdata length or -1 on overflow / no buffer. */
 int csync_encode_rdata(uint32_t serial, uint16_t flags, const char *types_csv, uint8_t *out,
                        int outsz);
+
+/* ── NSEC/NSEC3 type bitmap (RFC 4034 §4.1.2) ────────────────────────────────
+ * Encode `types` (any order, duplicates allowed, at most 64) as window blocks:
+ * one block per 256-type window that has a bit set, ascending, each trimmed
+ * to its last non-zero octet. Unlike the window-0-only encoders, types >= 256
+ * (URI, CAA, ...) land in window 1+. An empty list encodes as zero octets.
+ * Returns the encoded length, or -1 on overflow / bad arguments. */
+int type_bitmap_encode(const uint16_t *types, int ntypes, uint8_t *out, int outlen);
 
 /* ── TLS server helpers (DNS-over-TLS, RFC 7858) ─────────────────────────────
  * Shared by dnsd (authoritative DoT/XoT listener) and resolverd (stub-facing

@@ -1675,6 +1675,15 @@ typedef struct {
      * clear. */
     uint8_t bitmap[128];
     int bitmap_len;
+    /* RFC 9824 compact denial: the record proves something about its owner
+     * only — never a range. exact_only: the NSEC next name cannot be held
+     * faithfully in the dotted form (a label containing \000 or '.', e.g. the
+     * compact-denial successor "\000.<owner>" which name_from_wire turns into
+     * "", i.e. an apparent wrap to the end of the zone). nxname: the bitmap
+     * carries NXNAME, so the owner does not exist and must not be answered
+     * NODATA from this span either. */
+    int exact_only;
+    int nxname;
 } nsec_proof_t;
 
 #define MAX_NEG_PROOFS 4
@@ -1711,6 +1720,18 @@ static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uin
         int after = name_from_wire(pkt, plen, rdoff, next, sizeof(next));
         if (after < 0 || after > rdend)
             return 0;
+        /* Walk the uncompressed next-name labels: a 0x00 or '.' octet inside a
+         * label is lost in the dotted string, so this span may not be used to
+         * cover a range of names (it would cover the wrong one). */
+        for (int lp = rdoff; lp < after && pkt[lp] != 0 && (pkt[lp] & 0xC0) == 0;) {
+            int ll = pkt[lp];
+            if (lp + 1 + ll > after)
+                break;
+            for (int k = 1; k <= ll; k++)
+                if (pkt[lp + k] == 0 || pkt[lp + k] == '.')
+                    proof->exact_only = 1;
+            lp += 1 + ll;
+        }
         proof->is_nsec3 = 0;
         safe_strcpy(proof->owner, owner, sizeof(proof->owner));
         safe_strcpy(proof->next, next, sizeof(proof->next));
@@ -1721,6 +1742,8 @@ static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uin
             bmlen = (int) sizeof(proof->bitmap);
         memcpy(proof->bitmap, pkt + after, bmlen);
         proof->bitmap_len = bmlen;
+        if (nsec_bitmap_has_type(proof->bitmap, proof->bitmap_len, DNS_TYPE_NXNAME))
+            proof->nxname = proof->exact_only = 1;
         return 1;
     }
     if (rtype == DNS_TYPE_NSEC3) {
@@ -1769,6 +1792,8 @@ static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uin
             bmlen = (int) sizeof(proof->bitmap);
         memcpy(proof->bitmap, pkt + p, bmlen);
         proof->bitmap_len = bmlen;
+        if (nsec_bitmap_has_type(proof->bitmap, proof->bitmap_len, DNS_TYPE_NXNAME))
+            proof->nxname = proof->exact_only = 1;
         return 1;
     }
     return 0;
@@ -3444,11 +3469,14 @@ static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_re
             int cmp_next = memcmp(qhash, p->next_hash, 20);
             int wraps = memcmp(p->owner_hash, p->next_hash, 20) >= 0;
             if (cmp_owner == 0) {
+                if (p->nxname)
+                    continue; /* RFC 9824: owner does not exist — not NODATA */
                 if (nsec_bitmap_has_type(p->bitmap, p->bitmap_len, qtype))
                     continue; /* type actually exists here — can't help */
                 out->is_nxdomain = 0;
                 found = 1;
-            } else if (wraps ? (cmp_owner > 0 || cmp_next < 0) : (cmp_owner > 0 && cmp_next < 0)) {
+            } else if (!p->exact_only && (wraps ? (cmp_owner > 0 || cmp_next < 0)
+                                                : (cmp_owner > 0 && cmp_next < 0))) {
                 out->is_nxdomain = 1;
                 found = 1;
             }
@@ -3457,11 +3485,14 @@ static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_re
             int cmp_next = canon_name_cmp(qname, p->next);
             int wraps = canon_name_cmp(p->owner, p->next) >= 0;
             if (cmp_owner == 0) {
+                if (p->nxname)
+                    continue; /* RFC 9824: owner does not exist — not NODATA */
                 if (nsec_bitmap_has_type(p->bitmap, p->bitmap_len, qtype))
                     continue;
                 out->is_nxdomain = 0;
                 found = 1;
-            } else if (wraps ? (cmp_owner > 0 || cmp_next < 0) : (cmp_owner > 0 && cmp_next < 0)) {
+            } else if (!p->exact_only && (wraps ? (cmp_owner > 0 || cmp_next < 0)
+                                                : (cmp_owner > 0 && cmp_next < 0))) {
                 out->is_nxdomain = 1;
                 found = 1;
             }
