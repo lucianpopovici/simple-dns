@@ -1502,6 +1502,7 @@ check-zoneversion: $(BIN_DEBUG) | ossl-sanity
 	 NLABELS_HEX=$$(printf '%02x' $$NLABELS);                                                     \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) >/tmp/dnsd_zv.log 2>&1 & DNS=$$!; \
 	 sleep 1.5;                                                                                    \
+	 PORTS=$$(ss -lunp 2>/dev/null | grep ":$(TPORT) ");                                         \
 	 OUT=$$(dig +ednsopt=19 +nocookie @127.0.0.1 -p $(TPORT) "$$ZN" A +time=2 +tries=1);          \
 	 OUT_NOOPT=$$(dig +nocookie @127.0.0.1 -p $(TPORT) "$$ZN" A +time=2 +tries=1);                \
 	 OUT_REFUSED=$$(dig +ednsopt=19 +nocookie @127.0.0.1 -p $(TPORT) not-our-zone.example A +time=2 +tries=1); \
@@ -1513,7 +1514,7 @@ check-zoneversion: $(BIN_DEBUG) | ossl-sanity
 	 GOTSERIAL=$$(printf '%d' 0x$$SERIALHEX 2>/dev/null || echo -1);                               \
 	 echo "  zone=$$ZN labels=$$NLABELS serial=$$SERIAL";                                         \
 	 echo "  OPT=19 line: $$ZVLINE";                                                              \
-	 test -n "$$ZVLINE" || { echo "  FAIL  no OPT=19 in response to +ednsopt=19 query"; exit 1; }; \
+	 test -n "$$ZVLINE" || { echo "  FAIL  no OPT=19 in response to +ednsopt=19 query"; echo "  udp :$(TPORT) holders: $$PORTS"; echo "$$OUT" | sed 's/^/    | /'; exit 1; }; \
 	 test "$$LABELS" = "$$NLABELS_HEX" || { echo "  FAIL  LABELCOUNT $$LABELS != expected $$NLABELS_HEX"; exit 1; }; \
 	 test "$$TYPE" = "00" || { echo "  FAIL  TYPE $$TYPE != 00 (SOA-SERIAL)"; exit 1; };           \
 	 test "$$GOTSERIAL" = "$$SERIAL" || { echo "  FAIL  echoed serial $$GOTSERIAL != actual $$SERIAL"; exit 1; }; \
@@ -1658,7 +1659,7 @@ check-error-reporting: $(BIN_DEBUG) | ossl-sanity
 	 echo "  agent set:    $$(echo "$$SET"    | grep -o 'OPT=18:.*')";                              \
 	 echo "  agent unset:  $$(echo "$$UNSET"  | grep -c 'OPT=18') occurrences";                     \
 	 echo "  subdomain:    $$(echo "$$SUBDOM" | grep -c 'OPT=18') occurrences";                     \
-	 echo "$$SET" | grep -q "OPT=18" || { echo "  FAIL  Report-Channel option missing when configured"; exit 1; }; \
+	 echo "$$SET" | grep -q "OPT=18" || { echo "  FAIL  Report-Channel option missing when configured"; ss -lunp 2>/dev/null | grep ":$(TPORT) "; echo "$$SET" | sed 's/^/    | /'; exit 1; }; \
 	 echo "$$SET" | grep -q "report.example.net" || { echo "  FAIL  agent domain not correctly wire-encoded"; exit 1; }; \
 	 echo "$$UNSET"  | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted with no agent configured"; exit 1; }; \
 	 echo "$$SUBDOM" | grep -q "OPT=18" && { echo "  FAIL  Report-Channel emitted for a subdomain-of-zone agent (RFC 9567 §4 MUST NOT)"; exit 1; }; \
@@ -2060,7 +2061,7 @@ check-xfr-tsig: $(BIN_DEBUG)
 	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
 	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
 	 echo "  results:$$RES"; \
-	 test "$$R_ok" = "10.20.0.1" || { echo "  FAIL  valid TSIG transfer not applied"; exit 1; }; \
+	 test "$$R_ok" = "10.20.0.1" || { echo "  FAIL  valid TSIG transfer not applied"; tail -n 30 /tmp/xtsig_s.log /tmp/xtsig_m.log; exit 1; }; \
 	 test -z "$$R_badresp" || { echo "  FAIL  response with wrong key was NOT rejected"; exit 1; }; \
 	 test -z "$$R_unsigned" || { echo "  FAIL  unsigned response was NOT rejected (TSIG required)"; exit 1; }; \
 	 echo "  OK  valid TSIG applied; wrong-key + unsigned responses rejected"

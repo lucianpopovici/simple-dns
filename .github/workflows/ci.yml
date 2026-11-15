@@ -529,7 +529,10 @@ jobs:
 
       - name: Daemon logs (on failure)
         if: failure()
-        run: for f in /tmp/*.log; do echo "===== $f"; tail -n 40 "$f"; done
+        run: |
+          ss -lunpt || true
+          ps -ef | grep -E 'dns_server|resolverd|apid|mdnsd|certd|eppd|python3' | grep -v grep || true
+          for f in /tmp/*.log; do echo "===== $f"; tail -n 40 "$f"; done
 
   warnings:
     name: Warnings as errors
