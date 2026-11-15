@@ -130,7 +130,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -734,6 +734,66 @@ check-resolverd-stress: $(BIN_DEBUG) resolverd_debug tests/udp_stress
 check-resolverd-tsan: $(BIN_DEBUG) resolverd_tsan tests/udp_stress
 	@echo "  CHECK  resolverd cache under concurrent load, TSan build (Valkey + dig; $(STRESS_SECS)s)"
 	$(call RD_STRESS,tsan,resolverd_tsan)
+
+# CSA-NET-003 / CSA-AUTH-006 / CSA-DOS-004 (CLAUDE-client-identity.md): who
+# dnsd thinks the client is. IPv6 clients are themselves (an IPv6 allow-list
+# entry matches, an IPv4 one does not; cookies work over ::1); a PROXY v2
+# header from loopback carries the real client (judged as the claimed
+# address, not 127.0.0.1); DoH through apid is judged as the HTTP client, so
+# listing 127.0.0.1 no longer opens the ACL to every DoH client; RRL keys a
+# random-subdomain NXDOMAIN flood on (client /24, zone) so it is limited,
+# while another client is still answered. Needs Valkey + dig + python3-dnspython.
+check-client-identity: $(BIN_DEBUG) apid_debug
+	@echo "  CHECK  client identity: IPv6, PROXY v2 from apid/doqd, RRL keying (Valkey + dig + python3-dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.update' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
+	 Z=example.local; P="python3 tests/client_probe.py"; HP=18064;                     \
+	 KEYS="config:update_unsigned_allow config:tsig_secret_b64 config:ddns_allow_suffix config:rrl_enabled config:rrl_rate config:rrl_window config:rrl_slip config:http_port config:https_port config:dns_port"; \
+	 D=$$(mktemp -d); for k in $$KEYS; do $$VC --raw get $$k > $$D/$$k; done;          \
+	 $$VC del $$KEYS >/dev/null;                                                       \
+	 $$VC set config:http_port $$HP >/dev/null; $$VC set config:https_port 18455 >/dev/null; \
+	 $$VC set config:dns_port $(TPORT) >/dev/null;                                     \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_cid.log 2>&1 & DNS=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug > /tmp/apid_cid.log 2>&1 & API=$$!;      \
+	 sleep 2;                                                                          \
+	 $$VC set config:update_unsigned_allow ::1 >/dev/null; sleep 0.7;                  \
+	 V6A=$$($$P update ::1 $(TPORT) $$Z cid-v6a);                                      \
+	 $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null; sleep 0.7;            \
+	 V6R=$$($$P update ::1 $(TPORT) $$Z cid-v6r);                                      \
+	 CK=$$(dig -6 +cookie @::1 -p $(TPORT) $$Z A +time=2 +tries=2 2>&1 | grep -c 'status: NOERROR'); \
+	 $$VC set config:update_unsigned_allow 127.1.0.1 >/dev/null; sleep 0.7;            \
+	 PX1=$$($$P update 127.0.0.1 $(TPORT) $$Z cid-px1 --proxy 127.1.0.1);              \
+	 $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null; sleep 0.7;            \
+	 PX2=$$($$P update 127.0.0.1 $(TPORT) $$Z cid-px2 --proxy 127.1.0.1);              \
+	 D1=$$($$P doh-update 127.0.0.1 $$HP $$Z cid-doh1 --src 127.1.0.1);                \
+	 D2=$$($$P doh-update 127.0.0.1 $$HP $$Z cid-doh2 --src 127.0.0.1);                \
+	 $$VC set config:rrl_rate 5 >/dev/null; $$VC set config:rrl_window 10 >/dev/null;  \
+	 $$VC set config:rrl_slip 2 >/dev/null; $$VC set config:rrl_enabled 1 >/dev/null; sleep 1; \
+	 R1=$$($$P rrl 127.0.0.1 $(TPORT) $$Z 40);                                         \
+	 R2=$$(dig +short +nocookie -b 127.1.0.1 @127.0.0.1 -p $(TPORT) www.$$Z A +time=2 +tries=1); \
+	 kill $$DNS $$API 2>/dev/null || true; sleep 0.3;                                  \
+	 SAN=$$(cat /tmp/dnsd_cid.log /tmp/apid_cid.log | grep -c 'AddressSanitizer\|runtime error'); \
+	 for l in cid-v6a cid-v6r cid-px1 cid-px2 cid-doh1 cid-doh2; do $$VC del zone:$$Z:TXT:$$l.$$Z >/dev/null; done; \
+	 for k in $$KEYS; do if [ -s $$D/$$k ]; then $$VC set $$k "$$(cat $$D/$$k)" >/dev/null; else $$VC del $$k >/dev/null; fi; done; \
+	 rm -rf $$D;                                                                       \
+	 FULL=$$(echo "$$R1" | sed 's/full=\([0-9]*\).*/\1/');                             \
+	 echo "  IPv6: allow ::1 -> [$$V6A]  allow 127.0.0.1 -> [$$V6R]  cookie over ::1 ok=$$CK"; \
+	 echo "  PROXY v2 claiming 127.1.0.1: allow 127.1.0.1 -> [$$PX1]  allow 127.0.0.1 -> [$$PX2]"; \
+	 echo "  DoH via apid (allow 127.0.0.1): from 127.1.0.1 -> [$$D1]  from 127.0.0.1 -> [$$D2]"; \
+	 echo "  RRL rate=5: 40 random NXDOMAIN from one client -> $$R1 | other client answered=[$$R2]"; \
+	 rc=0;                                                                             \
+	 test "$$V6A" = "RCODE 0" || { echo "  FAIL  IPv6 client not matched by an IPv6 allow-list entry"; rc=1; }; \
+	 test "$$V6R" = "RCODE 5" || { echo "  FAIL  IPv6 client matched an IPv4-only allow-list"; rc=1; }; \
+	 test "$$CK" -ge 1 || { echo "  FAIL  DNS cookie exchange over ::1 failed"; rc=1; }; \
+	 test "$$PX1" = "RCODE 0" -a "$$PX2" = "RCODE 5" || { echo "  FAIL  PROXY v2 client address not honoured from loopback"; rc=1; }; \
+	 test "$$D1" = "RCODE 5" || { echo "  FAIL  DoH client judged as apid's loopback address (CSA-AUTH-006)"; rc=1; }; \
+	 test "$$D2" = "RCODE 0" || { echo "  FAIL  DoH client's own address not passed through apid"; rc=1; }; \
+	 test -n "$$FULL" && test "$$FULL" -le 12 || { echo "  FAIL  random-subdomain NXDOMAIN flood not rate-limited (CSA-DOS-004)"; rc=1; }; \
+	 test "$$R2" = 192.168.1.10 || { echo "  FAIL  a different client was rate-limited too"; rc=1; }; \
+	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report"; rc=1; }; \
+	 test $$rc -eq 0 || exit 1;                                                        \
+	 echo "  OK  IPv6 + DoH/DoQ clients keep their identity; RRL limits per client, not per name"
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -3481,6 +3541,7 @@ help:
 	@echo "  make check-ent       Empty non-terminals: zidx index, NODATA not NXDOMAIN, signed ENT denial"
 	@echo "  make check-tcp-plain plain TCP vs DoT per listener, stream connection cap + handshake timeout"
 	@echo "  make check-resolverd-stress / check-resolverd-tsan  resolverd cache under concurrent load (ASan / TSan; STRESS_SECS)"
+	@echo "  make check-client-identity  IPv6 clients, PROXY v2 from apid/doqd, RRL per client prefix"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"

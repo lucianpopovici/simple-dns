@@ -214,6 +214,53 @@ int main(void) {
         check(type_bitmap_encode(t2, 3, bm, 10) == -1, "bitmap: overflow fails closed");
     }
 
+    /* ── PROXY v2 header (CSA-AUTH-006) ─────────────────────────────────────── */
+    {
+        uint8_t h[128];
+        client_addr_t c;
+        struct sockaddr_in s4;
+        memset(&s4, 0, sizeof(s4));
+        s4.sin_family = AF_INET;
+        s4.sin_port = htons(4444);
+        inet_pton(AF_INET, "198.51.100.7", &s4.sin_addr);
+        int hl = proxy_v2_build(h, sizeof(h), (struct sockaddr *) &s4, 1);
+        check(hl == 28 && proxy_v2_parse(h, hl, &c) == 28 && c.family == AF_INET &&
+                  c.u.v4.s_addr == s4.sin_addr.s_addr,
+              "proxy v2: UDP4 build/parse round trip");
+        struct sockaddr_in6 s6;
+        memset(&s6, 0, sizeof(s6));
+        s6.sin6_family = AF_INET6;
+        inet_pton(AF_INET6, "2001:db8::42", &s6.sin6_addr);
+        hl = proxy_v2_build(h, sizeof(h), (struct sockaddr *) &s6, 0);
+        check(hl == 52 && proxy_v2_parse(h, hl, &c) == 52 && c.family == AF_INET6 &&
+                  memcmp(&c.u.v6, &s6.sin6_addr, 16) == 0,
+              "proxy v2: TCP6 build/parse round trip");
+        inet_pton(AF_INET6, "::ffff:192.0.2.9", &s6.sin6_addr);
+        hl = proxy_v2_build(h, sizeof(h), (struct sockaddr *) &s6, 1);
+        check(proxy_v2_parse(h, hl, &c) == hl && c.family == AF_INET,
+              "proxy v2: v4-mapped v6 normalised to v4");
+        uint8_t dns[12] = {0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0};
+        check(proxy_v2_parse(dns, sizeof(dns), &c) == 0, "proxy v2: plain DNS has no signature");
+        hl = proxy_v2_build(h, sizeof(h), (struct sockaddr *) &s4, 1);
+        check(proxy_v2_parse(h, hl - 1, &c) == -1, "proxy v2: truncated header rejected");
+        h[12] = 0x11; /* version 1 */
+        check(proxy_v2_parse(h, hl, &c) == -1, "proxy v2: wrong version rejected");
+        h[12] = 0x21;
+        h[14] = 0xFF;
+        h[15] = 0xFF; /* length past PROXY_V2_MAX_HDR */
+        check(proxy_v2_parse(h, hl, &c) == -1, "proxy v2: oversized length rejected");
+        h[14] = 0;
+        h[15] = 12 + 5; /* addresses + one 5-octet TLV */
+        uint8_t tl[64];
+        memcpy(tl, h, 28);
+        memset(tl + 28, 0xEE, 5);
+        check(proxy_v2_parse(tl, 33, &c) == 33 && c.family == AF_INET, "proxy v2: TLVs skipped");
+        h[12] = 0x20; /* LOCAL */
+        h[15] = 12;
+        check(proxy_v2_parse(h, 28, &c) == 28 && c.family == 0,
+              "proxy v2: LOCAL command carries no client address");
+    }
+
     /* ── DDNS suffix ACL (dns_name_in_suffix, CSA-AUTH-004) ──────────────────── */
     {
         check(dns_name_in_suffix("h1.dyn.example.local", "dyn.example.local") == 1,

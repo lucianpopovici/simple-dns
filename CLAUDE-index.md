@@ -43,6 +43,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-tcp-transport.md` | dnsd | Audit fixes: plain TCP vs DoT per listener; stream-listener bounds — **specced 2026-11-15** |
 | `CLAUDE-apid-auth.md` | apid (+libdnswire) | Audit fixes: `/list` + `/zone` mTLS-only, DDNS suffix ACL + key/value hygiene — **done 2026-11-15** |
 | `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **done 2026-11-15** |
+| `CLAUDE-client-identity.md` | dnsd, apid, doqd (+libdnswire) | Audit fixes: real v4/v6 client, PROXY v2 from front-ends, RRL keying — **done 2026-11-15** |
 | `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
 
@@ -66,13 +67,16 @@ validator and resolver sees, then availability).
 | CSA-DNSSEC-002 | High | RFC 9824 compact denial (= dnsd Add 11), NSEC or NSEC3 per `dnssec_nsec_mode` | **Done** 2026-11-15 (D1: keep selector) | dnssec-denial, Fix 3 |
 | CSA-PROTO-002 | High | Listener sets the transport for `dot_thread` | **Done** 2026-11-15 | tcp-transport, Fix 1 |
 | CSA-DOS-002 | Medium | Connection cap, handshake timeout, checked `pthread_create` | **Done** 2026-11-15 | tcp-transport, Fix 2 |
+| CSA-NET-003 | High | Real v4/v6 client (`client_addr_t`) through dnsd; IPv6 ACL entries; v6-aware cookies | **Done** 2026-11-15 | client-identity, Fix 1 |
+| CSA-AUTH-006 | Medium | PROXY v2 on the apid/doqd → dnsd loopback hop, honoured only from loopback | **Done** 2026-11-15 | client-identity, Fix 2 |
+| CSA-DOS-004 | Medium | RRL keyed on client prefix + zone (negative) / qname+qtype (positive); no bucket reset | **Done** 2026-11-15 | client-identity, Fix 3 |
 | CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | **Done** 2026-11-15 | resolverd-cache, Fix 1 |
 | — | — | TSan build + stress target + CI job | **Done** 2026-11-15 | resolverd-cache, Fix 2 |
 
 Found while fixing, not in the ledger, **fixed 2026-11-15**: multi-RR RRsets signed per record; DNSKEY/CDS/DS answered at any name; resolverd validator picked the first DNSKEY for every RRSIG; ZONEMD drift with live ddns leases; non-primary zone serial reset on reload (see `CLAUDE-dnssec-denial.md` implementation notes).
 
-Not yet specced (open in the ledger): CSA-AUTH-006/-007, CSA-NET-003,
-CSA-DOS-003..006, CSA-INJ-001/-002, CSA-SBX-001/-002, CSA-WEB-001/-002,
+Not yet specced (open in the ledger): CSA-AUTH-007,
+CSA-DOS-003, CSA-DOS-005, CSA-DOS-006, CSA-INJ-001/-002, CSA-SBX-001/-002, CSA-WEB-001/-002,
 CSA-CONC-002, CSA-MEM-001/-002, CSA-CRYPTO-001, and PERF-001..007.
 
 Release notes required by these fixes: unsigned UPDATE stops working by

@@ -363,6 +363,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-tcp-plain OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: Client identity — IPv6, PROXY v2 from apid/doqd, RRL keying (CSA-NET-003, CSA-AUTH-006, CSA-DOS-004)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-client-identity OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: resolverd cache under concurrent load — ASan (CSA-CONC-001)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

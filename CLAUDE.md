@@ -366,7 +366,9 @@ authoritative zone.
   uses a small in-house front (decision recorded in `specs/CLAUDE-migration.md`).
   `apid` terminates HTTP/HTTPS, serves DoH by forwarding the DNS message to
   `dnsd`'s loopback DNS port (UDP, TCP retry on truncation — it never parses
-  DNS payloads), and serves the management API by writing **Valkey only**
+  DNS payloads; it prefixes a PROXY v2 header with the HTTP client's address,
+  shared relay `dns_relay_loopback` in libdnswire, so dnsd's RRL/cookies/ACLs
+  see the real client — CSA-AUTH-006; doqd does the same), and serves the management API by writing **Valkey only**
   (it calls nothing inside `dnsd`). This removed the hand-rolled
   HTTP/HTTPS/mTLS server, `url_decode`, `qs_get`, `handle_api`, `handle_doh`
   and the first-boot config portal from `dnsd`.

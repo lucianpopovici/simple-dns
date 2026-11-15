@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <openssl/ssl.h> /* tls_server_ctx_from_pem / dot_alpn_select_cb */
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 /* ── DNS type constants (RFC 1035 and later) ─────────────────────────────── */
 
@@ -497,6 +499,41 @@ int type_bitmap_encode(const uint16_t *types, int ntypes, uint8_t *out, int outl
  * published. Shared by dnsd (signing, SIG(0)) and resolverd (selecting the
  * key an RRSIG names), so both sides compute it the same way. */
 uint16_t dnskey_keytag(const uint8_t *rd, int rdlen);
+
+/* ── Client identity (CSA-NET-003 / CSA-AUTH-006) ────────────────────────────
+ * The address a request is attributed to — for RRL, DNS cookies and ACLs —
+ * v4 or v6. family 0 = unknown. A v4-mapped v6 address is normalised to v4. */
+typedef struct {
+    int family; /* AF_INET, AF_INET6, or 0 */
+    union {
+        struct in_addr v4;
+        struct in6_addr v6;
+    } u;
+} client_addr_t;
+
+void client_from_sockaddr(client_addr_t *c, const struct sockaddr *sa);
+const char *client_ntop(const client_addr_t *c, char *buf, size_t n);
+int client_is_loopback(const client_addr_t *c);
+
+/* PROXY protocol v2 (HAProxy, §2.2) on the loopback hop from apid/doqd to dnsd,
+ * so dnsd sees the real DoH/DoQ client instead of 127.0.0.1.
+ * proxy_v2_build: header for `src` (dst = loopback, ports kept), UDP or TCP.
+ *   Returns its length or -1.
+ * proxy_v2_parse: if buf starts with the v2 signature, fills *src (family 0
+ *   for a LOCAL command or an unsupported family) and returns the header
+ *   length to strip; 0 if there is no signature; -1 if malformed/truncated.
+ *   Only call it for traffic from a loopback source. */
+#define PROXY_V2_SIG_LEN 12
+#define PROXY_V2_MAX_HDR 536 /* 16 + addresses + TLVs we are willing to skip */
+int proxy_v2_build(uint8_t *out, int cap, const struct sockaddr *src, int dgram);
+int proxy_v2_parse(const uint8_t *buf, int len, client_addr_t *src);
+
+/* Relay one DNS message to dnsd on 127.0.0.1:<port> — UDP first, TCP retry
+ * on TC — prefixing a PROXY v2 header for `client` (NULL = none). Never
+ * parses the payload. Returns the response length or -1. Shared by apid
+ * (DoH) and doqd (DoQ), which each carried a copy. */
+int dns_relay_loopback(int port, const struct sockaddr *client, const uint8_t *q, int qlen,
+                       uint8_t *resp, int rmax);
 
 /* ── TLS server helpers (DNS-over-TLS, RFC 7858) ─────────────────────────────
  * Shared by dnsd (authoritative DoT/XoT listener) and resolverd (stub-facing

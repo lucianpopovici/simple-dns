@@ -531,74 +531,18 @@ static void api_send(int fd, SSL *ssl, int code, const char *body) {
 /* ── DNS forwarding to dnsd over loopback ────────────────────────────────── */
 /* UDP first; if the response has TC set, retry over TCP (RFC 7766 framing).
  * Returns response length or -1. */
-static int dns_forward(const uint8_t *q, int qlen, uint8_t *resp, int rmax) {
-    if (qlen < 12)
-        return -1;
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(g_dns_port)};
-    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 3};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    int rlen = -1;
-    if (sendto(fd, q, qlen, 0, (struct sockaddr *) &sa, sizeof(sa)) == qlen) {
-        ssize_t n = recv(fd, resp, rmax, 0);
-        if (n >= 12)
-            rlen = (int) n;
-    }
-    close(fd);
-    if (rlen < 12)
-        return -1;
-    if (!(resp[2] & 0x02))
-        return rlen; /* no TC — done */
-    /* Truncated: retry over TCP */
-    int tfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (tfd < 0)
-        return rlen;
-    setsockopt(tfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(tfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(tfd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(tfd);
-        return rlen;
-    }
-    uint8_t lp[2] = {(uint8_t) (qlen >> 8), (uint8_t) (qlen & 0xFF)};
-    if (send(tfd, lp, 2, MSG_NOSIGNAL) != 2 || send(tfd, q, qlen, MSG_NOSIGNAL) != qlen) {
-        close(tfd);
-        return rlen;
-    }
-    uint8_t lr[2];
-    int got = 0;
-    while (got < 2) {
-        ssize_t n = recv(tfd, lr + got, 2 - got, 0);
-        if (n <= 0) {
-            close(tfd);
-            return rlen;
-        }
-        got += (int) n;
-    }
-    int tlen = (lr[0] << 8) | lr[1];
-    if (tlen < 12 || tlen > rmax) {
-        close(tfd);
-        return rlen;
-    }
-    got = 0;
-    while (got < tlen) {
-        ssize_t n = recv(tfd, resp + got, tlen - got, 0);
-        if (n <= 0) {
-            close(tfd);
-            return rlen;
-        }
-        got += (int) n;
-    }
-    close(tfd);
-    return tlen;
-}
 
 /* DoH response (RFC 8484): forward and answer as application/dns-message */
 static void handle_doh(int fd, SSL *ssl, const uint8_t *pkt, int plen) {
     uint8_t resp[DNS_BUF];
-    int rlen = dns_forward(pkt, plen, resp, sizeof(resp));
+    /* Relay to dnsd with a PROXY v2 header carrying this HTTP client's
+     * address, so dnsd's RRL, cookies and ACLs see the real DoH client, not
+     * apid's 127.0.0.1 (CSA-AUTH-006). Shared relay: libdnswire. */
+    struct sockaddr_storage peer;
+    socklen_t pl = sizeof(peer);
+    int have_peer = getpeername(fd, (struct sockaddr *) &peer, &pl) == 0;
+    int rlen = dns_relay_loopback(g_dns_port, have_peer ? (struct sockaddr *) &peer : NULL, pkt,
+                                  plen, resp, sizeof(resp));
     if (rlen < 0) {
         api_send(fd, ssl, 400, "bad dns message\n");
         return;

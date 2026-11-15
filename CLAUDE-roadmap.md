@@ -165,8 +165,9 @@ availability, then defense-in-depth.
 6. **Client identity** — CSA-NET-003 (*High*, IPv6 client address collapses to
    0.0.0.0 — RRL, cookies, ACLs all key on it), with CSA-AUTH-006 (DoH/DoQ
    clients reach dnsd as 127.0.0.1) and CSA-DOS-004 (RRL keyed on qname)
-   because all three change what dnsd treats as "the client". *Not yet
-   specced.*
+   because all three change what dnsd treats as "the client". **DONE
+   2026-11-15** — `CLAUDE-client-identity.md`, `make check-client-identity`
+   (in CI).
 7. **Remaining Medium** — CSA-AUTH-005 (transfers without TSIG, fail-open
    CIDR; `CLAUDE-update-auth.md` Fix 3, *Complementary*), CSA-AUTH-007
    (resolverd no client ACL; `--no-dnssec`/`--no-mdns` no-ops), CSA-DOS-003
