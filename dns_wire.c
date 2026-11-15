@@ -34,6 +34,24 @@ void strlower(char *s) {
             *s += 32;
 }
 
+int dns_name_in_suffix(const char *name, const char *suffix) {
+    if (!suffix)
+        return 1;
+    while (*suffix == '.')
+        suffix++; /* normalise ".dyn.corp.local" -> "dyn.corp.local" */
+    size_t sl = strlen(suffix);
+    if (sl == 0)
+        return 1;
+    if (!name)
+        return 0;
+    size_t nl = strlen(name);
+    if (nl == sl)
+        return strcasecmp(name, suffix) == 0;
+    if (nl > sl + 1)
+        return name[nl - sl - 1] == '.' && strcasecmp(name + nl - sl, suffix) == 0;
+    return 0;
+}
+
 void safe_strcpy(char *dst, const char *src, size_t dstsz) {
     if (dstsz == 0)
         return;

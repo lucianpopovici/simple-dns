@@ -19,10 +19,14 @@
  *
  * Listeners (same ports the monolith used):
  *   config:http_port   (8053) plain HTTP  — is_mgmt=0: DoH, health, metrics,
- *                      list, DDNS update/delete gated by config:ddns_secret
+ *                      DDNS /update + /delete gated by config:ddns_secret
+ *                      and config:ddns_allow_suffix
  *   config:https_port  (8443) HTTPS       — is_mgmt=1 when mTLS verifies the
- *                      client against config:mtls_ca_pem (required for
- *                      config and zone-table management, exactly as before)
+ *                      client against config:mtls_ca_pem; required for
+ *                      /list, /zone, /config, /zone/{list,add,del},
+ *                      /reverse/classless, /enum/provision
+ *                      (CSA-AUTH-003/004: the DDNS secret opens only
+ *                      /update and /delete)
  *
  * TLS material: cert:current (written by certd), falling back to
  * config:tls_cert_pem / config:tls_key_pem; hot-reloaded live via Valkey
@@ -421,13 +425,23 @@ static void url_decode(char *s) {
     }
     *w = 0;
 }
+/* Find `key` in an application/x-www-form-urlencoded string. A key matches
+ * only at the start of the string or right after '&' — a plain strstr let
+ * "xkey=" or a value containing "key=" satisfy a lookup for "key"
+ * (CSA-AUTH-004). */
 static int qs_get(const char *qs, const char *key, char *out, int olen) {
-    char nd[128];
-    snprintf(nd, sizeof(nd), "%s=", key);
-    const char *p = strstr(qs, nd);
-    if (!p)
+    size_t kl = strlen(key);
+    const char *p = qs;
+    while (p && *p) {
+        if (strncmp(p, key, kl) == 0 && p[kl] == '=')
+            break;
+        p = strchr(p, '&');
+        if (p)
+            p++;
+    }
+    if (!p || !*p)
         return 0;
-    p += strlen(nd);
+    p += kl + 1;
     int i = 0;
     while (p[i] && p[i] != '&' && i < olen - 1) {
         out[i] = p[i];
@@ -437,6 +451,59 @@ static int qs_get(const char *qs, const char *key, char *out, int olen) {
     url_decode(out);
     return 1;
 }
+/* Owner-name check for anything that becomes part of a Valkey key
+ * (zone:<zone>:<type>:<name>, ddns:<zone>:<type>:<name>). Strips one trailing
+ * dot in place, then requires labels of [a-z0-9_-] (the caller lowercases
+ * first), 1-63 octets each, 253 octets total; with allow_wild a leading "*"
+ * label is also accepted. Rejects ':' (shifts key fields), '|' (pipe
+ * encoding), control bytes and empty labels (CSA-AUTH-004). */
+static int api_name_ok(char *name, int allow_wild) {
+    size_t n = strlen(name);
+    if (n > 0 && name[n - 1] == '.')
+        name[--n] = 0;
+    if (n == 0 || n > 253)
+        return 0;
+    const char *p = name;
+    if (allow_wild && p[0] == '*' && (p[1] == '.' || p[1] == 0)) {
+        if (p[1] == 0)
+            return 0; /* a bare "*" names no zone */
+        p += 2;
+    }
+    int ll = 0;
+    for (; *p; p++) {
+        unsigned char c = (unsigned char) *p;
+        if (c == '.') {
+            if (ll == 0)
+                return 0;
+            ll = 0;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            return 0;
+        if (++ll > 63)
+            return 0;
+    }
+    return ll > 0;
+}
+
+/* A field that is stored inside a pipe-encoded value: no '|' (would add a
+ * field) and no control bytes (CSA-AUTH-004). */
+static int api_value_ok(const char *v) {
+    for (const unsigned char *p = (const unsigned char *) v; *p; p++)
+        if (*p == '|' || *p < 0x20 || *p == 0x7f)
+            return 0;
+    return 1;
+}
+
+static int api_digits_ok(const char *v) {
+    if (!v[0])
+        return 1; /* optional field, caller applies the default */
+    for (const char *p = v; *p; p++)
+        if (*p < '0' || *p > '9')
+            return 0;
+    return strlen(v) <= 10;
+}
+
 static void api_send(int fd, SSL *ssl, int code, const char *body) {
     char resp[HTTP_BUF];
     const char *st = code == 200   ? "OK"
@@ -698,7 +765,13 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         return;
     }
 
+    /* /list dumps every zone:* and ddns:* record — operator-only, never
+     * unlocked by the DDNS secret (CSA-AUTH-003). */
     if (!strcmp(path, "/list")) {
+        if (!is_mgmt) {
+            api_send(fd, ssl, 403, "forbidden\n");
+            return;
+        }
         char body[HTTP_BUF];
         int bp = 0;
         char zn[256] = "", zs[32] = "";
@@ -742,10 +815,33 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             return;
         }
     }
+    /* /zone writes are an operator action: the DDNS secret must not reach
+     * them (CSA-AUTH-004 — it could write NS at the apex or an ACME TXT). */
+    if (!strcmp(path, "/zone") && !is_mgmt) {
+        api_send(fd, ssl, 403, "forbidden\n");
+        return;
+    }
     char hostname[256] = {0};
     qs_get(qs, "hostname", hostname, sizeof(hostname));
     if (hostname[0])
         strlower(hostname);
+    /* DDNS: hostname must be a plain owner name inside
+     * config:ddns_allow_suffix — the same ACL dnsd applies to RFC 2136
+     * UPDATE, one shared implementation (dns_name_in_suffix). */
+    if (!strcmp(path, "/update") || !strcmp(path, "/delete")) {
+        if (hostname[0] && !api_name_ok(hostname, 0)) {
+            api_send(fd, ssl, 400, "bad hostname\n");
+            return;
+        }
+        char suffix[256] = "";
+        vk_get("config:ddns_allow_suffix", suffix, sizeof(suffix));
+        if (hostname[0] && !dns_name_in_suffix(hostname, suffix)) {
+            dns_log(LOG_WARNING, "[DDNS] REFUSED %s of %s — outside ddns_allow_suffix [%s]\n", path,
+                    hostname, suffix);
+            api_send(fd, ssl, 403, "hostname outside ddns_allow_suffix\n");
+            return;
+        }
+    }
 
     /* DDNS update */
     if (!strcmp(path, "/update")) {
@@ -847,6 +943,17 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
             api_send(fd, ssl, 400, "missing name/type/value\n");
             return;
         }
+        strlower(name); /* a query-string fallback name was not lowercased above */
+        if (!api_name_ok(name, 1)) {
+            api_send(fd, ssl, 400, "bad name\n");
+            return;
+        }
+        if (!api_value_ok(value) || !api_value_ok(pref) || !api_digits_ok(ttls) ||
+            !api_digits_ok(pref)) {
+            api_send(fd, ssl, 400,
+                     "bad value/ttl/pref ('|' and control characters are not allowed)\n");
+            return;
+        }
         uint16_t rt = str2type(type);
         if (!rt) {
             api_send(fd, ssl, 400, "unknown type\n");
@@ -879,6 +986,10 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
         qs_get(qs, "type", type, sizeof(type));
         if (!name[0]) {
             api_send(fd, ssl, 400, "missing name\n");
+            return;
+        }
+        if (!api_name_ok(name, 1)) {
+            api_send(fd, ssl, 400, "bad name\n");
             return;
         }
         char zn[256];

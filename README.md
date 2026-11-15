@@ -453,9 +453,12 @@ Valkey `config:dashboard_password_hash`. Set a persistent `FLASK_SECRET_KEY`
   `DASHBOARD_ENABLE_EXPLORER_WRITE=1`, and even then refuses to write/delete
   secret-bearing keys. Still, bind it to localhost or front it with a
   TLS-terminating proxy; never run it with `--debug` exposed.
-- `apid`'s management API (`/config`, `/zone*`) requires a client certificate
-  verified against `config:mtls_ca_pem` (mTLS); DDNS `/update` over plain HTTP
-  is gated by `config:ddns_secret`; DoH and read-only `/list` are open.
+- `apid`'s management API (`/list`, `/config`, `/zone*`, `/reverse/*`,
+  `/enum/*`) requires a client certificate verified against
+  `config:mtls_ca_pem` (mTLS). The DDNS secret (`config:ddns_secret`) opens
+  only `/update` and `/delete`, only for hostnames inside
+  `config:ddns_allow_suffix`, and only for `ddns:*` A/AAAA records. DoH,
+  `/health` and `/metrics` are open.
 - `dnsd`'s only HTTP surface is a read-only `/health`+`/metrics` bound to
   localhost. Secrets (TSIG key, cookie secret, DNSSEC private keys) live in
   Valkey and are read by `dnsd` only.

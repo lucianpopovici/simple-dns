@@ -136,7 +136,10 @@ availability, then defense-in-depth.
 2. **apid authentication** — CSA-AUTH-003 (*High*, `/list` dumps `zone:*`/
    `ddns:*` unauthenticated) and CSA-AUTH-004 (*High*, `/zone` write accepts
    the DDNS shared secret for any type/name). Same severity class as step 1.
-   *Not yet specced — write the spec before step 2 starts.*
+   **DONE 2026-11-15** — `CLAUDE-apid-auth.md`, `make check-apid-auth` (in
+   CI). Also: DDNS suffix ACL enforced in apid via the hoisted
+   `dns_name_in_suffix` (libdnswire, shared with dnsd), name/value charset
+   checks, `qs_get` matching on `&` boundaries.
 3. **DNSSEC / response correctness** — `CLAUDE-dnssec-denial.md`, build order
    Fix 1 → 2a → 3: CSA-DNSSEC-001 (KSK key tag), CSA-PROTO-001 (NODATA vs
    NXDOMAIN), CSA-DNSSEC-002 (invalid denial proof → RFC 9824 compact denial,

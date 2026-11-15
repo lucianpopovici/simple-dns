@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -764,6 +764,98 @@ check-enum-provision: apid_debug | ossl-sanity
 	 echo "$$VAL" | grep -q "sip:info@example.com"    || { echo "  FAIL  regexp missing from written value"; exit 1; }; \
 	 test "$$R2" = "400"                               || { echo "  FAIL  '|' in replacement was not rejected"; exit 1; }; \
 	 echo "  OK  E.164 number -> reversed-digit zone:*:NAPTR:* key; defaults and '|'-in-replacement guardrail correct"
+
+# CSA-AUTH-003 / CSA-AUTH-004 (CLAUDE-apid-auth.md). /list and /zone are
+# mTLS-management only — the DDNS secret opens nothing but /update and
+# /delete, and those honour config:ddns_allow_suffix and reject names that
+# would corrupt a Valkey key (':', '|'). /zone values with '|' are rejected.
+# qs_get matches keys on '&' boundaries only ("xkey=" is not "key="). Drives
+# apid's real plain-HTTP and HTTPS listeners with curl (with and without a
+# client cert) and asserts both the HTTP codes and the resulting Valkey keys.
+# Needs Valkey + openssl + curl.
+check-apid-auth: apid_debug | ossl-sanity
+	@echo "  CHECK  apid authorisation: /list + /zone mgmt-only, DDNS suffix ACL + name/value hygiene (requires Valkey + openssl + curl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v curl >/dev/null    || { echo "  SKIP  no curl on PATH"; exit 0; };                 \
+	 D=$$(mktemp -d); HP=18063; SP=18453; EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"; \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=apid-auth-ca" >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1;   \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=mgmt-client" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 Z=example.local; S=apid-auth-test-secret;                                                      \
+	 K_KEEP=zone:$$Z:TXT:apidtest-keep.$$Z; K_DKEEP=ddns:$$Z:A:apidtest-keep2.$$Z;                    \
+	 K_Z1=zone:$$Z:TXT:apidtest-z1.$$Z; K_Z3=zone:$$Z:TXT:apidtest-z3.$$Z; K_Z4=zone:$$Z:A:apidtest-pipe.$$Z; \
+	 K_U1=ddns:$$Z:A:h1.dyn.$$Z; K_U2=ddns:$$Z:A:www.$$Z; K_U5=ddns:$$Z:A:h5.dyn.$$Z;                \
+	 K_B1="ddns:$$Z:A:a:b.dyn.$$Z"; K_B2="ddns:$$Z:A:a|b.dyn.$$Z"; K_B3="zone:$$Z:TXT:a:b.$$Z";      \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);              \
+	 SAVE_A=$$($$VC get config:mtls_ca_pem); SAVE_HP=$$($$VC get config:https_port);                \
+	 SAVE_P=$$($$VC get config:http_port); SAVE_ZN=$$($$VC get config:zone_name);                   \
+	 SAVE_DS=$$($$VC get config:ddns_secret); SAVE_SX=$$($$VC get config:ddns_allow_suffix);        \
+	 $$VC set config:tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null;                                 \
+	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                                  \
+	 $$VC set config:mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                                   \
+	 $$VC set config:https_port "$$SP" >/dev/null;                                                  \
+	 $$VC set config:http_port "$$HP" >/dev/null;                                                   \
+	 $$VC set config:zone_name "$$Z" >/dev/null;                                                    \
+	 $$VC set config:ddns_secret "$$S" >/dev/null;                                                  \
+	 $$VC set config:ddns_allow_suffix "dyn.$$Z" >/dev/null;                                         \
+	 $$VC del $$K_Z1 $$K_Z3 $$K_Z4 $$K_U1 $$K_U2 $$K_U5 "$$K_B1" "$$K_B2" "$$K_B3" >/dev/null;        \
+	 $$VC set $$K_KEEP "300|keep" >/dev/null; $$VC set $$K_DKEEP "10.1.1.1" >/dev/null;             \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug >/tmp/apid_auth.log 2>&1 & API=$$!;                   \
+	 sleep 1.5;                                                                                      \
+	 H="http://127.0.0.1:$$HP"; T="https://127.0.0.1:$$SP"; C="curl -s -o /dev/null -w %{http_code}"; \
+	 CN="$$C -k"; CM="$$C -k --cacert $$D/ca.pem --cert $$D/cli.pem --key $$D/cli.key";             \
+	 L1=$$($$C "$$H/list"); L2=$$($$C "$$H/list?key=$$S"); L3=$$($$CN "$$T/list"); L4=$$($$CM "$$T/list"); \
+	 LB=$$(curl -s "$$H/list?key=$$S" | grep -c "zone:");                                            \
+	 Z1=$$($$C -X POST "$$H/zone?key=$$S" --data "name=apidtest-z1.$$Z&type=TXT&value=x");           \
+	 Z2=$$($$C -X DELETE "$$H/zone?key=$$S&name=apidtest-keep.$$Z&type=TXT");                        \
+	 Z3=$$($$CM -X POST "$$T/zone" --data "name=apidtest-z3.$$Z&type=TXT&value=hello");              \
+	 Z4=$$($$CM -X POST "$$T/zone" --data "name=apidtest-pipe.$$Z&type=A&value=1.2.3.4%7C9.9.9.9");  \
+	 Z5=$$($$CM -X POST "$$T/zone" --data "name=a:b.$$Z&type=TXT&value=x");                          \
+	 U1=$$($$C "$$H/update?key=$$S&hostname=h1.dyn.$$Z&ip=10.9.8.7");                                \
+	 U2=$$($$C "$$H/update?key=$$S&hostname=www.$$Z&ip=6.6.6.6");                                    \
+	 U3=$$($$C "$$H/delete?key=$$S&hostname=apidtest-keep2.$$Z");                                    \
+	 U4=$$($$C "$$H/update?key=$$S&hostname=a:b.dyn.$$Z&ip=10.9.8.7");                               \
+	 U4B=$$($$C "$$H/update?key=$$S&hostname=a%7Cb.dyn.$$Z&ip=10.9.8.7");                            \
+	 U5=$$($$C "$$H/update?xkey=$$S&hostname=h5.dyn.$$Z&ip=10.9.8.7");                               \
+	 U6=$$($$C "$$H/update?key=wrong&hostname=h5.dyn.$$Z&ip=10.9.8.7");                              \
+	 kill $$API 2>/dev/null; wait $$API 2>/dev/null || true;                                        \
+	 E_KEEP=$$($$VC exists $$K_KEEP); E_DKEEP=$$($$VC exists $$K_DKEEP); E_Z1=$$($$VC exists $$K_Z1); \
+	 E_Z3=$$($$VC exists $$K_Z3); E_Z4=$$($$VC exists $$K_Z4); E_U1=$$($$VC exists $$K_U1);         \
+	 E_U2=$$($$VC exists $$K_U2); E_U5=$$($$VC exists $$K_U5);                                      \
+	 E_BAD=$$(( $$($$VC exists "$$K_B1") + $$($$VC exists "$$K_B2") + $$($$VC exists "$$K_B3") )); \
+	 $$VC del $$K_KEEP $$K_DKEEP $$K_Z1 $$K_Z3 $$K_Z4 $$K_U1 $$K_U2 $$K_U5 "$$K_B1" "$$K_B2" "$$K_B3" >/dev/null; \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_A" ]; then $$VC set config:mtls_ca_pem "$$SAVE_A" >/dev/null; else $$VC del config:mtls_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_HP" ]; then $$VC set config:https_port "$$SAVE_HP" >/dev/null; else $$VC del config:https_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_P" ]; then $$VC set config:http_port "$$SAVE_P" >/dev/null; else $$VC del config:http_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_DS" ]; then $$VC set config:ddns_secret "$$SAVE_DS" >/dev/null; else $$VC del config:ddns_secret >/dev/null; fi; \
+	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; else $$VC del config:ddns_allow_suffix >/dev/null; fi; \
+	 rm -rf $$D;                                                                                     \
+	 echo "  /list: plain=$$L1 plain+key=$$L2 https-nocert=$$L3 (000 = handshake refused) mgmt=$$L4 (records leaked to plain+key: $$LB)"; \
+	 echo "  /zone: key-POST=$$Z1 key-DELETE=$$Z2 mgmt-POST=$$Z3 mgmt-pipe=$$Z4 mgmt-colon-name=$$Z5"; \
+	 echo "  /update+/delete: in-suffix=$$U1 out-of-suffix=$$U2 delete-out=$$U3 colon=$$U4 pipe=$$U4B xkey=$$U5 wrong-key=$$U6"; \
+	 echo "  keys: keep=$$E_KEEP dkeep=$$E_DKEEP z1=$$E_Z1 z3=$$E_Z3 pipe=$$E_Z4 u1=$$E_U1 www=$$E_U2 xkey=$$E_U5 colon=$$E_BAD"; \
+	 test "$$L1" = 403 -a "$$L2" = 403 -a "$$LB" = 0 || { echo "  FAIL  /list reachable without mTLS"; exit 1; }; \
+	 case "$$L3" in 000|403) ;; *) echo "  FAIL  /list served over HTTPS without a client cert ($$L3)"; exit 1;; esac; \
+	 test "$$L4" = 200                       || { echo "  FAIL  /list not served to mgmt"; tail -5 /tmp/apid_auth.log; exit 1; }; \
+	 test "$$Z1" = 403 -a "$$E_Z1" = 0       || { echo "  FAIL  DDNS secret wrote a zone record"; exit 1; }; \
+	 test "$$Z2" = 403 -a "$$E_KEEP" = 1     || { echo "  FAIL  DDNS secret deleted a zone record"; exit 1; }; \
+	 test "$$Z3" = 201 -a "$$E_Z3" = 1       || { echo "  FAIL  mgmt /zone POST no longer works"; exit 1; }; \
+	 test "$$Z4" = 400 -a "$$E_Z4" = 0       || { echo "  FAIL  '|' in a /zone value was accepted"; exit 1; }; \
+	 test "$$Z5" = 400                       || { echo "  FAIL  ':' in a /zone name was accepted"; exit 1; }; \
+	 test "$$U1" = 200 -a "$$E_U1" = 1       || { echo "  FAIL  in-suffix DDNS update not applied"; exit 1; }; \
+	 test "$$U2" = 403 -a "$$E_U2" = 0       || { echo "  FAIL  out-of-suffix DDNS update not refused"; exit 1; }; \
+	 test "$$U3" = 403 -a "$$E_DKEEP" = 1    || { echo "  FAIL  out-of-suffix DDNS delete not refused"; exit 1; }; \
+	 test "$$U4" = 400 -a "$$U4B" = 400 -a "$$E_BAD" = 0 || { echo "  FAIL  ':'/'|' in a DDNS hostname accepted"; exit 1; }; \
+	 test "$$U5" = 403 -a "$$E_U5" = 0       || { echo "  FAIL  'xkey=' satisfied the 'key=' lookup"; exit 1; }; \
+	 test "$$U6" = 403                       || { echo "  FAIL  wrong DDNS secret accepted"; exit 1; }; \
+	 echo "  OK  /list + /zone mgmt-only; DDNS secret limited to in-suffix /update + /delete; key/value hygiene enforced"
 
 # ADR-004 regression: apid's /reverse/classless used to bump the /24 zone's
 # serial TWICE for one logical request when delegating (once for the CNAME
@@ -3096,6 +3188,7 @@ help:
 	@echo "  make check-parent-notify RFC 9859 generalized NOTIFY(CDS/CDNSKEY) to a parent on KSK rollover (needs Valkey + python3)"
 	@echo "  make check-rollover-txn  ADR-004 ZSK rollover phases are atomic transactions (needs Valkey + dig)"
 	@echo "  make check-txn-atomicity ADR-004 write+serial-bump atomicity under concurrent polling (needs Valkey + dig + nsupdate)"
+	@echo "  make check-apid-auth  apid: /list + /zone mTLS-only, DDNS suffix ACL + name/value hygiene (needs Valkey + openssl + curl)"
 	@echo "  make check-classless-atomic  ADR-004 /reverse/classless delegate branch bumps serial exactly once (needs Valkey + openssl + curl)"
 	@echo "  make check-error-reporting RFC 9567 EDNS0 Report-Channel option; omitted when unset/subdomain (needs Valkey + dig)"
 	@echo "  make check-id-server RFC 3258/4892 CHAOS id.server/hostname.bind anycast identity (needs Valkey + dig)"

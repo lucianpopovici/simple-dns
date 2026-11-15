@@ -192,6 +192,13 @@ void strlower(char *s);
  * Pass the real destination size: safe_strcpy(dst, src, sizeof(dst)). */
 void safe_strcpy(char *dst, const char *src, size_t dstsz);
 
+/* Returns 1 if `name` equals `suffix` or is a child of it on a label boundary
+ * (case-insensitive; leading dots on `suffix` ignored), else 0. An empty
+ * suffix matches every name — the config:ddns_allow_suffix "unset" default.
+ * Shared by dnsd (RFC 2136 UPDATE) and apid (/update, /delete) so the DDNS
+ * suffix ACL has exactly one implementation (CSA-AUTH-004). */
+int dns_name_in_suffix(const char *name, const char *suffix);
+
 /* ── Hex / base64 / base32hex codecs ─────────────────────────────────────── */
 
 /* Lowercase hex; out must hold 2*n+1 bytes. */

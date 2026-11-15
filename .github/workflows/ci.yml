@@ -97,6 +97,12 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-enum OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: apid authorisation — /list + /zone mTLS-only, DDNS suffix ACL (CSA-AUTH-003/004)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-apid-auth OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: RFC 2317 classless in-addr.arpa delegation (CNAME chain + RRSIG)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

@@ -195,6 +195,29 @@ int main(void) {
         check(schema_version_check("1.0.3") == SCHEMA_MALFORMED, "trailing junk is MALFORMED");
     }
 
+    /* ── DDNS suffix ACL (dns_name_in_suffix, CSA-AUTH-004) ──────────────────── */
+    {
+        check(dns_name_in_suffix("h1.dyn.example.local", "dyn.example.local") == 1,
+              "suffix: child name matches");
+        check(dns_name_in_suffix("dyn.example.local", "dyn.example.local") == 1,
+              "suffix: the suffix itself matches");
+        check(dns_name_in_suffix("H1.DYN.Example.local", "dyn.example.LOCAL") == 1,
+              "suffix: case-insensitive");
+        check(dns_name_in_suffix("h1.dyn.example.local", ".dyn.example.local") == 1,
+              "suffix: leading dot on the suffix is ignored");
+        check(dns_name_in_suffix("xdyn.example.local", "dyn.example.local") == 0,
+              "suffix: look-alike sibling (no label boundary) rejected");
+        check(dns_name_in_suffix("www.example.local", "dyn.example.local") == 0,
+              "suffix: unrelated name rejected");
+        check(dns_name_in_suffix("example.local", "dyn.example.local") == 0,
+              "suffix: parent of the suffix rejected");
+        check(dns_name_in_suffix(".dyn.example.local", "dyn.example.local") == 0,
+              "suffix: empty first label rejected");
+        check(dns_name_in_suffix("anything.test", "") == 1, "suffix: empty suffix matches all");
+        check(dns_name_in_suffix("anything.test", "...") == 1, "suffix: dots-only suffix = empty");
+        check(dns_name_in_suffix(NULL, "dyn.example.local") == 0, "suffix: NULL name rejected");
+    }
+
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;
 }

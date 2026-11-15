@@ -7425,19 +7425,7 @@ static int prereq_rrset_exists(const char *name, uint16_t rtype) {
  * (a leading dot is ignored) or sit strictly under it at a label boundary.
  * Case-insensitive. */
 static int ddns_name_allowed(const char *name) {
-    if (!g_ddns_allow_suffix[0])
-        return 1;
-    const char *suf = g_ddns_allow_suffix;
-    while (*suf == '.')
-        suf++; /* normalise ".dyn.corp.local" -> "dyn.corp.local" */
-    size_t nl = strlen(name), sl = strlen(suf);
-    if (sl == 0)
-        return 1;
-    if (nl == sl)
-        return strcasecmp(name, suf) == 0;
-    if (nl > sl + 1)
-        return name[nl - sl - 1] == '.' && strcasecmp(name + nl - sl, suf) == 0;
-    return 0;
+    return dns_name_in_suffix(name, g_ddns_allow_suffix);
 }
 
 /* discovery Gap 4: build the reverse-DNS owner name for an IPv4/IPv6 address

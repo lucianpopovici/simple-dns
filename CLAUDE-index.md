@@ -41,6 +41,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-update-auth.md` | dnsd | Audit fixes: UPDATE fails closed, TSIG time/key/algorithm, transfers require TSIG — **specced 2026-11-15** |
 | `CLAUDE-dnssec-denial.md` | dnsd (+libdnswire, resolverd check) | Audit fixes: KSK key tag, NODATA vs NXDOMAIN, RFC 9824 compact denial (promotes Add 11) — **specced 2026-11-15** |
 | `CLAUDE-tcp-transport.md` | dnsd | Audit fixes: plain TCP vs DoT per listener; stream-listener bounds — **specced 2026-11-15** |
+| `CLAUDE-apid-auth.md` | apid (+libdnswire) | Audit fixes: `/list` + `/zone` mTLS-only, DDNS suffix ACL + key/value hygiene — **done 2026-11-15** |
 | `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **specced 2026-11-15** |
 | `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
@@ -57,6 +58,8 @@ validator and resolver sees, then availability).
 |---------|-----|-----|--------|------|
 | CSA-AUTH-001 | Critical | Unsigned UPDATE refused unless allow-listed | **Done** 2026-11-15 | update-auth, Fix 1 |
 | CSA-AUTH-002 | High | TSIG time window, key name, single algorithm | **Done** 2026-11-15 | update-auth, Fix 2 |
+| CSA-AUTH-003 | High | `/list` mTLS-only | **Done** 2026-11-15 | apid-auth, Fix 1 |
+| CSA-AUTH-004 | High | `/zone` mTLS-only; DDNS suffix ACL + name/value hygiene in apid | **Done** 2026-11-15 | apid-auth, Fix 2 + 3 |
 | CSA-AUTH-005 | Medium | Transfers require TSIG when configured; strict CIDR | Strict CIDR done; transfer TSIG open | update-auth, Fix 3 |
 | CSA-DNSSEC-001 | High | KSK key tag from the KSK encoding | Specced | dnssec-denial, Fix 1 |
 | CSA-PROTO-001 | High | Name existence decides NODATA vs NXDOMAIN | Specced (2a); Conditional (2b empty non-terminals — decision D2) | dnssec-denial, Fix 2 |
@@ -66,7 +69,7 @@ validator and resolver sees, then availability).
 | CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | Specced | resolverd-cache, Fix 1 |
 | — | — | TSan build + stress target + CI job | Specced | resolverd-cache, Fix 2 |
 
-Not yet specced (open in the ledger): CSA-AUTH-003/-004/-006/-007, CSA-NET-003,
+Not yet specced (open in the ledger): CSA-AUTH-006/-007, CSA-NET-003,
 CSA-DOS-003..006, CSA-INJ-001/-002, CSA-SBX-001/-002, CSA-WEB-001/-002,
 CSA-CONC-002, CSA-MEM-001/-002, CSA-CRYPTO-001, and PERF-001..007.
 
