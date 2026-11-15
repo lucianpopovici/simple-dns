@@ -4572,7 +4572,7 @@ static int nsec3_compact_rdata(const char *qname, const uint16_t *types, int nty
     const char *zsalt = t_zone ? t_zone->nsec3_salt : g_nsec3_salt;
     int ziters = t_zone ? t_zone->nsec3_iters : g_nsec3_iters;
     const char *zname = t_zone ? t_zone->name : g_zone_name;
-    uint8_t salt[16];
+    uint8_t salt[16] = {0};
     int saltlen = 0;
     if (zsalt[0]) {
         saltlen = hex_dec(zsalt, salt, sizeof(salt));
@@ -7592,7 +7592,7 @@ static void auto_ptr_apply(const char *fqdn, const char *ipstr, uint32_t ttl, in
         resp_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
     } else {
         char ts[16];
-        snprintf(ts, sizeof(ts), "%u", DEFAULT_TTL);
+        snprintf(ts, sizeof(ts), "%u", (unsigned) DEFAULT_TTL);
         resp_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
     }
     serial_bump_txn_queue(&t, rz);

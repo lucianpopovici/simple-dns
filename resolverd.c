@@ -4926,13 +4926,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(tcp4, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, tcp_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, tcp_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
 
@@ -4941,13 +4948,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(tcp6, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, tcp_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, tcp_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
 
@@ -4956,13 +4970,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(dotfd4, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, dot_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, dot_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
 
@@ -4971,13 +4992,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(dotfd6, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, dot_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, dot_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
     }
