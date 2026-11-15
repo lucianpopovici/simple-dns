@@ -130,7 +130,9 @@ availability, then defense-in-depth.
 1. **UPDATE / TSIG authentication** — `CLAUDE-update-auth.md` Fix 1 + Fix 2.
    CSA-AUTH-001 (*Critical*, unsigned UPDATE accepted by default) and
    CSA-AUTH-002 (*High*, TSIG time/fudge/key/algorithm unchecked → replay).
-   *Specced.*
+   **DONE 2026-11-15** — `make check-update-auth` (in CI). Fix 3's strict
+   CIDR parse landed with it; Fix 3's transfer-TSIG requirement stays in
+   step 7.
 2. **apid authentication** — CSA-AUTH-003 (*High*, `/list` dumps `zone:*`/
    `ddns:*` unauthenticated) and CSA-AUTH-004 (*High*, `/zone` write accepts
    the DDNS shared secret for any type/name). Same severity class as step 1.

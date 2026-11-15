@@ -111,7 +111,18 @@
  *   config:zone:<z>:soa_ttl    Per-zone override of the above.
  *   config:zone_serial         SOA serial (auto-incremented on changes)
  *   config:tsig_key_name       TSIG key name           (default: tsig-key)
- *   config:tsig_secret_b64     TSIG HMAC-SHA256 secret (base64)
+ *   config:tsig_secret_b64     TSIG HMAC-SHA256 secret (base64). hmac-sha256
+ *                              only; key name must equal tsig_key_name; Time
+ *                              Signed must be within min(fudge, 300 s). Set
+ *                              but undecodable = every UPDATE and transfer is
+ *                              refused until fixed (fail closed).
+ *   config:update_unsigned_allow  Comma-separated IPv4 addresses/CIDRs whose
+ *                              UNSIGNED RFC 2136 UPDATEs are accepted. Default
+ *                              empty: no unsigned UPDATE is accepted; anything
+ *                              else needs a verified TSIG or SIG(0). A
+ *                              malformed entry matches nobody. Never list
+ *                              127.0.0.1 on a host running apid/doqd (their
+ *                              DoH/DoQ clients arrive from loopback).
  *   config:nsid                NSID string             (default: hostname)
  *   config:cookie_secret       16-byte hex cookie secret
  *   config:axfr_allow          Comma-separated IPs/CIDRs allowed to do AXFR
@@ -649,6 +660,10 @@ static char g_ddns_secret[256] = "changeme";
  * confines dynamic registrants to a sub-domain so static/infra names are immune
  * (CLAUDE-discovery.md Gap 3). Empty = no restriction (legacy behaviour). */
 static char g_ddns_allow_suffix[256] = "";
+/* CSA-AUTH-001: IPv4 addresses/CIDRs whose UNSIGNED RFC 2136 UPDATEs are
+ * accepted (config:update_unsigned_allow). Empty (the default) = no unsigned
+ * UPDATE is ever accepted; every other UPDATE needs a verified TSIG/SIG(0). */
+static char g_update_unsigned_allow[1024] = "";
 /* config:ddns_auto_ptr — when set, a forward A/AAAA DDNS registration also
  * maintains the matching reverse PTR lease in whichever in-addr.arpa / ip6.arpa
  * zone is configured locally (CLAUDE-discovery.md Gap 4). Off = no auto-PTR. */
@@ -847,6 +862,10 @@ static char g_zone_name[256] = "example.local";
 static char g_tsig_key_name[256] = "tsig-key";
 static uint8_t g_tsig_secret[64] = {0};
 static int g_tsig_secret_len = 0;
+/* Set while config:tsig_secret_b64 is present but does not decode: TSIG and
+ * unsigned UPDATEs and all transfers are refused (fail closed) until a later
+ * reload loads a valid secret (CSA-AUTH-001). */
+static int g_tsig_secret_invalid = 0;
 
 /* NSID */
 static char g_nsid[256] = "";
@@ -1434,42 +1453,82 @@ static int is_local_zone(const char *qname) {
     return 0;
 }
 
+/* Parse one ACL entry ("a.b.c.d" or "a.b.c.d/N", surrounding spaces allowed)
+ * into a network + mask. Returns 1 on success, 0 if the entry is malformed —
+ * a malformed entry matches nothing (fail closed). The prefix must be 1-2
+ * decimal digits in 0..32: atoi() used to turn "10.0.0.0/x" into /0, i.e.
+ * "match every address" (CSA-AUTH-005). Modifies tok. */
+static int ip_list_entry_parse(char *tok, struct in_addr *net, uint32_t *mask) {
+    while (*tok == ' ' || *tok == '\t')
+        tok++;
+    size_t tl = strlen(tok);
+    while (tl > 0 && (tok[tl - 1] == ' ' || tok[tl - 1] == '\t'))
+        tok[--tl] = 0;
+    int bits = 32;
+    char *slash = strchr(tok, '/');
+    if (slash) {
+        const char *ps = slash + 1;
+        int nd = 0;
+        bits = 0;
+        while (*ps >= '0' && *ps <= '9' && nd < 3) {
+            bits = bits * 10 + (*ps - '0');
+            ps++;
+            nd++;
+        }
+        if (nd == 0 || *ps != 0 || bits > 32)
+            return 0;
+        *slash = 0;
+    }
+    if (inet_pton(AF_INET, tok, net) != 1)
+        return 0;
+    if (bits == 0)
+        *mask = 0u;
+    else if (bits == 32)
+        *mask = 0xFFFFFFFFu;
+    else
+        *mask = htonl(~((1u << (32 - bits)) - 1));
+    return 1;
+}
+
 /* Returns 1 if IPv4 address `ip` matches any entry in a comma-separated list of
- * IPs and /8-/32 CIDRs (e.g. "10.0.0.0/8, 192.168.1.5"). Shared by the AXFR ACL
- * and the forwarder client ACL (CLAUDE-forwarder.md Gap 1). An empty/blank list
- * matches nothing (fail closed). */
+ * IPs and /0-/32 CIDRs (e.g. "10.0.0.0/8, 192.168.1.5"). Shared by the AXFR ACL,
+ * the forwarder client ACL (CLAUDE-forwarder.md Gap 1) and the unsigned-UPDATE
+ * allow-list. An empty/blank list matches nothing, and so does a malformed
+ * entry (fail closed). */
 static int ip_list_allowed(const char *list, const struct in_addr *ip) {
-    if (!list || !list[0])
+    if (!list || !list[0] || !ip)
         return 0;
     char allow[1024];
     safe_strcpy(allow, list, sizeof(allow));
     char *sp = NULL;
     for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
-        while (*tok == ' ')
-            tok++;
-        char *slash = strchr(tok, '/');
-        if (slash) {
-            int bits = atoi(slash + 1);
-            *slash = 0;
-            if (bits < 0)
-                bits = 0;
-            if (bits > 32)
-                bits = 32;
-            struct in_addr net;
-            if (inet_pton(AF_INET, tok, &net) != 1)
-                continue;
-            uint32_t mask = bits ? htonl(~((1u << (32 - bits)) - 1)) : 0u;
-            if (bits == 32)
-                mask = 0xFFFFFFFFu;
-            if ((ip->s_addr & mask) == (net.s_addr & mask))
-                return 1;
-        } else {
-            struct in_addr a;
-            if (inet_pton(AF_INET, tok, &a) == 1 && a.s_addr == ip->s_addr)
-                return 1;
-        }
+        struct in_addr net;
+        uint32_t mask = 0;
+        if (!ip_list_entry_parse(tok, &net, &mask))
+            continue;
+        if ((ip->s_addr & mask) == (net.s_addr & mask))
+            return 1;
     }
     return 0;
+}
+
+/* Log (once per config load) every malformed entry of an ACL list, so an
+ * operator sees why an entry never matches. */
+static void ip_list_check(const char *key, const char *list) {
+    if (!list || !list[0])
+        return;
+    char allow[1024];
+    safe_strcpy(allow, list, sizeof(allow));
+    char *sp = NULL;
+    for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        char ent[128];
+        safe_strcpy(ent, tok, sizeof(ent));
+        struct in_addr net;
+        uint32_t mask = 0;
+        if (!ip_list_entry_parse(tok, &net, &mask))
+            dns_log(LOG_ERR, "[CONFIG] %s: malformed entry '%s' ignored (matches nothing)\n", key,
+                    ent);
+    }
 }
 
 /* ==========================================================================
@@ -2297,6 +2356,28 @@ static void config_load_from_valkey(void) {
     G("ddns_secret", g_ddns_secret);
     g_ddns_allow_suffix[0] = 0;
     G("ddns_allow_suffix", g_ddns_allow_suffix);
+    /* CSA-AUTH-001: unsigned-UPDATE allow-list (empty = closed). Read into a
+     * scratch buffer and only rewritten when it changed: config reloads run on
+     * every SOA serial bump, and a reset-then-refill would briefly empty the
+     * list under concurrent UPDATE workers (and re-log the warnings below). */
+    {
+        char ua[sizeof(g_update_unsigned_allow)] = "";
+        G("update_unsigned_allow", ua);
+        if (strcmp(ua, g_update_unsigned_allow) != 0) {
+            safe_strcpy(g_update_unsigned_allow, ua, sizeof(g_update_unsigned_allow));
+            ip_list_check("config:update_unsigned_allow", ua);
+            /* DoH (apid) and DoQ (doqd) relay to dnsd over loopback, so their
+             * clients arrive as 127.0.0.1 (CSA-AUTH-006): listing loopback
+             * opens unsigned UPDATE to every DoH/DoQ client on this host. */
+            struct in_addr lo;
+            lo.s_addr = htonl(INADDR_LOOPBACK);
+            if (ip_list_allowed(ua, &lo))
+                dns_log(LOG_WARNING,
+                        "[CONFIG] config:update_unsigned_allow matches 127.0.0.1 — any DoH/DoQ "
+                        "client relayed through apid/doqd on this host can send unsigned "
+                        "UPDATEs\n");
+        }
+    }
     g_ddns_auto_ptr = 0;
     GI("ddns_auto_ptr", g_ddns_auto_ptr);
     GI("ddns_sweep_secs", g_ddns_sweep_secs);
@@ -2398,6 +2479,14 @@ static void config_load_from_valkey(void) {
     g_error_report_agent[0] = 0;
     G("error_report_agent", g_error_report_agent);
     G("axfr_allow", g_axfr_allow);
+    {
+        /* Log malformed ACL entries once per change, not on every reload. */
+        static char s_axfr_checked[sizeof(g_axfr_allow)];
+        if (strcmp(s_axfr_checked, g_axfr_allow) != 0) {
+            safe_strcpy(s_axfr_checked, g_axfr_allow, sizeof(s_axfr_checked));
+            ip_list_check("config:axfr_allow", g_axfr_allow);
+        }
+    }
     G("notify_targets", g_notify_targets);
     G("zone_name", g_zone_name);
     /* Query log */
@@ -2481,9 +2570,37 @@ static void config_load_from_valkey(void) {
     /* RFC 6116 ENUM apex (config:enum_apex, e.g. "e164.arpa", empty = not set). */
     g_enum_apex[0] = 0;
     G("enum_apex", g_enum_apex);
-    /* TSIG secret (base64) */
-    if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0])
-        g_tsig_secret_len = b64std_dec(val, g_tsig_secret, sizeof(g_tsig_secret));
+    /* TSIG secret (base64). Decoded into a scratch buffer first so a reload
+     * never exposes a half-written secret. An absent key disables TSIG; a key
+     * that is present but does not decode must not silently disable
+     * authentication (CSA-AUTH-001): flag it so UPDATE and transfers refuse
+     * everything until it is fixed. */
+    {
+        uint8_t sec[sizeof(g_tsig_secret)];
+        int slen = 0;
+        int invalid = 0;
+        if (vk_get("config:tsig_secret_b64", val, sizeof(val)) && val[0]) {
+            slen = b64std_dec(val, sec, sizeof(sec));
+            if (slen <= 0) {
+                slen = 0;
+                invalid = 1;
+                if (!g_tsig_secret_invalid)
+                    dns_log(LOG_ERR, "[CONFIG] config:tsig_secret_b64 is set but is not valid "
+                                     "base64 — refusing all UPDATEs and zone transfers until "
+                                     "fixed\n");
+            }
+        }
+        if (invalid)
+            g_tsig_secret_invalid = 1;
+        if (slen > 0 &&
+            (slen != g_tsig_secret_len || memcmp(g_tsig_secret, sec, (size_t) slen) != 0))
+            memcpy(g_tsig_secret, sec, (size_t) slen);
+        if (g_tsig_secret_len != slen)
+            g_tsig_secret_len = slen;
+        if (!invalid)
+            g_tsig_secret_invalid = 0;
+        OPENSSL_cleanse(sec, sizeof(sec));
+    }
     /* Cookie secret (32 hex chars = 16 bytes) */
     if (vk_get("config:cookie_secret", val, sizeof(val)) && val[0])
         hex_dec(val, g_cookie_secret, 16);
@@ -4652,43 +4769,74 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
     return NULL;
 }
 
-/* Verify TSIG MAC.  Returns 1 if valid (or TSIG absent+no secret), 0 if invalid. */
-/* Map TSIG algorithm wire name to OpenSSL digest name.
- * RFC 8945 §6: mandatory algorithms are hmac-sha256 and hmac-sha512.
- * We also accept hmac-sha1 and hmac-sha384 for interoperability. */
-static const char *tsig_alg_to_digest(const char *alg_name) {
-    if (!alg_name)
-        return "SHA256";
-    if (strcasestr(alg_name, "sha512"))
-        return "SHA512";
-    if (strcasestr(alg_name, "sha384"))
-        return "SHA384";
-    if (strcasestr(alg_name, "sha256"))
-        return "SHA256";
-    if (strcasestr(alg_name, "sha1"))
-        return "SHA1";
-    if (strcasestr(alg_name, "md5"))
-        return "MD5";
-    return "SHA256"; /* safe default */
+/* TSIG verification results (RFC 8945 §5.2). TSIG_OK is the only "accepted"
+ * value; every caller compares against it explicitly. The negative values are
+ * the RFC 8945 TSIG error codes, negated. */
+enum { TSIG_OK = 1, TSIG_ABSENT = 0, TSIG_BADSIG = -16, TSIG_BADKEY = -17, TSIG_BADTIME = -18 };
+
+#define TSIG_ERR_BADSIG 16
+#define TSIG_ERR_BADKEY 17
+#define TSIG_ERR_BADTIME 18
+/* The one algorithm this server speaks (RFC 8945 §6: mandatory to implement).
+ * No negotiation: anything else is BADKEY. */
+#define TSIG_ALG_NAME "hmac-sha256."
+#define TSIG_ALG_WIRE "\x0bhmac-sha256\x00"
+#define TSIG_ALG_WIRE_LEN 13
+#define TSIG_DIGEST "SHA256"
+
+/* Copy a wire-derived (attacker-controlled) name for logging, replacing any
+ * non-printable byte so it cannot forge log lines. */
+static const char *tsig_log_name(char *dst, size_t dsz, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < dsz; i++)
+        dst[i] = (src[i] >= 0x20 && src[i] < 0x7f) ? src[i] : '?';
+    dst[i] = 0;
+    return dst;
 }
 
-static int tsig_verify(const uint8_t *pkt, int plen) {
+/* Key names compare case-insensitively, ignoring one trailing dot. */
+static int tsig_name_eq(const char *a, const char *b) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    if (la > 0 && a[la - 1] == '.')
+        la--;
+    if (lb > 0 && b[lb - 1] == '.')
+        lb--;
+    return la > 0 && la == lb && strncasecmp(a, b, la) == 0;
+}
+
+/* Verify the TSIG on a request (RFC 8945 §5.2), in the RFC's order: key name,
+ * algorithm, MAC, and only then the time window — an unauthenticated time
+ * value must not influence the outcome. The accepted fudge is the request's,
+ * capped at TSIG_FUDGE so a client cannot widen its own window.
+ * On TSIG_OK or TSIG_BADTIME the request MAC is stashed in g_tsig_req_mac for
+ * the (signed) response; BADSIG/BADKEY responses are unsigned. If `out` is
+ * non-NULL it receives the parsed TSIG RR (zeroed when absent). */
+static int tsig_verify(const uint8_t *pkt, int plen, tsig_rr_t *out) {
     g_tsig_req_mac_len = 0; /* clear any stale state */
-    if (g_tsig_secret_len == 0)
-        return 1; /* TSIG not configured: accept all */
     tsig_rr_t t;
     memset(&t, 0, sizeof(t));
+    if (out)
+        memset(out, 0, sizeof(*out));
+    if (g_tsig_secret_len <= 0)
+        return TSIG_ABSENT;
     const uint8_t *tsig_rr = tsig_find(pkt, plen, &t);
     if (!tsig_rr)
-        return 0; /* required but absent */
+        return TSIG_ABSENT;
+    if (out)
+        *out = t;
+    if (!tsig_name_eq(t.key_name, g_tsig_key_name))
+        return TSIG_BADKEY;
+    if (strcmp(t.alg_name, TSIG_ALG_NAME) != 0)
+        return TSIG_BADKEY;
     /* Build signing data: (pkt minus TSIG) + TSIG variables */
     int pkt_minus_tsig_len = (int) (tsig_rr - pkt);
     if (pkt_minus_tsig_len <= 0)
-        return 0;
+        return TSIG_BADSIG;
     /* Patch arcount -= 1 */
     uint8_t *tmp = malloc((size_t) pkt_minus_tsig_len);
     if (!tmp)
-        return 0;
+        return TSIG_BADSIG;
     memcpy(tmp, pkt, pkt_minus_tsig_len);
     uint16_t ar = ((uint16_t) tmp[10] << 8) | tmp[11];
     ar--;
@@ -4719,10 +4867,8 @@ static int tsig_verify(const uint8_t *pkt, int plen) {
     vars[vp++] = 0;
     vars[vp++] = 0;
     vars[vp++] = 0;
-    /* alg name: hmac-sha256. */
-    const char *alg_wire = "\x0bhmac-sha256\x00";
-    memcpy(vars + vp, alg_wire, 13);
-    vp += 13;
+    memcpy(vars + vp, TSIG_ALG_WIRE, TSIG_ALG_WIRE_LEN);
+    vp += TSIG_ALG_WIRE_LEN;
     /* time signed */
     vars[vp++] = (uint8_t) (t.time_high >> 8);
     vars[vp++] = (uint8_t) (t.time_high & 0xFF);
@@ -4736,47 +4882,54 @@ static int tsig_verify(const uint8_t *pkt, int plen) {
     vars[vp++] = t.error & 0xFF;
     vars[vp++] = 0;
     vars[vp++] = 0; /* other len = 0 */
-    /* Compute HMAC */
-    unsigned int mlen = 0;
+    /* Compute HMAC — any OpenSSL failure fails closed (BADSIG). */
     uint8_t mac[64];
+    size_t ml2 = 0;
+    int crypto_ok = 0;
     EVP_MAC *evp_mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
-    if (!evp_mac) {
-        free(tmp);
-        return 0;
+    EVP_MAC_CTX *mctx = evp_mac ? EVP_MAC_CTX_new(evp_mac) : NULL;
+    if (mctx) {
+        OSSL_PARAM params[2];
+        params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *) TSIG_DIGEST, 0);
+        params[1] = OSSL_PARAM_construct_end();
+        crypto_ok = EVP_MAC_init(mctx, g_tsig_secret, g_tsig_secret_len, params) == 1 &&
+                    EVP_MAC_update(mctx, tmp, pkt_minus_tsig_len) == 1 &&
+                    EVP_MAC_update(mctx, vars, vp) == 1 &&
+                    EVP_MAC_final(mctx, mac, &ml2, sizeof(mac)) == 1;
     }
-    EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(evp_mac);
-    if (!mctx) {
-        EVP_MAC_free(evp_mac);
-        free(tmp);
-        return 0;
-    }
-    OSSL_PARAM params[2];
-    const char *digest = tsig_alg_to_digest(t.alg_name);
-    params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *) digest, 0);
-    params[1] = OSSL_PARAM_construct_end();
-    EVP_MAC_init(mctx, g_tsig_secret, g_tsig_secret_len, params);
-    EVP_MAC_update(mctx, tmp, pkt_minus_tsig_len);
-    EVP_MAC_update(mctx, vars, vp);
     free(tmp);
-    size_t ml2 = 64;
-    EVP_MAC_final(mctx, mac, &ml2, sizeof(mac));
-    mlen = (unsigned) ml2;
     EVP_MAC_CTX_free(mctx);
     EVP_MAC_free(evp_mac);
-    int ok = (mlen == (unsigned) t.mac_len) && (CRYPTO_memcmp(mac, t.mac, mlen) == 0);
-    if (ok && t.mac_len > 0 && t.mac_len <= (int) sizeof(g_tsig_req_mac)) {
+    if (!crypto_ok)
+        return TSIG_BADSIG;
+    /* Full-length MAC only — a truncated MAC is never accepted. */
+    if (ml2 != (size_t) t.mac_len || CRYPTO_memcmp(mac, t.mac, ml2) != 0)
+        return TSIG_BADSIG;
+    /* MAC is valid: a BADTIME response is signed with it too. */
+    if (t.mac_len > 0 && t.mac_len <= (int) sizeof(g_tsig_req_mac)) {
         memcpy(g_tsig_req_mac, t.mac, t.mac_len);
         g_tsig_req_mac_len = t.mac_len;
     }
-    return ok;
+    uint64_t signed_at = ((uint64_t) t.time_high << 32) | t.time_low;
+    uint64_t fudge = t.fudge < TSIG_FUDGE ? t.fudge : TSIG_FUDGE;
+    uint64_t now = (uint64_t) time(NULL);
+    uint64_t skew = now > signed_at ? now - signed_at : signed_at - now;
+    if (skew > fudge)
+        return TSIG_BADTIME;
+    return TSIG_OK;
 }
 
-/* Append TSIG RR to a response */
-static int tsig_append(uint8_t *buf, int off, int blen, uint16_t orig_id, uint16_t error) {
-    if (g_tsig_secret_len == 0)
+/* Append a TSIG RR signed with the server key. `time_signed` goes in the
+ * Time Signed field; `other`/`other_len` (0 or 6 octets) in Other Data. The
+ * MAC covers the stashed request MAC (if any), the message and the TSIG
+ * variables (RFC 8945 §5.3, §4.3.3). */
+static int tsig_append_ex(uint8_t *buf, int off, int blen, uint16_t orig_id, uint16_t error,
+                          uint64_t time_signed, const uint8_t *other, int other_len) {
+    if (g_tsig_secret_len <= 0)
+        return off;
+    if (other_len < 0 || other_len > 6)
         return off;
     /* Build TSIG variables for signing */
-    time_t now = time(NULL);
     uint8_t vars[512];
     int vp = 0;
     /* key name wire */
@@ -4800,46 +4953,53 @@ static int tsig_append(uint8_t *buf, int off, int blen, uint16_t orig_id, uint16
     vars[vp++] = 0;
     vars[vp++] = 0;
     vars[vp++] = 0; /* ttl=0 */
-    const char *alg_wire = "\x0bhmac-sha256\x00";
-    memcpy(vars + vp, alg_wire, 13);
-    vp += 13;
-    vars[vp++] = 0;
-    vars[vp++] = 0; /* time high */
-    vars[vp++] = (uint8_t) ((now >> 24) & 0xFF);
-    vars[vp++] = (uint8_t) ((now >> 16) & 0xFF);
-    vars[vp++] = (uint8_t) ((now >> 8) & 0xFF);
-    vars[vp++] = (uint8_t) (now & 0xFF);
+    memcpy(vars + vp, TSIG_ALG_WIRE, TSIG_ALG_WIRE_LEN);
+    vp += TSIG_ALG_WIRE_LEN;
+    vars[vp++] = (uint8_t) ((time_signed >> 40) & 0xFF);
+    vars[vp++] = (uint8_t) ((time_signed >> 32) & 0xFF);
+    vars[vp++] = (uint8_t) ((time_signed >> 24) & 0xFF);
+    vars[vp++] = (uint8_t) ((time_signed >> 16) & 0xFF);
+    vars[vp++] = (uint8_t) ((time_signed >> 8) & 0xFF);
+    vars[vp++] = (uint8_t) (time_signed & 0xFF);
     vars[vp++] = TSIG_FUDGE >> 8;
     vars[vp++] = TSIG_FUDGE & 0xFF;
     vars[vp++] = error >> 8;
     vars[vp++] = error & 0xFF;
-    vars[vp++] = 0;
-    vars[vp++] = 0;
+    vars[vp++] = (uint8_t) (other_len >> 8);
+    vars[vp++] = (uint8_t) (other_len & 0xFF);
+    if (other_len > 0) {
+        memcpy(vars + vp, other, (size_t) other_len);
+        vp += other_len;
+    }
     unsigned int mlen = 64;
     uint8_t mac[64];
     {
         EVP_MAC *evp_mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
-        EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(evp_mac);
-        OSSL_PARAM params[2];
-        const char *digest = tsig_alg_to_digest(g_tsig_key_name);
-        params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *) digest, 0);
-        params[1] = OSSL_PARAM_construct_end();
-        EVP_MAC_init(mctx, g_tsig_secret, g_tsig_secret_len, params);
-        /* RFC 8945 §5.4.2: response MACs prepend the request's MAC (length-prefixed). */
-        if (g_tsig_req_mac_len > 0) {
-            uint8_t pre[2] = {(uint8_t) (g_tsig_req_mac_len >> 8),
-                              (uint8_t) (g_tsig_req_mac_len & 0xFF)};
-            EVP_MAC_update(mctx, pre, 2);
-            EVP_MAC_update(mctx, g_tsig_req_mac, g_tsig_req_mac_len);
+        EVP_MAC_CTX *mctx = evp_mac ? EVP_MAC_CTX_new(evp_mac) : NULL;
+        int crypto_ok = 0;
+        size_t ml2 = 0;
+        if (mctx) {
+            OSSL_PARAM params[2];
+            params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *) TSIG_DIGEST, 0);
+            params[1] = OSSL_PARAM_construct_end();
+            crypto_ok = EVP_MAC_init(mctx, g_tsig_secret, g_tsig_secret_len, params) == 1;
+            /* RFC 8945 §5.4.2: response MACs prepend the request's MAC (length-prefixed). */
+            if (crypto_ok && g_tsig_req_mac_len > 0) {
+                uint8_t pre[2] = {(uint8_t) (g_tsig_req_mac_len >> 8),
+                                  (uint8_t) (g_tsig_req_mac_len & 0xFF)};
+                crypto_ok = EVP_MAC_update(mctx, pre, 2) == 1 &&
+                            EVP_MAC_update(mctx, g_tsig_req_mac, g_tsig_req_mac_len) == 1;
+            }
+            crypto_ok = crypto_ok && EVP_MAC_update(mctx, buf, off) == 1 &&
+                        EVP_MAC_update(mctx, vars, vp) == 1 &&
+                        EVP_MAC_final(mctx, mac, &ml2, sizeof(mac)) == 1;
         }
-        EVP_MAC_update(mctx, buf, off);
-        EVP_MAC_update(mctx, vars, vp);
-        size_t ml2 = 64;
-        EVP_MAC_final(mctx, mac, &ml2, sizeof(mac));
-        mlen = (unsigned) ml2;
         EVP_MAC_CTX_free(mctx);
         EVP_MAC_free(evp_mac);
         g_tsig_req_mac_len = 0; /* consumed — clear so a stray future call won't reuse it */
+        if (!crypto_ok)
+            return off; /* fail closed: no (wrong) signature rather than a bogus one */
+        mlen = (unsigned) ml2;
     }
     /* Encode TSIG RR */
     if (off + 200 > blen)
@@ -4870,14 +5030,14 @@ static int tsig_append(uint8_t *buf, int off, int blen, uint16_t orig_id, uint16
     /* RDATA: alg name + time + fudge + mac len + mac + orig_id + error + other */
     uint8_t rdata[200];
     int rp = 0;
-    memcpy(rdata + rp, alg_wire, 13);
-    rp += 13;
-    rdata[rp++] = 0;
-    rdata[rp++] = 0; /* time high */
-    rdata[rp++] = (uint8_t) ((now >> 24) & 0xFF);
-    rdata[rp++] = (uint8_t) ((now >> 16) & 0xFF);
-    rdata[rp++] = (uint8_t) ((now >> 8) & 0xFF);
-    rdata[rp++] = (uint8_t) (now & 0xFF);
+    memcpy(rdata + rp, TSIG_ALG_WIRE, TSIG_ALG_WIRE_LEN);
+    rp += TSIG_ALG_WIRE_LEN;
+    rdata[rp++] = (uint8_t) ((time_signed >> 40) & 0xFF);
+    rdata[rp++] = (uint8_t) ((time_signed >> 32) & 0xFF);
+    rdata[rp++] = (uint8_t) ((time_signed >> 24) & 0xFF);
+    rdata[rp++] = (uint8_t) ((time_signed >> 16) & 0xFF);
+    rdata[rp++] = (uint8_t) ((time_signed >> 8) & 0xFF);
+    rdata[rp++] = (uint8_t) (time_signed & 0xFF);
     rdata[rp++] = TSIG_FUDGE >> 8;
     rdata[rp++] = TSIG_FUDGE & 0xFF;
     rdata[rp++] = (uint8_t) (mlen >> 8);
@@ -4888,13 +5048,90 @@ static int tsig_append(uint8_t *buf, int off, int blen, uint16_t orig_id, uint16
     rdata[rp++] = orig_id & 0xFF;
     rdata[rp++] = error >> 8;
     rdata[rp++] = error & 0xFF;
-    rdata[rp++] = 0;
-    rdata[rp++] = 0; /* other len=0 */
+    rdata[rp++] = (uint8_t) (other_len >> 8);
+    rdata[rp++] = (uint8_t) (other_len & 0xFF);
+    if (other_len > 0) {
+        memcpy(rdata + rp, other, (size_t) other_len);
+        rp += other_len;
+    }
     buf[off++] = 0;
     buf[off++] = (uint8_t) rp;
     memcpy(buf + off, rdata, rp);
     off += rp;
     /* Increment arcount */
+    dns_hdr_t *rh = (dns_hdr_t *) buf;
+    rh->arcount = htons(ntohs(rh->arcount) + 1);
+    return off;
+}
+
+/* Append TSIG RR to a response (success path, or an error the request MAC
+ * verified for): Time Signed = now, no Other Data. */
+static int tsig_append(uint8_t *buf, int off, int blen, uint16_t orig_id, uint16_t error) {
+    return tsig_append_ex(buf, off, blen, orig_id, error, (uint64_t) time(NULL), NULL, 0);
+}
+
+/* RFC 8945 §5.2.3 BADTIME response: signed with the request MAC (already
+ * stashed by tsig_verify), Time Signed = the client's time, Other Data = the
+ * server's current time (48-bit). */
+static int tsig_append_badtime(uint8_t *buf, int off, int blen, uint16_t orig_id,
+                               const tsig_rr_t *req) {
+    uint64_t now = (uint64_t) time(NULL);
+    uint8_t other[6];
+    other[0] = (uint8_t) ((now >> 40) & 0xFF);
+    other[1] = (uint8_t) ((now >> 32) & 0xFF);
+    other[2] = (uint8_t) ((now >> 24) & 0xFF);
+    other[3] = (uint8_t) ((now >> 16) & 0xFF);
+    other[4] = (uint8_t) ((now >> 8) & 0xFF);
+    other[5] = (uint8_t) (now & 0xFF);
+    uint64_t client_time = ((uint64_t) req->time_high << 32) | req->time_low;
+    return tsig_append_ex(buf, off, blen, orig_id, TSIG_ERR_BADTIME, client_time, other, 6);
+}
+
+/* RFC 8945 §5.3.2 BADSIG/BADKEY response: an UNSIGNED TSIG RR (MAC size 0)
+ * echoing the request's key name and algorithm, carrying the error code.
+ * Nothing secret-derived goes into it. */
+static int tsig_append_error_unsigned(uint8_t *buf, int off, int blen, uint16_t orig_id,
+                                      const tsig_rr_t *req, uint16_t error) {
+    uint8_t owner[256];
+    uint8_t alg[256];
+    int ol = name_to_wire(req->key_name[0] ? req->key_name : ".", owner, sizeof(owner));
+    int al = name_to_wire(req->alg_name[0] ? req->alg_name : TSIG_ALG_NAME, alg, sizeof(alg));
+    if (ol <= 0 || al <= 0)
+        return off;
+    int rdlen = al + 6 + 2 + 2 + 2 + 2 + 2; /* alg, time, fudge, maclen=0, id, error, otherlen */
+    if (off + ol + 10 + rdlen > blen)
+        return off;
+    uint64_t now = (uint64_t) time(NULL);
+    memcpy(buf + off, owner, (size_t) ol);
+    off += ol;
+    buf[off++] = 0;
+    buf[off++] = 250; /* type TSIG */
+    buf[off++] = 0;
+    buf[off++] = 255; /* class ANY */
+    buf[off++] = 0;
+    buf[off++] = 0;
+    buf[off++] = 0;
+    buf[off++] = 0; /* ttl=0 */
+    buf[off++] = (uint8_t) (rdlen >> 8);
+    buf[off++] = (uint8_t) (rdlen & 0xFF);
+    memcpy(buf + off, alg, (size_t) al);
+    off += al;
+    buf[off++] = (uint8_t) ((now >> 40) & 0xFF);
+    buf[off++] = (uint8_t) ((now >> 32) & 0xFF);
+    buf[off++] = (uint8_t) ((now >> 24) & 0xFF);
+    buf[off++] = (uint8_t) ((now >> 16) & 0xFF);
+    buf[off++] = (uint8_t) ((now >> 8) & 0xFF);
+    buf[off++] = (uint8_t) (now & 0xFF);
+    buf[off++] = TSIG_FUDGE >> 8;
+    buf[off++] = TSIG_FUDGE & 0xFF;
+    buf[off++] = 0;
+    buf[off++] = 0; /* MAC size 0 */
+    buf[off++] = (uint8_t) (orig_id >> 8);
+    buf[off++] = (uint8_t) (orig_id & 0xFF);
+    buf[off++] = (uint8_t) (error >> 8);
+    buf[off++] = (uint8_t) (error & 0xFF);
+    buf[off++] = 0;
+    buf[off++] = 0; /* other len = 0 */
     dns_hdr_t *rh = (dns_hdr_t *) buf;
     rh->arcount = htons(ntohs(rh->arcount) + 1);
     return off;
@@ -4915,8 +5152,7 @@ static EVP_MAC_CTX *tsig_hmac_new(EVP_MAC **em_out) {
         return NULL;
     }
     OSSL_PARAM p[2];
-    const char *dg = tsig_alg_to_digest(g_tsig_key_name);
-    p[0] = OSSL_PARAM_construct_utf8_string("digest", (char *) dg, 0);
+    p[0] = OSSL_PARAM_construct_utf8_string("digest", (char *) TSIG_DIGEST, 0);
     p[1] = OSSL_PARAM_construct_end();
     if (EVP_MAC_init(ctx, g_tsig_secret, g_tsig_secret_len, p) != 1) {
         EVP_MAC_CTX_free(ctx);
@@ -8044,7 +8280,7 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
 /* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
-static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
+static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const struct in_addr *cip) {
     if (plen < 12)
         return -1;
     const dns_hdr_t *h = (const dns_hdr_t *) pkt;
@@ -8061,13 +8297,69 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
         return 12;
     }
-    /* Authentication: RFC 2931 SIG(0) if the message carries one (verified
-     * below once the zone is known — trusted keys are per-zone), otherwise
-     * the existing global-secret TSIG gate, unchanged. */
+    /* Authentication (CSA-AUTH-001 — fail closed). An UPDATE is applied only
+     * if it carries:
+     *   - a SIG(0) — verified below once the zone is known (trusted keys are
+     *     per-zone); an SRP registration is routed to its own handler first;
+     *   - or a TSIG that verifies against the configured key (RFC 8945);
+     *   - or nothing, from an address in config:update_unsigned_allow (empty
+     *     by default).
+     * Everything else is refused. Header RCODE is NOTAUTH for TSIG failures:
+     * BADSIG/BADKEY/BADTIME (16-18) do not fit the 4-bit header RCODE and
+     * travel in the TSIG RR's error field instead. */
     int has_sig0 = sig0_present(pkt, plen);
-    if (!has_sig0 && g_tsig_secret_len > 0 && !tsig_verify(pkt, plen)) {
-        rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_BADSIG);
-        return 12;
+    int tsig_ok = 0;
+    if (!has_sig0) {
+        tsig_rr_t treq;
+        memset(&treq, 0, sizeof(treq));
+        int has_tsig = tsig_find(pkt, plen, &treq) != NULL;
+        uint16_t qid = ntohs(h->id);
+        if (g_tsig_secret_invalid) {
+            dns_log(LOG_ERR, "[UPDATE] REFUSED — config:tsig_secret_b64 is invalid; no UPDATE "
+                             "is accepted until it is fixed\n");
+            rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
+            return 12;
+        }
+        if (has_tsig) {
+            if (g_tsig_secret_len <= 0) {
+                dns_log(LOG_WARNING, "[UPDATE] NOTAUTH — TSIG-signed UPDATE but no TSIG key is "
+                                     "configured (config:tsig_secret_b64)\n");
+                rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
+                return tsig_append_error_unsigned(resp, 12, BUF_SIZE, qid, &treq, TSIG_ERR_BADKEY);
+            }
+            int trc = tsig_verify(pkt, plen, &treq);
+            if (trc != TSIG_OK) {
+                char lk[128];
+                char la[64];
+                tsig_log_name(lk, sizeof(lk), treq.key_name);
+                tsig_log_name(la, sizeof(la), treq.alg_name);
+                rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_NOTAUTH);
+                if (trc == TSIG_BADTIME) {
+                    dns_log(LOG_WARNING, "[UPDATE] NOTAUTH — TSIG BADTIME (key '%s')\n", lk);
+                    return tsig_append_badtime(resp, 12, BUF_SIZE, qid, &treq);
+                }
+                uint16_t terr = (trc == TSIG_BADKEY) ? TSIG_ERR_BADKEY : TSIG_ERR_BADSIG;
+                dns_log(LOG_WARNING, "[UPDATE] NOTAUTH — TSIG %s (key '%s', alg '%s')\n",
+                        terr == TSIG_ERR_BADKEY ? "BADKEY" : "BADSIG", lk, la);
+                return tsig_append_error_unsigned(resp, 12, BUF_SIZE, qid, &treq, terr);
+            }
+            tsig_ok = 1;
+        } else {
+            /* Every IPv6 client currently arrives as 0.0.0.0 (CSA-NET-003):
+             * never let a 0.0.0.0/0 entry turn that into "allow all IPv6". */
+            int allowed = cip && cip->s_addr != 0 && ip_list_allowed(g_update_unsigned_allow, cip);
+            if (!allowed) {
+                char cs[INET_ADDRSTRLEN] = "?";
+                if (cip)
+                    inet_ntop(AF_INET, cip, cs, sizeof(cs));
+                dns_log(LOG_WARNING,
+                        "[UPDATE] REFUSED unsigned update from %s (no TSIG/SIG(0); "
+                        "client not in config:update_unsigned_allow)\n",
+                        cs);
+                rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
+                return 12;
+            }
+        }
     }
     int off = 12;
     t_zone = NULL;
@@ -8147,7 +8439,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
         if (prereq_fail) {
             rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | prereq_fail);
             {
-                int o2 = (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
+                int o2 = (tsig_ok ? tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0) : 12);
                 return o2;
             }
         }
@@ -8172,7 +8464,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
             dns_log(LOG_WARNING, "[DDNS] REFUSED update of %s — outside ddns_allow_suffix [%s]\n",
                     un, g_ddns_allow_suffix);
             rh->flags = htons(DNS_QR | DNS_OPCODE_UPDATE | DNS_RCODE_REFUSED);
-            return (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
+            return (tsig_ok ? tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0) : 12);
         }
         char k[768];
         if (uc == DNS_CLASS_IN && rdlen > 0) {
@@ -8344,7 +8636,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp) {
     }
     /* Append TSIG to response */
     {
-        int off2 = (has_sig0 ? 12 : tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0));
+        int off2 = (tsig_ok ? tsig_append(resp, 12, BUF_SIZE, ntohs(h->id), 0) : 12);
         return off2;
     }
 formerr:
@@ -9569,6 +9861,20 @@ static int xfr_tsig_verify_msg(const uint8_t *msg, int mlen, uint8_t *prior, int
     EVP_MAC_free(em);
     int ok = ((int) ml == t.mac_len) && CRYPTO_memcmp(mac, t.mac, ml) == 0;
     if (ok) {
+        /* CSA-AUTH-002: after (never before) the MAC check, the signed time
+         * must be within the fudge window — capped at TSIG_FUDGE so the master
+         * cannot widen it — or a captured transfer could be replayed forever. */
+        uint64_t signed_at = ((uint64_t) t.time_high << 32) | t.time_low;
+        uint64_t fudge = t.fudge < TSIG_FUDGE ? t.fudge : TSIG_FUDGE;
+        uint64_t now = (uint64_t) time(NULL);
+        uint64_t skew = now > signed_at ? now - signed_at : signed_at - now;
+        if (skew > fudge) {
+            dns_log(LOG_WARNING, "[XFR] TSIG BADTIME on transfer message (skew %llus)\n",
+                    (unsigned long long) skew);
+            ok = 0;
+        }
+    }
+    if (ok) {
         memcpy(prior, t.mac, (size_t) t.mac_len);
         *prior_len = t.mac_len;
     }
@@ -9959,7 +10265,7 @@ static void *axfr_thread(void *arg) {
      * to t_zone.  Refuse if we are not authoritative for it. */
     t_zone = zone_for_qname(c.zone);
     const char *allow = (t_zone && t_zone->axfr_allow[0]) ? t_zone->axfr_allow : g_axfr_allow;
-    if (!t_zone || !axfr_ip_allowed(&c.addr.sin_addr, allow)) {
+    if (!t_zone || g_tsig_secret_invalid || !axfr_ip_allowed(&c.addr.sin_addr, allow)) {
         dns_log(LOG_ERR, "[AXFR] REFUSED %s for %s\n", cip, c.zone);
         /* Send REFUSED response */
         uint8_t ref[12] = {0};
@@ -11040,7 +11346,7 @@ static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len
     if (op == DNS_OPCODE_QUERY)
         return build_query_resp(pkt, plen, resp, resp_len, is_tcp, cip);
     if (op == DNS_OPCODE_UPDATE)
-        return handle_update(pkt, plen, resp);
+        return handle_update(pkt, plen, resp, cip);
     if (op == DNS_OPCODE_NOTIFY) {
         /* Accept and acknowledge NOTIFY. On a secondary, a NOTIFY from the
          * configured master triggers an immediate refresh (RFC 1996 §4.7,
@@ -11191,7 +11497,9 @@ static void *dot_thread(void *arg) {
                 }
             }
             ac->query_id = ntohs(((dns_hdr_t *) pkt)->id);
-            tsig_verify(pkt, ml); /* stash request MAC into g_tsig_req_mac for response signing */
+            /* Result intentionally not enforced yet (CSA-AUTH-005, roadmap Phase 0b
+             * step 7); called to stash a verified request MAC for response signing. */
+            (void) tsig_verify(pkt, ml, NULL);
             axfr_thread(ac);
             return NULL;
         }
@@ -11966,8 +12274,11 @@ int main(int argc, char **argv) {
             b_ksk);
     dns_log(LOG_INFO, "║  DNSSEC KSK Ed25519 tag                     %-6u (signs DNSKEY)   ║\n",
             b_ksk_ed);
-    dns_log(LOG_INFO, "║  TSIG                                       %s                ║\n",
-            g_tsig_secret_len ? "enabled" : "disabled");
+    dns_log(LOG_INFO, "║  TSIG                                       %-14s  ║\n",
+            g_tsig_secret_invalid ? "INVALID SECRET"
+                                  : (g_tsig_secret_len ? "enabled" : "disabled"));
+    dns_log(LOG_INFO, "║  Unsigned UPDATE allowed from               %-20.20s  ║\n",
+            g_update_unsigned_allow[0] ? g_update_unsigned_allow : "(nobody)");
     dns_log(LOG_INFO, "║  RRL                                        %s (rate=%d/win=%ds)  ║\n",
             g_rrl_enabled ? "enabled" : "disabled", g_rrl_rate, g_rrl_window);
     dns_log(LOG_INFO, "║  Forwarding (out-of-zone)                   %s               ║\n",

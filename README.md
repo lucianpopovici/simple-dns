@@ -222,7 +222,8 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:soa_*` | Default SOA `mname`, `rname`, `refresh`, `retry`, `expire`, `minimum` for the primary zone. |
 | `config:soa_ttl` | TTL the SOA RR is served with (default: unset → `soa_minimum`). Negative-response NSEC/NSEC3 + authority SOA are capped at `min(soa_ttl, soa_minimum)` per RFC 9077. Per-zone override: `config:zone:<zone>:soa_ttl`. |
 | `config:zone_serial` | Primary zone SOA serial; other zones use `config:zone:<zone>:serial`. |
-| `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. |
+| `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. Only `hmac-sha256` is accepted; the key name must match; Time Signed must be within ±300 s (RFC 8945 BADTIME otherwise). A secret that is set but is not valid base64 makes dnsd refuse every UPDATE and transfer. |
+| `config:update_unsigned_allow` | Comma-separated IPv4 addresses/CIDRs allowed to send **unsigned** UPDATEs. Default empty: an UPDATE must carry a valid TSIG or SIG(0), otherwise it is REFUSED. Malformed entries (e.g. `10.0.0.0/x`) match nobody. Do not list `127.0.0.1` on a host running `apid`/`doqd` — DoH/DoQ clients reach dnsd from loopback. |
 | `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
 | `config:notify_targets` | Comma-separated `IP:port` recipients for NOTIFY on zone change. |
@@ -300,6 +301,9 @@ layout, run `tools/migrate-multizone.sh` (dry-run by default; re-run with
 ## Operating notes
 
 ### Sending a dynamic update
+
+UPDATEs must be TSIG-signed (or SIG(0)-signed). Unsigned UPDATEs are refused
+unless the client address is listed in `config:update_unsigned_allow`.
 
 ```bash
 KEY_B64=$(valkey-cli GET config:tsig_secret_b64)

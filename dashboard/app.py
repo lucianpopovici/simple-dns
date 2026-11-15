@@ -136,6 +136,7 @@ CONFIG_SCHEMA = [
     # ── Security ────────────────────────────────────────────────────────
     ("tsig_key_name",   "TSIG Key Name",     "text",     "tsig-key",             "security","TSIG key identifier"),
     ("tsig_secret_b64", "TSIG Secret (b64)", "password", "",                     "security","Base64 HMAC secret"),
+    ("update_unsigned_allow", "Unsigned UPDATE Allow", "text", "",              "security","IPs/CIDRs allowed to send UNSIGNED UPDATEs (empty = none)"),
     ("cookie_secret",   "Cookie Secret",     "password", "16-byte hex",          "security","32 hex chars = 16 bytes"),
     ("nsid",            "NSID",              "text",     "ns1",                  "security","Name Server Identifier string"),
     # ── RRL ─────────────────────────────────────────────────────────────

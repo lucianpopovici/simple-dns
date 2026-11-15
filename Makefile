@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -1568,6 +1568,76 @@ check-role: $(BIN_DEBUG)
 	 test "$$PRI_DK" -ge 1 || { echo "  FAIL  primary did not generate DNSKEY (control)"; exit 1; }; \
 	 echo "  OK  secondary refuses UPDATE + serves unsigned (no keygen); primary signs"
 
+# CSA-AUTH-001 / CSA-AUTH-002 (CLAUDE-update-auth.md Fix 1 + Fix 2). UPDATE
+# fails closed: unsigned is REFUSED unless the client is in
+# config:update_unsigned_allow (empty by default; a malformed CIDR matches
+# nobody); a TSIG must name the configured key, use hmac-sha256, carry a valid
+# MAC and be within the fudge window (checked after the MAC, fudge capped at
+# 300s); a secret that is set but does not decode refuses everything. The
+# final record scan proves no refused UPDATE wrote anything. Needs Valkey +
+# python3 with dnspython.
+check-update-auth: $(BIN_DEBUG)
+	@echo "  CHECK  UPDATE authentication: fail-closed default + TSIG time/key/alg (Valkey + python3-dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.tsig' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
+	 Z=example.local; C="python3 tests/update_auth_client.py";                         \
+	 B64=$$(printf '0123456789abcdef0123456789abcdef' | base64);                       \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_KN=$$($$VC get config:tsig_key_name); \
+	 SAVE_UA=$$($$VC get config:update_unsigned_allow); SAVE_SX=$$($$VC get config:ddns_allow_suffix); \
+	 $$VC del config:tsig_secret_b64 config:update_unsigned_allow config:ddns_allow_suffix >/dev/null; \
+	 $$VC set config:tsig_key_name tsig-key >/dev/null;                                \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:TXT:ua*"); do $$VC del "$$k" >/dev/null; done; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_uauth.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 R1=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua1);                                   \
+	 $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null; sleep 1;              \
+	 R2=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua2);                                   \
+	 $$VC set config:update_unsigned_allow 127.0.0.1/x >/dev/null; sleep 1;            \
+	 R2B=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua2b);                                 \
+	 $$VC del config:update_unsigned_allow >/dev/null;                                 \
+	 $$VC set config:tsig_secret_b64 "$$B64" >/dev/null; sleep 1;                      \
+	 R3=$$($$C signed 127.0.0.1 $(TPORT) $$Z ua3);                                     \
+	 R4=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua4);                                   \
+	 T2=$$($$C signed-shift 127.0.0.1 $(TPORT) $$Z ua-t2 -31536000);                   \
+	 T3=$$($$C signed-shift 127.0.0.1 $(TPORT) $$Z ua-t3 600);                         \
+	 T4=$$($$C signed-key 127.0.0.1 $(TPORT) $$Z ua-t4 other-key);                     \
+	 T5=$$($$C signed-alg 127.0.0.1 $(TPORT) $$Z ua-t5 hmac-sha1);                     \
+	 T6=$$($$C signed-alg 127.0.0.1 $(TPORT) $$Z ua-t6 hmac-md5);                      \
+	 T7=$$($$C signed-fudge 127.0.0.1 $(TPORT) $$Z ua-t7 -3600 65535);                 \
+	 T8=$$($$C signed-flip 127.0.0.1 $(TPORT) $$Z ua-t8);                              \
+	 $$VC set config:tsig_secret_b64 '!!!not-base64!!!' >/dev/null; sleep 1;           \
+	 R5=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua5);                                   \
+	 R6=$$($$C signed 127.0.0.1 $(TPORT) $$Z ua6);                                     \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 GOT=$$($$VC --scan --pattern "zone:$$Z:TXT:ua*" | sed "s/^zone:$$Z:TXT://" | sort | tr '\n' ' '); \
+	 BADLOG=$$(grep -c "config:tsig_secret_b64 is set but is not valid base64" /tmp/dnsd_uauth.log); \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:TXT:ua*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; else $$VC del config:tsig_secret_b64 >/dev/null; fi; \
+	 if [ -n "$$SAVE_KN" ]; then $$VC set config:tsig_key_name "$$SAVE_KN" >/dev/null; else $$VC del config:tsig_key_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
+	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; fi; \
+	 echo "  default-unsigned=[$$R1] allow-listed=[$$R2] malformed-cidr=[$$R2B] signed=[$$R3] unsigned+secret=[$$R4]"; \
+	 echo "  -1y=[$$T2] +10m=[$$T3] wrong-key=[$$T4] sha1=[$$T5] md5=[$$T6] fudge65535-1h=[$$T7] flipped-mac=[$$T8]"; \
+	 echo "  invalid-secret: unsigned=[$$R5] signed=[$$R6] log=$$BADLOG | written: $$GOT"; \
+	 test "$$R1" = "RCODE 5" || { echo "  FAIL  unsigned UPDATE not REFUSED by default"; exit 1; }; \
+	 test "$$R2" = "RCODE 0" || { echo "  FAIL  allow-listed unsigned UPDATE not accepted"; tail -20 /tmp/dnsd_uauth.log; exit 1; }; \
+	 test "$$R2B" = "RCODE 5" || { echo "  FAIL  malformed CIDR '127.0.0.1/x' matched (fail-open prefix parse)"; exit 1; }; \
+	 test "$$R3" = "RCODE 0 TSIGOK" || { echo "  FAIL  correctly signed UPDATE not accepted with a verifying response TSIG"; exit 1; }; \
+	 test "$$R4" = "RCODE 5" || { echo "  FAIL  unsigned UPDATE from a non-listed client accepted while TSIG is configured"; exit 1; }; \
+	 test "$$T2" = "RCODE 9 TSIG 18" || { echo "  FAIL  year-old TSIG not BADTIME"; exit 1; }; \
+	 test "$$T3" = "RCODE 9 TSIG 18" || { echo "  FAIL  future (+10m) TSIG not BADTIME"; exit 1; }; \
+	 test "$$T4" = "RCODE 9 TSIG 17" || { echo "  FAIL  wrong key name not BADKEY"; exit 1; }; \
+	 test "$$T5" = "RCODE 9 TSIG 17" || { echo "  FAIL  hmac-sha1 not BADKEY"; exit 1; }; \
+	 test "$$T6" = "RCODE 9 TSIG 17" || { echo "  FAIL  hmac-md5 not BADKEY"; exit 1; }; \
+	 test "$$T7" = "RCODE 9 TSIG 18" || { echo "  FAIL  client fudge 65535 widened the time window"; exit 1; }; \
+	 test "$$T8" = "RCODE 9 TSIG 16" || { echo "  FAIL  flipped MAC byte not BADSIG"; exit 1; }; \
+	 test "$$R5" = "RCODE 5" || { echo "  FAIL  undecodable secret: unsigned UPDATE not refused"; exit 1; }; \
+	 test "$$R6" = "RCODE 5" || { echo "  FAIL  undecodable secret: signed UPDATE not refused"; exit 1; }; \
+	 test "$$BADLOG" -ge 1 || { echo "  FAIL  undecodable secret not logged at LOG_ERR"; exit 1; }; \
+	 test "$$GOT" = "ua2.example.local ua3.example.local " || { echo "  FAIL  unexpected records written: [$$GOT]"; exit 1; }; \
+	 echo "  OK  unsigned refused by default; allow-list + strict CIDR; TSIG key/alg/MAC/time enforced; bad secret fails closed"
+
 # RFC 2931 SIG(0) transaction signatures — the SRP prerequisite (CLAUDE-mdnsd.md
 # Add 3). An asymmetric alternative to TSIG: dnsd verifies a self-signed UPDATE
 # against a KEY RR it already trusts (zone:<zone>:KEY:<signer>). nsupdate can't
@@ -1701,7 +1771,7 @@ check-txn-atomicity: $(BIN_DEBUG)
 	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
 	 Z=example.local; FQDN=txnatomic.$$Z; D=$$(mktemp -d);                             \
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64);                                       \
-	 $$VC del config:tsig_secret_b64 >/dev/null;                                        \
+	 $$VC del config:tsig_secret_b64 >/dev/null; SAVE_UA=$$($$VC get config:update_unsigned_allow); $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                                        \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_txnatomic.log 2>&1 & DNS=$$!; \
 	 sleep 1.5;                                                                         \
 	 S0=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
@@ -1717,7 +1787,7 @@ check-txn-atomicity: $(BIN_DEBUG)
 	 wait $$POLLPIDS;                                                                    \
 	 kill $$DNS 2>/dev/null || true;                                                     \
 	 $$VC del ddns:$$Z:TXT:$$FQDN zone:$$Z:TXT:$$FQDN >/dev/null 2>&1;                   \
-	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 TOTAL=$$(cat $$D/poll_*.out | wc -l);                                               \
 	 VIOLATIONS=$$(awk -F'|' -v s0="$$S0" '$$1 > s0 && $$2 == "" {c++} END{print c+0}' $$D/poll_*.out); \
 	 rm -rf $$D;                                                                          \
@@ -1733,7 +1803,7 @@ check-ddns-acl: $(BIN_DEBUG)
 	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
 	 Z=example.local; FQDN=web1.dyn.$$Z;                                               \
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_SX=$$($$VC get config:ddns_allow_suffix); \
-	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 $$VC del config:tsig_secret_b64 >/dev/null; SAVE_UA=$$($$VC get config:update_unsigned_allow); $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                                       \
 	 $$VC set config:ddns_allow_suffix ".dyn.$$Z" >/dev/null;                          \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ddns.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
@@ -1748,7 +1818,7 @@ check-ddns-acl: $(BIN_DEBUG)
 	 S3=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del config:ddns_allow_suffix ddns:$$Z:A:$$FQDN >/dev/null;                   \
-	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; fi; \
 	 echo "  in-suffix A=[$$IN]  out-of-suffix refused=$$OUT www=[$$WWW]  serial S1=$$S1 S2=$$S2 S3=$$S3"; \
 	 test "$$IN" = "10.0.0.1" || { echo "  FAIL  in-suffix UPDATE not applied"; exit 1; }; \
@@ -1857,7 +1927,7 @@ check-ptr: $(BIN_DEBUG)
 	 REV6=8.b.d.0.1.0.0.2.ip6.arpa; HOST6=ptr6.dyn.$$FWD; IP6=2001:db8::5;             \
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_AP=$$($$VC get config:ddns_auto_ptr); \
 	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
-	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 $$VC del config:tsig_secret_b64 >/dev/null; SAVE_UA=$$($$VC get config:update_unsigned_allow); $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                                       \
 	 $$VC set config:ddns_auto_ptr 1 >/dev/null;                                       \
 	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
 	 $$VC set zone_table:$$REV "ns1.$$REV|hostmaster.$$REV|10|3600|900|604800|300|127.0.0.1|" >/dev/null; \
@@ -1878,7 +1948,7 @@ check-ptr: $(BIN_DEBUG)
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$REV zone_table:$$REV6 zone:$$REV:PTR:$$STATREV ddns:$$REV:PTR:$$REVNAME ddns:$$FWD:A:$$HOST ddns:$$FWD:AAAA:$$HOST6 config:zone:$$REV:serial config:zone:$$REV6:serial >/dev/null; \
 	 for k in $$($$VC --scan --pattern "dnssec:$$REV:*") $$($$VC --scan --pattern "dnssec:$$REV6:*") $$($$VC --scan --pattern "ddns:$$REV6:*") $$($$VC --scan --pattern "ixfr:$$REV:*") $$($$VC --scan --pattern "ixfr:$$REV6:*"); do $$VC del "$$k" >/dev/null; done; \
-	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 if [ -n "$$SAVE_AP" ]; then $$VC set config:ddns_auto_ptr "$$SAVE_AP" >/dev/null; else $$VC del config:ddns_auto_ptr >/dev/null; fi; \
 	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
 	 echo "  static=[$$STAT] auto=[$$AUTO] auto6=[$$AUTO6] gone=[$$GONE]"; echo "$$AX" | sed 's/^/    AXFR PTR /'; \
@@ -3042,6 +3112,7 @@ help:
 	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"
+	@echo "  make check-update-auth  UPDATE auth: unsigned refused by default, TSIG time/key/alg (Valkey + python3-dnspython)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make check-resolverd-cache resolverd Valkey cache-load regression (needs Valkey + dig)"
 	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"

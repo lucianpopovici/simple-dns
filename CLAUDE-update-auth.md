@@ -15,9 +15,38 @@ not part of the dnsd "Add" sequence.
 
 | Fix | Finding | Status |
 |----:|---------|--------|
-| 1 | CSA-AUTH-001 — unsigned UPDATE accepted by default | Specced |
-| 2 | CSA-AUTH-002 — TSIG time window, key name and algorithm not enforced | Specced |
-| 3 | CSA-AUTH-005 — transfers do not require TSIG; CIDR parser fails open | Complementary |
+| 1 | CSA-AUTH-001 — unsigned UPDATE accepted by default | **Done** 2026-11-15 (`make check-update-auth`) |
+| 2 | CSA-AUTH-002 — TSIG time window, key name and algorithm not enforced | **Done** 2026-11-15 (`make check-update-auth`) |
+| 3 | CSA-AUTH-005 — transfers do not require TSIG; CIDR parser fails open | Strict CIDR **done** (pulled forward — the new allow-list reuses `ip_list_allowed`); transfer TSIG requirement still open |
+
+## Implementation notes (2026-11-15) — where the code differs from the text below
+
+- **Invalid secret scope.** `g_tsig_secret_invalid` refuses TSIG-signed and
+  unsigned UPDATEs and every AXFR/IXFR. SIG(0) and SRP UPDATEs are not
+  affected: they do not use the TSIG secret, so refusing them adds nothing.
+- **Error responses.** BADKEY/BADSIG answers carry an unsigned TSIG RR (MAC
+  size 0, request key name + algorithm echoed, error 16/17) per RFC 8945
+  §5.3.2, so clients see the TSIG error, not just NOTAUTH. BADTIME answers
+  are signed with the request MAC, Time Signed = client time, Other Data =
+  server time (verified independently against dnspython's digest).
+- **Responses to allow-listed unsigned UPDATEs are no longer TSIG-signed**
+  (they were whenever a secret was configured; RFC 8945 signs only responses
+  to signed requests).
+- **Secret reload.** Removing `config:tsig_secret_b64` now disables TSIG on
+  the next reload (it used to keep the stale secret). The secret and the
+  allow-list are only rewritten when they change: reloads run on every SOA
+  serial bump, and reset-then-refill briefly emptied the allow-list under
+  concurrent workers (it made `check-ptr` flaky during development).
+- **Log hygiene.** Wire-derived key/algorithm names are logged with
+  non-printables replaced; the loopback and malformed-entry warnings are
+  logged once per change, not per reload.
+- **Loopback warning.** `config:update_unsigned_allow` matching 127.0.0.1
+  logs a warning: DoH/DoQ clients reach dnsd from loopback (CSA-AUTH-006).
+- **Make targets.** Only `check-ptr`, `check-ddns-acl` and
+  `check-txn-atomicity` depend on an unsigned UPDATE being applied; they now
+  set `config:update_unsigned_allow 127.0.0.1` for the run and restore it.
+  The other targets in the list below needed no change.
+- **CI** installs `python3-dnspython` for `check-update-auth`.
 
 ---
 

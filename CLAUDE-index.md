@@ -55,9 +55,9 @@ validator and resolver sees, then availability).
 
 | Finding | Sev | Fix | Status | File |
 |---------|-----|-----|--------|------|
-| CSA-AUTH-001 | Critical | Unsigned UPDATE refused unless allow-listed | Specced | update-auth, Fix 1 |
-| CSA-AUTH-002 | High | TSIG time window, key name, single algorithm | Specced | update-auth, Fix 2 |
-| CSA-AUTH-005 | Medium | Transfers require TSIG when configured; strict CIDR | Complementary | update-auth, Fix 3 |
+| CSA-AUTH-001 | Critical | Unsigned UPDATE refused unless allow-listed | **Done** 2026-11-15 | update-auth, Fix 1 |
+| CSA-AUTH-002 | High | TSIG time window, key name, single algorithm | **Done** 2026-11-15 | update-auth, Fix 2 |
+| CSA-AUTH-005 | Medium | Transfers require TSIG when configured; strict CIDR | Strict CIDR done; transfer TSIG open | update-auth, Fix 3 |
 | CSA-DNSSEC-001 | High | KSK key tag from the KSK encoding | Specced | dnssec-denial, Fix 1 |
 | CSA-PROTO-001 | High | Name existence decides NODATA vs NXDOMAIN | Specced (2a); Conditional (2b empty non-terminals — decision D2) | dnssec-denial, Fix 2 |
 | CSA-DNSSEC-002 | High | RFC 9824 compact denial (= dnsd Add 11) | Specced — decision D1 (NSEC-only vs NSEC3 variant) | dnssec-denial, Fix 3 |
