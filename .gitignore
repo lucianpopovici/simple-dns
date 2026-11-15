@@ -55,3 +55,5 @@ bench/out/dns_server_*
 resolverd_tsan
 dns_server_tsan
 tests/udp_stress
+tests/test_mdnsd_lookup
+tests/test_sandbox_caps

@@ -176,7 +176,8 @@ availability, then defense-in-depth.
    (raw qname in JSON log), CSA-SBX-001 (seccomp without TSYNC; threads start
    before the filter — `libsandbox`, all three callers), CSA-SBX-002 (apid/
    certd/mdnsd/doqd unsandboxed — extend `libsandbox`), CSA-WEB-001 (dashboard
-   CSRF). *Not yet specced, except AUTH-005.*
+   CSRF). **DONE 2026-11-15** — `CLAUDE-medium-fixes.md` (7a–7h), one
+   `make check-*` per item, all in CI.
 8. **Low** — CSA-MEM-001 (certd EST-202 double free — small, do early if
    convenient), CSA-MEM-002 (OOB reads: TSIG alg-name, IXFR authority scan,
    forwarder RRL truncation), CSA-CONC-002 (config reload races workers),

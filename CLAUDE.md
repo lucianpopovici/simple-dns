@@ -81,7 +81,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
 | `object_graph.{c,h}` | Vendored **objectdb** engine (pinned — see file headers; fix upstream, never here) backing `resolverd`'s optional embedded cache tier (ADR-008 pilot, `RESOLVERD_CACHE_BACKEND=objectdb`). |
-| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd`, `resolverd`, and `eppd`. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
+| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd`, `resolverd`, `eppd`, and (CSA-SBX-002) `apid`, `certd`, `mdnsd`, `doqd` — the last four seccomp `audit` by default. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
 | `dns_server.c` | **`dnsd`** — the authoritative core (~3600 lines). ACME/EST extracted in Step 2, mDNS in Step 3, the HTTP/DoH/portal surface in Step 4. Now: DNS/DoT + localhost `/health`+`/metrics` only. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |

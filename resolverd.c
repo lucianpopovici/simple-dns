@@ -275,6 +275,11 @@ typedef struct {
     /* Size of the UDP worker pool (RESOLVERD_UDP_WORKERS); resolves queries
      * off the select() loop so one slow miss cannot stall other clients. */
     int udp_workers;
+    /* CSA-AUTH-007: who may query (RESOLVERD_ALLOW / --allow); default
+     * loopback + RFC 1918 + RFC 4193 — never an open resolver by default. */
+    char client_allow[512];
+    int dnssec_enabled; /* --no-dnssec clears it: no validation at all */
+    int mdns_enabled;   /* --no-mdns clears it: .local goes to the upstream */
     /* Persistent cache tier backend (ADR-008 pilot). `valkey` keeps the
      * network cache tier; `objectdb` embeds a WAL-backed object store
      * (removes resolverd's Valkey dependency from the cache path);
@@ -4079,7 +4084,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
     STAT_INC(g_stat_queries);
 
     /* -1. mDNS for .local names (RFC 6762) — try multicast before unicast */
-    if (is_local_name(qname)) {
+    if (g_cfg.mdns_enabled && is_local_name(qname)) {
         uint8_t mresp[DNS_BUF * 2];
         int mrlen = mdns_query(qname, qtype, mresp, sizeof(mresp));
         if (mrlen > 0) {
@@ -4197,7 +4202,9 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
     /* 4. Parse response + DNSSEC validation */
     ce = parse_response_to_entry(resp, rlen, qname, qtype);
     if (ce) {
-        if (ce->negative) {
+        if (!g_cfg.dnssec_enabled) {
+            ce->dnssec_status = (int) DNSSEC_UNCHECKED; /* --no-dnssec */
+        } else if (ce->negative) {
             nsec_proof_t proofs[MAX_NEG_PROOFS];
             int proof_n = 0;
             ce->dnssec_status =
@@ -4580,9 +4587,49 @@ static int build_dns_response(const uint8_t *pkt, int plen, int is_tcp, uint8_t 
 /* =========================================================================
  * Proxy mode: listen on local UDP, forward, respond from cache
  * ======================================================================= */
+/* CSA-AUTH-007: REFUSED (header + question) for a client outside
+ * g_cfg.client_allow. Returns the response length, or -1 to stay silent. */
+static int acl_refused_response(const uint8_t *pkt, int plen, uint8_t *resp, int cap) {
+    if (plen < 12 || (pkt[2] & 0x80))
+        return -1; /* not a query */
+    char qn[256];
+    int qa = name_from_wire(pkt, plen, 12, qn, sizeof(qn));
+    int qend = (qa > 0 && qa + 4 <= plen && get16(pkt, 4) == 1) ? qa + 4 : 12;
+    if (qend > cap)
+        return -1;
+    memcpy(resp, pkt, (size_t) qend);
+    resp[2] = (uint8_t) (0x80 | (pkt[2] & 0x79)); /* QR, keep opcode + RD */
+    resp[3] = 5;                                  /* RA=0, RCODE REFUSED */
+    put16(resp, 4, qend > 12 ? 1 : 0);
+    put16(resp, 6, 0);
+    put16(resp, 8, 0);
+    put16(resp, 10, 0);
+    return qend;
+}
+
+static int client_allowed_sa(const struct sockaddr *sa) {
+    client_addr_t c;
+    client_from_sockaddr(&c, sa);
+    return acl_allows(g_cfg.client_allow, &c);
+}
+
+static int client_allowed_fd(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *) &ss, &sl) != 0)
+        return 0;
+    return client_allowed_sa((struct sockaddr *) &ss);
+}
+
 static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct sockaddr *src,
                          socklen_t srclen) {
     uint8_t resp[DNS_BUF * 2];
+    if (!client_allowed_sa(src)) {
+        int r = acl_refused_response(pkt, plen, resp, (int) sizeof(resp));
+        if (r > 0)
+            sendto(srv_fd, resp, r, 0, src, srclen);
+        return;
+    }
     int off = build_dns_response(pkt, plen, 0 /* is_tcp */, resp, (int) sizeof(resp));
     if (off < 0)
         return;
@@ -4700,7 +4747,9 @@ static void proxy_handle_tcp(int cfd) {
     if (pkt[2] & 0x80)
         goto done; /* ignore responses */
     uint8_t resp[DNS_BUF * 2];
-    int off = build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp));
+    int off = client_allowed_fd(cfd)
+                  ? build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp))
+                  : acl_refused_response(pkt, qlen, resp, (int) sizeof(resp));
     if (off < 0)
         goto done;
     /* Send with 2-byte length prefix */
@@ -4762,7 +4811,9 @@ static void proxy_handle_dot(int cfd) {
         if (pkt[2] & 0x80)
             goto done; /* ignore responses */
         uint8_t resp[DNS_BUF * 2];
-        int off = build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp));
+        int off = client_allowed_fd(cfd)
+                      ? build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp))
+                      : acl_refused_response(pkt, qlen, resp, (int) sizeof(resp));
         if (off < 0)
             goto done;
         uint8_t hdr[2] = {(uint8_t) (off >> 8), (uint8_t) (off & 0xFF)};
@@ -4914,8 +4965,11 @@ static void *proxy_run(void *arg) {
      * user, so checkpoint's rename/reopen keeps working confined. */
     pog_cache_open();
 
-    /* Workers start after the sandbox so they inherit the dropped
-     * privileges (and, with a TSYNC seccomp filter, the syscall policy). */
+    /* Every worker — UDP pool, async cache writer, prefetcher — starts after
+     * the sandbox so it inherits the dropped privileges, the confined
+     * filesystem and the syscall filter (CSA-SBX-001). */
+    vkw_start();
+    prefetch_start();
     udp_workers_start(g_cfg.udp_workers);
 
     uint8_t buf[DNS_BUF];
@@ -5216,6 +5270,12 @@ static void config_load_env(void) {
     }
     safe_strcpy(g_cfg.dns64_exclude, getenv_or("DNS64_EXCLUDE", ""), sizeof(g_cfg.dns64_exclude));
     g_cfg.udp_workers = atoi(getenv_or("RESOLVERD_UDP_WORKERS", "8"));
+    safe_strcpy(g_cfg.client_allow,
+                getenv_or("RESOLVERD_ALLOW", "127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, "
+                                             "192.168.0.0/16, fc00::/7"),
+                sizeof(g_cfg.client_allow));
+    g_cfg.dnssec_enabled = 1;
+    g_cfg.mdns_enabled = 1;
     if (g_cfg.udp_workers < 1)
         g_cfg.udp_workers = 1;
     if (g_cfg.udp_workers > UDP_WORKERS_MAX)
@@ -5586,6 +5646,8 @@ static void usage(const char *prog) {
            "  --no-tcp-proxy             Disable TCP proxy listener\n"
            "  --no-dnssec                Disable DNSSEC validation\n"
            "  --no-mdns                  Disable mDNS for .local names\n"
+           "  --allow <list>             Clients allowed to query (IPv4/IPv6 prefixes)\n"
+           "                             [RESOLVERD_ALLOW; default loopback+RFC1918+fc00::/7]\n"
            "  --conf <path>              Load config from file\n"
            "\nExamples:\n"
            "  %s example.local A\n"
@@ -5809,8 +5871,12 @@ int main(int argc, char **argv) {
             /* alternative: --route suffix=host:port[:proto] */
             if (!parse_server_arg(argv[++i]))
                 fprintf(stderr, "[warn] --route: bad format: %s\n", argv[i]);
-        } else if (!strcmp(argv[i], "--no-dnssec")) { /* future flag */
-        } else if (!strcmp(argv[i], "--no-mdns")) {   /* future flag */
+        } else if (!strcmp(argv[i], "--no-dnssec")) {
+            g_cfg.dnssec_enabled = 0; /* CSA-AUTH-007: was parsed and ignored */
+        } else if (!strcmp(argv[i], "--no-mdns")) {
+            g_cfg.mdns_enabled = 0;
+        } else if (!strcmp(argv[i], "--allow") && i + 1 < argc) {
+            safe_strcpy(g_cfg.client_allow, argv[++i], sizeof(g_cfg.client_allow));
         } else if (!strcmp(argv[i], "--conf") && i + 1 < argc) {
             config_load_file(argv[++i]);
         } else if (argv[i][0] != '-' && !query_name[0]) {
@@ -5820,8 +5886,9 @@ int main(int argc, char **argv) {
         }
     }
     cache_init();
-    vkw_start();      /* async Valkey cache writer */
-    prefetch_start(); /* single prefetch worker (replaces thread-per-job) */
+    /* vkw/prefetch threads start where they are needed: the one-shot query
+     * below, or proxy_run AFTER apply_sandbox (CSA-SBX-001 — a thread started
+     * before the sandbox kept the original mount namespace in mountns mode). */
     if (g_cfg.proto == PROTO_DOT || g_cfg.proto == PROTO_DOH)
         dot_init();
     dot_server_init(); /* no-op unless DOT_SERVER_ENABLED=1; must run before apply_sandbox() */
@@ -5846,6 +5913,8 @@ int main(int argc, char **argv) {
     }
     if (query_name[0]) {
         /* One-shot query */
+        vkw_start();      /* async Valkey cache writer */
+        prefetch_start(); /* single prefetch worker */
         uint16_t qtype = str2type(query_type_s);
         if (!qtype) {
             fprintf(stderr, "Unknown type: %s\n", query_type_s);

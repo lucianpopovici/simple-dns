@@ -44,6 +44,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-apid-auth.md` | apid (+libdnswire) | Audit fixes: `/list` + `/zone` mTLS-only, DDNS suffix ACL + key/value hygiene — **done 2026-11-15** |
 | `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **done 2026-11-15** |
 | `CLAUDE-client-identity.md` | dnsd, apid, doqd (+libdnswire) | Audit fixes: real v4/v6 client, PROXY v2 from front-ends, RRL keying — **done 2026-11-15** |
+| `CLAUDE-medium-fixes.md` | dnsd, resolverd, apid, mdnsd, certd, doqd, dashboard, libsandbox | Audit fixes: Phase 0b step 7, the remaining Medium findings — **done 2026-11-15** |
 | `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
 
@@ -61,7 +62,14 @@ validator and resolver sees, then availability).
 | CSA-AUTH-002 | High | TSIG time window, key name, single algorithm | **Done** 2026-11-15 | update-auth, Fix 2 |
 | CSA-AUTH-003 | High | `/list` mTLS-only | **Done** 2026-11-15 | apid-auth, Fix 1 |
 | CSA-AUTH-004 | High | `/zone` mTLS-only; DDNS suffix ACL + name/value hygiene in apid | **Done** 2026-11-15 | apid-auth, Fix 2 + 3 |
-| CSA-AUTH-005 | Medium | Transfers require TSIG when configured; strict CIDR | Strict CIDR done; transfer TSIG open | update-auth, Fix 3 |
+| CSA-AUTH-005 | Medium | Transfers require TSIG when configured; strict CIDR | **Done** 2026-11-15 | update-auth, Fix 3; medium-fixes 7a |
+| CSA-INJ-002 | Medium | JSON-escape the query log | **Done** 2026-11-15 | medium-fixes 7b |
+| CSA-SBX-001 | Medium | seccomp TSYNC; threads start after the sandbox | **Done** 2026-11-15 | medium-fixes 7c |
+| CSA-AUTH-007 | Medium | resolverd client ACL; working `--no-dnssec`/`--no-mdns` | **Done** 2026-11-15 | medium-fixes 7d |
+| CSA-DOS-003 | Medium | apid thread per connection, capped | **Done** 2026-11-15 | medium-fixes 7e |
+| CSA-DOS-005 + CSA-INJ-001 | Medium | mdnsd direct GETs, scheduled delay, on-link only | **Done** 2026-11-15 | medium-fixes 7f |
+| CSA-WEB-001 | Medium | Dashboard CSRF token + hardened session cookie | **Done** 2026-11-15 | medium-fixes 7g |
+| CSA-SBX-002 | Medium | apid/certd/mdnsd/doqd on libsandbox (seccomp audit by default) | **Done** 2026-11-15 | medium-fixes 7h |
 | CSA-DNSSEC-001 | High | KSK key tag from the KSK encoding (+ whole-RRset DNSKEY signature) | **Done** 2026-11-15 | dnssec-denial, Fix 1 |
 | CSA-PROTO-001 | High | Name existence decides NODATA vs NXDOMAIN; empty non-terminals via the dnsd-owned `zidx:*` index | **Done** 2026-11-15 (2a + 2b, D2 = A) | dnssec-denial, Fix 2 |
 | CSA-DNSSEC-002 | High | RFC 9824 compact denial (= dnsd Add 11), NSEC or NSEC3 per `dnssec_nsec_mode` | **Done** 2026-11-15 (D1: keep selector) | dnssec-denial, Fix 3 |
@@ -75,8 +83,11 @@ validator and resolver sees, then availability).
 
 Found while fixing, not in the ledger, **fixed 2026-11-15**: multi-RR RRsets signed per record; DNSKEY/CDS/DS answered at any name; resolverd validator picked the first DNSKEY for every RRSIG; ZONEMD drift with live ddns leases; non-primary zone serial reset on reload (see `CLAUDE-dnssec-denial.md` implementation notes).
 
-Not yet specced (open in the ledger): CSA-AUTH-007,
-CSA-DOS-003, CSA-DOS-005, CSA-DOS-006, CSA-INJ-001/-002, CSA-SBX-001/-002, CSA-WEB-001/-002,
+Also found while fixing step 7, **fixed**: the dashboard's Valkey client hung on
+any bulk reply already buffered with its header (see `CLAUDE-medium-fixes.md`
+implementation notes).
+
+Not yet specced (open in the ledger): CSA-DOS-006, CSA-WEB-002,
 CSA-CONC-002, CSA-MEM-001/-002, CSA-CRYPTO-001, and PERF-001..007.
 
 Release notes required by these fixes: unsigned UPDATE stops working by

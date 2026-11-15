@@ -130,7 +130,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -201,46 +201,46 @@ $(BIN_DEBUG): $(SRC) dns_wire.h sandbox.h | ossl-sanity
 # =============================================================================
 # certd — certificate manager sidecar (ACME + EST; migration Step 2)
 # =============================================================================
-certd: certd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+certd: certd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
-	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
-certd_debug: certd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+certd_debug: certd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
-	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 
 # =============================================================================
 # mdnsd — mDNS / DNS-SD responder (link-local; migration Step 3)
 # =============================================================================
-mdnsd: mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+mdnsd: mdnsd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
-	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
-mdnsd_debug: mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+mdnsd_debug: mdnsd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
-	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 
 # =============================================================================
 # apid — HTTP/HTTPS front for DoH + management (migration Step 4)
 # =============================================================================
-apid: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+apid: apid.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [PROD]  $@"
-	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
-apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+apid_debug: apid.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
-	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
@@ -249,16 +249,16 @@ apid_debug: apid.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 # doqd — DNS-over-QUIC (RFC 9250) sidecar. Needs OpenSSL >= 3.5 (server-side
 # QUIC API) — a higher floor than every other binary; see doqd-ossl-sanity.
 # =============================================================================
-doqd: doqd.c $(WIRE_SRC) dns_wire.h | doqd-ossl-sanity
+doqd: doqd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | doqd-ossl-sanity
 	@echo "  CC [PROD]  $@"
-	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(PROD_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
 
-doqd_debug: doqd.c $(WIRE_SRC) dns_wire.h | doqd-ossl-sanity
+doqd_debug: doqd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | doqd-ossl-sanity
 	@echo "  CC [DEBUG] $@"
-	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) \
-	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS)
+	$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	@echo ""
 	@echo "  Debug binary: $@  (ASan/UBSan enabled — do NOT use in production)"
 	@echo "  Run as:  ASAN_OPTIONS=detect_leaks=1 ./$@"
@@ -794,6 +794,220 @@ check-client-identity: $(BIN_DEBUG) apid_debug
 	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report"; rc=1; }; \
 	 test $$rc -eq 0 || exit 1;                                                        \
 	 echo "  OK  IPv6 + DoH/DoQ clients keep their identity; RRL limits per client, not per name"
+
+# CSA-AUTH-005 (CLAUDE-medium-fixes.md 7a): with a TSIG key configured, a
+# zone transfer must carry a TSIG that verifies, in addition to the IP ACL.
+# Unsigned and wrong-key AXFR from an allowed address are refused (NOTAUTH);
+# a correctly signed AXFR transfers. Needs Valkey + dig.
+check-xfr-tsig-required: $(BIN_DEBUG)
+	@echo "  CHECK  transfers require TSIG when a key is configured (Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 B64=$$(printf '0123456789abcdef0123456789abcdef' | base64);                       \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_KN=$$($$VC get config:tsig_key_name); \
+	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
+	 $$VC set config:tsig_secret_b64 "$$B64" >/dev/null; $$VC set config:tsig_key_name tsig-key >/dev/null; \
+	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_xtr.log 2>&1 & DNS=$$!; \
+	 sleep 2;                                                                          \
+	 xf() { dig +nocookie @127.0.0.1 -p $(TPORT) example.local AXFR +time=3 +tries=1 "$$@" 2>&1; }; \
+	 U=$$(xf); S=$$(xf -y hmac-sha256:tsig-key:$$B64); W=$$(xf -y hmac-sha256:other-key:$$B64); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; else $$VC del config:tsig_secret_b64 >/dev/null; fi; \
+	 if [ -n "$$SAVE_KN" ]; then $$VC set config:tsig_key_name "$$SAVE_KN" >/dev/null; else $$VC del config:tsig_key_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
+	 UN=$$(echo "$$U" | grep -c 'IN.SOA'); SN=$$(echo "$$S" | grep -c 'IN.SOA'); WN=$$(echo "$$W" | grep -c 'IN.SOA'); \
+	 echo "  SOA records received: unsigned=$$UN signed=$$SN wrong-key=$$WN (a full transfer has 2)"; \
+	 test "$$UN" -eq 0 || { echo "  FAIL  unsigned AXFR transferred although a TSIG key is configured"; exit 1; }; \
+	 test "$$WN" -eq 0 || { echo "  FAIL  AXFR signed with the wrong key name transferred"; exit 1; }; \
+	 test "$$SN" -ge 2 || { echo "  FAIL  correctly signed AXFR did not transfer"; echo "$$S" | tail -5; exit 1; }; \
+	 echo "  OK  TSIG required for transfers when configured (in addition to the IP ACL)"
+
+# CSA-INJ-002 (7b): the JSON query log escapes client-chosen label bytes.
+# Queries for names whose labels contain '"', '\', a newline and a high byte
+# must leave a log in which every line is one valid JSON object that
+# round-trips the name. Needs Valkey + python3-dnspython.
+check-qlog-escape: $(BIN_DEBUG)
+	@echo "  CHECK  query log escapes qnames (RFC 8259) (Valkey + python3-dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.message' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
+	 D=$$(mktemp -d); SAVE_QL=$$($$VC get config:query_log_path);                      \
+	 $$VC set config:query_log_path $$D/q.log >/dev/null;                              \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_qle.log 2>&1 & DNS=$$!; \
+	 sleep 2;                                                                          \
+	 python3 tests/qlog_check.py send 127.0.0.1 $(TPORT);                              \
+	 sleep 0.5; kill $$DNS 2>/dev/null || true; sleep 0.3;                             \
+	 OUT=$$(python3 tests/qlog_check.py verify $$D/q.log);                             \
+	 if [ -n "$$SAVE_QL" ]; then $$VC set config:query_log_path "$$SAVE_QL" >/dev/null; else $$VC del config:query_log_path >/dev/null; fi; \
+	 rm -rf $$D; echo "  $$OUT";                                                       \
+	 echo "$$OUT" | grep -q '^OK' || { echo "  FAIL  query log not valid JSON / name not preserved (CSA-INJ-002)"; exit 1; }; \
+	 echo "  OK  every query-log line is one JSON object; hostile qnames round-trip"
+
+# CSA-SBX-001 (7c): the seccomp filter covers every thread. For dnsd and
+# resolverd (seccomp enforce by default), every task listed under
+# /proc/<pid>/task reports "Seccomp: 2" (filter mode) — background threads
+# started before the sandbox used to run unfiltered. Needs Valkey + libseccomp.
+check-sandbox-threads: $(BIN_DEBUG) resolverd_debug
+	@echo "  CHECK  seccomp filter on every dnsd/resolverd thread (Valkey; libseccomp build)"
+	@grep -q 'HAVE_SECCOMP' Makefile && ldconfig -p 2>/dev/null | grep -q libseccomp || { echo "  SKIP  no libseccomp"; exit 0; }; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_sbt.log 2>&1 & DNS=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5354 ./resolverd_debug --upstream 127.0.0.1:$(TPORT) --no-valkey \
+	   > /tmp/rd_sbt.log 2>&1 & RD=$$!;                                                \
+	 sleep 3;                                                                          \
+	 cnt() { n=0; u=0; for t in /proc/$$1/task/*; do n=$$((n+1)); grep -q '^Seccomp:[[:space:]]*2' $$t/status || u=$$((u+1)); done; echo "$$n $$u"; }; \
+	 DT=$$(cnt $$DNS); RT=$$(cnt $$RD);                                                \
+	 kill $$DNS $$RD 2>/dev/null || true; sleep 0.3;                                   \
+	 echo "  dnsd: threads/unfiltered = $$DT   resolverd: threads/unfiltered = $$RT"; \
+	 test "$$(echo $$DT | cut -d' ' -f2)" -eq 0 -a "$$(echo $$DT | cut -d' ' -f1)" -gt 3 || { echo "  FAIL  a dnsd thread runs without the seccomp filter"; exit 1; }; \
+	 test "$$(echo $$RT | cut -d' ' -f2)" -eq 0 -a "$$(echo $$RT | cut -d' ' -f1)" -gt 3 || { echo "  FAIL  a resolverd thread runs without the seccomp filter"; exit 1; }; \
+	 echo "  OK  every thread of dnsd and resolverd is under the seccomp filter"
+
+# CSA-AUTH-007 (CLAUDE-medium-fixes.md 7d): resolverd is not an open resolver
+# — a client outside --allow / RESOLVERD_ALLOW gets REFUSED over UDP and TCP;
+# --no-mdns sends .local to the upstream (no 500 ms multicast wait first);
+# --no-dnssec really disables validation (status UNCHECKED). Needs Valkey + dig.
+check-resolverd-acl: $(BIN_DEBUG) resolverd_debug
+	@echo "  CHECK  resolverd client ACL + --no-mdns/--no-dnssec (Valkey + dig)"
+	@ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_rdacl.log 2>&1 & DNS=$$!; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5354 ./resolverd_debug --upstream 127.0.0.1:$(TPORT) \
+	   --no-mdns --no-valkey --allow 127.0.0.1 > /tmp/rd_acl.log 2>&1 & RD=$$!;        \
+	 sleep 2;                                                                          \
+	 st() { dig +nocookie +noall +comments $$@ @127.0.0.1 -p 5354 www.example.local A +time=2 +tries=1 | sed -n 's/.*status: \([A-Z]*\).*/\1/p'; }; \
+	 A1=$$(st -b 127.0.0.1); A2=$$(st -b 127.1.0.1); A3=$$(st +tcp -b 127.1.0.1);     \
+	 QT=$$(dig +nocookie @127.0.0.1 -p 5354 mail.example.local A +time=2 +tries=1 | sed -n 's/.*Query time: \([0-9]*\).*/\1/p'); \
+	 kill $$RD 2>/dev/null || true; sleep 0.3;                                         \
+	 D1=$$(ASAN_OPTIONS=detect_leaks=0 ./resolverd_debug --upstream 127.0.0.1:$(TPORT) --no-mdns --no-valkey --no-dnssec www.example.local A 2>&1 | sed -n 's/^;; DNSSEC: \([A-Z]*\).*/\1/p'); \
+	 D2=$$(ASAN_OPTIONS=detect_leaks=0 ./resolverd_debug --upstream 127.0.0.1:$(TPORT) --no-mdns --no-valkey www.example.local A 2>&1 | sed -n 's/^;; DNSSEC: \([A-Z]*\).*/\1/p'); \
+	 kill $$DNS 2>/dev/null || true;                                                   \
+	 echo "  allowed 127.0.0.1=$$A1  outside 127.1.0.1: udp=$$A2 tcp=$$A3 | --no-mdns .local query time=$${QT}ms | DNSSEC: --no-dnssec=$$D1 default=$$D2"; \
+	 test "$$A1" = NOERROR   || { echo "  FAIL  allowed client not answered"; exit 1; }; \
+	 test "$$A2" = REFUSED   || { echo "  FAIL  client outside the ACL answered over UDP (open resolver)"; exit 1; }; \
+	 test "$$A3" = REFUSED   || { echo "  FAIL  client outside the ACL answered over TCP"; exit 1; }; \
+	 test -n "$$QT" && test "$$QT" -lt 400 || { echo "  FAIL  --no-mdns still waited for mDNS on a .local name"; exit 1; }; \
+	 test "$$D1" = UNCHECKED || { echo "  FAIL  --no-dnssec did not disable validation"; exit 1; }; \
+	 test "$$D2" != UNCHECKED -a -n "$$D2" || { echo "  FAIL  validation not running by default"; exit 1; }; \
+	 echo "  OK  resolverd refuses clients outside its ACL; --no-mdns and --no-dnssec work"
+
+# CSA-DOS-003 (CLAUDE-medium-fixes.md 7e): apid serves connections
+# concurrently. With three clients connected and silent, /health from a
+# fourth client must answer at once (it used to wait out the 10 s read
+# timeout of each idle connection in turn). Needs Valkey + curl + python3.
+check-apid-concurrency: apid_debug
+	@echo "  CHECK  apid serves connections concurrently (Valkey + curl + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v curl >/dev/null || { echo "  SKIP  no curl on PATH"; exit 0; };        \
+	 HP=18066; SAVE_P=$$($$VC get config:http_port); SAVE_S=$$($$VC get config:https_port); \
+	 $$VC set config:http_port $$HP >/dev/null; $$VC set config:https_port 18456 >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug > /tmp/apid_conc.log 2>&1 & API=$$!;     \
+	 sleep 1.5;                                                                        \
+	 python3 tests/tcp_idle_flood.py 127.0.0.1 $$HP 3 8 > /dev/null & FL=$$!;          \
+	 sleep 0.5;                                                                        \
+	 T=$$(curl -s -o /dev/null -w '%{time_total} %{http_code}' --max-time 15 http://127.0.0.1:$$HP/health); \
+	 kill $$FL $$API 2>/dev/null || true; wait $$FL 2>/dev/null; sleep 0.3;            \
+	 if [ -n "$$SAVE_P" ]; then $$VC set config:http_port "$$SAVE_P" >/dev/null; else $$VC del config:http_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_S" ]; then $$VC set config:https_port "$$SAVE_S" >/dev/null; else $$VC del config:https_port >/dev/null; fi; \
+	 SECS=$$(echo $$T | cut -d' ' -f1); CODE=$$(echo $$T | cut -d' ' -f2);             \
+	 echo "  /health with 3 idle connections open: $${SECS}s HTTP $$CODE";            \
+	 test "$$CODE" = 200 || { echo "  FAIL  /health did not answer"; exit 1; };        \
+	 awk "BEGIN{exit !($$SECS < 1.0)}" || { echo "  FAIL  /health waited behind idle connections (CSA-DOS-003)"; exit 1; }; \
+	 echo "  OK  an idle client no longer blocks other requests"
+
+# CSA-DOS-005 / CSA-INJ-001 (CLAUDE-medium-fixes.md 7f): mdnsd looks shared
+# zone records up by direct GET (suffix walk), never with the qname in a SCAN
+# glob, and only answers on-link sources. Unit test of mdnsd.c (UNIT_TEST);
+# the lookup cases use Valkey on 127.0.0.1:6379.
+check-mdnsd-lookup: tests/test_mdnsd_lookup.c mdnsd.c $(WIRE_SRC) dns_wire.h | ossl-sanity
+	@echo "  CC [TEST]  tests/test_mdnsd_lookup"
+	$(CC) $(CSTD) $(WARN) -Wno-unused-function $(DEBUG_FLAGS) $(INCLUDES) -I. \
+	      -o tests/test_mdnsd_lookup tests/test_mdnsd_lookup.c $(WIRE_SRC) $(LIBS)
+	./tests/test_mdnsd_lookup
+
+# CSA-SBX-002 (CLAUDE-medium-fixes.md 7h): apid, mdnsd and certd confine
+# themselves via libsandbox — every thread runs under the seccomp filter
+# (audit by default) and the sandbox state is logged. Where passwordless sudo
+# exists (CI), also starts apid and certd as root and checks they dropped to
+# an unprivileged uid, certd keeping only CAP_NET_BIND_SERVICE. mdnsd is
+# skipped without a multicast interface; certd when PKI is configured in this
+# Valkey (it would contact a CA). doqd needs OpenSSL >= 3.5 and goes through
+# the same code path; it is not run here. Needs Valkey + libseccomp.
+check-sidecar-sandbox: apid_debug mdnsd_debug certd_debug tests/test_sandbox_caps.c $(SANDBOX_SRC) $(WIRE_SRC) | ossl-sanity
+	@echo "  CHECK  apid/mdnsd/certd run sandboxed (CSA-SBX-002; Valkey + libseccomp)"
+	@$(CC) $(CSTD) $(WARN) $(DEBUG_FLAGS) $(SECCOMP_CFLAGS) $(INCLUDES) -I. -o tests/test_sandbox_caps \
+	      tests/test_sandbox_caps.c $(SANDBOX_SRC) $(WIRE_SRC) $(LIBS) $(SECCOMP_LIBS)
+	@if sudo -n true 2>/dev/null; then RUN="sudo -n env TEST_USER=nobody";                \
+	 elif unshare --map-auto --map-root-user --setgroups allow --net true 2>/dev/null; then \
+	   RUN="env TEST_USER=nobody unshare --map-auto --map-root-user --setgroups allow --net"; \
+	 else echo "  SKIP  capability half (no sudo, no user namespaces)"; exit 0; fi;    \
+	 K=$$(ASAN_OPTIONS=detect_leaks=0 $$RUN ./tests/test_sandbox_caps keep 2>/dev/null);   \
+	 N=$$(ASAN_OPTIONS=detect_leaks=0 $$RUN ./tests/test_sandbox_caps nokeep 2>/dev/null); \
+	 echo "  keep:   $$(echo "$$K" | tr '\n\t' '  ')"; echo "  nokeep: $$(echo "$$N" | tr '\n\t' '  ')"; \
+	 echo "$$K" | grep -q '^CapEff:[[:space:]]*0000000000000400' && echo "$$K" | grep -q 'bind 443: ok' \
+	   && echo "$$K" | grep -q 'setuid(0): refused' && ! echo "$$K" | grep -q '^Uid:[[:space:]]*0[[:space:]]' \
+	   || { echo "  FAIL  keep_net_bind_service: expected uid!=0 + CAP_NET_BIND_SERVICE only"; exit 1; }; \
+	 echo "$$N" | grep -q '^CapEff:[[:space:]]*0000000000000000' && echo "$$N" | grep -q 'bind 443: EACCES' \
+	   && echo "$$N" | grep -q 'setuid(0): refused' \
+	   || { echo "  FAIL  plain privilege drop kept a capability"; exit 1; }
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 ldconfig -p 2>/dev/null | grep -q libseccomp || { echo "  SKIP  no libseccomp"; exit 0; }; \
+	 cnt() { n=0; u=0; for t in /proc/$$1/task/*; do n=$$((n+1)); grep -q '^Seccomp:[[:space:]]*2' $$t/status || u=$$((u+1)); done; echo "$$n $$u"; }; \
+	 SAVED=$$(for k in config:http_port config:https_port config:mdns_enabled config:mdns_interfaces config:mdns_hostname config:dp_enabled config:dp_port; do echo "$$k=$$($$VC get $$k)"; done); \
+	 restore() { echo "$$SAVED" | while IFS='=' read -r k v; do if [ -n "$$v" ]; then $$VC set "$$k" "$$v" >/dev/null; else $$VC del "$$k" >/dev/null; fi; done; }; \
+	 FAIL=0;                                                                           \
+	 $$VC set config:http_port 18067 >/dev/null; $$VC set config:https_port 18457 >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug > /tmp/apid_sbx.log 2>&1 & AP=$$!;      \
+	 IFACE=""; for i in $$(ip -o link show up 2>/dev/null | awk -F': ' '{print $$2}'); do \
+	   case "$$i" in lo|lo@*) continue ;; esac; F=$$(ip link show "$$i" 2>/dev/null);   \
+	   echo "$$F" | grep -q MULTICAST && echo "$$F" | grep -q LOWER_UP && { IFACE="$$i"; break; }; done; \
+	 MD=""; if [ -n "$$IFACE" ]; then                                                  \
+	   $$VC set config:mdns_enabled 1 >/dev/null; $$VC set config:mdns_interfaces "$$IFACE" >/dev/null; \
+	   $$VC set config:mdns_hostname sbxtest.local >/dev/null;                         \
+	   $$VC set config:dp_enabled 1 >/dev/null; $$VC set config:dp_port 8533 >/dev/null; \
+	   ASAN_OPTIONS=detect_leaks=0 ./mdnsd_debug > /tmp/mdnsd_sbx.log 2>&1 & MD=$$!;  \
+	 fi;                                                                               \
+	 CD=""; if [ "$$($$VC exists config:acme_domain config:est_server)" = 0 ]; then    \
+	   ASAN_OPTIONS=detect_leaks=0 ./certd_debug > /tmp/certd_sbx.log 2>&1 & CD=$$!;  \
+	 fi;                                                                               \
+	 sleep 3;                                                                          \
+	 for p in "apid:$$AP" "mdnsd:$$MD" "certd:$$CD"; do                                \
+	   tag=$${p%%:*}; pid=$${p#*:}; test -n "$$pid" || { echo "  SKIP  $$tag (no multicast interface / PKI configured)"; continue; }; \
+	   C=$$(cnt $$pid); L=$$(grep -c "\[$$tag/seccomp\]" /tmp/$${tag}_sbx.log);        \
+	   echo "  $$tag: threads/unfiltered = $$C, seccomp log lines = $$L";              \
+	   test "$$(echo $$C | cut -d' ' -f2)" -eq 0 -a "$$L" -gt 0 || { echo "  FAIL  $$tag is not sandboxed"; FAIL=1; }; \
+	 done;                                                                             \
+	 kill $$AP $$MD $$CD 2>/dev/null || true; sleep 0.3;                               \
+	 if sudo -n true 2>/dev/null; then                                                 \
+	   sudo -n env ASAN_OPTIONS=detect_leaks=0 DNS_VALKEY_HOST=$${DNS_VALKEY_HOST:-127.0.0.1} ./apid_debug > /tmp/apid_sbx_root.log 2>&1 & \
+	   if [ "$$($$VC exists config:acme_domain config:est_server)" = 0 ]; then         \
+	     sudo -n env ASAN_OPTIONS=detect_leaks=0 DNS_VALKEY_HOST=$${DNS_VALKEY_HOST:-127.0.0.1} ./certd_debug > /tmp/certd_sbx_root.log 2>&1 & \
+	   fi; sleep 3;                                                                    \
+	   AR=$$(pgrep -n -x apid_debug); CR=$$(pgrep -n -x certd_debug);                  \
+	   AU=$$(awk '/^Uid:/{print $$2}' /proc/$$AR/status 2>/dev/null);                  \
+	   echo "  apid as root: now uid=$$AU";                                            \
+	   test -n "$$AU" && test "$$AU" != 0 || { echo "  FAIL  apid kept root"; FAIL=1; }; \
+	   if [ -n "$$CR" ]; then                                                          \
+	     CU=$$(awk '/^Uid:/{print $$2}' /proc/$$CR/status); CE=$$(awk '/^CapEff:/{print $$2}' /proc/$$CR/status); \
+	     echo "  certd as root: now uid=$$CU CapEff=$$CE";                             \
+	     test "$$CU" != 0 -a "$$CE" = 0000000000000400 || { echo "  FAIL  certd did not drop to uid!=0 + CAP_NET_BIND_SERVICE only"; FAIL=1; }; \
+	   fi;                                                                             \
+	   sudo -n kill $$AR $$CR 2>/dev/null || true; sleep 0.3;                          \
+	 else echo "  SKIP  root privilege-drop half (no passwordless sudo)"; fi;          \
+	 restore;                                                                          \
+	 test $$FAIL = 0 || exit 1;                                                        \
+	 echo "  OK  the sidecars run under libsandbox"
+
+# CSA-WEB-001 (CLAUDE-medium-fixes.md 7g): the dashboard rejects POSTs without
+# the per-session CSRF token and sets SameSite=Strict/HttpOnly/Secure cookies.
+# Flask test client against Valkey; needs dashboard/requirements.txt installed
+# for DASH_PY (CI uses a venv). Skips when Flask is missing.
+DASH_PY ?= python3
+check-dashboard-csrf:
+	@echo "  CHECK  dashboard CSRF tokens + session cookie flags (Valkey + Flask)"
+	@$(DASH_PY) tests/dashboard_csrf.py; rc=$$?;                                       \
+	 if [ $$rc = 77 ]; then echo "  SKIP  set DASH_PY to a python with dashboard/requirements.txt"; exit 0; fi; \
+	 exit $$rc
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -3542,6 +3756,7 @@ help:
 	@echo "  make check-tcp-plain plain TCP vs DoT per listener, stream connection cap + handshake timeout"
 	@echo "  make check-resolverd-stress / check-resolverd-tsan  resolverd cache under concurrent load (ASan / TSan; STRESS_SECS)"
 	@echo "  make check-client-identity  IPv6 clients, PROXY v2 from apid/doqd, RRL per client prefix"
+	@echo "  make check-xfr-tsig-required / check-qlog-escape / check-sandbox-threads  step-7 dnsd fixes"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"

@@ -53,6 +53,11 @@ typedef struct {
     sandbox_seccomp_default_t seccomp_default; /* used when seccomp_mode empty */
     unsigned extra_syscall_groups;             /* SANDBOX_SYS_* bitmask */
 
+    /* Keep CAP_NET_BIND_SERVICE (only) across the privilege drop, for a daemon
+     * that must bind a port < 1024 on demand after confinement (certd's
+     * tls-alpn-01 listener, RFC 8737 — the validator always dials 443).
+     * Applies to the calling thread and threads it creates afterwards. */
+    int keep_net_bind_service;
     sandbox_logf log; /* required — must be non-NULL */
     const char *tag;  /* daemon name for log lines, e.g. "dnsd" / "resolverd" */
 } sandbox_config_t;
@@ -65,5 +70,16 @@ void sandbox_apply(const sandbox_config_t *cfg);
  * overriding whatever the caller already read from its config store. Shared so
  * both daemons gather config the same way. */
 void sandbox_env_override(char *buf, int len, const char *name);
+
+/* Config-store getter: copies the value of `key` into out, returns non-zero
+ * when found. Every daemon's vk_get() has this shape. */
+typedef int (*sandbox_kv_get)(const char *key, char *out, int olen);
+
+/* Fill the five per-daemon knobs from config:<daemon>_{chroot_dir,
+ * isolation_mode,privdrop_user,privdrop_group,seccomp_mode}, each overridden by
+ * env <ENV>_{CHROOT,ISOLATION,USER,GROUP,SECCOMP}. Zeroes *cfg first; the
+ * caller then sets seccomp_default, extra_syscall_groups, log and tag. */
+void sandbox_config_load(sandbox_config_t *cfg, const char *daemon, const char *env_prefix,
+                         sandbox_kv_get get);
 
 #endif /* SANDBOX_H */

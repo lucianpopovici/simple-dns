@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
@@ -56,6 +57,7 @@
 #include <openssl/x509.h>
 
 #include "dns_wire.h"
+#include "sandbox.h"
 
 #define HTTP_BUF 16384
 #define MAX_PEM 65536
@@ -1334,67 +1336,134 @@ static int listen_on(int port) {
     return fd;
 }
 
+/* CSA-DOS-003: connections are served concurrently, one detached thread
+ * each, bounded by config:apid_max_conns (default 128). The listener loops
+ * used to accept → handle → close inline, so one idle client stalled every
+ * other request (including /health) for the whole 10 s read timeout. */
+static atomic_int g_apid_conns = 0;
+static int g_apid_max_conns = 128;
+
+typedef struct {
+    int fd;
+    int tls;
+} apid_conn_t;
+
+static void apid_serve_https(int cfd) {
+    pthread_mutex_lock(&g_tls_mutex);
+    SSL_CTX *ctx = g_https_ctx;
+    SSL *ssl = ctx ? SSL_new(ctx) : NULL;
+    pthread_mutex_unlock(&g_tls_mutex);
+    if (!ssl)
+        return;
+    if (SSL_set_fd(ssl, cfd) != 1 || SSL_accept(ssl) <= 0) {
+        SSL_free(ssl);
+        return;
+    }
+    /* Management status comes from mTLS: a verified client cert. When no
+     * CA is configured the context does not request a cert and is_mgmt
+     * stays 0 (DoH-only TLS). */
+    X509 *peer = SSL_get_peer_certificate(ssl);
+    int is_mgmt = 0;
+    if (peer) {
+        X509_free(peer);
+        is_mgmt = (SSL_get_verify_result(ssl) == X509_V_OK);
+    }
+    handle_api(cfd, ssl, is_mgmt);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+}
+
+static void *apid_conn_thread(void *arg) {
+    apid_conn_t c = *(apid_conn_t *) arg;
+    free(arg);
+    if (c.tls)
+        apid_serve_https(c.fd);
+    else
+        handle_api(c.fd, NULL, 0);
+    close(c.fd);
+    atomic_fetch_sub(&g_apid_conns, 1);
+    return NULL;
+}
+
+static void apid_dispatch(int cfd, int tls) {
+    if (atomic_fetch_add(&g_apid_conns, 1) >= g_apid_max_conns) {
+        atomic_fetch_sub(&g_apid_conns, 1);
+        close(cfd); /* over the cap: shed load rather than queue */
+        return;
+    }
+    struct timeval tv = {.tv_sec = 10};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    apid_conn_t *c = malloc(sizeof(*c));
+    if (!c) {
+        close(cfd);
+        atomic_fetch_sub(&g_apid_conns, 1);
+        return;
+    }
+    c->fd = cfd;
+    c->tls = tls;
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, apid_conn_thread, c) != 0) {
+        free(c);
+        close(cfd);
+        atomic_fetch_sub(&g_apid_conns, 1);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+/* Listener sockets are bound in main() before sandbox_apply() (a port < 1024
+ * needs root); the accept loops only serve them. */
+static int g_http_fd = -1;
+static int g_https_fd = -1;
+
 static void *http_thread(void *arg) {
     (void) arg;
-    int srv = listen_on(g_http_port);
+    int srv = g_http_fd;
     if (srv < 0)
         return NULL;
     dns_log(LOG_NOTICE, "[apid] HTTP (DoH + DDNS) on :%d\n", g_http_port);
     for (;;) {
         int cfd = accept(srv, NULL, NULL);
-        if (cfd < 0)
-            continue;
-        struct timeval tv = {.tv_sec = 10};
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        handle_api(cfd, NULL, 0);
-        close(cfd);
+        if (cfd >= 0)
+            apid_dispatch(cfd, 0);
     }
     return NULL;
 }
 
 static void *https_thread(void *arg) {
     (void) arg;
-    int srv = listen_on(g_https_port);
+    int srv = g_https_fd;
     if (srv < 0)
         return NULL;
     dns_log(LOG_NOTICE, "[apid] HTTPS (DoH + mgmt) on :%d\n", g_https_port);
     for (;;) {
         int cfd = accept(srv, NULL, NULL);
-        if (cfd < 0)
-            continue;
-        struct timeval tv = {.tv_sec = 10};
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        pthread_mutex_lock(&g_tls_mutex);
-        SSL_CTX *ctx = g_https_ctx;
-        SSL *ssl = ctx ? SSL_new(ctx) : NULL;
-        pthread_mutex_unlock(&g_tls_mutex);
-        if (!ssl) {
-            close(cfd);
-            continue;
-        }
-        SSL_set_fd(ssl, cfd);
-        if (SSL_accept(ssl) <= 0) {
-            SSL_free(ssl);
-            close(cfd);
-            continue;
-        }
-        /* Management status comes from mTLS: a verified client cert. When no
-         * CA is configured the context does not request a cert and is_mgmt
-         * stays 0 (DoH-only TLS). */
-        X509 *peer = SSL_get_peer_certificate(ssl);
-        int is_mgmt = 0;
-        if (peer) {
-            X509_free(peer);
-            is_mgmt = (SSL_get_verify_result(ssl) == X509_V_OK);
-        }
-        handle_api(cfd, ssl, is_mgmt);
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(cfd);
+        if (cfd >= 0)
+            apid_dispatch(cfd, 1);
     }
     return NULL;
+}
+
+/* CSA-SBX-002: apid parses untrusted HTTP/TLS, so it confines itself like
+ * dnsd/resolverd/eppd once its listeners are bound: privilege drop (when
+ * started as root), optional chroot/mountns, seccomp. Config is apid-scoped —
+ * config:apid_{chroot_dir,isolation_mode,privdrop_user,privdrop_group,
+ * seccomp_mode}, env APID_{CHROOT,ISOLATION,USER,GROUP,SECCOMP} — and read
+ * here, before confinement. seccomp defaults to audit until a syscall
+ * harvest validates an enforce profile (the rollout resolverd/eppd followed);
+ * GETADDRINFO covers a hostname DNS_VALKEY_HOST. A chroot must carry what a
+ * hostname lookup needs (resolv.conf, nsswitch.conf) if one is used. */
+static void apply_apid_sandbox(void) {
+    sandbox_config_t sb;
+    sandbox_config_load(&sb, "apid", "APID", vk_get);
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO;
+    sb.log = dns_log;
+    sb.tag = "apid";
+    sandbox_apply(&sb);
 }
 
 /* ── Config + main ──────────────────────────────────────────────────────── */
@@ -1409,6 +1478,8 @@ static void load_config(void) {
         g_https_port = atoi(val);
     if (vk_get("config:dns_port", val, sizeof(val)) && val[0])
         g_dns_port = atoi(val);
+    if (vk_get("config:apid_max_conns", val, sizeof(val)) && val[0] && atoi(val) > 0)
+        g_apid_max_conns = atoi(val);
     vk_get("config:mtls_ca_pem", g_mtls_ca_pem, sizeof(g_mtls_ca_pem));
     tls_material_load();
 }
@@ -1454,6 +1525,14 @@ int main(int argc, char **argv) {
     tls_reload();
     dns_log(LOG_NOTICE, "[apid] Starting: HTTP :%d, HTTPS :%d, dnsd at 127.0.0.1:%d\n", g_http_port,
             g_https_port, g_dns_port);
+    g_http_fd = listen_on(g_http_port);
+    g_https_fd = listen_on(g_https_port);
+    if (g_http_fd < 0 && g_https_fd < 0) {
+        dns_log(LOG_ERR, "[apid] FATAL: no listener could be bound\n");
+        return 1;
+    }
+    /* Every thread starts after this, so all of them run confined. */
+    apply_apid_sandbox();
     pthread_t t1, t2, t3;
     static keyspace_watch_config_t kcfg;
     memset(&kcfg, 0, sizeof(kcfg));
@@ -1472,7 +1551,11 @@ int main(int argc, char **argv) {
         pthread_detach(t3);
     if (pthread_create(&t2, NULL, https_thread, NULL) == 0)
         pthread_detach(t2);
-    http_thread(NULL); /* plain-HTTP accept loop runs in main */
+    if (g_http_fd >= 0)
+        http_thread(NULL); /* plain-HTTP accept loop runs in main */
+    else
+        for (;;)
+            pause(); /* HTTPS-only: keep the process (and its threads) alive */
     (void) t1;
     return 0;
 }

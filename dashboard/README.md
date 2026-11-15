@@ -60,6 +60,14 @@ Other controls:
 - Bind to localhost (default) or front with a TLS-terminating proxy; never run
   `--debug` on an exposed instance (it enables the Werkzeug debugger).
 - Session lifetime: `DASHBOARD_SESSION_HOURS` (default 12).
+- **CSRF** (CSA-WEB-001): every POST (login and sign-out included) must carry
+  the per-session `csrf_token` that each form embeds automatically; a request
+  without it gets `400`. Scripted clients send it as a `csrf_token` form field
+  or an `X-CSRF-Token` header.
+- The session cookie is `SameSite=Strict`, `HttpOnly` and `Secure`. Browsers
+  send a `Secure` cookie over plain `http://` only to localhost; for plain-HTTP
+  access from another host set `DASHBOARD_INSECURE_COOKIE=1` (better: put TLS
+  in front).
 
 ## Requirements
 

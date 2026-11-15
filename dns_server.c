@@ -824,17 +824,52 @@ static pthread_mutex_t g_qlog_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Format: {"ts":<unix>,"client":"<ip>","qname":"<n>","qtype":"<t>",
  *           "rcode":<r>,"answers":<n>,"rtt_us":<t>,"transport":"<udp|tcp|dot|doh>"}
  */
+/* RFC 8259 JSON string escape (CSA-INJ-002): a qname's label bytes are
+ * client-chosen — '"', '\\', newlines and any other byte. Quote and
+ * backslash are escaped, and every byte < 0x20, 0x7f or >= 0x80 becomes
+ * \\u00XX, so the output is plain ASCII and one log record stays one line.
+ * Always NUL-terminates; truncates rather than overflows. */
+static const char *json_escape(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *) (in ? in : ""); *p; p++) {
+        char tmp[8];
+        const char *e = tmp;
+        if (*p == '"')
+            e = "\\\"";
+        else if (*p == '\\')
+            e = "\\\\";
+        else if (*p < 0x20 || *p >= 0x7f)
+            snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
+        else {
+            tmp[0] = (char) *p;
+            tmp[1] = 0;
+        }
+        size_t el = strlen(e);
+        if (o + el + 1 > cap)
+            break;
+        memcpy(out + o, e, el);
+        o += el;
+    }
+    if (cap)
+        out[o < cap ? o : cap - 1] = 0;
+    return out;
+}
+
 static void qlog_write(const char *client_ip, const char *qname, uint16_t qtype, uint8_t rcode,
                        int answers, long rtt_us, const char *transport) {
     if (!g_query_log_fp && !g_query_log_path[0])
         return;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    char line[512];
+    char eqn[256 * 6 + 1];
+    char ecl[INET6_ADDRSTRLEN * 2];
+    json_escape(qname, eqn, sizeof(eqn));
+    json_escape(client_ip, ecl, sizeof(ecl));
+    char line[2048];
     snprintf(line, sizeof(line),
              "{\"ts\":%ld,\"client\":\"%s\",\"qname\":\"%s\",\"qtype\":\"%s\""
              ",\"rcode\":%u,\"answers\":%d,\"rtt_us\":%ld,\"transport\":\"%s\"}\n",
-             (long) ts.tv_sec, client_ip, qname, type2str(qtype), (unsigned) rcode, answers, rtt_us,
+             (long) ts.tv_sec, ecl, eqn, type2str(qtype), (unsigned) rcode, answers, rtt_us,
              transport);
     pthread_mutex_lock(&g_qlog_mutex);
     FILE *fp = g_query_log_fp ? g_query_log_fp : stderr;
@@ -1496,79 +1531,10 @@ static int is_local_zone(const char *qname) {
  * a malformed entry matches nothing (fail closed). The prefix must be 1-2
  * decimal digits in 0..32: atoi() used to turn "10.0.0.0/x" into /0, i.e.
  * "match every address" (CSA-AUTH-005). Modifies tok. */
-/* Parse one ACL entry — "a.b.c.d[/N]" (N 0-32) or an IPv6 address
- * "x::y[/N]" (N 0-128), surrounding spaces allowed — into family + network
- * octets + prefix length. Returns 1 on success, 0 if malformed: a malformed
- * entry matches nothing (fail closed; atoi used to turn "10.0.0.0/x" into
- * /0 = "everyone", CSA-AUTH-005). Modifies tok. */
-static int ip_list_entry_parse(char *tok, int *fam, uint8_t net[16], int *bits) {
-    while (*tok == ' ' || *tok == '\t')
-        tok++;
-    size_t tl = strlen(tok);
-    while (tl > 0 && (tok[tl - 1] == ' ' || tok[tl - 1] == '\t'))
-        tok[--tl] = 0;
-    int is6 = strchr(tok, ':') != NULL;
-    int maxbits = is6 ? 128 : 32;
-    *bits = maxbits;
-    char *slash = strchr(tok, '/');
-    if (slash) {
-        const char *ps = slash + 1;
-        int nd = 0;
-        int v = 0;
-        while (*ps >= '0' && *ps <= '9' && nd < 4) {
-            v = v * 10 + (*ps - '0');
-            ps++;
-            nd++;
-        }
-        if (nd == 0 || *ps != 0 || v > maxbits)
-            return 0;
-        *bits = v;
-        *slash = 0;
-    }
-    memset(net, 0, 16);
-    if (inet_pton(is6 ? AF_INET6 : AF_INET, tok, net) != 1)
-        return 0;
-    *fam = is6 ? AF_INET6 : AF_INET;
-    return 1;
-}
-
-/* Do the first `bits` bits of a and b agree? */
-static int prefix_match(const uint8_t *a, const uint8_t *b, int bits) {
-    int full = bits / 8;
-    if (full && memcmp(a, b, (size_t) full) != 0)
-        return 0;
-    int rem = bits % 8;
-    if (rem) {
-        uint8_t m = (uint8_t) (0xFF << (8 - rem));
-        if ((a[full] & m) != (b[full] & m))
-            return 0;
-    }
-    return 1;
-}
-
-/* Returns 1 if client `c` matches any entry in a comma-separated list of IPv4
- * and IPv6 addresses / prefixes ("10.0.0.0/8, 192.168.1.5, 2001:db8::/32").
- * An entry only matches its own family (v4-mapped clients were normalised to
- * v4). Shared by the AXFR ACL, the forwarder client ACL and the unsigned-
- * UPDATE allow-list. An empty list, an unknown client and a malformed entry
- * match nothing (fail closed). */
+/* The ACL matcher lives once in libdnswire (acl_allows), shared with
+ * resolverd's client ACL. */
 static int ip_list_allowed(const char *list, const client_addr_t *c) {
-    if (!list || !list[0] || !c || (c->family != AF_INET && c->family != AF_INET6))
-        return 0;
-    const uint8_t *ca = c->family == AF_INET ? (const uint8_t *) &c->u.v4 : c->u.v6.s6_addr;
-    char allow[1024];
-    safe_strcpy(allow, list, sizeof(allow));
-    char *sp = NULL;
-    for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
-        int fam = 0;
-        uint8_t net[16];
-        int bits = 0;
-        if (!ip_list_entry_parse(tok, &fam, net, &bits) || fam != c->family)
-            continue;
-        if (prefix_match(ca, net, bits))
-            return 1;
-    }
-    return 0;
+    return acl_allows(list, c);
 }
 
 /* Log (once per config load) every malformed entry of an ACL list, so an
@@ -1585,7 +1551,7 @@ static void ip_list_check(const char *key, const char *list) {
         int fam = 0;
         uint8_t net[16];
         int bits = 0;
-        if (!ip_list_entry_parse(tok, &fam, net, &bits))
+        if (!acl_entry_parse(tok, &fam, net, &bits))
             dns_log(LOG_ERR, "[CONFIG] %s: malformed entry '%s' ignored (matches nothing)\n", key,
                     ent);
     }
@@ -12164,9 +12130,46 @@ static void dot_thread_body(dot_conn_t *cp) {
                 }
             }
             ac->query_id = ntohs(((dns_hdr_t *) pkt)->id);
-            /* Result intentionally not enforced yet (CSA-AUTH-005, roadmap Phase 0b
-             * step 7); called to stash a verified request MAC for response signing. */
-            (void) tsig_verify(pkt, ml, NULL);
+            /* CSA-AUTH-005: with a TSIG key configured a transfer must carry a
+             * TSIG that verifies (key name, algorithm, MAC, time) — in addition
+             * to the IP ACL axfr_thread checks. Otherwise NOTAUTH with the TSIG
+             * error, exactly as for UPDATE, and the connection is closed.
+             * tsig_verify also stashes a verified request MAC for signing. */
+            tsig_rr_t treq;
+            int trc = tsig_verify(pkt, ml, &treq);
+            if (g_tsig_secret_invalid || (g_tsig_secret_len > 0 && trc != TSIG_OK)) {
+                uint8_t ref[BUF_SIZE];
+                int qsec = (int) (sizeof(dns_hdr_t));
+                {
+                    char qn2[256];
+                    int qa = name_from_wire(pkt, ml, 12, qn2, sizeof(qn2));
+                    if (qa > 0 && qa + 4 <= ml)
+                        qsec = qa + 4;
+                }
+                memcpy(ref, pkt, (size_t) qsec);
+                dns_hdr_t *rh = (dns_hdr_t *) ref;
+                rh->flags = htons(DNS_QR | DNS_RCODE_NOTAUTH);
+                rh->qdcount = htons(qsec > 12 ? 1 : 0);
+                rh->ancount = rh->nscount = rh->arcount = 0;
+                int rlen = qsec;
+                if (!g_tsig_secret_invalid) {
+                    if (trc == TSIG_BADTIME)
+                        rlen = tsig_append_badtime(ref, rlen, sizeof(ref), ac->query_id, &treq);
+                    else if (trc != TSIG_ABSENT)
+                        rlen = tsig_append_error_unsigned(
+                            ref, rlen, sizeof(ref), ac->query_id, &treq,
+                            trc == TSIG_BADKEY ? TSIG_ERR_BADKEY : TSIG_ERR_BADSIG);
+                }
+                char cs[INET6_ADDRSTRLEN];
+                dns_log(LOG_WARNING, "[AXFR] NOTAUTH %s for %s — %s\n",
+                        client_ntop(&c.addr, cs, sizeof(cs)), axfr_qn,
+                        g_tsig_secret_invalid ? "TSIG secret invalid"
+                        : trc == TSIG_ABSENT  ? "no TSIG (a key is configured)"
+                                              : "TSIG did not verify");
+                tcp_send_msg(c.fd, ssl, ref, rlen);
+                free(ac);
+                goto dot_done;
+            }
             axfr_thread(ac);
             return;
         }
@@ -12763,79 +12766,6 @@ int main(int argc, char **argv) {
      * server to be listening before Let's Encrypt can validate the challenge). */
     tls_reload();
 
-    /* Phase 5: live-reload subscriber — applies config:*, cert:current,
-     * zone_table:* edits via Valkey keyspace notifications, no restart needed
-     * (migration Step 6). Also does the boot catch-up for cert:current, so it
-     * subsumes the old polling cert watcher. ACME/EST live in certd. */
-    {
-        pthread_t ctid;
-        if (pthread_create(&ctid, NULL, keyspace_watch_thread, NULL) == 0)
-            pthread_detach(ctid);
-        else
-            dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
-    }
-
-    /* Per-zone ZSK rollover engine (RFC 6781 Pre-Publish). */
-    {
-        pthread_t rtid;
-        if (pthread_create(&rtid, NULL, rollover_thread, NULL) == 0)
-            pthread_detach(rtid);
-        else
-            dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
-    }
-
-    /* NOTIFY sender: background worker that TSIG-signs + retries master→secondary
-     * NOTIFYs (RFC 1996 §3.6). Idle until a zone change enqueues a job. */
-    {
-        pthread_t ntid;
-        if (pthread_create(&ntid, NULL, notify_thread, NULL) == 0)
-            pthread_detach(ntid);
-        else
-            dns_log(LOG_ERR, "[NOTIFY] Failed to start NOTIFY sender thread\n");
-    }
-
-    /* Primary: DDNS lease-expiry sweeper — replays silent ddns:* expiries as
-     * replicated deletions so secondaries converge (CLAUDE-discovery.md Gap 2). */
-    if (!g_zone_secondary) {
-        pthread_t stid;
-        if (pthread_create(&stid, NULL, ddns_sweeper_thread, NULL) == 0)
-            pthread_detach(stid);
-        else
-            dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
-    }
-
-    /* Primary: RFC 9665/9664 SRP lease-expiry sweeper — same role as the DDNS
-     * sweeper above, for srp:* registrations. Idle (just sleeps) unless
-     * config:srp_enabled is set. */
-    if (!g_zone_secondary) {
-        pthread_t srtid;
-        if (pthread_create(&srtid, NULL, srp_sweeper_thread, NULL) == 0)
-            pthread_detach(srtid);
-        else
-            dns_log(LOG_ERR, "[SRP] Failed to start lease-expiry sweeper\n");
-    }
-
-    /* Load-balancing health-check probe thread (CLAUDE-loadbalance.md Gap 2).
-     * Idle (just sleeps) until config:lb_health_enabled is set. */
-    {
-        pthread_t htid;
-        if (pthread_create(&htid, NULL, lb_health_thread, NULL) == 0)
-            pthread_detach(htid);
-        else
-            dns_log(LOG_ERR, "[LB] Failed to start health-check thread\n");
-    }
-
-    /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry
-     * timers + NOTIFY-triggered re-pull (hidden-master plan Gap 6/5). Detached so
-     * an unreachable master never blocks the server. */
-    if (g_zone_secondary && g_primary_host[0]) {
-        pthread_t xtid;
-        if (pthread_create(&xtid, NULL, xfr_refresh_thread, NULL) == 0)
-            pthread_detach(xtid);
-        else
-            dns_log(LOG_ERR, "[XFR] Failed to start transfer-client thread\n");
-    }
-
     /* (mDNS moved to the mdnsd daemon — migration Step 3.) */
 
     /* Phase 6: Open unicast DNS sockets — dual-stack IPv4 + IPv6 */
@@ -13044,6 +12974,82 @@ int main(int argc, char **argv) {
     sb.log = dns_log;
     sb.tag = "dnsd";
     sandbox_apply(&sb);
+    /* CSA-SBX-001: background threads start only now, under the sandbox — in
+     * mountns mode unshare() moves only the calling thread, so a thread started
+     * earlier would keep the original filesystem view (seccomp itself now
+     * syncs onto every thread via TSYNC). */
+    /* Phase 5: live-reload subscriber — applies config:*, cert:current,
+     * zone_table:* edits via Valkey keyspace notifications, no restart needed
+     * (migration Step 6). Also does the boot catch-up for cert:current, so it
+     * subsumes the old polling cert watcher. ACME/EST live in certd. */
+    {
+        pthread_t ctid;
+        if (pthread_create(&ctid, NULL, keyspace_watch_thread, NULL) == 0)
+            pthread_detach(ctid);
+        else
+            dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
+    }
+
+    /* Per-zone ZSK rollover engine (RFC 6781 Pre-Publish). */
+    {
+        pthread_t rtid;
+        if (pthread_create(&rtid, NULL, rollover_thread, NULL) == 0)
+            pthread_detach(rtid);
+        else
+            dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
+    }
+
+    /* NOTIFY sender: background worker that TSIG-signs + retries master→secondary
+     * NOTIFYs (RFC 1996 §3.6). Idle until a zone change enqueues a job. */
+    {
+        pthread_t ntid;
+        if (pthread_create(&ntid, NULL, notify_thread, NULL) == 0)
+            pthread_detach(ntid);
+        else
+            dns_log(LOG_ERR, "[NOTIFY] Failed to start NOTIFY sender thread\n");
+    }
+
+    /* Primary: DDNS lease-expiry sweeper — replays silent ddns:* expiries as
+     * replicated deletions so secondaries converge (CLAUDE-discovery.md Gap 2). */
+    if (!g_zone_secondary) {
+        pthread_t stid;
+        if (pthread_create(&stid, NULL, ddns_sweeper_thread, NULL) == 0)
+            pthread_detach(stid);
+        else
+            dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
+    }
+
+    /* Primary: RFC 9665/9664 SRP lease-expiry sweeper — same role as the DDNS
+     * sweeper above, for srp:* registrations. Idle (just sleeps) unless
+     * config:srp_enabled is set. */
+    if (!g_zone_secondary) {
+        pthread_t srtid;
+        if (pthread_create(&srtid, NULL, srp_sweeper_thread, NULL) == 0)
+            pthread_detach(srtid);
+        else
+            dns_log(LOG_ERR, "[SRP] Failed to start lease-expiry sweeper\n");
+    }
+
+    /* Load-balancing health-check probe thread (CLAUDE-loadbalance.md Gap 2).
+     * Idle (just sleeps) until config:lb_health_enabled is set. */
+    {
+        pthread_t htid;
+        if (pthread_create(&htid, NULL, lb_health_thread, NULL) == 0)
+            pthread_detach(htid);
+        else
+            dns_log(LOG_ERR, "[LB] Failed to start health-check thread\n");
+    }
+
+    /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry
+     * timers + NOTIFY-triggered re-pull (hidden-master plan Gap 6/5). Detached so
+     * an unreachable master never blocks the server. */
+    if (g_zone_secondary && g_primary_host[0]) {
+        pthread_t xtid;
+        if (pthread_create(&xtid, NULL, xfr_refresh_thread, NULL) == 0)
+            pthread_detach(xtid);
+        else
+            dns_log(LOG_ERR, "[XFR] Failed to start transfer-client thread\n");
+    }
 
     /* Spawn IPv4 UDP worker threads (workers>1) on the pre-bound REUSEPORT
      * sockets. Post-sandbox is fine: dnsd already pthread_create()s DoT threads

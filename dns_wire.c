@@ -1314,6 +1314,81 @@ int client_is_loopback(const client_addr_t *c) {
     return 0;
 }
 
+/* Parse one ACL entry — "a.b.c.d[/N]" (N 0-32) or an IPv6 address
+ * "x::y[/N]" (N 0-128), surrounding spaces allowed — into family + network
+ * octets + prefix length. Returns 1 on success, 0 if malformed: a malformed
+ * entry matches nothing (fail closed; atoi used to turn "10.0.0.0/x" into
+ * /0 = "everyone", CSA-AUTH-005). Modifies tok. */
+int acl_entry_parse(char *tok, int *fam, uint8_t net[16], int *bits) {
+    while (*tok == ' ' || *tok == '\t')
+        tok++;
+    size_t tl = strlen(tok);
+    while (tl > 0 && (tok[tl - 1] == ' ' || tok[tl - 1] == '\t'))
+        tok[--tl] = 0;
+    int is6 = strchr(tok, ':') != NULL;
+    int maxbits = is6 ? 128 : 32;
+    *bits = maxbits;
+    char *slash = strchr(tok, '/');
+    if (slash) {
+        const char *ps = slash + 1;
+        int nd = 0;
+        int v = 0;
+        while (*ps >= '0' && *ps <= '9' && nd < 4) {
+            v = v * 10 + (*ps - '0');
+            ps++;
+            nd++;
+        }
+        if (nd == 0 || *ps != 0 || v > maxbits)
+            return 0;
+        *bits = v;
+        *slash = 0;
+    }
+    memset(net, 0, 16);
+    if (inet_pton(is6 ? AF_INET6 : AF_INET, tok, net) != 1)
+        return 0;
+    *fam = is6 ? AF_INET6 : AF_INET;
+    return 1;
+}
+
+/* Do the first `bits` bits of a and b agree? */
+static int acl_prefix_match(const uint8_t *a, const uint8_t *b, int bits) {
+    int full = bits / 8;
+    if (full && memcmp(a, b, (size_t) full) != 0)
+        return 0;
+    int rem = bits % 8;
+    if (rem) {
+        uint8_t m = (uint8_t) (0xFF << (8 - rem));
+        if ((a[full] & m) != (b[full] & m))
+            return 0;
+    }
+    return 1;
+}
+
+/* Returns 1 if client `c` matches any entry in a comma-separated list of IPv4
+ * and IPv6 addresses / prefixes ("10.0.0.0/8, 192.168.1.5, 2001:db8::/32").
+ * An entry only matches its own family (v4-mapped clients were normalised to
+ * v4). Shared by the AXFR ACL, the forwarder client ACL and the unsigned-
+ * UPDATE allow-list. An empty list, an unknown client and a malformed entry
+ * match nothing (fail closed). */
+int acl_allows(const char *list, const client_addr_t *c) {
+    if (!list || !list[0] || !c || (c->family != AF_INET && c->family != AF_INET6))
+        return 0;
+    const uint8_t *ca = c->family == AF_INET ? (const uint8_t *) &c->u.v4 : c->u.v6.s6_addr;
+    char allow[1024];
+    safe_strcpy(allow, list, sizeof(allow));
+    char *sp = NULL;
+    for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        int fam = 0;
+        uint8_t net[16];
+        int bits = 0;
+        if (!acl_entry_parse(tok, &fam, net, &bits) || fam != c->family)
+            continue;
+        if (acl_prefix_match(ca, net, bits))
+            return 1;
+    }
+    return 0;
+}
+
 int proxy_v2_build(uint8_t *out, int cap, const struct sockaddr *src, int dgram) {
     if (!src || cap < 16)
         return -1;

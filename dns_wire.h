@@ -515,6 +515,15 @@ void client_from_sockaddr(client_addr_t *c, const struct sockaddr *sa);
 const char *client_ntop(const client_addr_t *c, char *buf, size_t n);
 int client_is_loopback(const client_addr_t *c);
 
+/* Client ACLs: a comma-separated list of IPv4/IPv6 addresses and prefixes
+ * ("10.0.0.0/8, 192.168.1.5, 2001:db8::/32"). acl_entry_parse parses one
+ * entry (modifies tok; 1 ok, 0 malformed — a malformed entry matches
+ * nothing). acl_allows: 1 if `c` matches an entry of its own family; an empty
+ * list, an unknown client or a malformed entry never match (fail closed).
+ * Shared by dnsd (axfr/forward/update ACLs) and resolverd (client ACL). */
+int acl_entry_parse(char *tok, int *fam, uint8_t net[16], int *bits);
+int acl_allows(const char *list, const client_addr_t *c);
+
 /* PROXY protocol v2 (HAProxy, §2.2) on the loopback hop from apid/doqd to dnsd,
  * so dnsd sees the real DoH/DoQ client instead of 127.0.0.1.
  * proxy_v2_build: header for `src` (dst = loopback, ports kept), UDP or TCP.

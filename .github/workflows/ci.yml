@@ -369,6 +369,57 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-client-identity OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: Transfers require TSIG when a key is configured (CSA-AUTH-005)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-xfr-tsig-required OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Query log escapes qnames (CSA-INJ-002)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-qlog-escape OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: seccomp on every dnsd/resolverd thread (CSA-SBX-001)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-sandbox-threads OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: apid/mdnsd/certd sandboxed (CSA-SBX-002)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-sidecar-sandbox OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: resolverd client ACL + --no-mdns/--no-dnssec (CSA-AUTH-007)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-resolverd-acl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: apid serves connections concurrently (CSA-DOS-003)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-apid-concurrency OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: mdnsd direct lookups + on-link check (CSA-DOS-005, CSA-INJ-001)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-mdnsd-lookup OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: dashboard CSRF + cookie flags (CSA-WEB-001)
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: |
+          python3 -m venv /tmp/dashvenv
+          /tmp/dashvenv/bin/pip install -q -r dashboard/requirements.txt
+          make check-dashboard-csrf DASH_PY=/tmp/dashvenv/bin/python3
+
       - name: resolverd cache under concurrent load — ASan (CSA-CONC-001)
         env:
           DNS_VALKEY_HOST: 127.0.0.1

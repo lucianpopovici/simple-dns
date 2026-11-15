@@ -56,10 +56,15 @@ class _Conn:
             n = int(data)
             if n == -1:
                 return None
-            val = b""
-            while len(val) < n + 2:
-                val += self.sock.recv(n + 2 - len(val))
-            return val[:-2].decode(errors="replace")
+            # The payload usually arrives in the same segment as the "$n"
+            # header, so take what _read_line already buffered first.
+            while len(self._buf) < n + 2:
+                chunk = self.sock.recv(max(4096, n + 2 - len(self._buf)))
+                if not chunk:
+                    raise ValkeyError("Connection closed")
+                self._buf += chunk
+            val, self._buf = self._buf[:n], self._buf[n + 2:]
+            return val.decode(errors="replace")
         if t == "*":
             n = int(data)
             if n == -1:

@@ -50,6 +50,7 @@
 #include <openssl/quic.h>
 
 #include "dns_wire.h"
+#include "sandbox.h"
 
 #define MAX_PEM 65536
 #define DOQ_MAX_MSG 65535 /* a DNS message's own 16-bit length ceiling */
@@ -456,12 +457,13 @@ static void *doq_conn_thread(void *arg) {
     return NULL;
 }
 
-static void *doq_listen_thread(void *arg) {
-    (void) arg;
+/* Bound in main() before sandbox_apply() (853/udp needs root); the listener
+ * thread only serves it. Returns the socket or -1. */
+static int doq_bind(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         dns_log(LOG_ERR, "[DoQ] socket failed: %s\n", strerror(errno));
-        return NULL;
+        return -1;
     }
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -471,8 +473,13 @@ static void *doq_listen_thread(void *arg) {
     if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
         dns_log(LOG_ERR, "[DoQ] bind :%d/udp failed: %s\n", g_doq_port, strerror(errno));
         close(fd);
-        return NULL;
+        return -1;
     }
+    return fd;
+}
+
+static void *doq_listen_thread(void *arg) {
+    int fd = (int) (intptr_t) arg;
 
     pthread_mutex_lock(&g_tls_mutex);
     SSL_CTX *ctx = g_doq_ctx;
@@ -582,6 +589,22 @@ static int schema_gate(void) {
 }
 
 #ifndef UNIT_TEST
+/* CSA-SBX-002: doqd terminates untrusted QUIC/TLS, so it confines itself
+ * once its socket is bound: privilege drop (when started as root), optional
+ * chroot/mountns, seccomp. Config: config:doqd_{chroot_dir,isolation_mode,
+ * privdrop_user,privdrop_group,seccomp_mode}, env DOQD_{CHROOT,ISOLATION,
+ * USER,GROUP,SECCOMP}, read before confinement. seccomp defaults to audit
+ * until a syscall harvest validates enforce. */
+static void apply_doqd_sandbox(void) {
+    sandbox_config_t sb;
+    sandbox_config_load(&sb, "doqd", "DOQD", vk_get);
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* hostname DNS_VALKEY_HOST */
+    sb.log = dns_log;
+    sb.tag = "doqd";
+    sandbox_apply(&sb);
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -596,6 +619,11 @@ int main(int argc, char **argv) {
     }
     dns_log(LOG_NOTICE, "[doqd] Starting: DoQ :%d/udp, dnsd at 127.0.0.1:%d\n", g_doq_port,
             g_dns_port);
+    int doq_fd = doq_bind();
+    if (doq_fd < 0)
+        return 1;
+    /* Every thread starts after this, so all of them run confined. */
+    apply_doqd_sandbox();
     pthread_t kt, lt;
     static keyspace_watch_config_t kcfg;
     memset(&kcfg, 0, sizeof(kcfg));
@@ -613,7 +641,7 @@ int main(int argc, char **argv) {
     kcfg.tag = "doqd";
     if (pthread_create(&kt, NULL, keyspace_watch_loop, &kcfg) == 0)
         pthread_detach(kt);
-    if (pthread_create(&lt, NULL, doq_listen_thread, NULL) != 0) {
+    if (pthread_create(&lt, NULL, doq_listen_thread, (void *) (intptr_t) doq_fd) != 0) {
         dns_log(LOG_ERR, "[DoQ] failed to start listener thread\n");
         return 1;
     }

@@ -51,6 +51,7 @@
 #include <openssl/bio.h>
 
 #include "dns_wire.h"
+#include "sandbox.h"
 
 #define ACME_CA_PROD "https://acme-v02.api.letsencrypt.org/directory"
 #define ACME_RENEW_DAYS 30
@@ -2008,6 +2009,29 @@ static int schema_gate(void) {
 }
 
 #ifndef UNIT_TEST
+/* CSA-SBX-002: certd parses CA responses (ACME JSON, EST) and, for
+ * tls-alpn-01, briefly accepts inbound TLS, so it confines itself like the
+ * other daemons: privilege drop (when started as root), optional
+ * chroot/mountns, seccomp. Config: config:certd_{chroot_dir,isolation_mode,
+ * privdrop_user,privdrop_group,seccomp_mode}, env CERTD_{CHROOT,ISOLATION,
+ * USER,GROUP,SECCOMP}, read before confinement. seccomp defaults to audit
+ * until a syscall harvest validates enforce. GETADDRINFO: certd resolves the
+ * CA/EST host names. It keeps CAP_NET_BIND_SERVICE (and nothing else) because
+ * the tls-alpn-01 listener is bound on demand, after confinement, on
+ * config:acme_tls_alpn_port (default 443 — the port the validator dials). A
+ * chroot must carry resolv.conf/nsswitch.conf and the system CA bundle at its
+ * usual path: each request loads the default verify paths. */
+static void apply_certd_sandbox(void) {
+    sandbox_config_t sb;
+    sandbox_config_load(&sb, "certd", "CERTD", vk_get);
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO;
+    sb.keep_net_bind_service = 1;
+    sb.log = dns_log;
+    sb.tag = "certd";
+    sandbox_apply(&sb);
+}
+
 int main(int argc, char **argv) {
     int once = 0;
     for (int i = 1; i < argc; i++) {
@@ -2032,6 +2056,9 @@ int main(int argc, char **argv) {
     (void) est_cacerts;
     if (schema_gate() != 0)
         return 1;
+    /* No thread exists yet; the tls-alpn-01 accept thread is created later
+     * from this one and inherits the sandbox (and the kept capability). */
+    apply_certd_sandbox();
     if (once)
         return renewal_check() < 0 ? 1 : 0;
     for (;;) {
