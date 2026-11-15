@@ -64,7 +64,7 @@ static const uint8_t WIRE_SIGNER[] = {7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, '
 #define ZSK_FLAGS 256u /* DNSKEY flags for a Zone Signing Key (RFC 4034 §2.1.1) */
 
 /* RFC 4034 Appendix B key tag over a DNSKEY rdata blob. */
-static uint16_t dnskey_keytag(const uint8_t *rd, int n) {
+static uint16_t ref_keytag(const uint8_t *rd, int n) { /* independent copy */
     unsigned long ac = 0;
     for (int i = 0; i < n; i++)
         ac += (i & 1) ? (unsigned long) rd[i] : (unsigned long) rd[i] << 8;
@@ -86,7 +86,9 @@ static void make_dnskey(pubkey_t *k, uint8_t alg, const uint8_t *pub, int publen
     k->rd[3] = alg;
     memcpy(k->rd + 4, pub, (size_t) publen);
     k->len = 4 + publen;
-    k->tag = dnskey_keytag(k->rd, k->len);
+    k->tag = ref_keytag(k->rd, k->len);
+    if (k->tag != dnskey_keytag(k->rd, k->len)) /* libdnswire must agree */
+        k->tag ^= 0xFFFF;
 }
 
 /* Extract the raw DNSKEY public-key bytes from an EVP_PKEY (64 for P-256,

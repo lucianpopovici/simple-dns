@@ -126,7 +126,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -444,16 +444,22 @@ check-conformance: tests/test_conformance.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 # RFC 9715 / Flag Day 2020: UDP responses must not exceed the fragmentation-safe
 # size even when the client advertises a larger EDNS buffer — cap to 1232 and set
 # TC so the client retries over TCP, where the full answer is returned. The probe
-# is a DNSSEC-signed AAAA RRset (the canonical fragmentation case): the full
-# response (~2.3 KB) sits between 1232 and the client's advertised 4096, so a TC
-# bit proves the 1232 cap fired rather than the 4096 buffer.
+# is a DNSSEC-signed 32-address AAAA RRset in a throwaway zone with a long apex
+# (the canonical fragmentation case): the full UDP response (~1.3 KB) sits
+# between 1232 and the client's advertised 4096, so a TC bit proves the 1232
+# cap fired rather than the 4096 buffer. (The RRset is signed ONCE per
+# algorithm since the RRset-signing fix, so it takes 32 addresses and a long
+# signer name — not 8 addresses with 16 per-record RRSIGs — to exceed 1232.)
 check-frag: $(BIN_DEBUG)
 	@echo "  CHECK  RFC 9715 UDP fragmentation avoidance (1232 cap + TC fallback)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
-	 Z=example.local; BIGN=big.$$Z;                                                    \
-	 VAL=30; for i in 1 2 3 4 5 6 7 8; do VAL="$$VAL|2001:db8:$$i::$$i"; done;          \
+	 Z=rfc9715-fragmentation-avoidance-probe.test; BIGN=big.$$Z;                       \
+	 clean() { for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done; }; \
+	 clean;                                                                            \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
+	 VAL=30; for i in $$(seq 1 32); do VAL="$$VAL|2001:db8:$$i::$$i"; done;          \
 	 $$VC set zone:$$Z:AAAA:$$BIGN "$$VAL" >/dev/null;                                 \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_frag.log 2>&1 & DNS=$$!; \
 	 sleep 1.5;                                                                        \
@@ -462,13 +468,67 @@ check-frag: $(BIN_DEBUG)
 	 TCPSIZE=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +tcp +dnssec $$BIGN AAAA +time=3 +tries=1 | awk '/MSG SIZE/{print $$NF}'); \
 	 TCPAAAA=$$(dig +nocookie @127.0.0.1 -p $(TPORT) +tcp +dnssec $$BIGN AAAA +time=3 +tries=1 +short | grep -c '^2001:db8:'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
-	 $$VC del zone:$$Z:AAAA:$$BIGN >/dev/null;                                         \
+	 clean;                                                                            \
 	 echo "  udp_flags=[$$UDPFLAGS] opt_udp=[$$OPT] tcp_size=[$$TCPSIZE] tcp_aaaa=[$$TCPAAAA]"; \
 	 test -n "$$TCPSIZE" && test "$$TCPSIZE" -gt 1232 || { echo "  FAIL  probe response not >1232 over TCP (size=$$TCPSIZE) — cannot exercise the UDP cap"; exit 1; }; \
 	 echo "$$UDPFLAGS" | grep -qw tc || { echo "  FAIL  UDP answer >1232 not truncated (TC unset) despite bufsize=4096"; exit 1; }; \
 	 test "$$OPT" = "1232" || { echo "  FAIL  response OPT advertises [$$OPT], expected 1232"; exit 1; }; \
-	 test "$$TCPAAAA" -eq 8 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 8)"; exit 1; }; \
-	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 8 AAAA)"
+	 test "$$TCPAAAA" -eq 32 || { echo "  FAIL  TCP did not return the full AAAA RRset (got $$TCPAAAA of 32)"; exit 1; }; \
+	 echo "  PASS  UDP capped+TC, OPT=1232, TCP full ($$TCPSIZE bytes, 32 AAAA)"
+
+# CSA-DNSSEC-001 / CSA-PROTO-001 / CSA-DNSSEC-002 (CLAUDE-dnssec-denial.md).
+# Validates dnsd's answers with an INDEPENDENT validator (dnspython +
+# cryptography), not with dnsd's or resolverd's own code: the DNSKEY RRset
+# validates under each KSK (tags = published flags-257 keys, whole RRset
+# signed); DS/CDS tags match; NODATA vs NXDOMAIN is decided by name existence
+# (zone:, ddns:, srp:, apex); every negative answer carries ONE RFC 9824
+# compact-denial record (NSEC: owner=qname, next=\000.qname; NSEC3: owner=
+# H(qname), next=H+1) with the exact type bitmap, NXNAME for a nonexistent
+# name, NOERROR unless Compact Answers OK, CO echoed; QTYPE NXNAME -> FORMERR +
+# EDE 30. Runs both config:zone:<z>:dnssec_nsec_mode values on a throwaway
+# non-.local zone. check-dnssec-live only counts RRSIGs and caught none of
+# these. Needs Valkey + python3 with dnspython + cryptography.
+check-dnssec-validate: $(BIN_DEBUG) resolverd_debug
+	@echo "  CHECK  independent DNSSEC validation: KSK tags, NODATA vs NXDOMAIN, RFC 9824 compact denial (Valkey + python3-dnspython + cryptography)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.dnssec, cryptography' 2>/dev/null || { echo "  SKIP  python3 dnspython/cryptography not installed"; exit 0; }; \
+	 Z=dv.test; V="python3 tests/dnssec_validate.py 127.0.0.1 $(TPORT) $$Z";           \
+	 clean() { for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done; }; \
+	 clean;                                                                            \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
+	 $$VC set zone:$$Z:NS:$$Z "300|ns1.$$Z|ns2.$$Z" >/dev/null;                        \
+	 $$VC set zone:$$Z:A:multi.$$Z "60|10.0.0.5|10.0.0.6|10.0.0.7" >/dev/null;           \
+	 $$VC set zone:$$Z:A:www.$$Z "60|10.0.0.1" >/dev/null;                             \
+	 $$VC set ddns:$$Z:A:dyn.$$Z "10.0.0.2" >/dev/null;                                \
+	 $$VC set srp:$$Z:A:srp.$$Z "60|10.0.0.3" >/dev/null;                              \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dv.log 2>&1 & DNS=$$!; \
+	 sleep 2.5; rc=0;                                                                  \
+	 for M in nsec3 nsec; do                                                           \
+	   $$VC set config:zone:$$Z:dnssec_nsec_mode $$M >/dev/null; sleep 1.2;            \
+	   echo "  -- dnssec_nsec_mode=$$M";                                               \
+	   for C in "dnskey" "ds-tags" "nxname nope" "nxname-co nope" "nodata www AAAA A"   \
+	            "nodata @ AAAA NS,SOA,DNSKEY,CDS,CDNSKEY" "nodata dyn AAAA A"           \
+	            "nodata srp TXT A" "qtype128" "rcode nope A NXDOMAIN"                   \
+	            "rcode www AAAA NOERROR" "rcode @ AAAA NOERROR" "rcode dyn TXT NOERROR"   \
+	            "positive multi A 3" "positive @ NS 2" "positive www A 1" "apex-only www"; do \
+	     OUT=$$($$V $$M $$C 2>&1) || rc=1; echo "    $$OUT" | cut -c1-200;             \
+	   done;                                                                           \
+	   TA=$$($$V $$M anchors);                                                         \
+	   for Q in "nope A" "www AAAA" "www A" "multi A" "dyn A" "$$Z NS"; do               \
+	     set -- $$Q; QN=$$1; case $$QN in *.*) ;; *) QN=$$QN.$$Z;; esac;              \
+	     ST=$$(ASAN_OPTIONS=detect_leaks=0 DNSSEC_TRUST_ANCHORS=$$TA ./resolverd_debug \
+	           --upstream 127.0.0.1:$(TPORT) --no-mdns --no-valkey $$QN $$2 2>&1 | sed -n 's/^;; DNSSEC: \([A-Z]*\).*/\1/p'); \
+	     echo "    resolverd $$QN $$2: $$ST";                                           \
+	     test "$$ST" = SECURE || rc=1;                                                 \
+	   done;                                                                           \
+	 done;                                                                             \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 SAN=$$(grep -c 'AddressSanitizer\|runtime error' /tmp/dnsd_dv.log);               \
+	 clean;                                                                            \
+	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report in /tmp/dnsd_dv.log"; exit 1; }; \
+	 test $$rc -eq 0 || { echo "  FAIL  independent validation failed (see FAIL lines above)"; exit 1; }; \
+	 echo "  OK  DNSKEY/DS/CDS tags + whole-RRset signatures valid; NODATA by name existence; compact denial (NSEC + NSEC3) validates; resolverd SECURE end-to-end"
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -556,14 +616,15 @@ check-zonemd: tests/test_zonemd.c $(BIN_DEBUG) $(WIRE_SRC) $(SANDBOX_SRC) dns_wi
 	 $$VC set config:zone:$$Z:zonemd 1 >/dev/null;                                     \
 	 $$VC set zone:$$Z:A:web.$$Z "120|10.1.2.3|10.1.2.4" >/dev/null;                   \
 	 $$VC set zone:$$Z:TXT:info.$$Z "120|hello-zonemd" >/dev/null;                     \
+	 $$VC set ddns:$$Z:A:lease.$$Z 10.1.2.9 EX 300 >/dev/null;                         \
 	 $$VC del zone:$$Z:ZONEMD:$$Z >/dev/null;                                          \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_zonemd.log 2>&1 & DNS=$$!; \
-	 sleep 1.5;                                                                        \
+	 sleep 2.5; # > 1 s after the digest: a live ddns lease must not make it drift   \
 	 DIGO=$$(dig +nocookie +noall +answer @127.0.0.1 -p $(TPORT) $$Z ZONEMD +time=2 +tries=1); \
 	 VER=$$(python3 tests/zonemd_verify.py 127.0.0.1 $(TPORT) $$Z 2>&1);               \
 	 RC=$$?;                                                                            \
 	 kill $$DNS 2>/dev/null || true;                                                   \
-	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z zone:$$Z:ZONEMD:$$Z >/dev/null; \
+	 $$VC del zone:$$Z:A:web.$$Z zone:$$Z:TXT:info.$$Z zone:$$Z:ZONEMD:$$Z ddns:$$Z:A:lease.$$Z >/dev/null; \
 	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
 	 if [ -n "$$SAVE_ZM" ]; then $$VC set config:zone:$$Z:zonemd "$$SAVE_ZM" >/dev/null; else $$VC del config:zone:$$Z:zonemd >/dev/null; fi; \
 	 echo "  dig: $$(echo "$$DIGO" | tr -s ' ')";                                      \
@@ -764,6 +825,98 @@ check-enum-provision: apid_debug | ossl-sanity
 	 echo "$$VAL" | grep -q "sip:info@example.com"    || { echo "  FAIL  regexp missing from written value"; exit 1; }; \
 	 test "$$R2" = "400"                               || { echo "  FAIL  '|' in replacement was not rejected"; exit 1; }; \
 	 echo "  OK  E.164 number -> reversed-digit zone:*:NAPTR:* key; defaults and '|'-in-replacement guardrail correct"
+
+# CSA-AUTH-003 / CSA-AUTH-004 (CLAUDE-apid-auth.md). /list and /zone are
+# mTLS-management only — the DDNS secret opens nothing but /update and
+# /delete, and those honour config:ddns_allow_suffix and reject names that
+# would corrupt a Valkey key (':', '|'). /zone values with '|' are rejected.
+# qs_get matches keys on '&' boundaries only ("xkey=" is not "key="). Drives
+# apid's real plain-HTTP and HTTPS listeners with curl (with and without a
+# client cert) and asserts both the HTTP codes and the resulting Valkey keys.
+# Needs Valkey + openssl + curl.
+check-apid-auth: apid_debug | ossl-sanity
+	@echo "  CHECK  apid authorisation: /list + /zone mgmt-only, DDNS suffix ACL + name/value hygiene (requires Valkey + openssl + curl)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                                         \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };                \
+	 command -v openssl >/dev/null || { echo "  SKIP  no openssl on PATH"; exit 0; };              \
+	 command -v curl >/dev/null    || { echo "  SKIP  no curl on PATH"; exit 0; };                 \
+	 D=$$(mktemp -d); HP=18063; SP=18453; EC="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"; \
+	 openssl req -x509 $$EC -keyout $$D/ca.key -out $$D/ca.pem -days 2 -subj "/CN=apid-auth-ca" >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/srv.key -out $$D/srv.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1;   \
+	 openssl x509 -req -in $$D/srv.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/srv.pem -days 2 >/dev/null 2>&1; \
+	 openssl req $$EC -keyout $$D/cli.key -out $$D/cli.csr -subj "/CN=mgmt-client" >/dev/null 2>&1; \
+	 openssl x509 -req -in $$D/cli.csr -CA $$D/ca.pem -CAkey $$D/ca.key -CAcreateserial -out $$D/cli.pem -days 2 >/dev/null 2>&1; \
+	 Z=example.local; S=apid-auth-test-secret;                                                      \
+	 K_KEEP=zone:$$Z:TXT:apidtest-keep.$$Z; K_DKEEP=ddns:$$Z:A:apidtest-keep2.$$Z;                    \
+	 K_Z1=zone:$$Z:TXT:apidtest-z1.$$Z; K_Z3=zone:$$Z:TXT:apidtest-z3.$$Z; K_Z4=zone:$$Z:A:apidtest-pipe.$$Z; \
+	 K_U1=ddns:$$Z:A:h1.dyn.$$Z; K_U2=ddns:$$Z:A:www.$$Z; K_U5=ddns:$$Z:A:h5.dyn.$$Z;                \
+	 K_B1="ddns:$$Z:A:a:b.dyn.$$Z"; K_B2="ddns:$$Z:A:a|b.dyn.$$Z"; K_B3="zone:$$Z:TXT:a:b.$$Z";      \
+	 SAVE_C=$$($$VC get config:tls_cert_pem); SAVE_K=$$($$VC get config:tls_key_pem);              \
+	 SAVE_A=$$($$VC get config:mtls_ca_pem); SAVE_HP=$$($$VC get config:https_port);                \
+	 SAVE_P=$$($$VC get config:http_port); SAVE_ZN=$$($$VC get config:zone_name);                   \
+	 SAVE_DS=$$($$VC get config:ddns_secret); SAVE_SX=$$($$VC get config:ddns_allow_suffix);        \
+	 $$VC set config:tls_cert_pem "$$(cat $$D/srv.pem)" >/dev/null;                                 \
+	 $$VC set config:tls_key_pem "$$(cat $$D/srv.key)" >/dev/null;                                  \
+	 $$VC set config:mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null;                                   \
+	 $$VC set config:https_port "$$SP" >/dev/null;                                                  \
+	 $$VC set config:http_port "$$HP" >/dev/null;                                                   \
+	 $$VC set config:zone_name "$$Z" >/dev/null;                                                    \
+	 $$VC set config:ddns_secret "$$S" >/dev/null;                                                  \
+	 $$VC set config:ddns_allow_suffix "dyn.$$Z" >/dev/null;                                         \
+	 $$VC del $$K_Z1 $$K_Z3 $$K_Z4 $$K_U1 $$K_U2 $$K_U5 "$$K_B1" "$$K_B2" "$$K_B3" >/dev/null;        \
+	 $$VC set $$K_KEEP "300|keep" >/dev/null; $$VC set $$K_DKEEP "10.1.1.1" >/dev/null;             \
+	 ASAN_OPTIONS=detect_leaks=0 ./apid_debug >/tmp/apid_auth.log 2>&1 & API=$$!;                   \
+	 sleep 1.5;                                                                                      \
+	 H="http://127.0.0.1:$$HP"; T="https://127.0.0.1:$$SP"; C="curl -s -o /dev/null -w %{http_code}"; \
+	 CN="$$C -k"; CM="$$C -k --cacert $$D/ca.pem --cert $$D/cli.pem --key $$D/cli.key";             \
+	 L1=$$($$C "$$H/list"); L2=$$($$C "$$H/list?key=$$S"); L3=$$($$CN "$$T/list"); L4=$$($$CM "$$T/list"); \
+	 LB=$$(curl -s "$$H/list?key=$$S" | grep -c "zone:");                                            \
+	 Z1=$$($$C -X POST "$$H/zone?key=$$S" --data "name=apidtest-z1.$$Z&type=TXT&value=x");           \
+	 Z2=$$($$C -X DELETE "$$H/zone?key=$$S&name=apidtest-keep.$$Z&type=TXT");                        \
+	 Z3=$$($$CM -X POST "$$T/zone" --data "name=apidtest-z3.$$Z&type=TXT&value=hello");              \
+	 Z4=$$($$CM -X POST "$$T/zone" --data "name=apidtest-pipe.$$Z&type=A&value=1.2.3.4%7C9.9.9.9");  \
+	 Z5=$$($$CM -X POST "$$T/zone" --data "name=a:b.$$Z&type=TXT&value=x");                          \
+	 U1=$$($$C "$$H/update?key=$$S&hostname=h1.dyn.$$Z&ip=10.9.8.7");                                \
+	 U2=$$($$C "$$H/update?key=$$S&hostname=www.$$Z&ip=6.6.6.6");                                    \
+	 U3=$$($$C "$$H/delete?key=$$S&hostname=apidtest-keep2.$$Z");                                    \
+	 U4=$$($$C "$$H/update?key=$$S&hostname=a:b.dyn.$$Z&ip=10.9.8.7");                               \
+	 U4B=$$($$C "$$H/update?key=$$S&hostname=a%7Cb.dyn.$$Z&ip=10.9.8.7");                            \
+	 U5=$$($$C "$$H/update?xkey=$$S&hostname=h5.dyn.$$Z&ip=10.9.8.7");                               \
+	 U6=$$($$C "$$H/update?key=wrong&hostname=h5.dyn.$$Z&ip=10.9.8.7");                              \
+	 kill $$API 2>/dev/null; wait $$API 2>/dev/null || true;                                        \
+	 E_KEEP=$$($$VC exists $$K_KEEP); E_DKEEP=$$($$VC exists $$K_DKEEP); E_Z1=$$($$VC exists $$K_Z1); \
+	 E_Z3=$$($$VC exists $$K_Z3); E_Z4=$$($$VC exists $$K_Z4); E_U1=$$($$VC exists $$K_U1);         \
+	 E_U2=$$($$VC exists $$K_U2); E_U5=$$($$VC exists $$K_U5);                                      \
+	 E_BAD=$$(( $$($$VC exists "$$K_B1") + $$($$VC exists "$$K_B2") + $$($$VC exists "$$K_B3") )); \
+	 $$VC del $$K_KEEP $$K_DKEEP $$K_Z1 $$K_Z3 $$K_Z4 $$K_U1 $$K_U2 $$K_U5 "$$K_B1" "$$K_B2" "$$K_B3" >/dev/null; \
+	 if [ -n "$$SAVE_C" ]; then $$VC set config:tls_cert_pem "$$SAVE_C" >/dev/null; else $$VC del config:tls_cert_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_K" ]; then $$VC set config:tls_key_pem "$$SAVE_K" >/dev/null; else $$VC del config:tls_key_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_A" ]; then $$VC set config:mtls_ca_pem "$$SAVE_A" >/dev/null; else $$VC del config:mtls_ca_pem >/dev/null; fi; \
+	 if [ -n "$$SAVE_HP" ]; then $$VC set config:https_port "$$SAVE_HP" >/dev/null; else $$VC del config:https_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_P" ]; then $$VC set config:http_port "$$SAVE_P" >/dev/null; else $$VC del config:http_port >/dev/null; fi; \
+	 if [ -n "$$SAVE_ZN" ]; then $$VC set config:zone_name "$$SAVE_ZN" >/dev/null; else $$VC del config:zone_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_DS" ]; then $$VC set config:ddns_secret "$$SAVE_DS" >/dev/null; else $$VC del config:ddns_secret >/dev/null; fi; \
+	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; else $$VC del config:ddns_allow_suffix >/dev/null; fi; \
+	 rm -rf $$D;                                                                                     \
+	 echo "  /list: plain=$$L1 plain+key=$$L2 https-nocert=$$L3 (000 = handshake refused) mgmt=$$L4 (records leaked to plain+key: $$LB)"; \
+	 echo "  /zone: key-POST=$$Z1 key-DELETE=$$Z2 mgmt-POST=$$Z3 mgmt-pipe=$$Z4 mgmt-colon-name=$$Z5"; \
+	 echo "  /update+/delete: in-suffix=$$U1 out-of-suffix=$$U2 delete-out=$$U3 colon=$$U4 pipe=$$U4B xkey=$$U5 wrong-key=$$U6"; \
+	 echo "  keys: keep=$$E_KEEP dkeep=$$E_DKEEP z1=$$E_Z1 z3=$$E_Z3 pipe=$$E_Z4 u1=$$E_U1 www=$$E_U2 xkey=$$E_U5 colon=$$E_BAD"; \
+	 test "$$L1" = 403 -a "$$L2" = 403 -a "$$LB" = 0 || { echo "  FAIL  /list reachable without mTLS"; exit 1; }; \
+	 case "$$L3" in 000|403) ;; *) echo "  FAIL  /list served over HTTPS without a client cert ($$L3)"; exit 1;; esac; \
+	 test "$$L4" = 200                       || { echo "  FAIL  /list not served to mgmt"; tail -5 /tmp/apid_auth.log; exit 1; }; \
+	 test "$$Z1" = 403 -a "$$E_Z1" = 0       || { echo "  FAIL  DDNS secret wrote a zone record"; exit 1; }; \
+	 test "$$Z2" = 403 -a "$$E_KEEP" = 1     || { echo "  FAIL  DDNS secret deleted a zone record"; exit 1; }; \
+	 test "$$Z3" = 201 -a "$$E_Z3" = 1       || { echo "  FAIL  mgmt /zone POST no longer works"; exit 1; }; \
+	 test "$$Z4" = 400 -a "$$E_Z4" = 0       || { echo "  FAIL  '|' in a /zone value was accepted"; exit 1; }; \
+	 test "$$Z5" = 400                       || { echo "  FAIL  ':' in a /zone name was accepted"; exit 1; }; \
+	 test "$$U1" = 200 -a "$$E_U1" = 1       || { echo "  FAIL  in-suffix DDNS update not applied"; exit 1; }; \
+	 test "$$U2" = 403 -a "$$E_U2" = 0       || { echo "  FAIL  out-of-suffix DDNS update not refused"; exit 1; }; \
+	 test "$$U3" = 403 -a "$$E_DKEEP" = 1    || { echo "  FAIL  out-of-suffix DDNS delete not refused"; exit 1; }; \
+	 test "$$U4" = 400 -a "$$U4B" = 400 -a "$$E_BAD" = 0 || { echo "  FAIL  ':'/'|' in a DDNS hostname accepted"; exit 1; }; \
+	 test "$$U5" = 403 -a "$$E_U5" = 0       || { echo "  FAIL  'xkey=' satisfied the 'key=' lookup"; exit 1; }; \
+	 test "$$U6" = 403                       || { echo "  FAIL  wrong DDNS secret accepted"; exit 1; }; \
+	 echo "  OK  /list + /zone mgmt-only; DDNS secret limited to in-suffix /update + /delete; key/value hygiene enforced"
 
 # ADR-004 regression: apid's /reverse/classless used to bump the /24 zone's
 # serial TWICE for one logical request when delegating (once for the CNAME
@@ -1568,6 +1721,76 @@ check-role: $(BIN_DEBUG)
 	 test "$$PRI_DK" -ge 1 || { echo "  FAIL  primary did not generate DNSKEY (control)"; exit 1; }; \
 	 echo "  OK  secondary refuses UPDATE + serves unsigned (no keygen); primary signs"
 
+# CSA-AUTH-001 / CSA-AUTH-002 (CLAUDE-update-auth.md Fix 1 + Fix 2). UPDATE
+# fails closed: unsigned is REFUSED unless the client is in
+# config:update_unsigned_allow (empty by default; a malformed CIDR matches
+# nobody); a TSIG must name the configured key, use hmac-sha256, carry a valid
+# MAC and be within the fudge window (checked after the MAC, fudge capped at
+# 300s); a secret that is set but does not decode refuses everything. The
+# final record scan proves no refused UPDATE wrote anything. Needs Valkey +
+# python3 with dnspython.
+check-update-auth: $(BIN_DEBUG)
+	@echo "  CHECK  UPDATE authentication: fail-closed default + TSIG time/key/alg (Valkey + python3-dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.tsig' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
+	 Z=example.local; C="python3 tests/update_auth_client.py";                         \
+	 B64=$$(printf '0123456789abcdef0123456789abcdef' | base64);                       \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_KN=$$($$VC get config:tsig_key_name); \
+	 SAVE_UA=$$($$VC get config:update_unsigned_allow); SAVE_SX=$$($$VC get config:ddns_allow_suffix); \
+	 $$VC del config:tsig_secret_b64 config:update_unsigned_allow config:ddns_allow_suffix >/dev/null; \
+	 $$VC set config:tsig_key_name tsig-key >/dev/null;                                \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:TXT:ua*"); do $$VC del "$$k" >/dev/null; done; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_uauth.log 2>&1 & DNS=$$!; \
+	 sleep 1.5;                                                                        \
+	 R1=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua1);                                   \
+	 $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null; sleep 1;              \
+	 R2=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua2);                                   \
+	 $$VC set config:update_unsigned_allow 127.0.0.1/x >/dev/null; sleep 1;            \
+	 R2B=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua2b);                                 \
+	 $$VC del config:update_unsigned_allow >/dev/null;                                 \
+	 $$VC set config:tsig_secret_b64 "$$B64" >/dev/null; sleep 1;                      \
+	 R3=$$($$C signed 127.0.0.1 $(TPORT) $$Z ua3);                                     \
+	 R4=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua4);                                   \
+	 T2=$$($$C signed-shift 127.0.0.1 $(TPORT) $$Z ua-t2 -31536000);                   \
+	 T3=$$($$C signed-shift 127.0.0.1 $(TPORT) $$Z ua-t3 600);                         \
+	 T4=$$($$C signed-key 127.0.0.1 $(TPORT) $$Z ua-t4 other-key);                     \
+	 T5=$$($$C signed-alg 127.0.0.1 $(TPORT) $$Z ua-t5 hmac-sha1);                     \
+	 T6=$$($$C signed-alg 127.0.0.1 $(TPORT) $$Z ua-t6 hmac-md5);                      \
+	 T7=$$($$C signed-fudge 127.0.0.1 $(TPORT) $$Z ua-t7 -3600 65535);                 \
+	 T8=$$($$C signed-flip 127.0.0.1 $(TPORT) $$Z ua-t8);                              \
+	 $$VC set config:tsig_secret_b64 '!!!not-base64!!!' >/dev/null; sleep 1;           \
+	 R5=$$($$C unsigned 127.0.0.1 $(TPORT) $$Z ua5);                                   \
+	 R6=$$($$C signed 127.0.0.1 $(TPORT) $$Z ua6);                                     \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 GOT=$$($$VC --scan --pattern "zone:$$Z:TXT:ua*" | sed "s/^zone:$$Z:TXT://" | sort | tr '\n' ' '); \
+	 BADLOG=$$(grep -c "config:tsig_secret_b64 is set but is not valid base64" /tmp/dnsd_uauth.log); \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:TXT:ua*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; else $$VC del config:tsig_secret_b64 >/dev/null; fi; \
+	 if [ -n "$$SAVE_KN" ]; then $$VC set config:tsig_key_name "$$SAVE_KN" >/dev/null; else $$VC del config:tsig_key_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
+	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; fi; \
+	 echo "  default-unsigned=[$$R1] allow-listed=[$$R2] malformed-cidr=[$$R2B] signed=[$$R3] unsigned+secret=[$$R4]"; \
+	 echo "  -1y=[$$T2] +10m=[$$T3] wrong-key=[$$T4] sha1=[$$T5] md5=[$$T6] fudge65535-1h=[$$T7] flipped-mac=[$$T8]"; \
+	 echo "  invalid-secret: unsigned=[$$R5] signed=[$$R6] log=$$BADLOG | written: $$GOT"; \
+	 test "$$R1" = "RCODE 5" || { echo "  FAIL  unsigned UPDATE not REFUSED by default"; exit 1; }; \
+	 test "$$R2" = "RCODE 0" || { echo "  FAIL  allow-listed unsigned UPDATE not accepted"; tail -20 /tmp/dnsd_uauth.log; exit 1; }; \
+	 test "$$R2B" = "RCODE 5" || { echo "  FAIL  malformed CIDR '127.0.0.1/x' matched (fail-open prefix parse)"; exit 1; }; \
+	 test "$$R3" = "RCODE 0 TSIGOK" || { echo "  FAIL  correctly signed UPDATE not accepted with a verifying response TSIG"; exit 1; }; \
+	 test "$$R4" = "RCODE 5" || { echo "  FAIL  unsigned UPDATE from a non-listed client accepted while TSIG is configured"; exit 1; }; \
+	 test "$$T2" = "RCODE 9 TSIG 18" || { echo "  FAIL  year-old TSIG not BADTIME"; exit 1; }; \
+	 test "$$T3" = "RCODE 9 TSIG 18" || { echo "  FAIL  future (+10m) TSIG not BADTIME"; exit 1; }; \
+	 test "$$T4" = "RCODE 9 TSIG 17" || { echo "  FAIL  wrong key name not BADKEY"; exit 1; }; \
+	 test "$$T5" = "RCODE 9 TSIG 17" || { echo "  FAIL  hmac-sha1 not BADKEY"; exit 1; }; \
+	 test "$$T6" = "RCODE 9 TSIG 17" || { echo "  FAIL  hmac-md5 not BADKEY"; exit 1; }; \
+	 test "$$T7" = "RCODE 9 TSIG 18" || { echo "  FAIL  client fudge 65535 widened the time window"; exit 1; }; \
+	 test "$$T8" = "RCODE 9 TSIG 16" || { echo "  FAIL  flipped MAC byte not BADSIG"; exit 1; }; \
+	 test "$$R5" = "RCODE 5" || { echo "  FAIL  undecodable secret: unsigned UPDATE not refused"; exit 1; }; \
+	 test "$$R6" = "RCODE 5" || { echo "  FAIL  undecodable secret: signed UPDATE not refused"; exit 1; }; \
+	 test "$$BADLOG" -ge 1 || { echo "  FAIL  undecodable secret not logged at LOG_ERR"; exit 1; }; \
+	 test "$$GOT" = "ua2.example.local ua3.example.local " || { echo "  FAIL  unexpected records written: [$$GOT]"; exit 1; }; \
+	 echo "  OK  unsigned refused by default; allow-list + strict CIDR; TSIG key/alg/MAC/time enforced; bad secret fails closed"
+
 # RFC 2931 SIG(0) transaction signatures — the SRP prerequisite (CLAUDE-mdnsd.md
 # Add 3). An asymmetric alternative to TSIG: dnsd verifies a self-signed UPDATE
 # against a KEY RR it already trusts (zone:<zone>:KEY:<signer>). nsupdate can't
@@ -1600,6 +1823,7 @@ check-sig0: $(BIN_DEBUG)
 	 R_EXP=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad2.example.local expired); \
 	 A_EXP=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad2.example.local A +time=2 +tries=1); \
 	 $$VC del zone:example.local:KEY:$$SIGNER >/dev/null; \
+	 $$VC del ddns:example.local:A:good1.example.local >/dev/null; \
 	 R_NOKEY=$$(python3 tests/sig0_client.py sign 127.0.0.1 $(TPORT) example.local $$D/sig0.key $$SIGNER bad3.example.local none); \
 	 A_NOKEY=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) bad3.example.local A +time=2 +tries=1); \
 	 kill $$DNS 2>/dev/null || true; wait 2>/dev/null || true; \
@@ -1701,7 +1925,7 @@ check-txn-atomicity: $(BIN_DEBUG)
 	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
 	 Z=example.local; FQDN=txnatomic.$$Z; D=$$(mktemp -d);                             \
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64);                                       \
-	 $$VC del config:tsig_secret_b64 >/dev/null;                                        \
+	 $$VC del config:tsig_secret_b64 >/dev/null; SAVE_UA=$$($$VC get config:update_unsigned_allow); $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                                        \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_txnatomic.log 2>&1 & DNS=$$!; \
 	 sleep 1.5;                                                                         \
 	 S0=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
@@ -1717,7 +1941,7 @@ check-txn-atomicity: $(BIN_DEBUG)
 	 wait $$POLLPIDS;                                                                    \
 	 kill $$DNS 2>/dev/null || true;                                                     \
 	 $$VC del ddns:$$Z:TXT:$$FQDN zone:$$Z:TXT:$$FQDN >/dev/null 2>&1;                   \
-	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 TOTAL=$$(cat $$D/poll_*.out | wc -l);                                               \
 	 VIOLATIONS=$$(awk -F'|' -v s0="$$S0" '$$1 > s0 && $$2 == "" {c++} END{print c+0}' $$D/poll_*.out); \
 	 rm -rf $$D;                                                                          \
@@ -1733,7 +1957,7 @@ check-ddns-acl: $(BIN_DEBUG)
 	 command -v nsupdate >/dev/null || { echo "  SKIP  no nsupdate on PATH"; exit 0; };\
 	 Z=example.local; FQDN=web1.dyn.$$Z;                                               \
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_SX=$$($$VC get config:ddns_allow_suffix); \
-	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 $$VC del config:tsig_secret_b64 >/dev/null; SAVE_UA=$$($$VC get config:update_unsigned_allow); $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                                       \
 	 $$VC set config:ddns_allow_suffix ".dyn.$$Z" >/dev/null;                          \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_ddns.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
@@ -1748,7 +1972,7 @@ check-ddns-acl: $(BIN_DEBUG)
 	 S3=$$(dig +short +nocookie @127.0.0.1 -p $(TPORT) $$Z SOA +time=2 +tries=1 | awk '{print $$3}'); \
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del config:ddns_allow_suffix ddns:$$Z:A:$$FQDN >/dev/null;                   \
-	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 if [ -n "$$SAVE_SX" ]; then $$VC set config:ddns_allow_suffix "$$SAVE_SX" >/dev/null; fi; \
 	 echo "  in-suffix A=[$$IN]  out-of-suffix refused=$$OUT www=[$$WWW]  serial S1=$$S1 S2=$$S2 S3=$$S3"; \
 	 test "$$IN" = "10.0.0.1" || { echo "  FAIL  in-suffix UPDATE not applied"; exit 1; }; \
@@ -1857,7 +2081,7 @@ check-ptr: $(BIN_DEBUG)
 	 REV6=8.b.d.0.1.0.0.2.ip6.arpa; HOST6=ptr6.dyn.$$FWD; IP6=2001:db8::5;             \
 	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_AP=$$($$VC get config:ddns_auto_ptr); \
 	 SAVE_AX=$$($$VC get config:axfr_allow);                                           \
-	 $$VC del config:tsig_secret_b64 >/dev/null;                                       \
+	 $$VC del config:tsig_secret_b64 >/dev/null; SAVE_UA=$$($$VC get config:update_unsigned_allow); $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                                       \
 	 $$VC set config:ddns_auto_ptr 1 >/dev/null;                                       \
 	 $$VC set config:axfr_allow 127.0.0.1 >/dev/null;                                  \
 	 $$VC set zone_table:$$REV "ns1.$$REV|hostmaster.$$REV|10|3600|900|604800|300|127.0.0.1|" >/dev/null; \
@@ -1878,7 +2102,7 @@ check-ptr: $(BIN_DEBUG)
 	 kill $$DNS 2>/dev/null || true;                                                   \
 	 $$VC del zone_table:$$REV zone_table:$$REV6 zone:$$REV:PTR:$$STATREV ddns:$$REV:PTR:$$REVNAME ddns:$$FWD:A:$$HOST ddns:$$FWD:AAAA:$$HOST6 config:zone:$$REV:serial config:zone:$$REV6:serial >/dev/null; \
 	 for k in $$($$VC --scan --pattern "dnssec:$$REV:*") $$($$VC --scan --pattern "dnssec:$$REV6:*") $$($$VC --scan --pattern "ddns:$$REV6:*") $$($$VC --scan --pattern "ixfr:$$REV:*") $$($$VC --scan --pattern "ixfr:$$REV6:*"); do $$VC del "$$k" >/dev/null; done; \
-	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; fi; if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 if [ -n "$$SAVE_AP" ]; then $$VC set config:ddns_auto_ptr "$$SAVE_AP" >/dev/null; else $$VC del config:ddns_auto_ptr >/dev/null; fi; \
 	 if [ -n "$$SAVE_AX" ]; then $$VC set config:axfr_allow "$$SAVE_AX" >/dev/null; else $$VC del config:axfr_allow >/dev/null; fi; \
 	 echo "  static=[$$STAT] auto=[$$AUTO] auto6=[$$AUTO6] gone=[$$GONE]"; echo "$$AX" | sed 's/^/    AXFR PTR /'; \
@@ -2611,14 +2835,14 @@ check-ede: tests/test_ede.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sa
 	 echo "  OK  EDE_NETWORK_ERROR (23) surfaced only to the EDNS-speaking client"
 
 # RFC 7858 DoT server (resolverd's own stub-facing listener) + RFC 9462 DDR
-# self-advertisement. Positive: a real dig +tls query over the listener
-# resolves, and _dns.resolver.arpa SVCB advertises the right target/alpn/port.
+# self-advertisement. Positive: a real certificate-verifying DoT query over the
+# listener (tests/dot_query.py, dnspython) resolves, and _dns.resolver.arpa SVCB advertises the right target/alpn/port.
 # Negative: without DOT_SERVER_ENABLED, no SVCB is served and the DoT port
 # never opens — resolverd must never advertise an endpoint it doesn't serve.
 check-ddr: resolverd_debug
-	@echo "  CHECK  RFC 7858 DoT server + RFC 9462 DDR (requires dig +tls + openssl + python3)"
+	@echo "  CHECK  RFC 7858 DoT server + RFC 9462 DDR (requires dig + openssl + python3-dnspython)"
 	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
-	 dig -h 2>&1 | grep -q -- '+\[no\]tls ' || { echo "  SKIP  dig has no +tls support"; exit 0; }; \
+	 python3 -c 'import dns.query' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
 	 D=$$(mktemp -d); \
 	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 	   -keyout $$D/srv.key -out $$D/srv.pem -days 2 -subj "/CN=resolver.test" \
@@ -2629,8 +2853,7 @@ check-ddr: resolverd_debug
 	     ./resolverd_debug --upstream 127.0.0.1:5416 --no-dnssec --no-valkey \
 	     > /tmp/resolverd_ddr.log 2>&1 & RD=$$!; \
 	 sleep 1.5; \
-	 DOTANS=$$(dig @127.0.0.1 -p 5418 +tls +tls-ca=$$D/srv.pem +tls-hostname=resolver.test \
-	     +time=2 +tries=1 +short primed.dot.test A); \
+	 DOTANS=$$(python3 tests/dot_query.py 127.0.0.1 5418 $$D/srv.pem resolver.test primed.dot.test); \
 	 DDR=$$(dig @127.0.0.1 -p 5417 +time=2 +tries=1 +short _dns.resolver.arpa SVCB); \
 	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true; \
 	 echo "  DoT answer=[$$DOTANS]  DDR=[$$DDR]"; \
@@ -3026,6 +3249,7 @@ help:
 	@echo "  make check-parent-notify RFC 9859 generalized NOTIFY(CDS/CDNSKEY) to a parent on KSK rollover (needs Valkey + python3)"
 	@echo "  make check-rollover-txn  ADR-004 ZSK rollover phases are atomic transactions (needs Valkey + dig)"
 	@echo "  make check-txn-atomicity ADR-004 write+serial-bump atomicity under concurrent polling (needs Valkey + dig + nsupdate)"
+	@echo "  make check-apid-auth  apid: /list + /zone mTLS-only, DDNS suffix ACL + name/value hygiene (needs Valkey + openssl + curl)"
 	@echo "  make check-classless-atomic  ADR-004 /reverse/classless delegate branch bumps serial exactly once (needs Valkey + openssl + curl)"
 	@echo "  make check-error-reporting RFC 9567 EDNS0 Report-Channel option; omitted when unset/subdomain (needs Valkey + dig)"
 	@echo "  make check-id-server RFC 3258/4892 CHAOS id.server/hostname.bind anycast identity (needs Valkey + dig)"
@@ -3042,14 +3266,16 @@ help:
 	@echo "  make check-xfr-client Secondary AXFR pull from master (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-refresh NOTIFY re-pull + SOA expire (needs Valkey + dig + python3)"
 	@echo "  make check-xfr-tsig  Transfer TSIG sign+verify (needs Valkey + dig + python3)"
+	@echo "  make check-update-auth  UPDATE auth: unsigned refused by default, TSIG time/key/alg (Valkey + python3-dnspython)"
 	@echo "  make check-resolverd resolverd caching proxy → dnsd (needs Valkey + dig)"
 	@echo "  make check-resolverd-cache resolverd Valkey cache-load regression (needs Valkey + dig)"
 	@echo "  make check-resolverd-cookie resolverd RFC 7873 cookie exchange (needs dig + python3)"
 	@echo "  make check-dns0x20   resolverd RFC 5452 0x20 QNAME case randomization (needs dig + python3)"
 	@echo "  make check-serve-stale resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL cache (needs dig + python3)"
+	@echo "  make check-dnssec-validate  Independent DNSSEC validation (dnspython): KSK tags, NODATA, RFC 9824 compact denial"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
-	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"
+	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"
 	@echo "  make check-dns64     resolverd RFC 6147 DNS64 AAAA synthesis (KAT + live, needs dig + python3)"
 	@echo "  make check-dp        mdnsd RFC 8766 Discovery Proxy (needs Valkey + dig + python3)"
 	@echo "  make check-dso       mdnsd RFC 8490 DSO + RFC 8765 Push Notifications (needs Valkey + openssl + python3)"

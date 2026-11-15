@@ -131,8 +131,12 @@ glance:
   when `eppd` has published one, falling back to the ordinary unsigned
   referral for an insecure delegation.
 - **DNSSEC**: RFC 4033–4035, 9364. ZSK + KSK with algorithm 13 (ECDSA P-256)
-  and algorithm 15 (Ed25519, RFC 8080). NSEC (4034) and NSEC3 (5155)
-  authenticated denial. Validation (in `resolverd.c`) covers the full
+  and algorithm 15 (Ed25519, RFC 8080). Authenticated denial is RFC 9824
+  compact denial of existence (dnsd signs on the fly): one NSEC (4034) or
+  NSEC3 (5155) record matching the query name — selected per zone with
+  `config:[zone:<zone>:]dnssec_nsec_mode` (`nsec3`, the default, or `nsec`) —
+  with NXNAME in the bitmap for a nonexistent name; NOERROR unless the client
+  sets the Compact Answers OK EDNS flag, then NXDOMAIN. Validation (in `resolverd.c`) covers the full
   canonical RRset per RFC 4034 §3.1.8.1. Automated per-zone ZSK rollover
   follows RFC 6781 §4.1.1.1 (Pre-Publish): the incoming key is published
   alongside the current one before the signer switches, and the old key is
@@ -222,7 +226,8 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:soa_*` | Default SOA `mname`, `rname`, `refresh`, `retry`, `expire`, `minimum` for the primary zone. |
 | `config:soa_ttl` | TTL the SOA RR is served with (default: unset → `soa_minimum`). Negative-response NSEC/NSEC3 + authority SOA are capped at `min(soa_ttl, soa_minimum)` per RFC 9077. Per-zone override: `config:zone:<zone>:soa_ttl`. |
 | `config:zone_serial` | Primary zone SOA serial; other zones use `config:zone:<zone>:serial`. |
-| `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. |
+| `config:tsig_key_name` / `config:tsig_secret_b64` | TSIG HMAC-SHA256 key for UPDATE/AXFR/NOTIFY. Only `hmac-sha256` is accepted; the key name must match; Time Signed must be within ±300 s (RFC 8945 BADTIME otherwise). A secret that is set but is not valid base64 makes dnsd refuse every UPDATE and transfer. |
+| `config:update_unsigned_allow` | Comma-separated IPv4 addresses/CIDRs allowed to send **unsigned** UPDATEs. Default empty: an UPDATE must carry a valid TSIG or SIG(0), otherwise it is REFUSED. Malformed entries (e.g. `10.0.0.0/x`) match nobody. Do not list `127.0.0.1` on a host running `apid`/`doqd` — DoH/DoQ clients reach dnsd from loopback. |
 | `config:cookie_secret` | 16-byte hex; key for DNS Cookies SipHash. Random if absent. |
 | `config:axfr_allow` | Comma-separated IPs/CIDRs allowed to do AXFR/IXFR. |
 | `config:notify_targets` | Comma-separated `IP:port` recipients for NOTIFY on zone change. |
@@ -232,7 +237,8 @@ The full schema is in the `dns_server.c` header comment; the most-edited keys:
 | `config:rrl_enabled` / `_rate` / `_window` / `_slip` | Response rate limiting. |
 | `config:lb_mode` | A/AAAA RRset rotation: `none` (default), `rr` (round-robin), `random`. Local serving policy — not zone data. |
 | `config:lb_health_enabled` / `_targets` / `_interval` / `_timeout_ms` | TCP health checks for load-balanced addresses: probe the addresses behind `_targets` (`name[:port],...`, port default 80) every `_interval`s (default 10) with a `_timeout_ms` connect timeout (default 1000); down addresses are dropped from answers, with fail-open when all are down. |
-| `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters. |
+| `config:dnssec_nsec_mode` | Denial record type for signed negative answers: `nsec3` (default) or `nsec`. Both use RFC 9824 compact denial. Per-zone override: `config:zone:<zone>:dnssec_nsec_mode`. |
+| `config:nsec3_iters` / `config:nsec3_salt` | NSEC3 parameters (default 0 extra iterations, empty salt — RFC 9276 / RFC 9824 §4). |
 | `config:zsk_validity` (or `config:zone:<zone>:zsk_validity`) | ZSK lifetime in seconds; `dnsd` auto-starts a rollover when the active ZSK is older. `0`/unset = no automatic rollover. |
 | `config:zone:<zone>:zsk_rollover_request` | Manual trigger: set to a fresh value (e.g. an epoch) to start a ZSK rollover for that zone now. Edge-triggered. |
 | `config:rollover_publish_hold` / `config:rollover_commit_hold` | Hold times (seconds) for the publish and commit phases (defaults 3600 each; per-zone overridable via `config:zone:<zone>:*`). Size publish ≥ DNSKEY TTL and commit ≥ max record TTL. |
@@ -300,6 +306,9 @@ layout, run `tools/migrate-multizone.sh` (dry-run by default; re-run with
 ## Operating notes
 
 ### Sending a dynamic update
+
+UPDATEs must be TSIG-signed (or SIG(0)-signed). Unsigned UPDATEs are refused
+unless the client address is listed in `config:update_unsigned_allow`.
 
 ```bash
 KEY_B64=$(valkey-cli GET config:tsig_secret_b64)
@@ -449,9 +458,12 @@ Valkey `config:dashboard_password_hash`. Set a persistent `FLASK_SECRET_KEY`
   `DASHBOARD_ENABLE_EXPLORER_WRITE=1`, and even then refuses to write/delete
   secret-bearing keys. Still, bind it to localhost or front it with a
   TLS-terminating proxy; never run it with `--debug` exposed.
-- `apid`'s management API (`/config`, `/zone*`) requires a client certificate
-  verified against `config:mtls_ca_pem` (mTLS); DDNS `/update` over plain HTTP
-  is gated by `config:ddns_secret`; DoH and read-only `/list` are open.
+- `apid`'s management API (`/list`, `/config`, `/zone*`, `/reverse/*`,
+  `/enum/*`) requires a client certificate verified against
+  `config:mtls_ca_pem` (mTLS). The DDNS secret (`config:ddns_secret`) opens
+  only `/update` and `/delete`, only for hostnames inside
+  `config:ddns_allow_suffix`, and only for `ddns:*` A/AAAA records. DoH,
+  `/health` and `/metrics` are open.
 - `dnsd`'s only HTTP surface is a read-only `/health`+`/metrics` bound to
   localhost. Secrets (TSIG key, cookie secret, DNSSEC private keys) live in
   Valkey and are read by `dnsd` only.

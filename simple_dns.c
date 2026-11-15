@@ -1794,7 +1794,7 @@ static void nsec3_hash_name(const char *name, const uint8_t *salt, int saltlen, 
 
 /* Build NSEC3 RDATA for a name, covering given type bitmap */
 static int nsec3_rdata(const char *name, uint16_t covered_type, uint8_t *out, int outlen) {
-    uint8_t salt[16];
+    uint8_t salt[16] = {0};
     int saltlen = 0;
     if (g_nsec3_salt[0])
         saltlen = hex_dec(g_nsec3_salt, salt, sizeof(salt));
@@ -2338,7 +2338,7 @@ static int add_nsec3_denial(uint8_t *resp, int off, int resp_len, const char *qn
     int n3len = nsec3_rdata(qname, qtype, n3rd, sizeof(n3rd));
     if (n3len > 0) {
         /* NSEC3 owner name = base32hex_hash.zone */
-        uint8_t salt[16];
+        uint8_t salt[16] = {0};
         int saltlen = 0;
         if (g_nsec3_salt[0])
             saltlen = hex_dec(g_nsec3_salt, salt, sizeof(salt));
@@ -2369,7 +2369,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
     if (after < 0 || after + 3 >= qlen)
         return -1;
     int qsec = after - off + 4;
-    if (off + qsec > resp_len)
+    if (qsec < 0 || off + qsec > resp_len)
         return -1;
     memcpy(resp + off, query + off, qsec);
     uint16_t qtype = get16(query, after);
@@ -4389,6 +4389,10 @@ int main(int argc, char **argv) {
             int cfd = accept(dot_sock, (struct sockaddr *) &cli, &clen);
             if (cfd >= 0) {
                 dot_conn_t *c = malloc(sizeof(dot_conn_t));
+                if (!c) {
+                    close(cfd);
+                    continue;
+                }
                 c->fd = cfd;
                 c->addr = cli;
                 pthread_t tid;

@@ -371,8 +371,10 @@ authoritative zone.
   HTTP/HTTPS/mTLS server, `url_decode`, `qs_get`, `handle_api`, `handle_doh`
   and the first-boot config portal from `dnsd`.
   - Auth: the HTTPS listener treats a request as management only when a client
-    cert verifies against `config:mtls_ca_pem` (mTLS); plain HTTP allows DoH,
-    read-only `/list`, and DDNS `/update` gated by `config:ddns_secret`.
+    cert verifies against `config:mtls_ca_pem` (mTLS); plain HTTP allows DoH
+    and DDNS `/update`/`/delete` gated by `config:ddns_secret` and
+    `config:ddns_allow_suffix`; `/list` and `/zone` are mTLS-only
+    (CSA-AUTH-003/004).
   - Because `apid` is the relocated embedded API, it inherits that API's Valkey
     writes (`config:*`, `zone:*` records, `ddns:*`) — see the ownership table.
     `dnsd` applies `config:*`/`zone_table:*` changes live via Valkey keyspace

@@ -1278,7 +1278,7 @@ static int dnskey_is_trusted(const uint8_t *dkrd, int dklen) {
  *                      rdlength | canonical rdata), sorted per §6.3.
  * ======================================================================= */
 
-#define DNSSEC_MAX_RRS 16 /* max RRs in one verified RRset */
+#define DNSSEC_MAX_RRS 32 /* max RRs in one verified RRset (= dnsd LB_MAX_ADDRS) */
 /* Number of labels in a dotted name ("" = root = 0). The leftmost "*" of an
  * already-wildcard owner does not count (RFC 4034 §3.1.3). */
 static int name_label_count(const char *name) {
@@ -1503,13 +1503,58 @@ static void dnskey_cache_put(const char *name, const uint8_t *rd, int rdlen, uin
     pthread_mutex_unlock(&g_dnskey_cache_mutex);
 }
 
-static int dnssec_fetch_dnskey(const char *name, uint8_t *dnskey_rd, int cap) {
-    int cached = dnskey_cache_get(name, dnskey_rd, cap);
-    if (cached > 0)
+static int name_in_zone(const char *name, const char *zone);
+
+/* Does this DNSKEY rdata have algorithm `alg` and key tag `tag`? */
+static int dnskey_matches(const uint8_t *rd, int rdlen, uint8_t alg, uint16_t tag) {
+    return rdlen >= 4 && rd[3] == alg && dnskey_keytag(rd, rdlen) == tag;
+}
+
+/* Find the DNSKEY an RRSIG names — owner `signer`, algorithm `alg`, key tag
+ * `tag` (RFC 4035 §5.3.1). Looks first at DNSKEY RRs carried in the
+ * response itself (any section), then fetches the signer's DNSKEY RRset
+ * upstream; fetched keys are cached per (signer, alg, tag). Returns the
+ * rdata length (copied to out) or 0. Previously the FIRST DNSKEY at the
+ * QNAME was used for every RRSIG, so any zone with two keys or two
+ * algorithms validated as BOGUS. */
+static int dnssec_find_key(const uint8_t *resp, int rlen, const char *signer, uint8_t alg,
+                           uint16_t tag, uint8_t *out, int cap) {
+    if (resp && rlen >= 12) {
+        const dns_hdr_t *h = (const dns_hdr_t *) resp;
+        int off = 12;
+        for (int i = 0; i < ntohs(h->qdcount) && off >= 0 && off < rlen; i++) {
+            char qn[256];
+            off = name_from_wire(resp, rlen, off, qn, sizeof(qn));
+            if (off < 0)
+                break;
+            off += 4;
+        }
+        int total = ntohs(h->ancount) + ntohs(h->nscount) + ntohs(h->arcount);
+        for (int i = 0; off >= 0 && i < total && off < rlen; i++) {
+            char rn[256];
+            int a = name_from_wire(resp, rlen, off, rn, sizeof(rn));
+            if (a < 0 || a + 10 > rlen)
+                break;
+            uint16_t rt = get16(resp, a);
+            uint16_t rdl = get16(resp, a + 8);
+            if (a + 10 + (int) rdl > rlen)
+                break;
+            if (rt == DNS_TYPE_DNSKEY && strcasecmp(rn, signer) == 0 && rdl <= cap &&
+                dnskey_matches(resp + a + 10, rdl, alg, tag)) {
+                memcpy(out, resp + a + 10, rdl);
+                return (int) rdl;
+            }
+            off = a + 10 + (int) rdl;
+        }
+    }
+    char ck[300];
+    snprintf(ck, sizeof(ck), "%u/%u/%s", (unsigned) alg, (unsigned) tag, signer);
+    int cached = dnskey_cache_get(ck, out, cap);
+    if (cached > 0 && dnskey_matches(out, cached, alg, tag))
         return cached;
     uint8_t dkresp[DNS_BUF * 2];
     long rtt = 0;
-    int dkrlen = upstream_query(name, 48 /*DNSKEY*/, dkresp, sizeof(dkresp), &rtt);
+    int dkrlen = upstream_query(signer, DNS_TYPE_DNSKEY, dkresp, sizeof(dkresp), &rtt);
     if (dkrlen < 12)
         return 0;
     const dns_hdr_t *dkh = (const dns_hdr_t *) dkresp;
@@ -1531,14 +1576,58 @@ static int dnssec_fetch_dnskey(const char *name, uint8_t *dnskey_rd, int cap) {
         uint16_t rdl = get16(dkresp, a + 8);
         if (a + 10 + (int) rdl > dkrlen)
             break; /* rdlength runs past the packet — fail closed */
-        if (rt == 48 && rdl > 0 && rdl <= (uint16_t) cap) {
-            memcpy(dnskey_rd, dkresp + a + 10, rdl);
-            dnskey_cache_put(name, dnskey_rd, (int) rdl, rttl);
+        if (rt == DNS_TYPE_DNSKEY && strcasecmp(rn, signer) == 0 && rdl > 0 &&
+            rdl <= (uint16_t) cap && dnskey_matches(dkresp + a + 10, rdl, alg, tag)) {
+            memcpy(out, dkresp + a + 10, rdl);
+            dnskey_cache_put(ck, out, (int) rdl, rttl);
             return (int) rdl;
         }
         dkoff = a + 10 + (int) rdl;
     }
     return 0;
+}
+
+/* Outcome of checking one RRset against all RRSIGs that cover it. */
+typedef enum { RRSET_UNSIGNED = 0, RRSET_SECURE, RRSET_INSECURE, RRSET_BOGUS } rrset_verdict_t;
+
+/* Verify the RRset at rr_offs[0..rr_n) against every RRSIG in `sigs` (their
+ * rdata copies). SECURE if some RRSIG verifies with a trusted key; INSECURE
+ * if one verifies but the key is not trusted (or no key/alg is usable);
+ * BOGUS only if every usable RRSIG failed. An RRSIG whose signer is not the
+ * owner or an ancestor of it is ignored (RFC 4035 §5.3.1). */
+static rrset_verdict_t dnssec_check_rrset(const uint8_t *resp, int rlen, const char *owner,
+                                          const int *rr_offs, int rr_n, uint8_t sigs[][512],
+                                          const int *siglens, int nsigs) {
+    int any_valid_untrusted = 0;
+    int any_failed = 0;
+    for (int i = 0; i < nsigs; i++) {
+        const uint8_t *sd = sigs[i];
+        int sl = siglens[i];
+        if (sl < 19)
+            continue;
+        char signer[256];
+        if (name_from_wire(sd, sl, 18, signer, sizeof(signer)) < 0)
+            continue;
+        if (!name_in_zone(owner, signer))
+            continue;
+        uint8_t key[512];
+        int kl = dnssec_find_key(resp, rlen, signer, sd[2], get16(sd, 16), key, sizeof(key));
+        if (kl <= 0)
+            continue;
+        int r = dnssec_verify_rrset(resp, rlen, rr_offs, rr_n, sd, sl, key, kl);
+        if (r == 1) {
+            if (dnskey_is_trusted(key, kl))
+                return RRSET_SECURE;
+            any_valid_untrusted = 1;
+        } else if (r == 0) {
+            any_failed = 1;
+        }
+    }
+    if (any_valid_untrusted)
+        return RRSET_INSECURE;
+    if (any_failed)
+        return RRSET_BOGUS;
+    return RRSET_INSECURE;
 }
 
 /*
@@ -1548,25 +1637,22 @@ static int dnssec_fetch_dnskey(const char *name, uint8_t *dnskey_rd, int cap) {
  * Returns DNSSEC_SECURE, DNSSEC_INSECURE, or DNSSEC_BOGUS.
  */
 static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen, const char *qname) {
+    (void) qname;
     if (rlen < 12)
         return DNSSEC_INSECURE;
     const dns_hdr_t *h = (const dns_hdr_t *) resp;
     int ancount = ntohs(h->ancount);
     if (ancount == 0)
         return DNSSEC_INSECURE;
-    /* Scan the answer section: record every RR's offset/owner/type, and grab
-     * the RRSIG + DNSKEY rdata. */
-    uint8_t rrsig_rd[512];
-    int rrsig_rdlen = 0;
-    char rrsig_owner[256] = {0};
-    uint8_t dnskey_rd[128];
-    int dnskey_rdlen = 0;
-    int an_offs[DNSSEC_MAX_RRS];
-    char an_names[DNSSEC_MAX_RRS][256];
-    uint16_t an_types[DNSSEC_MAX_RRS];
+#define VAL_MAX_RRS 48
+#define VAL_MAX_SIGS 8
+    int an_offs[VAL_MAX_RRS];
+    char an_names[VAL_MAX_RRS][256];
+    uint16_t an_types[VAL_MAX_RRS];
+    int an_rdoff[VAL_MAX_RRS];
+    uint16_t an_rdlen[VAL_MAX_RRS];
     int an_n = 0;
     int off = 12;
-    /* Skip question */
     for (int i = 0; i < ntohs(h->qdcount) && off < rlen; i++) {
         char tmp[256];
         off = name_from_wire(resp, rlen, off, tmp, sizeof(tmp));
@@ -1579,65 +1665,86 @@ static dnssec_status_t dnssec_validate_response(const uint8_t *resp, int rlen, c
         int a = name_from_wire(resp, rlen, off, rname, sizeof(rname));
         if (a < 0 || a + 10 > rlen)
             break;
-        uint16_t rtype = get16(resp, a);
         uint16_t rdlen = get16(resp, a + 8);
         if (a + 10 + (int) rdlen > rlen)
             break;
-        if (rtype == DNS_TYPE_RRSIG && rrsig_rdlen == 0 && rdlen > 0 &&
-            rdlen <= (int) sizeof(rrsig_rd)) {
-            memcpy(rrsig_rd, resp + a + 10, rdlen);
-            rrsig_rdlen = (int) rdlen;
-            safe_strcpy(rrsig_owner, rname, sizeof(rrsig_owner));
-        }
-        if (rtype == DNS_TYPE_DNSKEY && rdlen > 0 && rdlen <= (int) sizeof(dnskey_rd)) {
-            memcpy(dnskey_rd, resp + a + 10, rdlen);
-            dnskey_rdlen = (int) rdlen;
-        }
-        if (an_n < DNSSEC_MAX_RRS) {
-            an_offs[an_n] = off;
-            an_types[an_n] = rtype;
-            safe_strcpy(an_names[an_n], rname, sizeof(an_names[an_n]));
-            an_names[an_n][sizeof(an_names[an_n]) - 1] = 0;
-            an_n++;
-        }
+        if (an_n >= VAL_MAX_RRS)
+            return DNSSEC_INSECURE; /* too large to judge — never call it SECURE */
+        an_offs[an_n] = off;
+        an_types[an_n] = get16(resp, a);
+        an_rdoff[an_n] = a + 10;
+        an_rdlen[an_n] = rdlen;
+        safe_strcpy(an_names[an_n], rname, sizeof(an_names[an_n]));
+        an_n++;
         off = a + 10 + (int) rdlen;
     }
-    if (rrsig_rdlen == 0)
-        return DNSSEC_INSECURE; /* no signature — zone not signed */
-    if (rrsig_rdlen < 18)
-        return DNSSEC_BOGUS;
-    /* Select the RRset the RRSIG covers: same owner name + the covered type. */
-    uint16_t covered = get16(rrsig_rd, 0);
-    int rr_offs[DNSSEC_MAX_RRS];
-    int rr_n = 0;
+    int saw_sig = 0;
+    int all_secure = 1;
+    /* Judge every distinct (owner, type) RRset in the answer (RFC 4035 §5). */
     for (int i = 0; i < an_n; i++) {
-        if (an_types[i] == covered && strcmp(an_names[i], rrsig_owner) == 0)
-            rr_offs[rr_n++] = an_offs[i];
-    }
-    if (rr_n == 0)
-        return DNSSEC_BOGUS; /* signature over nothing present — fail closed */
-    /* If no DNSKEY in response, fetch it */
-    if (dnskey_rdlen == 0)
-        dnskey_rdlen = dnssec_fetch_dnskey(qname, dnskey_rd, (int) sizeof(dnskey_rd));
-    if (dnskey_rdlen == 0)
-        return DNSSEC_INSECURE;
-    /* Check trust anchor */
-    if (!dnskey_is_trusted(dnskey_rd, dnskey_rdlen)) {
-        /* Key not trusted — still validate signature, mark as insecure */
-        int r = dnssec_verify_rrset(resp, rlen, rr_offs, rr_n, rrsig_rd, rrsig_rdlen, dnskey_rd,
-                                    dnskey_rdlen);
-        if (r == 0)
+        if (an_types[i] == DNS_TYPE_RRSIG)
+            continue;
+        int first = 1;
+        for (int j = 0; j < i; j++)
+            if (an_types[j] == an_types[i] && strcmp(an_names[j], an_names[i]) == 0)
+                first = 0;
+        if (!first)
+            continue;
+        int rr_offs[DNSSEC_MAX_RRS];
+        int rr_n = 0;
+        for (int j = 0; j < an_n; j++)
+            if (an_types[j] == an_types[i] && strcmp(an_names[j], an_names[i]) == 0) {
+                if (rr_n >= DNSSEC_MAX_RRS)
+                    return DNSSEC_INSECURE;
+                rr_offs[rr_n++] = an_offs[j];
+            }
+        uint8_t sigs[VAL_MAX_SIGS][512];
+        int siglens[VAL_MAX_SIGS];
+        int nsigs = 0;
+        for (int j = 0; j < an_n && nsigs < VAL_MAX_SIGS; j++) {
+            if (an_types[j] != DNS_TYPE_RRSIG || strcmp(an_names[j], an_names[i]) != 0)
+                continue;
+            if (an_rdlen[j] < 18 || an_rdlen[j] > 512)
+                continue;
+            if (get16(resp, an_rdoff[j]) != an_types[i])
+                continue;
+            memcpy(sigs[nsigs], resp + an_rdoff[j], an_rdlen[j]);
+            siglens[nsigs] = an_rdlen[j];
+            nsigs++;
+        }
+        if (nsigs == 0) {
+            /* An unsigned RRset can never be SECURE — except a DNSKEY RRset
+             * carried alongside the answer as key material (its own RRSIG,
+             * when present, is judged like any other RRset). */
+            if (an_types[i] != DNS_TYPE_DNSKEY)
+                all_secure = 0;
+            continue;
+        }
+        saw_sig = 1;
+        rrset_verdict_t v =
+            dnssec_check_rrset(resp, rlen, an_names[i], rr_offs, rr_n, sigs, siglens, nsigs);
+        if (v == RRSET_BOGUS)
             return DNSSEC_BOGUS;
-        return DNSSEC_INSECURE;
+        if (v != RRSET_SECURE)
+            all_secure = 0;
     }
-    /* Key trusted — validate signature */
-    int r = dnssec_verify_rrset(resp, rlen, rr_offs, rr_n, rrsig_rd, rrsig_rdlen, dnskey_rd,
-                                dnskey_rdlen);
-    if (r == 1)
-        return DNSSEC_SECURE;
-    if (r == 0)
-        return DNSSEC_BOGUS;
-    return DNSSEC_INSECURE; /* unsupported alg */
+    /* An RRSIG that covers nothing present is malformed — fail closed. */
+    for (int j = 0; j < an_n; j++) {
+        if (an_types[j] != DNS_TYPE_RRSIG || an_rdlen[j] < 2)
+            continue;
+        uint16_t cov = get16(resp, an_rdoff[j]);
+        int present = 0;
+        for (int i = 0; i < an_n; i++)
+            if (an_types[i] == cov && strcmp(an_names[i], an_names[j]) == 0)
+                present = 1;
+        if (!present)
+            return DNSSEC_BOGUS;
+    }
+    if (!saw_sig)
+        return DNSSEC_INSECURE; /* no signature — zone not signed */
+    return all_secure ? DNSSEC_SECURE : DNSSEC_INSECURE;
+#undef VAL_MAX_RRS
+#undef VAL_MAX_SIGS
 }
 
 /* =========================================================================
@@ -1675,6 +1782,15 @@ typedef struct {
      * clear. */
     uint8_t bitmap[128];
     int bitmap_len;
+    /* RFC 9824 compact denial: the record proves something about its owner
+     * only — never a range. exact_only: the NSEC next name cannot be held
+     * faithfully in the dotted form (a label containing \000 or '.', e.g. the
+     * compact-denial successor "\000.<owner>" which name_from_wire turns into
+     * "", i.e. an apparent wrap to the end of the zone). nxname: the bitmap
+     * carries NXNAME, so the owner does not exist and must not be answered
+     * NODATA from this span either. */
+    int exact_only;
+    int nxname;
 } nsec_proof_t;
 
 #define MAX_NEG_PROOFS 4
@@ -1711,6 +1827,18 @@ static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uin
         int after = name_from_wire(pkt, plen, rdoff, next, sizeof(next));
         if (after < 0 || after > rdend)
             return 0;
+        /* Walk the uncompressed next-name labels: a 0x00 or '.' octet inside a
+         * label is lost in the dotted string, so this span may not be used to
+         * cover a range of names (it would cover the wrong one). */
+        for (int lp = rdoff; lp < after && pkt[lp] != 0 && (pkt[lp] & 0xC0) == 0;) {
+            int ll = pkt[lp];
+            if (lp + 1 + ll > after)
+                break;
+            for (int k = 1; k <= ll; k++)
+                if (pkt[lp + k] == 0 || pkt[lp + k] == '.')
+                    proof->exact_only = 1;
+            lp += 1 + ll;
+        }
         proof->is_nsec3 = 0;
         safe_strcpy(proof->owner, owner, sizeof(proof->owner));
         safe_strcpy(proof->next, next, sizeof(proof->next));
@@ -1721,6 +1849,8 @@ static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uin
             bmlen = (int) sizeof(proof->bitmap);
         memcpy(proof->bitmap, pkt + after, bmlen);
         proof->bitmap_len = bmlen;
+        if (nsec_bitmap_has_type(proof->bitmap, proof->bitmap_len, DNS_TYPE_NXNAME))
+            proof->nxname = proof->exact_only = 1;
         return 1;
     }
     if (rtype == DNS_TYPE_NSEC3) {
@@ -1769,6 +1899,8 @@ static int nsec_parse_rdata(const uint8_t *pkt, int plen, const char *owner, uin
             bmlen = (int) sizeof(proof->bitmap);
         memcpy(proof->bitmap, pkt + p, bmlen);
         proof->bitmap_len = bmlen;
+        if (nsec_bitmap_has_type(proof->bitmap, proof->bitmap_len, DNS_TYPE_NXNAME))
+            proof->nxname = proof->exact_only = 1;
         return 1;
     }
     return 0;
@@ -1821,8 +1953,6 @@ static dnssec_status_t dnssec_validate_negative(const uint8_t *resp, int rlen, c
     uint16_t ns_types[NEG_MAX_RRS];
     int ns_n = 0;
     char zone[256] = {0};
-    uint8_t dnskey_rd[128];
-    int dnskey_rdlen = 0;
     for (int i = 0; i < nscount && off < rlen; i++) {
         int rr_start = off;
         char rname[256];
@@ -1845,79 +1975,59 @@ static dnssec_status_t dnssec_validate_negative(const uint8_t *resp, int rlen, c
         }
         off = a + 10 + (int) rdlen;
     }
-    /* A negative response doesn't normally carry its zone's DNSKEY, but if
-     * one happens to be glued into the additional section (mirrors the
-     * in-band check dnssec_validate_response does on the answer section),
-     * use it instead of an upstream round trip. */
-    for (int i = 0; i < ntohs(h->arcount) && off < rlen; i++) {
-        char rname[256];
-        int a = name_from_wire(resp, rlen, off, rname, sizeof(rname));
-        if (a < 0 || a + 10 > rlen)
-            break;
-        uint16_t rtype = get16(resp, a);
-        uint16_t rdlen = get16(resp, a + 8);
-        if (a + 10 + (int) rdlen > rlen)
-            break;
-        if (rtype == DNS_TYPE_DNSKEY && dnskey_rdlen == 0 && rdlen > 0 &&
-            rdlen <= (int) sizeof(dnskey_rd)) {
-            memcpy(dnskey_rd, resp + a + 10, rdlen);
-            dnskey_rdlen = (int) rdlen;
-        }
-        off = a + 10 + (int) rdlen;
-    }
+    /* A DNSKEY glued into the response (any section) is used by
+     * dnssec_find_key before an upstream round trip. */
     if (!zone[0])
         return DNSSEC_INSECURE; /* no SOA — not a well-formed denial proof */
     int soa_secure = 0, saw_bogus = 0;
+    /* One verdict per distinct (owner, covered) SOA/NSEC/NSEC3 RRset, over
+     * all of its RRSIGs (a zone signed with two algorithms carries two). */
     for (int i = 0; i < ns_n; i++) {
-        if (ns_types[i] != DNS_TYPE_RRSIG)
+        uint16_t t = ns_types[i];
+        if (t != DNS_TYPE_SOA && t != DNS_TYPE_NSEC && t != DNS_TYPE_NSEC3)
             continue;
-        const char *rname = ns_names[i];
-        uint16_t rdlen = ns_rdlen[i];
-        uint8_t rrsig_rd[512];
-        if (rdlen < 18 || rdlen > (int) sizeof(rrsig_rd))
-            continue;
-        memcpy(rrsig_rd, resp + ns_rdoff[i], rdlen);
-        uint16_t covered = get16(rrsig_rd, 0);
-        if (covered != DNS_TYPE_SOA && covered != DNS_TYPE_NSEC && covered != DNS_TYPE_NSEC3)
+        int first = 1;
+        for (int j = 0; j < i; j++)
+            if (ns_types[j] == t && strcmp(ns_names[j], ns_names[i]) == 0)
+                first = 0;
+        if (!first)
             continue;
         int rr_offs[NEG_MAX_RRS];
         int rr_n = 0;
-        int rdata_off = -1;
-        uint16_t rdata_len = 0;
-        for (int j = 0; j < ns_n; j++) {
-            if (ns_types[j] == covered && strcmp(ns_names[j], rname) == 0) {
+        for (int j = 0; j < ns_n; j++)
+            if (ns_types[j] == t && strcmp(ns_names[j], ns_names[i]) == 0)
                 rr_offs[rr_n++] = ns_start[j];
-                if (rdata_off < 0) {
-                    rdata_off = ns_rdoff[j];
-                    rdata_len = ns_rdlen[j];
-                }
-            }
+        uint8_t sigs[4][512];
+        int siglens[4];
+        int nsigs = 0;
+        for (int j = 0; j < ns_n && nsigs < 4; j++) {
+            if (ns_types[j] != DNS_TYPE_RRSIG || strcmp(ns_names[j], ns_names[i]) != 0)
+                continue;
+            if (ns_rdlen[j] < 18 || ns_rdlen[j] > 512 || get16(resp, ns_rdoff[j]) != t)
+                continue;
+            memcpy(sigs[nsigs], resp + ns_rdoff[j], ns_rdlen[j]);
+            siglens[nsigs] = ns_rdlen[j];
+            nsigs++;
         }
-        if (rr_n == 0)
+        if (nsigs == 0)
             continue;
-        if (dnskey_rdlen == 0)
-            dnskey_rdlen = dnssec_fetch_dnskey(zone, dnskey_rd, (int) sizeof(dnskey_rd));
-        if (dnskey_rdlen == 0)
-            return DNSSEC_INSECURE;
-        int r = dnssec_verify_rrset(resp, rlen, rr_offs, rr_n, rrsig_rd, rdlen, dnskey_rd,
-                                    dnskey_rdlen);
-        if (r == 0) {
+        rrset_verdict_t v =
+            dnssec_check_rrset(resp, rlen, ns_names[i], rr_offs, rr_n, sigs, siglens, nsigs);
+        if (v == RRSET_BOGUS) {
             saw_bogus = 1;
             continue;
         }
-        if (r == 1 && dnskey_is_trusted(dnskey_rd, dnskey_rdlen)) {
-            if (covered == DNS_TYPE_SOA) {
-                soa_secure = 1;
-            } else if (*proof_count < max_proofs) {
-                nsec_proof_t *pr = &proofs[*proof_count];
-                if (nsec_parse_rdata(resp, rlen, rname, covered, rdata_off, rdata_len, pr)) {
-                    safe_strcpy(pr->zone, zone, sizeof(pr->zone));
-                    (*proof_count)++;
-                }
+        if (v != RRSET_SECURE)
+            continue;
+        if (t == DNS_TYPE_SOA) {
+            soa_secure = 1;
+        } else if (*proof_count < max_proofs) {
+            nsec_proof_t *pr = &proofs[*proof_count];
+            if (nsec_parse_rdata(resp, rlen, ns_names[i], t, ns_rdoff[i], ns_rdlen[i], pr)) {
+                safe_strcpy(pr->zone, zone, sizeof(pr->zone));
+                (*proof_count)++;
             }
         }
-        /* r == -1 (unsupported alg) or an untrusted key: neither bogus nor
-         * securely proven — just doesn't contribute to SECURE. */
     }
     if (saw_bogus)
         return DNSSEC_BOGUS;
@@ -3444,11 +3554,14 @@ static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_re
             int cmp_next = memcmp(qhash, p->next_hash, 20);
             int wraps = memcmp(p->owner_hash, p->next_hash, 20) >= 0;
             if (cmp_owner == 0) {
+                if (p->nxname)
+                    continue; /* RFC 9824: owner does not exist — not NODATA */
                 if (nsec_bitmap_has_type(p->bitmap, p->bitmap_len, qtype))
                     continue; /* type actually exists here — can't help */
                 out->is_nxdomain = 0;
                 found = 1;
-            } else if (wraps ? (cmp_owner > 0 || cmp_next < 0) : (cmp_owner > 0 && cmp_next < 0)) {
+            } else if (!p->exact_only && (wraps ? (cmp_owner > 0 || cmp_next < 0)
+                                                : (cmp_owner > 0 && cmp_next < 0))) {
                 out->is_nxdomain = 1;
                 found = 1;
             }
@@ -3457,11 +3570,14 @@ static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_re
             int cmp_next = canon_name_cmp(qname, p->next);
             int wraps = canon_name_cmp(p->owner, p->next) >= 0;
             if (cmp_owner == 0) {
+                if (p->nxname)
+                    continue; /* RFC 9824: owner does not exist — not NODATA */
                 if (nsec_bitmap_has_type(p->bitmap, p->bitmap_len, qtype))
                     continue;
                 out->is_nxdomain = 0;
                 found = 1;
-            } else if (wraps ? (cmp_owner > 0 || cmp_next < 0) : (cmp_owner > 0 && cmp_next < 0)) {
+            } else if (!p->exact_only && (wraps ? (cmp_owner > 0 || cmp_next < 0)
+                                                : (cmp_owner > 0 && cmp_next < 0))) {
                 out->is_nxdomain = 1;
                 found = 1;
             }
@@ -4895,13 +5011,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(tcp4, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, tcp_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, tcp_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
 
@@ -4910,13 +5033,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(tcp6, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, tcp_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, tcp_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
 
@@ -4925,13 +5055,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(dotfd4, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, dot_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, dot_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
 
@@ -4940,13 +5077,20 @@ static void *proxy_run(void *arg) {
             int cfd = accept(dotfd6, NULL, NULL);
             if (cfd >= 0) {
                 tcp_client_arg_t *ta = malloc(sizeof(*ta));
-                ta->cfd = cfd;
-                pthread_t tid;
-                pthread_attr_t attr;
-                pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&tid, &attr, dot_client_thread, ta);
-                pthread_attr_destroy(&attr);
+                if (!ta) {
+                    close(cfd); /* fail closed: drop the connection */
+                } else {
+                    ta->cfd = cfd;
+                    pthread_t tid;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&tid, &attr, dot_client_thread, ta) != 0) {
+                        close(cfd);
+                        free(ta);
+                    }
+                    pthread_attr_destroy(&attr);
+                }
             }
         }
     }

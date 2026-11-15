@@ -38,7 +38,48 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `specs/CLAUDE-DoQ.md` | doqd | RFC 9250 DNS-over-QUIC sidecar — **done** (Gaps 1–3; Gap 4, resolverd outbound DoQ client, deferred by the plan itself), archived untracked |
 | `CLAUDE-rfc-skipped.md` | (triage) | Exclusion record with reasons |
 | `CLAUDE-roadmap.md` | all | Execution order (Phase 0 security → 1 ADRs → 2 features) |
+| `CLAUDE-update-auth.md` | dnsd | Audit fixes: UPDATE fails closed, TSIG time/key/algorithm, transfers require TSIG — **specced 2026-11-15** |
+| `CLAUDE-dnssec-denial.md` | dnsd (+libdnswire, resolverd check) | Audit fixes: KSK key tag, NODATA vs NXDOMAIN, RFC 9824 compact denial (promotes Add 11) — **specced 2026-11-15** |
+| `CLAUDE-tcp-transport.md` | dnsd | Audit fixes: plain TCP vs DoT per listener; stream-listener bounds — **specced 2026-11-15** |
+| `CLAUDE-apid-auth.md` | apid (+libdnswire) | Audit fixes: `/list` + `/zone` mTLS-only, DDNS suffix ACL + key/value hygiene — **done 2026-11-15** |
+| `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **specced 2026-11-15** |
+| `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
+
+---
+
+## Audit fixes — 2026-11-15 (`SECURITY_AUDIT.md` @ `b0a6b32`)
+
+Keyed by finding ID, numbered "Fix N" per file — not part of any Add sequence.
+Suggested order: top to bottom (authentication first, then the answers every
+validator and resolver sees, then availability).
+
+| Finding | Sev | Fix | Status | File |
+|---------|-----|-----|--------|------|
+| CSA-AUTH-001 | Critical | Unsigned UPDATE refused unless allow-listed | **Done** 2026-11-15 | update-auth, Fix 1 |
+| CSA-AUTH-002 | High | TSIG time window, key name, single algorithm | **Done** 2026-11-15 | update-auth, Fix 2 |
+| CSA-AUTH-003 | High | `/list` mTLS-only | **Done** 2026-11-15 | apid-auth, Fix 1 |
+| CSA-AUTH-004 | High | `/zone` mTLS-only; DDNS suffix ACL + name/value hygiene in apid | **Done** 2026-11-15 | apid-auth, Fix 2 + 3 |
+| CSA-AUTH-005 | Medium | Transfers require TSIG when configured; strict CIDR | Strict CIDR done; transfer TSIG open | update-auth, Fix 3 |
+| CSA-DNSSEC-001 | High | KSK key tag from the KSK encoding (+ whole-RRset DNSKEY signature) | **Done** 2026-11-15 | dnssec-denial, Fix 1 |
+| CSA-PROTO-001 | High | Name existence decides NODATA vs NXDOMAIN | 2a **Done** 2026-11-15; 2b Conditional (empty non-terminals — decision D2) | dnssec-denial, Fix 2 |
+| CSA-DNSSEC-002 | High | RFC 9824 compact denial (= dnsd Add 11), NSEC or NSEC3 per `dnssec_nsec_mode` | **Done** 2026-11-15 (D1: keep selector) | dnssec-denial, Fix 3 |
+| CSA-PROTO-002 | High | Listener sets the transport for `dot_thread` | Specced | tcp-transport, Fix 1 |
+| CSA-DOS-002 | Medium | Connection cap, handshake timeout, checked `pthread_create` | Complementary | tcp-transport, Fix 2 |
+| CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | Specced | resolverd-cache, Fix 1 |
+| — | — | TSan build + stress target + CI job | Specced | resolverd-cache, Fix 2 |
+
+Found while fixing, not in the ledger, **fixed 2026-11-15**: multi-RR RRsets signed per record; DNSKEY/CDS/DS answered at any name; resolverd validator picked the first DNSKEY for every RRSIG; ZONEMD drift with live ddns leases; non-primary zone serial reset on reload (see `CLAUDE-dnssec-denial.md` implementation notes).
+
+Not yet specced (open in the ledger): CSA-AUTH-006/-007, CSA-NET-003,
+CSA-DOS-003..006, CSA-INJ-001/-002, CSA-SBX-001/-002, CSA-WEB-001/-002,
+CSA-CONC-002, CSA-MEM-001/-002, CSA-CRYPTO-001, and PERF-001..007.
+
+Release notes required by these fixes: unsigned UPDATE stops working by
+default (update-auth Fix 1); `hmac-sha1`/`hmac-md5` TSIG clients are rejected
+(update-auth Fix 2); advertised KSK key tags change by +1 (dnssec-denial
+Fix 1); online NSEC3 is no longer produced if D1 = Option A (dnssec-denial
+Fix 3).
 
 ---
 
@@ -59,7 +100,7 @@ lives in `CLAUDE-ENUM.md`, not the additions files.
 | 8 | 9471 | Glue in referrals | **Done** (dnsd zone-cut/referral engine; done 2026-07-06 as an eppd prerequisite) | batch3 |
 | 9 | 1982 | Serial-number arithmetic | **Done** (libdnswire + IXFR uses serial_lt) | batch3 |
 | 10 | 9715 | UDP fragmentation avoidance | **Done** | batch3 |
-| 11 | 9824 (+4470) | Compact denial of existence | Follow-on | batch3 |
+| 11 | 9824 (+4470) | Compact denial of existence | **Done** 2026-11-15 as the fix for CSA-DNSSEC-002 (NSEC + NSEC3 forms) | `CLAUDE-dnssec-denial.md`, Fix 3 |
 | 12 | 2317 | Classless reverse delegation | **Done** (dnsd already wire-capable — CNAME chain + co-hosted subzone PTR, DNSSEC-signed; `POST /reverse/classless` provisioning in apid; `make check-2317`) | batch4 |
 
 Complementary (batch3) — **all Done, batch 3 fully closed 2026-07-01**:

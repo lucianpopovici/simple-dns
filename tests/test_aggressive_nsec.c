@@ -270,6 +270,10 @@ static int build_rr(uint8_t *out, const char *owner, uint16_t type, uint32_t ttl
 
 /* RRSIG rdata up to (and including) the signer name; sig_off_out receives
  * the offset of the 64-byte signature that follows. */
+/* Key tag of the test DNSKEY: resolverd selects the verifying key by
+ * (algorithm, key tag), so the RRSIGs must carry the real tag. */
+static uint16_t g_neg_tag;
+
 static int build_rrsig_rdata(uint8_t *out, uint16_t covered, uint8_t alg, uint8_t labels,
                              uint32_t origttl, const char *signer, const uint8_t sig64[64],
                              int *sig_off_out) {
@@ -284,8 +288,8 @@ static int build_rrsig_rdata(uint8_t *out, uint16_t covered, uint8_t alg, uint8_
     o += 4; /* expiration: not checked here */
     put32(out, o, 0);
     o += 4; /* inception: not checked here */
-    put16(out, o, 0);
-    o += 2; /* key tag: not checked here */
+    put16(out, o, g_neg_tag);
+    o += 2; /* key tag: names the test DNSKEY */
     o += name_to_wire(signer, out + o, 256);
     if (sig_off_out)
         *sig_off_out = o;
@@ -442,6 +446,7 @@ static void test_validate_negative(void) {
     dnskey_rd[2] = 3;
     dnskey_rd[3] = 15;
     memcpy(dnskey_rd + 4, pub, 32);
+    g_neg_tag = dnskey_keytag(dnskey_rd, 36);
 
     uint8_t hash[32];
     char hex[65];
@@ -503,8 +508,57 @@ static void test_validate_negative(void) {
     EVP_PKEY_free(key);
 }
 
+/* RFC 9824 compact denial (dnsd CSA-DNSSEC-002): an NSEC whose next name is
+ * "\000.<owner>" must never be used as a range. name_from_wire renders that
+ * next name as "" — read naively it is a wrap to the end of the zone and
+ * would synthesize NXDOMAIN for every later name. */
+static void test_compact_denial_spans(void) {
+    printf("== RFC 9824 compact denial spans ==\n");
+    g_cfg.aggressive_nsec_enabled = 1;
+    reset_agg_store();
+    uint8_t rd[128];
+    int o = 0;
+    rd[o++] = 1;
+    rd[o++] = 0; /* \000 label */
+    o += name_to_wire("nope.example.com", rd + o, sizeof(rd) - o);
+    uint16_t nxt[] = {DNS_TYPE_RRSIG, DNS_TYPE_NSEC, DNS_TYPE_NXNAME};
+    o += type_bitmap_encode(nxt, 3, rd + o, sizeof(rd) - o);
+    nsec_proof_t p;
+    int ok = nsec_parse_rdata(rd, o, "nope.example.com", DNS_TYPE_NSEC, 0, o, &p);
+    CHECK(ok == 1 && p.exact_only && p.nxname, "NXNAME NSEC parses as exact-only + nxname");
+    safe_strcpy(p.zone, "example.com", sizeof(p.zone));
+    aggressive_nsec_insert(&p, 300);
+    agg_nsec_result_t r;
+    CHECK(aggressive_nsec_answer("zz.example.com", DNS_TYPE_A, &r) == 0,
+          "NXNAME NSEC does not cover a later name (no false NXDOMAIN)");
+    CHECK(aggressive_nsec_answer("a.nope.example.com", DNS_TYPE_A, &r) == 0,
+          "NXNAME NSEC does not cover a child name");
+    CHECK(aggressive_nsec_answer("nope.example.com", DNS_TYPE_AAAA, &r) == 0,
+          "NXNAME owner is not answered NODATA");
+
+    /* NODATA flavour: the name exists with A; next = \000.www — owner-exact only. */
+    reset_agg_store();
+    o = 0;
+    rd[o++] = 1;
+    rd[o++] = 0;
+    o += name_to_wire("www.example.com", rd + o, sizeof(rd) - o);
+    uint16_t ndt[] = {DNS_TYPE_A, DNS_TYPE_RRSIG, DNS_TYPE_NSEC};
+    o += type_bitmap_encode(ndt, 3, rd + o, sizeof(rd) - o);
+    ok = nsec_parse_rdata(rd, o, "www.example.com", DNS_TYPE_NSEC, 0, o, &p);
+    CHECK(ok == 1 && p.exact_only && !p.nxname, "compact NODATA NSEC is exact-only");
+    safe_strcpy(p.zone, "example.com", sizeof(p.zone));
+    aggressive_nsec_insert(&p, 300);
+    CHECK(aggressive_nsec_answer("www.example.com", DNS_TYPE_AAAA, &r) == 1 && !r.is_nxdomain,
+          "compact NODATA: owner-exact AAAA -> NODATA");
+    CHECK(aggressive_nsec_answer("www.example.com", DNS_TYPE_A, &r) == 0,
+          "compact NODATA: type in bitmap -> no answer");
+    CHECK(aggressive_nsec_answer("zzz.example.com", DNS_TYPE_A, &r) == 0,
+          "compact NODATA: no range coverage");
+}
+
 int main(void) {
     test_nsec_parse_nsec();
+    test_compact_denial_spans();
     test_nsec_parse_nsec3();
     test_aggressive_answer_nsec();
     test_aggressive_answer_nsec3();

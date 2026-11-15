@@ -94,6 +94,18 @@ static int build_signing_input(const uint8_t *rrsig_hdr, int hdr_len, uint8_t *o
 
 /* Build the full response packet for algorithm `alg` using signature `sig`
  * (64 bytes) and DNSKEY public key material pub/publen. */
+/* Key tag the RRSIGs carry: resolverd selects the verifying DNSKEY by
+ * (algorithm, key tag) per RFC 4035 §5.3.1, so the tag must be the real
+ * RFC 4034 App. B tag of the DNSKEY in the packet (flags 0x0101). */
+static uint16_t test_keytag(uint8_t alg, const uint8_t *pub, int publen) {
+    uint8_t rd[4 + 80];
+    put16(rd, 0, 0x0101);
+    rd[2] = 3;
+    rd[3] = alg;
+    memcpy(rd + 4, pub, (size_t) publen);
+    return dnskey_keytag(rd, 4 + publen);
+}
+
 static void build_packet(testpkt_t *t, uint8_t alg, const uint8_t *sig, const uint8_t *pub,
                          int publen) {
     uint8_t *p = t->pkt;
@@ -171,8 +183,8 @@ static void build_packet(testpkt_t *t, uint8_t alg, const uint8_t *sig, const ui
     o += 4; /* expiration (not checked) */
     put32(p, o, 0);
     o += 4; /* inception  (not checked) */
-    put16(p, o, 0);
-    o += 2; /* key tag    (not checked) */
+    put16(p, o, test_keytag(alg, pub, publen));
+    o += 2; /* key tag: must name the DNSKEY below */
     memcpy(p + o, WIRE_SIGNER, sizeof(WIRE_SIGNER));
     o += (int) sizeof(WIRE_SIGNER);
     t->sig_off = o;
@@ -494,6 +506,7 @@ static void run_alg(uint8_t alg) {
 
     /* Build the RRSIG header exactly as it will appear in rdata, construct
      * the signing input independently, and sign it. */
+    uint16_t ktag = test_keytag(alg, pub, publen);
     uint8_t hdr[18 + sizeof(WIRE_SIGNER)];
     put16(hdr, 0, 1); /* covered: A */
     hdr[2] = alg;
@@ -501,7 +514,7 @@ static void run_alg(uint8_t alg) {
     put32(hdr, 4, ORIG_TTL);
     put32(hdr, 8, 0xFFFFFFFFu);
     put32(hdr, 12, 0);
-    put16(hdr, 16, 0);
+    put16(hdr, 16, ktag);
     memcpy(hdr + 18, WIRE_SIGNER, sizeof(WIRE_SIGNER));
 
     uint8_t signing[512];

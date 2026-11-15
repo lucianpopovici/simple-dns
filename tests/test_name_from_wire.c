@@ -195,6 +195,48 @@ int main(void) {
         check(schema_version_check("1.0.3") == SCHEMA_MALFORMED, "trailing junk is MALFORMED");
     }
 
+    /* ── NSEC type bitmap (type_bitmap_encode, RFC 4034 §4.1.2) ─────────────── */
+    {
+        uint8_t bm[64];
+        uint16_t t1[] = {DNS_TYPE_NSEC, DNS_TYPE_A, DNS_TYPE_RRSIG, DNS_TYPE_A};
+        int n1 = type_bitmap_encode(t1, 4, bm, sizeof(bm));
+        /* A=1, RRSIG=46, NSEC=47 -> window 0, 6 octets: 40 00 00 00 00 03 */
+        uint8_t e1[] = {0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x03};
+        check(n1 == (int) sizeof(e1) && memcmp(bm, e1, sizeof(e1)) == 0,
+              "bitmap: A RRSIG NSEC (unsorted, duplicate) -> one window-0 block");
+        uint16_t t2[] = {DNS_TYPE_CAA, DNS_TYPE_NXNAME, DNS_TYPE_RRSIG};
+        int n2 = type_bitmap_encode(t2, 3, bm, sizeof(bm));
+        /* window 0: RRSIG(46) + NXNAME(128) -> 17 octets; window 1: CAA(257) -> 01 01 40 */
+        check(n2 == 2 + 17 + 3 && bm[0] == 0 && bm[1] == 17 && bm[2 + 5] == 0x02 &&
+                  bm[2 + 16] == 0x80 && bm[19] == 1 && bm[20] == 1 && bm[21] == 0x40,
+              "bitmap: types >= 256 go to window 1 (CAA), NXNAME sets bit 128");
+        check(type_bitmap_encode(NULL, 0, bm, sizeof(bm)) == 0, "bitmap: empty list -> 0 octets");
+        check(type_bitmap_encode(t2, 3, bm, 10) == -1, "bitmap: overflow fails closed");
+    }
+
+    /* ── DDNS suffix ACL (dns_name_in_suffix, CSA-AUTH-004) ──────────────────── */
+    {
+        check(dns_name_in_suffix("h1.dyn.example.local", "dyn.example.local") == 1,
+              "suffix: child name matches");
+        check(dns_name_in_suffix("dyn.example.local", "dyn.example.local") == 1,
+              "suffix: the suffix itself matches");
+        check(dns_name_in_suffix("H1.DYN.Example.local", "dyn.example.LOCAL") == 1,
+              "suffix: case-insensitive");
+        check(dns_name_in_suffix("h1.dyn.example.local", ".dyn.example.local") == 1,
+              "suffix: leading dot on the suffix is ignored");
+        check(dns_name_in_suffix("xdyn.example.local", "dyn.example.local") == 0,
+              "suffix: look-alike sibling (no label boundary) rejected");
+        check(dns_name_in_suffix("www.example.local", "dyn.example.local") == 0,
+              "suffix: unrelated name rejected");
+        check(dns_name_in_suffix("example.local", "dyn.example.local") == 0,
+              "suffix: parent of the suffix rejected");
+        check(dns_name_in_suffix(".dyn.example.local", "dyn.example.local") == 0,
+              "suffix: empty first label rejected");
+        check(dns_name_in_suffix("anything.test", "") == 1, "suffix: empty suffix matches all");
+        check(dns_name_in_suffix("anything.test", "...") == 1, "suffix: dots-only suffix = empty");
+        check(dns_name_in_suffix(NULL, "dyn.example.local") == 0, "suffix: NULL name rejected");
+    }
+
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;
 }

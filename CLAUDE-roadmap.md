@@ -17,7 +17,8 @@ The backlog files are not all the same kind of work. Sort before sequencing:
 
 | Kind | Files | Where it goes |
 |------|-------|---------------|
-| **Live code vulnerabilities** | `SECURITY_AUDIT.md` | Phase 0 — first |
+| **Live code vulnerabilities** | `SECURITY_AUDIT.md` (2026-06-23/25 run) | Phase 0 — **done** |
+| **Live code vulnerabilities (2026-11-15 audit)** | `SECURITY_AUDIT.md` (2026-11-15 section) → fix specs `CLAUDE-update-auth.md`, `CLAUDE-dnssec-denial.md`, `CLAUDE-tcp-transport.md`, `CLAUDE-resolverd-cache.md` | Phase 0b — first, ahead of all remaining Phase 2 work |
 | **System decisions (no/low code)** | `CLAUDE-architecture.md` (ADR-003…007) | Phase 1 — before new record types |
 | **Feature specs** | `CLAUDE-rfc-additions-batch3.md`, `CLAUDE-ENUM.md`, `CLAUDE-libdnswire.md`, `CLAUDE-eppd.md` | Phase 2 |
 | **Feature specs — done, archived untracked** | `specs/CLAUDE-rfc-additions.md`, `specs/CLAUDE-rfc-additions-batch4.md`, `specs/CLAUDE-discovery.md`, `specs/CLAUDE-hidden-master.md`, `specs/CLAUDE-loadbalance.md`, `specs/CLAUDE-mdnsd.md`, `specs/CLAUDE-resolverd.md`, `specs/CLAUDE-DoQ.md`, `specs/CLAUDE-certd.md` | Done — see below |
@@ -64,7 +65,7 @@ by RFC 8739 STAR; its entire checklist is now closed.
 
 ---
 
-## Phase 0 — Security audit fixes (do first)
+## Phase 0 — Security audit fixes (2026-06-23 audit — done; re-verified 2026-11-15)
 
 `SECURITY_AUDIT.md` documents live vulnerabilities in already-shipped code.
 Small, no design needed, highest priority. Every item here touches DNS wire /
@@ -111,6 +112,97 @@ Order:
 
 **Decision (sequencing):** finish the in-flight branch (ddns-expiry-sweeper,
 merged as PR #19), then start Phase 0 before any new feature spec.
+
+---
+
+## Phase 0b — 2026-11-15 audit fixes (do first)
+
+Source: `SECURITY_AUDIT.md`, section 2026-11-15 (@ `b0a6b32`). The 12 Phase-0
+findings were re-verified **Fixed, none regressed**; this run adds **28 new
+findings** (Critical 1 · High 9 · Medium 12 · Low 6), all Open. Per-finding
+status lives in `CLAUDE-index.md` → "Audit fixes — 2026-11-15"; this section
+only orders them. Everything here is behind the security-sensitive change gate.
+
+Ordering rule: authentication first (remote write/read with no credentials),
+then the answers every validator and resolver sees, then memory safety and
+availability, then defense-in-depth.
+
+1. **UPDATE / TSIG authentication** — `CLAUDE-update-auth.md` Fix 1 + Fix 2.
+   CSA-AUTH-001 (*Critical*, unsigned UPDATE accepted by default) and
+   CSA-AUTH-002 (*High*, TSIG time/fudge/key/algorithm unchecked → replay).
+   **DONE 2026-11-15** — `make check-update-auth` (in CI). Fix 3's strict
+   CIDR parse landed with it; Fix 3's transfer-TSIG requirement stays in
+   step 7.
+2. **apid authentication** — CSA-AUTH-003 (*High*, `/list` dumps `zone:*`/
+   `ddns:*` unauthenticated) and CSA-AUTH-004 (*High*, `/zone` write accepts
+   the DDNS shared secret for any type/name). Same severity class as step 1.
+   **DONE 2026-11-15** — `CLAUDE-apid-auth.md`, `make check-apid-auth` (in
+   CI). Also: DDNS suffix ACL enforced in apid via the hoisted
+   `dns_name_in_suffix` (libdnswire, shared with dnsd), name/value charset
+   checks, `qs_get` matching on `&` boundaries.
+3. **DNSSEC / response correctness** — `CLAUDE-dnssec-denial.md`, build order
+   Fix 1 → 2a → 3: CSA-DNSSEC-001 (KSK key tag), CSA-PROTO-001 (NODATA vs
+   NXDOMAIN), CSA-DNSSEC-002 (invalid denial proof → RFC 9824 compact denial,
+   promotes batch3 Add 11). **DONE 2026-11-15** (Fix 1, 2a, 3; D1 = keep
+   the `dnssec_nsec_mode` selector, both forms implemented) —
+   `make check-dnssec-validate` (in CI). Fix 2b still waits on **D2**.
+   Verifying surfaced pre-existing defects, all fixed in the follow-up
+   commit: multi-RR RRsets signed per record, DNSKEY/CDS/DS answered at any
+   name, resolverd picking the first DNSKEY for every RRSIG (now SECURE
+   end-to-end in `check-dnssec-validate`), ZONEMD drift with live ddns
+   leases, non-primary zone serial reset on reload (`check-ixfr-client`
+   flake). CI blockers (cppcheck, clang-format) cleared in their own commits.
+4. **Transport confusion** — `CLAUDE-tcp-transport.md` Fix 1 (CSA-PROTO-002,
+   *High*, plain TCP/53 speaks TLS once a cert loads) + Fix 2 (CSA-DOS-002,
+   connection cap / handshake timeout / checked `pthread_create`). *Specced.*
+5. **resolverd cache UAF** — `CLAUDE-resolverd-cache.md` Fix 1 (CSA-CONC-001,
+   *High*, reproduced) + Fix 2 (TSan build + stress target in CI). *Specced.*
+6. **Client identity** — CSA-NET-003 (*High*, IPv6 client address collapses to
+   0.0.0.0 — RRL, cookies, ACLs all key on it), with CSA-AUTH-006 (DoH/DoQ
+   clients reach dnsd as 127.0.0.1) and CSA-DOS-004 (RRL keyed on qname)
+   because all three change what dnsd treats as "the client". *Not yet
+   specced.*
+7. **Remaining Medium** — CSA-AUTH-005 (transfers without TSIG, fail-open
+   CIDR; `CLAUDE-update-auth.md` Fix 3, *Complementary*), CSA-AUTH-007
+   (resolverd no client ACL; `--no-dnssec`/`--no-mdns` no-ops), CSA-DOS-003
+   (apid single connection per listener), CSA-DOS-005 + CSA-INJ-001 (mdnsd
+   SCAN-per-query with qname in the MATCH glob — fix together), CSA-INJ-002
+   (raw qname in JSON log), CSA-SBX-001 (seccomp without TSYNC; threads start
+   before the filter — `libsandbox`, all three callers), CSA-SBX-002 (apid/
+   certd/mdnsd/doqd unsandboxed — extend `libsandbox`), CSA-WEB-001 (dashboard
+   CSRF). *Not yet specced, except AUTH-005.*
+8. **Low** — CSA-MEM-001 (certd EST-202 double free — small, do early if
+   convenient), CSA-MEM-002 (OOB reads: TSIG alg-name, IXFR authority scan,
+   forwarder RRL truncation), CSA-CONC-002 (config reload races workers),
+   CSA-DOS-006 (secondary NOTIFY: blocking `getaddrinfo`, no TSIG),
+   CSA-WEB-002 (login throttle trusts `X-Forwarded-For`), CSA-CRYPTO-001 (EPP
+   password/authInfo plaintext + `strcmp`), and the Phase-0 residual:
+   `csprng_u16` falling back to `rand()` when `RAND_bytes` fails
+   (`dns_server.c:1054`, `resolverd.c:2281`) — fail closed instead.
+9. **Tooling the audit asked for** — a libFuzzer harness over `dns_process`
+   (QUERY + UPDATE + `tsig_find`/`sig0_find`); a TSan CI job for resolverd
+   **and** dnsd (step 5 covers resolverd); a CI step validating dnsd's positive
+   and negative answers with an independent validator (would have caught
+   DNSSEC-001/002 and PROTO-001 — land it with step 3).
+
+**Release notes these fixes require** (breaking for operators): unsigned
+UPDATE stops working by default (step 1); `hmac-sha1`/`hmac-md5` TSIG clients
+are rejected (step 1); advertised KSK key tags change by +1 (step 3); online
+NSEC3 is no longer produced if D1 = Option A (step 3).
+
+**Performance observations (PERF-001..007, not security):** sequence after
+Phase 0b, not inside it. PERF-001 (PING before every Valkey command) and
+PERF-002 (64 KB reply zeroing per command) are two small edits worth ~2× on
+dnsd, but both sit in `dns_server.c`'s private RESP client — fold them into
+the deferred `vkc_` repoint of `dns_server.c` rather than patching the copy
+that's slated for removal. PERF-004 (cache signed negatives) depends on step
+3. PERF-003/005/007 (pipelined/in-process zone image, shared TCP Valkey conn,
+serve-stale living in the Valkey it should outlive) are ADR-005 / ADR-007
+inputs. PERF-006 (thread per forwarded query) is standalone.
+
+**Decision (sequencing):** Phase 0b blocks the remaining Phase 2 items (ENUM
+deployment/ops, ADR-005/006/007, `vkc_` repoint of dnsd/resolverd). Open
+owner decisions: D1, D2 (step 3).
 
 ---
 
