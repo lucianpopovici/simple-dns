@@ -2835,14 +2835,14 @@ check-ede: tests/test_ede.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sa
 	 echo "  OK  EDE_NETWORK_ERROR (23) surfaced only to the EDNS-speaking client"
 
 # RFC 7858 DoT server (resolverd's own stub-facing listener) + RFC 9462 DDR
-# self-advertisement. Positive: a real dig +tls query over the listener
-# resolves, and _dns.resolver.arpa SVCB advertises the right target/alpn/port.
+# self-advertisement. Positive: a real certificate-verifying DoT query over the
+# listener (tests/dot_query.py, dnspython) resolves, and _dns.resolver.arpa SVCB advertises the right target/alpn/port.
 # Negative: without DOT_SERVER_ENABLED, no SVCB is served and the DoT port
 # never opens — resolverd must never advertise an endpoint it doesn't serve.
 check-ddr: resolverd_debug
-	@echo "  CHECK  RFC 7858 DoT server + RFC 9462 DDR (requires dig +tls + openssl + python3)"
+	@echo "  CHECK  RFC 7858 DoT server + RFC 9462 DDR (requires dig + openssl + python3-dnspython)"
 	@command -v python3 >/dev/null 2>&1 || { echo "  SKIP  python3 not found"; exit 0; }; \
-	 dig -h 2>&1 | grep -q -- '+\[no\]tls ' || { echo "  SKIP  dig has no +tls support"; exit 0; }; \
+	 python3 -c 'import dns.query' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
 	 D=$$(mktemp -d); \
 	 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 	   -keyout $$D/srv.key -out $$D/srv.pem -days 2 -subj "/CN=resolver.test" \
@@ -2853,8 +2853,7 @@ check-ddr: resolverd_debug
 	     ./resolverd_debug --upstream 127.0.0.1:5416 --no-dnssec --no-valkey \
 	     > /tmp/resolverd_ddr.log 2>&1 & RD=$$!; \
 	 sleep 1.5; \
-	 DOTANS=$$(dig @127.0.0.1 -p 5418 +tls +tls-ca=$$D/srv.pem +tls-hostname=resolver.test \
-	     +time=2 +tries=1 +short primed.dot.test A); \
+	 DOTANS=$$(python3 tests/dot_query.py 127.0.0.1 5418 $$D/srv.pem resolver.test primed.dot.test); \
 	 DDR=$$(dig @127.0.0.1 -p 5417 +time=2 +tries=1 +short _dns.resolver.arpa SVCB); \
 	 kill $$RD $$STUB 2>/dev/null || true; wait 2>/dev/null || true; \
 	 echo "  DoT answer=[$$DOTANS]  DDR=[$$DDR]"; \
@@ -3276,7 +3275,7 @@ help:
 	@echo "  make check-dnssec-validate  Independent DNSSEC validation (dnspython): KSK tags, NODATA, RFC 9824 compact denial"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
-	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig +tls + openssl + python3)"
+	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"
 	@echo "  make check-dns64     resolverd RFC 6147 DNS64 AAAA synthesis (KAT + live, needs dig + python3)"
 	@echo "  make check-dp        mdnsd RFC 8766 Discovery Proxy (needs Valkey + dig + python3)"
 	@echo "  make check-dso       mdnsd RFC 8490 DSO + RFC 8765 Push Notifications (needs Valkey + openssl + python3)"
