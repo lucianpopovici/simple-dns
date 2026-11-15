@@ -61,7 +61,7 @@
 #define MAX_PEM 65536
 #define DNS_BUF 65535
 #define DEFAULT_TTL 60
-#define MAX_ZONES_LIST 64 /* cap on zones scanned for longest-suffix resolution */
+#define MAX_ZONES_LIST 64  /* cap on zones scanned for longest-suffix resolution */
 #define LIST_KEYS_MAX 1024 /* cap on keys collected per prefix by /list and /zone/list */
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
@@ -195,7 +195,6 @@ static void resolve_zone(const char *name, char *out, int outsz) {
     if (!out[0])
         vk_get("config:zone_name", out, outsz);
 }
-
 
 /* ADR-004: compute the config:zone_serial / config:zone:<z>:serial key for
  * `zn`, mirroring serial_bump_zone's own primary-vs-named-zone logic — used

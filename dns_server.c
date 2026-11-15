@@ -2762,7 +2762,7 @@ static uint32_t serial_bump_txn_apply(zone_entry_t *z, resp_reply_t *r) {
  * (already logged at LOG_ERR under `log_ctx`; caller must treat the whole
  * write as not applied). */
 static uint32_t txn_set_and_bump(zone_entry_t *z, const char *key, const char *val, uint32_t ttl,
-                                  const char *log_ctx) {
+                                 const char *log_ctx) {
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
@@ -2792,7 +2792,7 @@ static uint32_t txn_set_and_bump(zone_entry_t *z, const char *key, const char *v
 /* ADR-004: DEL 1..n keys and bump z's serial as one atomic transaction.
  * Returns the new serial on success, 0 on failure (already logged). */
 static uint32_t txn_del_and_bump(zone_entry_t *z, const char *const *keys, int n,
-                                  const char *log_ctx) {
+                                 const char *log_ctx) {
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
@@ -2998,8 +2998,9 @@ static void cert_publish_tlsa(const char *cert_pem) {
                 notify_send();
             } else {
                 pthread_mutex_unlock(&g_vk_mutex);
-                dns_log(LOG_ERR, "[PKI] TLSA publish transaction failed for %s (zone %s) — "
-                                 "Valkey unreachable? Not published.\n",
+                dns_log(LOG_ERR,
+                        "[PKI] TLSA publish transaction failed for %s (zone %s) — "
+                        "Valkey unreachable? Not published.\n",
                         domain, zn);
             }
         } else {
@@ -3975,7 +3976,8 @@ static void rollover_to_commit(zone_entry_t *z) {
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) < 0) {
         pthread_mutex_unlock(&g_vk_mutex);
-        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — commit phase not advanced\n", z->name);
+        dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — commit phase not advanced\n",
+                z->name);
         return;
     }
     resp_txn_t t;
@@ -8038,7 +8040,6 @@ static void srp_owner_write(char *out, size_t outsz, int flags, int proto, int a
     hex_enc(pubkey, publen, hex);
     snprintf(out, outsz, "%d|%d|%d|%s", flags, proto, alg, hex);
 }
-
 
 /* The SRP registration handler: validates the whole message read-only first
  * (RFC 2136 §3.8 — no partial application), then applies every write. Called
