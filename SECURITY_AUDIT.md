@@ -5,6 +5,431 @@
 
 ---
 
+## 2026-11-15 — Full audit: security, protocol correctness, performance (@ commit b0a6b32)
+
+**Scope:** whole repository at `b0a6b32` (2026-07-07): `dns_server.c` (dnsd),
+`resolverd.c`, `apid.c`, `eppd.c`, `certd.c`, `mdnsd.c`, `doqd.c`, `dns_wire.c`,
+`sandbox.c`, `dashboard/app.py`, Makefile and CI. `simple_dns.c` (no build
+target) and `object_graph.c` were not reviewed.
+
+**Method:** Pass-0 attack-surface map; manual review of the request, auth,
+transfer, cache and sandbox paths; `clang --analyze` on every TU; ASan/UBSan
+debug builds of dnsd, apid, resolverd run against a local Redis-compatible
+server; a 4-minute black-box mutation fuzz of dnsd's UDP path (QUERY, UPDATE
+signed and unsigned, NOTIFY, IXFR seeds; 15M packets sent, an unknown share
+processed — no sanitizer report); independent DNSSEC validation of dnsd's
+answers with dnspython; a closed-loop UDP load generator for throughput.
+**Not available:** cppcheck, scan-build, TSan run, libseccomp (so the seccomp
+layer was reviewed by reading only), OpenSSL ≥ 3.5 (doqd was read, not built).
+
+**Evidence labels:** *Reproduced* = triggered on a running build in this audit.
+*By inspection* = read in source, not executed.
+
+**Deltas first:**
+- **Prior 12 findings (2026-06-23/25): all still Fixed, none regressed**
+  (signature greps: `tls_verify_peer_name` on every outbound TLS path,
+  `SSL_VERIFY_PEER` unconditional in certd, `response_matches_query` gating
+  resolverd replies, `CRYPTO_memcmp` on TSIG/cookie/DDNS secret, `csprng_u16`
+  for IDs, label cap in `name_to_wire`). Residual note: `csprng_u16` still
+  falls back to `rand()` if `RAND_bytes` fails (`dns_server.c:1054`,
+  `resolverd.c:2281`).
+- **28 new findings.** The earlier audits concentrated on TLS and resolver
+  anti-spoofing; this run covered the areas their coverage caveat deferred
+  (dynamic UPDATE, AXFR/IXFR, resolverd cache concurrency, mdnsd) plus protocol
+  correctness and the non-dnsd daemons.
+
+**Counts (new, this run):** Critical 1 · High 9 · Medium 12 · Low 6 · Info 0
+
+### Status table
+
+| ID | Sev | Status | Evidence | One-line |
+|---|---|---|---|---|
+| CSA-AUTH-001 | Critical | Open | Reproduced | Unsigned RFC 2136 UPDATE accepted when no TSIG secret is set (the default) |
+| CSA-AUTH-002 | High | Open | Reproduced | TSIG time/fudge never checked — signed messages replayable indefinitely |
+| CSA-AUTH-003 | High | Open | Reproduced | apid `/list` dumps `zone:*`/`ddns:*` with no authentication |
+| CSA-AUTH-004 | High | Open | Reproduced | apid `/zone` write accepts the DDNS shared secret (any type, any name) |
+| CSA-DNSSEC-001 | High | Open | Reproduced | KSK key tag computed with ZSK flags — RRSIG(DNSKEY)/DS tag off by one |
+| CSA-DNSSEC-002 | High | Open | Reproduced | NXDOMAIN "proof" is one NSEC3 matching the qname — not a valid denial |
+| CSA-PROTO-001 | High | Open | Reproduced | NODATA answered as NXDOMAIN (existence tracked per type, not per name) |
+| CSA-PROTO-002 | High | Open | Reproduced | Plain TCP/53 speaks TLS as soon as a certificate is loaded |
+| CSA-CONC-001 | High | Open | Reproduced | resolverd cache/LRU use-after-free under concurrent UDP load |
+| CSA-NET-003 | High | Open | By inspection | IPv6 client address collapses to 0.0.0.0 (RRL, cookies, ACLs) |
+| CSA-AUTH-005 | Medium | Open | Reproduced | AXFR/IXFR does not require TSIG; malformed CIDR in ACL matches all |
+| CSA-AUTH-006 | Medium | Open | By inspection | DoH/DoQ clients reach dnsd as 127.0.0.1 (identity lost across the proxy hop) |
+| CSA-AUTH-007 | Medium | Open | By inspection | resolverd has no client ACL; `--no-dnssec`/`--no-mdns` are no-ops |
+| CSA-DOS-002 | Medium | Open | Reproduced | No TCP/DoT connection cap; TLS handshake has no timeout |
+| CSA-DOS-003 | Medium | Open | Reproduced | apid handles one connection at a time per listener |
+| CSA-DOS-004 | Medium | Open | By inspection | RRL keyed on qname — random-subdomain floods bypass it |
+| CSA-DOS-005 | Medium | Open | By inspection | mdnsd runs a full-keyspace SCAN per query; 20–120 ms sleep in the recv loop |
+| CSA-INJ-001 | Medium | Open | By inspection | mdnsd puts the qname into a SCAN MATCH glob |
+| CSA-INJ-002 | Medium | Open | By inspection | Raw qname written into the JSON query log |
+| CSA-SBX-001 | Medium | Open | By inspection | seccomp filter loaded without TSYNC; background threads start before it |
+| CSA-SBX-002 | Medium | Open | By inspection | apid, certd, mdnsd, doqd run with no sandbox |
+| CSA-WEB-001 | Medium | Open | By inspection | Dashboard has no CSRF protection on state-changing POSTs |
+| CSA-CONC-002 | Low | Open | By inspection | Live config reload rewrites globals while workers read them |
+| CSA-MEM-001 | Low | Open | By inspection | certd double free on the EST 202 retry path |
+| CSA-MEM-002 | Low | Open | By inspection | Small out-of-bounds reads in TSIG alg-name copy, IXFR authority scan, forwarder RRL truncation |
+| CSA-DOS-006 | Low | Open | By inspection | NOTIFY on a secondary: blocking `getaddrinfo` per packet, no TSIG |
+| CSA-WEB-002 | Low | Open | By inspection | Dashboard login throttle trusts `X-Forwarded-For`; table unbounded |
+| CSA-CRYPTO-001 | Low | Open | By inspection | EPP registrar password and authInfo: plaintext storage, `strcmp` |
+
+Already tracked elsewhere and unchanged at this commit: DNSSEC private keys as
+plaintext PEM in Valkey (ADR-006).
+
+---
+
+### Findings — Critical / High
+
+#### CSA-AUTH-001 — Unsigned dynamic UPDATE accepted by default  [Critical] [Open]
+- Location: `dns_server.c:8068` (`handle_update`); secret load `dns_server.c:2485`.
+- Reachability: any host that can send UDP to the DNS port; source spoofable.
+- Issue: the gate is `!has_sig0 && g_tsig_secret_len > 0 && !tsig_verify(...)`.
+  With no `config:tsig_secret_b64` the length is 0 and the gate is skipped.
+  `ddns_allow_suffix` is empty by default, so no name restriction applies
+  either. A secret that fails base64 decoding yields length 0 and silently
+  turns authentication off.
+- Reproduced: default config, unsigned UDP UPDATE → rcode 0;
+  `_acme-challenge.example.local TXT` and an extra `www` A record were then
+  served.
+- Impact: anyone can rewrite zone data — including the DNS-01 challenge name,
+  which is enough to obtain certificates for the zone.
+- Fix: fail closed. Refuse UPDATE (REFUSED) unless a TSIG secret or a SIG(0)
+  trust anchor is configured. Treat an undecodable secret as a startup/reload
+  error, not as "disabled". Do NOT make this a config toggle that defaults to
+  open.
+
+#### CSA-AUTH-002 — TSIG time window never checked  [High] [Open]
+- Location: `dns_server.c:4675-4772` (`tsig_verify`); time/fudge are parsed at
+  `:4632-4635` and fed into the MAC, never compared with the clock. Same gap in
+  the XFR client's verifier (`:9456` onward).
+- Reachability: anyone who can observe one signed UPDATE (DNS/UDP is cleartext).
+- Reproduced: an UPDATE signed with a timestamp one year old → rcode 0, record
+  written.
+- Impact: indefinite replay of captured signed updates (re-adding deleted
+  records, reverting an address).
+- Fix: reject when `|now − time_signed| > fudge` with BADTIME (RFC 8945 §5.2.3).
+  Also bind the key name to `g_tsig_key_name`, and stop choosing the digest from
+  the client-supplied algorithm name (`tsig_alg_to_digest` accepts MD5/SHA-1).
+  Side note: BADSIG (16) is written into the 4-bit header rcode at `:8069`, so
+  the client sees a different rcode.
+
+#### CSA-AUTH-003 — apid `/list` is unauthenticated  [High] [Open]
+- Location: `apid.c:701` (handler) sits above the auth check at `apid.c:730`.
+- Reachability: any client of the plain-HTTP listener.
+- Reproduced: `GET /list` with no credentials returned every `ddns:*` and
+  `zone:*` key and value.
+- Impact: full zone enumeration, bypassing the AXFR ACL and NSEC3.
+- Fix: move the handler below the auth gate and require mgmt (mTLS).
+
+#### CSA-AUTH-004 — DDNS secret authorises arbitrary zone writes  [High] [Open]
+- Location: `apid.c:826` (`/zone` POST/PUT) and the DELETE branch below it —
+  neither checks `is_mgmt`; auth at `apid.c:730` accepts `?key=<ddns_secret>`.
+- Reachability: any holder of the DDNS secret, which travels in a URL over
+  plain HTTP.
+- Reproduced: `POST /zone?key=<ddns_secret>` wrote `NS` at the apex and
+  `TXT` at `_acme-challenge`.
+- Impact: a credential meant for "update my A record" can delegate the zone
+  away. `ddns_allow_suffix` is not enforced in apid at all.
+- Fix: gate `/zone` on `is_mgmt`; enforce `ddns_allow_suffix` in `/update` and
+  `/delete`; reject `|` and control characters in `value`/`name` (pipe-format
+  injection). `qs_get` uses `strstr`, so `xkey=` matches `key=` — parse on
+  `&` boundaries.
+
+#### CSA-DNSSEC-001 — KSK key tag off by one  [High] [Open]
+- Location: `dns_server.c:3472-3476` (`dnssec_init_key` always uses the ZSK
+  rdata encoders, flags 256). `dnssec_load_existing` (`:3510`) does it
+  correctly.
+- Reproduced: `example.local` publishes KSKs with tags 20791 / 25129;
+  RRSIG(DNSKEY) and the DS answer carry 20790 / 25128. Same on a `zone_table`
+  zone.
+- Impact: validators select the verifying key by tag and algorithm; no
+  published DNSKEY has the advertised tag, so the DNSKEY RRset cannot be
+  verified and the zone is treated as bogus. A DS built from the server's own
+  answer also carries the wrong tag.
+- Fix: pass `is_ksk` into `dnssec_init_key` and use the KSK encoder for the
+  tag. Note for the release: the advertised KSK tags change by +1; any DS
+  already published at a parent from this server's DS answer must be
+  regenerated.
+- Test gap: `check-dnssec-live` checks for RRSIG presence only.
+
+#### CSA-DNSSEC-002 — Signed NXDOMAIN is not a valid denial  [High] [Open]
+- Location: `dns_server.c:5866-5888` (`add_nsec3_denial`), called from `:7110`.
+- Reproduced: NXDOMAIN for `nope.example.test` returned one NSEC3 whose owner
+  is H(`nope.example.test`), next = H(apex), bitmap `A`. No closest-encloser
+  proof, no wildcard denial. No NSEC3PARAM at the apex.
+- Impact: RFC 5155 §7.2.2 requires a closest-encloser proof; an NSEC3 that
+  *matches* the qname asserts the name exists. resolverd logs dnsd's negative
+  answers as `DNSSEC BOGUS`. (The individual signatures do verify once the key
+  is known.)
+- Fix: for an online signer, Compact Denial of Existence (RFC 9824: NOERROR +
+  NSEC with the NXNAME type) is the simplest correct scheme; otherwise emit
+  the three-record white-lies proof. Publish NSEC3PARAM if NSEC3 stays.
+
+#### CSA-PROTO-001 — NODATA answered as NXDOMAIN  [High] [Open]
+- Location: `dns_server.c:7100` — rcode is chosen from `found`, which records
+  whether the *queried type* was found.
+- Reproduced: on a `zone_table` zone with `www A`, `www AAAA` → NXDOMAIN;
+  apex `AAAA` → NXDOMAIN. (The primary zone's `www` returned NOERROR.)
+- Impact: resolvers cache NXDOMAIN for the whole name (RFC 2308) and subtree
+  (RFC 8020). Dual-stack clients lose the A record after the AAAA query;
+  QNAME-minimising resolvers stop at an empty non-terminal.
+- Fix: decide existence per name — any type at the name, or any name beneath
+  it, means NODATA. The apex always exists.
+
+#### CSA-PROTO-002 — Plain TCP/53 becomes TLS once a certificate is loaded  [High] [Open]
+- Location: `dns_server.c:11092-11104` (`dot_thread` wraps the socket whenever
+  `g_dot_ctx` is non-NULL); the plain-TCP accept at `:12171` passes no
+  transport flag in `dot_conn_t`.
+- Reproduced: TCP/53 query answered with no cert; after loading a cert the
+  same query got a connection reset.
+- Impact: every TC=1 retry fails on a deployment with DoT enabled — large
+  signed answers become unreachable for clients with a 512-byte buffer.
+- Fix: add an `is_tls` field to `dot_conn_t`, set by the accepting listener.
+
+#### CSA-CONC-001 — resolverd cache/LRU use-after-free  [High] [Open]
+- Location: `resolverd.c:3238-3277` (`cache_insert` links the entry into the
+  hash bucket, releases the bucket lock, and only then calls `lru_insert` at
+  `:3271`); `resolverd.c:3340` (`cache_lookup` calls `lru_touch(e)` after
+  releasing the bucket lock); `cache_evict_one` (`:3204`) unlinks from the LRU
+  and the hash under separate locks.
+- Reachability: ordinary UDP queries from any client, 8 workers by default.
+- Reproduced: `--cache-size 8`, 12 client threads mixing one repeated name and
+  random names → ASan `heap-use-after-free` WRITE in `lru_insert`
+  (`resolverd.c:3188`) within 20 s; process died.
+- Impact: remote crash; heap corruption in a production build.
+- Fix: make the hash and LRU updates one critical section (a single cache
+  mutex is enough at this size), or give entries a refcount held across the
+  unlock. Do NOT touch an entry pointer after releasing the lock that
+  protects its lifetime.
+- Test gap: no TSan job in CI.
+
+#### CSA-NET-003 — IPv6 clients collapse to 0.0.0.0  [High] [Open]
+- Location: `dns_server.c:11840`, `:11857` (`IPV6_V6ONLY`), `:12139` and
+  `:12217` (dead `IN6_IS_ADDR_V4MAPPED` branches).
+- Impact: all IPv6 clients share one RRL bucket and one cookie identity, and
+  match ACLs only through a `0.0.0.0` entry. Already known as Add A; recorded
+  here because it is still present at this commit.
+- Fix: carry `sockaddr_storage` through `dns_process`; key RRL on /56 for v6.
+
+---
+
+### Findings — Medium
+
+#### CSA-AUTH-005 — Transfers do not require TSIG; ACL parser fails open  [Medium] [Open]
+- Location: `dns_server.c:11194` (result of `tsig_verify` discarded before
+  `axfr_thread`); ACL check `:9961`; CIDR parse `:1441-1470`.
+- Reproduced: with a TSIG secret configured, an unsigned AXFR from an
+  ACL-listed address transferred the zone.
+- Issue: authorisation is source-IP only. `atoi` on the prefix turns
+  `10.0.0.0/x` into `/0`, which matches everything.
+- Fix: when a TSIG secret is configured, refuse unsigned transfers. Reject
+  ACL entries whose prefix is not a number in 0–32.
+
+#### CSA-AUTH-006 — Client identity lost across the apid/doqd → dnsd hop  [Medium] [Open]
+- Location: `apid.c` `dns_forward` and `doqd.c` `dns_forward` (loopback UDP/TCP
+  to dnsd).
+- Issue: dnsd sees 127.0.0.1 for every DoH/DoQ client. RRL and cookies are
+  shared across all of them, and a forwarder ACL that lists loopback opens the
+  forwarder to the internet through DoH.
+- Fix: pass the client address on the internal hop (PROXY protocol v2 or a
+  private EDNS option accepted only from loopback), or apply the client
+  policy in the front-end daemon.
+
+#### CSA-AUTH-007 — resolverd answers anyone; two documented flags do nothing  [Medium] [Open]
+- Location: listeners bind `INADDR_ANY` (`resolverd.c:4694` onward) with no
+  client ACL or rate limit anywhere in the file; `resolverd.c:5688-5689`.
+- Issue: an open recursive resolver is a reflection source. `--no-dnssec` and
+  `--no-mdns` are parsed and ignored although `usage()` documents them; with
+  `--no-mdns` ignored, every `.local` name still goes to mDNS first.
+- Fix: add an allow-list defaulting to loopback + RFC 1918; implement or
+  remove the two flags (the Makefile's `check-resolverd` passes `--no-mdns`).
+
+#### CSA-DOS-002 — No connection cap; TLS handshake without timeout  [Medium] [Open]
+- Location: `dns_server.c:12160-12225` (one detached thread per accepted
+  connection, `pthread_create` result unchecked — `c` and the fd leak on
+  failure); `SO_RCVTIMEO` is set at `:11113`, after `SSL_accept` at `:11104`.
+  Same pattern in `resolverd.c:4903-4948` and `eppd.c:4220`.
+- Reproduced: 1,500 idle TCP connections → 1,400 threads, RSS 10 MB → 268 MB.
+- Fix: cap concurrent connections (doqd already does, `doqd.c:548`), set the
+  socket timeouts before the handshake, check `pthread_create`.
+
+#### CSA-DOS-003 — apid serves one connection at a time  [Medium] [Open]
+- Location: `apid.c:1290` and `:1309` (accept → handle → close, inline, 10 s
+  timeout).
+- Reproduced: one idle connection delayed `/health` by 9.9 s.
+- Fix: worker pool or thread-per-connection with a cap.
+
+#### CSA-DOS-004 — RRL keyed on qname  [Medium] [Open]
+- Location: `dns_server.c:5154-5190`; direct-mapped 4,096-entry table where a
+  collision resets the bucket; one global mutex.
+- Issue: every random subdomain gets a fresh bucket, so the NXDOMAIN flood RRL
+  exists to stop is never limited. Signed NXDOMAIN is ~13× the query size.
+  RRL is off by default.
+- Fix: key negative answers on (client prefix, zone), positive on (client
+  prefix, qname, qtype); run the check before building the response.
+
+#### CSA-DOS-005 — mdnsd: keyspace SCAN and a sleep per query  [Medium] [Open]
+- Location: `mdnsd.c:182-195` (`zone_glob_get`), `mdnsd.c:2003` (`usleep`
+  inside the single-threaded receive loop).
+- Issue: up to 10 questions × 6 types per packet, each a full SCAN of the
+  shared Valkey. Legacy-unicast replies go to any source with no on-link
+  check (RFC 6762 §11).
+- Fix: look up `zone:<zone>:<type>:<name>` directly for the configured
+  zones; schedule delayed responses instead of sleeping; drop off-link
+  sources.
+
+#### CSA-INJ-001 — mdnsd glob injection into SCAN MATCH  [Medium] [Open]
+- Location: `mdnsd.c:184` (`"zone:*:%s:%s"` with the wire qname).
+- Issue: `name_from_wire` copies label bytes verbatim; `*`, `?`, `[` in a
+  `.local` qname become pattern characters, returning the first matching
+  record from any zone.
+- Fix: as CSA-DOS-005 (no glob); otherwise escape glob metacharacters.
+
+#### CSA-INJ-002 — Query-log JSON injection  [Medium] [Open]
+- Location: `dns_server.c:779-795` (`qlog_write`); also `%s` of qnames in
+  `dns_log` calls.
+- Issue: labels may contain `"`, newlines and control bytes; they are written
+  unescaped, so a client can forge log records.
+- Fix: escape per RFC 8259 / RFC 4343 presentation format at the logging
+  boundary.
+
+#### CSA-SBX-001 — seccomp does not cover threads started before it  [Medium] [Open]
+- Location: `sandbox.c:397` (`seccomp_load` with no
+  `SCMP_FLTATR_CTL_TSYNC`; the comment at `sandbox.c:223` says TSYNC is used,
+  the comment in `eppd.c` above `accept_loop` says it is not);
+  `dns_server.c:11744-11810` start the keyspace, rollover, NOTIFY, sweeper,
+  health and XFR threads before `sandbox_apply` at `:12011`; resolverd starts
+  `vkw_worker` and `prefetch_worker` before `apply_sandbox`.
+- Issue: those threads run unfiltered, and several parse network input
+  (NOTIFY replies, XFR data, prefetched upstream answers). In `mountns` mode
+  they also keep the original filesystem view.
+- Fix: set TSYNC on the filter, or create every thread after `sandbox_apply`.
+  Not verified at runtime (libseccomp unavailable here).
+
+#### CSA-SBX-002 — Four daemons have no sandbox  [Medium] [Open]
+- Location: `apid.c`, `certd.c`, `mdnsd.c`, `doqd.c` never call
+  `sandbox_apply`.
+- Issue: apid parses HTTP from the internet and holds a Valkey connection
+  that can write `config:*`. All daemons share one Valkey credential, so a
+  compromise of any one is a compromise of the bus.
+- Fix: apply libsandbox in each; create one Valkey ACL user per daemon that
+  mirrors the data-ownership table.
+
+#### CSA-WEB-001 — Dashboard lacks CSRF protection  [Medium] [Open]
+- Location: `dashboard/app.py` — every POST route (`/config/save`,
+  `/dnssec/delete-key`, `/pki/upload-pem`, …); no token anywhere in the file.
+- Fix: per-session token on every form; set `SESSION_COOKIE_SAMESITE=Strict`
+  and `SESSION_COOKIE_SECURE`.
+
+---
+
+### Findings — Low
+
+#### CSA-CONC-002 — Config reload races with readers  [Low] [Open]
+- Location: `keyspace_apply` (`dns_server.c:2939`) → `config_load_from_valkey`
+  (`:2280`); also SIGHUP at `:12066`.
+- Issue: globals are reset to defaults and rewritten while worker threads read
+  them. Every serial bump triggers a full reload (seen in the log on each
+  UPDATE).
+- Fix: build a new config struct and swap a pointer; do not reload on
+  `config:zone_serial`.
+
+#### CSA-MEM-001 — certd double free on EST 202 retry  [Low] [Open]
+- Location: `certd.c:1792` frees `body`; if the retry allocation or CSR build
+  fails, `body` is not reassigned and is freed again at `:1815`.
+- Fix: set `body = NULL` after the first free. (Flagged by `clang --analyze`.)
+
+#### CSA-MEM-002 — Small out-of-bounds reads  [Low] [Open]
+- `dns_server.c:4618`: TSIG algorithm-name label copied with only `rp < plen`
+  checked, not `rp + c`.
+- `dns_server.c:11175`: IXFR authority scan reads type/rdlen at `ra`..`ra+9`
+  without checking against `ml`.
+- `dns_server.c:11456`: forwarder RRL truncation sets `rlen = qa + 4` without
+  checking the upstream reply is that long — up to 4 stale stack bytes sent.
+- All read within or just past a stack buffer; none was hit by the fuzz run.
+  Fix: bounds-check before each read.
+
+#### CSA-DOS-006 — NOTIFY handling on a secondary  [Low] [Open]
+- Location: `dns_server.c:11059` — a blocking `getaddrinfo` per NOTIFY on the
+  query thread; NOTIFY is not TSIG-verified and the UDP source is spoofable.
+- Fix: resolve the primary once at config load; require TSIG when configured;
+  rate-limit `xfr_refresh_kick`.
+
+#### CSA-WEB-002 — Login throttle trusts X-Forwarded-For  [Low] [Open]
+- Location: `dashboard/app.py:63` (`_client_ip`), `_login_fails` dict.
+- Issue: a client rotates the header to avoid the back-off; the dict grows
+  without bound.
+- Fix: honour the header only behind a configured proxy; bound and expire the
+  table.
+
+#### CSA-CRYPTO-001 — EPP credentials  [Low] [Open]
+- Location: `eppd.c:911` (registrar password: plaintext in
+  `config:eppd_registrar_pw:<clID>`, compared with `strcmp`), `eppd.c:3729`
+  (authInfo `strcmp`).
+- Issue: no hashing, variable-time compare, no failed-login limit, and the
+  clID is not bound to the client certificate.
+- Fix: store a password hash, compare in constant time, bind clID to the
+  certificate subject, limit failures per clID.
+
+---
+
+### Performance observations (not security findings)
+
+Measured with the prod build on a 2-core sandbox with the key-value server on
+the same host — use the ratios, not the absolute numbers.
+
+| Query | HEAD, 1 thread | HEAD, 4 workers | Patched, 4 workers | HEAD + rcache, 4 workers |
+|---|---|---|---|---|
+| Positive A | 3.4k qps | 10.4k | 20.5k | 34.9k |
+| NXDOMAIN (random names) | 2.6k | 8.0k | 17.5k | 9.1k |
+| NXDOMAIN + DO | 1.9k | 4.7k | 7.0k | 4.7k |
+
+"Patched" = the two edits below, nothing else.
+
+- **PERF-001** `valkey_ensure` (`dns_server.c:1911-1919`) sends `PING` before
+  every command. A positive A query costs 10 round-trips (4 GET, 1 TTL, 5
+  PING), an NXDOMAIN 12. Drop the PING; reconnect when a command fails.
+- **PERF-002** `resp_parse` (`dns_server.c:1690`) zeroes a `resp_reply_t`
+  holding `char str[MAX_PEM]` (64 KB) per reply. Reset the scalar fields and
+  `str[0]` only.
+- **PERF-003** Six sequential GETs per miss (NS, ddns A, zone A, srp A, CNAME,
+  wildcard). Pipeline them, or serve from an in-process zone image refreshed
+  by keyspace notifications (ADR-005).
+- **PERF-004** Negative answers are signed online with two algorithms on every
+  query; random names defeat `rcache`. Cache signed negative responses per
+  covering range once CSA-DNSSEC-002 is fixed.
+- **PERF-005** TCP/DoT threads share the global `vk` connection under
+  `g_vk_mutex`; only UDP workers have private connections.
+- **PERF-006** One thread spawned per forwarded UDP query (`:11515`).
+- **PERF-007** Serve-stale cannot work: the `stale:` shadow keys live in the
+  Valkey whose outage they are meant to cover (`dns_server.c:2098-2112`), and
+  each query then blocks on up to 4 s connect attempts.
+
+### Notes / non-findings (verified this run)
+
+- dnsd UDP request path: 4-minute mutation fuzz under ASan/UBSan, no report.
+- No memory growth in the prod dnsd across the load runs (RSS flat at 10 MB).
+- UDP truncation honours the advertised EDNS size and sets TC.
+- Forwarder validates reply source, ID and question (`fwd_reply_valid`).
+- Positive answers, SOA and NSEC3 RRSIGs verify with dnspython for both
+  algorithms.
+- Production ELF: PIE, full RELRO, BIND_NOW, non-exec stack, stack protector,
+  fortified calls present.
+- Dashboard: password hashing, constant-time username compare, session reset
+  on login, secret-bearing keys hidden in the explorer.
+
+### Coverage caveat and next steps
+
+Not line-by-line: `build_query_resp` record-emission branches, SRP, catalog
+zones, the rollover engine, eppd object handlers and `object_graph.c` were
+skimmed or skipped. Highest-value follow-ups: a libFuzzer harness over
+`dns_process` (QUERY + UPDATE + `tsig_find`/`sig0_find`), a TSan CI job for
+resolverd and dnsd, and a CI step that validates dnsd's positive and negative
+answers with an independent validator (it would have caught CSA-DNSSEC-001,
+CSA-DNSSEC-002 and CSA-PROTO-001).
+
+---
+
 ## 2026-06-25 — Incremental re-audit (@ commit 42a8ce5)
 
 **Scope:** the trust-boundary code changed since the 2026-06-23 full audit —
