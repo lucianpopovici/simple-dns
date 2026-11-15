@@ -1,0 +1,13 @@
+# ThreadSanitizer suppressions for check-resolverd-tsan.
+#
+# Only for races TSan cannot see the synchronisation of: uninstrumented
+# third-party code. Each entry is filed with its report in
+# CLAUDE-resolverd-cache.md ("TSan findings"). Never add an entry for
+# project code — fix the race instead.
+#
+# OpenSSL >= 3.3 looks up algorithm names in its lock-free (RCU) hashtable
+# (ossl_ht_get, from EVP_PKEY_fromdata / EVP fetch in verify_ecdsa_p256 /
+# verify_ed25519). libcrypto is not built with -fsanitize=thread, so the RCU
+# publication is invisible to TSan and every concurrent DNSSEC verify is
+# reported as a race on the hashtable's key buffer.
+race:ossl_ht_get

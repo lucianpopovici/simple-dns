@@ -158,7 +158,10 @@ availability, then defense-in-depth.
    connection cap / handshake timeout / checked `pthread_create`). **DONE
    2026-11-15** — `make check-tcp-plain` (in CI).
 5. **resolverd cache UAF** — `CLAUDE-resolverd-cache.md` Fix 1 (CSA-CONC-001,
-   *High*, reproduced) + Fix 2 (TSan build + stress target in CI). *Specced.*
+   *High*, reproduced) + Fix 2 (TSan build + stress target in CI). **DONE
+   2026-11-15** — `make check-resolverd-stress` + `check-resolverd-tsan`
+   (blocking in CI); dnsd's TSan run recorded the CSA-CONC-002 reload races
+   for step 8.
 6. **Client identity** — CSA-NET-003 (*High*, IPv6 client address collapses to
    0.0.0.0 — RRL, cookies, ACLs all key on it), with CSA-AUTH-006 (DoH/DoQ
    clients reach dnsd as 127.0.0.1) and CSA-DOS-004 (RRL keyed on qname)

@@ -116,6 +116,10 @@ DEBUG_FLAGS := -Og -g3 -ggdb \
                -fsanitize=address,undefined \
                -fno-omit-frame-pointer \
                -DDEBUG
+# ThreadSanitizer build (cannot be combined with ASan) — CLAUDE-resolverd-cache.md
+TSAN_FLAGS := -O1 -g -fsanitize=thread -fno-omit-frame-pointer -DDEBUG
+# Seconds per stress run (the spec's acceptance run is 120; CI uses the default)
+STRESS_SECS ?= 60
 
 # ── Build version string (embedded via -DBUILD_VERSION) ─────────────────────
 GIT_SHA    := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -126,7 +130,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -276,6 +280,21 @@ resolverd: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.
 	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(PROD_FLAGS) $(VERSION_FLAGS) \
 	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
 	strip --strip-unneeded $@
+
+resolverd_tsan: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.h object_graph.h | ossl-sanity
+	@echo "  CC [TSAN]  $@"
+	$(CC) $(CSTD) $(WARN) -Wno-misleading-indentation $(TSAN_FLAGS) $(VERSION_FLAGS) \
+	      $(SECCOMP_CFLAGS) $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
+
+# Built and run, not blocking: dnsd's live config reload is a known
+# reader/writer race (CSA-CONC-002) with its own fix.
+dns_server_tsan: $(SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [TSAN]  $@"
+	$(CC) $(CSTD) $(WARN) $(TSAN_FLAGS) $(VERSION_FLAGS) $(SECCOMP_CFLAGS) \
+	      $(INCLUDES) -o $@ $(filter %.c,$^) $(LIBS) $(SECCOMP_LIBS)
+
+tests/udp_stress: tests/udp_stress.c
+	$(CC) $(CSTD) -O2 -Wall -Wextra -o $@ $< -lpthread
 
 resolverd_debug: resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) $(POG_SRC) dns_wire.h sandbox.h object_graph.h | ossl-sanity
 	@echo "  CC [DEBUG] $@"
@@ -668,6 +687,53 @@ check-tcp-plain: $(BIN_DEBUG)
 	 test "$$SAN" -eq 0 || { echo "  FAIL  sanitizer report"; rc=1; }; \
 	 test $$rc -eq 0 || exit 1;                                                        \
 	 echo "  OK  listener decides TLS vs plain; TC retry works with a cert; silent clients dropped; connection cap holds"
+
+# CSA-CONC-001 (CLAUDE-resolverd-cache.md): resolverd's cache index and LRU
+# were guarded by three independent locks and touched entries after dropping
+# the lock that kept them alive — heap-use-after-free under concurrent
+# queries. Stress: a tiny cache (8 entries), 6 threads hammering one name
+# (concurrent replace) + 6 threads querying random names (constant insert +
+# eviction), STRESS_SECS seconds; then the process must still answer and its
+# log must hold no sanitizer report or cache-invariant failure (the -DDEBUG
+# invariant walks the LRU and bucket counts on every insert/flush).
+# check-resolverd-stress uses the ASan build, check-resolverd-tsan the TSan
+# build (any ThreadSanitizer warning fails it).
+define RD_STRESS
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 Z=stress.test; RDLOG=/tmp/rd_$(1).log;                                            \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300||" >/dev/null; \
+	 $$VC set zone:$$Z:A:www.$$Z "1|10.0.0.1" >/dev/null;                              \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) UDP_WORKERS=2 ./$(BIN_DEBUG) > /tmp/st_dnsd_$(1).log 2>&1 & DNS=$$!; \
+	 sleep 2;                                                                          \
+	 ASAN_OPTIONS=detect_leaks=0 TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 suppressions=$(CURDIR)/tests/tsan.supp" \
+	   LISTEN_PORT=5354 ./$(2) --upstream 127.0.0.1:$(TPORT) --no-valkey --no-mdns --cache-size 8 \
+	   > $$RDLOG 2>&1 & RD=$$!;                                                        \
+	 sleep 2;                                                                          \
+	 ./tests/udp_stress 5354 6 $(STRESS_SECS) nx stress test > /tmp/st_nx_$(1).out & P1=$$!; \
+	 ./tests/udp_stress 5354 6 $(STRESS_SECS) a stress test > /tmp/st_a_$(1).out & P2=$$!; \
+	 wait $$P1 $$P2;                                                                   \
+	 ALIVE=0; kill -0 $$RD 2>/dev/null && ALIVE=1;                                     \
+	 ANS=$$(dig +short +nocookie @127.0.0.1 -p 5354 www.$$Z A +time=3 +tries=1);       \
+	 kill $$DNS $$RD 2>/dev/null || true; sleep 0.5;                                   \
+	 $$VC del zone_table:$$Z zone:$$Z:A:www.$$Z >/dev/null;                           \
+	 for k in $$($$VC --scan --pattern "*$$Z*"); do $$VC del "$$k" >/dev/null; done;  \
+	 BAD=$$(grep -c "ERROR: AddressSanitizer\|runtime error\|WARNING: ThreadSanitizer\|cache invariant" $$RDLOG); \
+	 echo "  load: $$(cat /tmp/st_nx_$(1).out) | $$(cat /tmp/st_a_$(1).out)";        \
+	 echo "  resolverd alive=$$ALIVE answer=[$$ANS] sanitizer/invariant reports=$$BAD"; \
+	 test "$$BAD" -eq 0 || { grep -m1 -A25 "ERROR: AddressSanitizer\|WARNING: ThreadSanitizer\|cache invariant" $$RDLOG; echo "  FAIL  sanitizer/invariant report under concurrent load"; exit 1; }; \
+	 test "$$ALIVE" = 1 || { tail -20 $$RDLOG; echo "  FAIL  resolverd died under concurrent load"; exit 1; }; \
+	 test "$$ANS" = 10.0.0.1 || { echo "  FAIL  resolverd does not answer after the stress run"; exit 1; }; \
+	 echo "  OK  cache survives concurrent insert/replace/evict ($(STRESS_SECS)s, $(1))"
+endef
+
+check-resolverd-stress: $(BIN_DEBUG) resolverd_debug tests/udp_stress
+	@echo "  CHECK  resolverd cache under concurrent load, ASan build (Valkey + dig; $(STRESS_SECS)s)"
+	$(call RD_STRESS,asan,resolverd_debug)
+
+check-resolverd-tsan: $(BIN_DEBUG) resolverd_tsan tests/udp_stress
+	@echo "  CHECK  resolverd cache under concurrent load, TSan build (Valkey + dig; $(STRESS_SECS)s)"
+	$(call RD_STRESS,tsan,resolverd_tsan)
 
 # RFC 9077: the NSEC/NSEC3 + authority SOA in a negative response carry TTL =
 # min(SOA.MINIMUM, the SOA's TTL), while a positive SOA answer carries the SOA's
@@ -2280,7 +2346,7 @@ check-dot-mtls: $(BIN_DEBUG)
 	 $$VC set config:dot_require_client_cert 1 >/dev/null;                             \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_dotm.log 2>&1 & DNS=$$!;    \
 	 sleep 1.5;                                                                        \
-	 NOCERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
+	 NOCERT=$$(echo | timeout 6 openssl s_client -ign_eof -connect 127.0.0.1:8853 -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
 	 WITHCERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -cert $$D/cli.pem -key $$D/cli.key -CAfile $$D/ca.pem 2>&1 | grep -c "Verify return code: 0"); \
 	 WC_ALERT=$$(echo | openssl s_client -connect 127.0.0.1:8853 -cert $$D/cli.pem -key $$D/cli.key -CAfile $$D/ca.pem 2>&1 | grep -c "certificate required"); \
 	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
@@ -3343,7 +3409,7 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 clean:
 	@echo "  CLEAN"
 	rm -f $(BIN) $(BIN_DEBUG) certd certd_debug mdnsd mdnsd_debug apid apid_debug \
-	      resolverd resolverd_debug \
+	      resolverd resolverd_debug resolverd_tsan dns_server_tsan tests/udp_stress \
 	      $(SIG_GPG) $(SIG_OSSL) \
 	      tests/test_dnssec_verify tests/test_rollover tests/test_name_from_wire \
 	      tests/test_zonemd tests/test_csync tests/test_aggressive_nsec tests/test_ede \
@@ -3414,6 +3480,7 @@ help:
 	@echo "  make check-dnssec-validate  Independent DNSSEC validation (dnspython): KSK tags, NODATA, RFC 9824 compact denial"
 	@echo "  make check-ent       Empty non-terminals: zidx index, NODATA not NXDOMAIN, signed ENT denial"
 	@echo "  make check-tcp-plain plain TCP vs DoT per listener, stream connection cap + handshake timeout"
+	@echo "  make check-resolverd-stress / check-resolverd-tsan  resolverd cache under concurrent load (ASan / TSan; STRESS_SECS)"
 	@echo "  make check-aggressive-nsec resolverd RFC 8198 aggressive NSEC/NSEC3 cache (KAT + negative)"
 	@echo "  make check-ede       resolverd RFC 8914 Extended DNS Errors (KAT + live, needs dig + python3)"
 	@echo "  make check-ddr       resolverd RFC 7858 DoT server + RFC 9462 DDR (needs dig + openssl + python3-dnspython)"

@@ -11,8 +11,49 @@ grep -n "g_lru_mutex\|g_cache_count_mutex\|g_cache\[.*\]\.lock\|lru_touch(\|lru_
 
 | Fix | Finding | Status |
 |----:|---------|--------|
-| 1 | CSA-CONC-001 — cache/LRU use-after-free under concurrent queries | Specced |
-| 2 | TSan build + stress target so this class of bug is caught in CI | Specced |
+| 1 | CSA-CONC-001 — cache/LRU use-after-free under concurrent queries | **Done** 2026-11-15 (Option A, single `g_cache_mutex`) |
+| 2 | TSan build + stress target so this class of bug is caught in CI | **Done** 2026-11-15 (`check-resolverd-stress`, `check-resolverd-tsan`, blocking in CI) |
+
+## Implementation notes (2026-11-15)
+
+- **Reproduced first.** The harness as written (random names, 60 s TTL on
+  the hot name) did not reproduce on this machine in 30 s: random names never
+  repeat, so no two workers ever insert the same key, and the hot name never
+  re-inserts. `udp_stress nx` now draws from 64 names and the hot record has
+  TTL 1, so concurrent misses of one name race their replaces. With that,
+  the pre-fix ASan build hit `heap-use-after-free` within 45 s, and the
+  pre-fix TSan build reported the `cache_insert` race at once.
+- **After the fix:** 120 s ASan stress — no report, process alive and
+  answering; 60 s TSan stress — no report in project code. The `-DDEBUG`
+  invariant (`cache_check_invariant_locked`) runs on every insert and flush.
+- `lru_unlink_locked` only clears head/tail when the entry really is the
+  head/tail, so unlinking an entry not on the list is harmless.
+- The `make` recipes run the two load generators by PID (`wait $P1 $P2`);
+  waiting on all jobs would block on the background dnsd/resolverd.
+
+## TSan findings (filed, per the Fix 2 guardrail)
+
+1. **OpenSSL RCU hashtable — suppressed (third-party, uninstrumented).**
+   `race:ossl_ht_get` in `tests/tsan.supp`, the only entry. Report:
+   ```
+   WARNING: ThreadSanitizer: data race
+     Read of size 5 ... by thread T9:
+       #0 memcmp  #1 ossl_ht_get (libcrypto.so.4)
+       #2 dnssec_verify_rrset resolverd.c:1436 ... udp_worker
+     Previous write of size 8 ... by thread T8 (mutexes: write M0, write M1):
+       #0 malloc  #1 CRYPTO_malloc (libcrypto.so.4)
+       #2 dnssec_verify_rrset resolverd.c:1436 ... udp_worker
+   ```
+   OpenSSL >= 3.3 looks algorithm names up in a lock-free (RCU) hashtable;
+   libcrypto is not built with `-fsanitize=thread`, so TSan cannot see the
+   RCU publication. Not a resolverd defect; `--no-dnssec` could not be used to
+   sidestep it because that flag is still a no-op (CSA-AUTH-007).
+2. **dnsd (`dns_server_tsan`, non-blocking, recorded):** a 15 s load run
+   reports 12 races, all in the config/zone reload path —
+   `config_load_from_valkey` (`:2597`, `:2601`) and `zone_upsert`
+   (`:625-629`) writing globals / zone entries while UDP workers read them
+   (`forward_should :6731`, `strncpy` from readers). This is CSA-CONC-002,
+   roadmap step 8; not addressed here.
 
 ---
 

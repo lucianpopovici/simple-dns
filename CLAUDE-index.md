@@ -42,7 +42,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-dnssec-denial.md` | dnsd (+libdnswire, resolverd check) | Audit fixes: KSK key tag, NODATA vs NXDOMAIN, RFC 9824 compact denial (promotes Add 11) — **specced 2026-11-15** |
 | `CLAUDE-tcp-transport.md` | dnsd | Audit fixes: plain TCP vs DoT per listener; stream-listener bounds — **specced 2026-11-15** |
 | `CLAUDE-apid-auth.md` | apid (+libdnswire) | Audit fixes: `/list` + `/zone` mTLS-only, DDNS suffix ACL + key/value hygiene — **done 2026-11-15** |
-| `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **specced 2026-11-15** |
+| `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **done 2026-11-15** |
 | `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
 
@@ -66,8 +66,8 @@ validator and resolver sees, then availability).
 | CSA-DNSSEC-002 | High | RFC 9824 compact denial (= dnsd Add 11), NSEC or NSEC3 per `dnssec_nsec_mode` | **Done** 2026-11-15 (D1: keep selector) | dnssec-denial, Fix 3 |
 | CSA-PROTO-002 | High | Listener sets the transport for `dot_thread` | **Done** 2026-11-15 | tcp-transport, Fix 1 |
 | CSA-DOS-002 | Medium | Connection cap, handshake timeout, checked `pthread_create` | **Done** 2026-11-15 | tcp-transport, Fix 2 |
-| CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | Specced | resolverd-cache, Fix 1 |
-| — | — | TSan build + stress target + CI job | Specced | resolverd-cache, Fix 2 |
+| CSA-CONC-001 | High | Single cache mutex for hash + LRU + count | **Done** 2026-11-15 | resolverd-cache, Fix 1 |
+| — | — | TSan build + stress target + CI job | **Done** 2026-11-15 | resolverd-cache, Fix 2 |
 
 Found while fixing, not in the ledger, **fixed 2026-11-15**: multi-RR RRsets signed per record; DNSKEY/CDS/DS answered at any name; resolverd validator picked the first DNSKEY for every RRSIG; ZONEMD drift with live ddns leases; non-primary zone serial reset on reload (see `CLAUDE-dnssec-denial.md` implementation notes).
 

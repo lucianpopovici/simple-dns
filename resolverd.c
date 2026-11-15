@@ -195,10 +195,9 @@ typedef struct cache_entry {
     struct cache_entry *hash_next;
 } cache_entry_t;
 
-/* Per-bucket lock */
+/* Hash bucket — guarded by g_cache_mutex (no per-bucket lock; see below) */
 typedef struct {
     cache_entry_t *head;
-    pthread_rwlock_t lock;
     int count;
 } cache_bucket_t;
 
@@ -321,11 +320,18 @@ static pthread_mutex_t g_route_mutex = PTHREAD_MUTEX_INITIALIZER;
  * ======================================================================= */
 static config_t g_cfg;
 static cache_bucket_t g_cache[CACHE_BUCKETS];
-static int g_cache_total = 0; /* total entries (approximate) */
-static pthread_mutex_t g_cache_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* CSA-CONC-001: ONE mutex guards the hash chains, the LRU list and
+ * g_cache_total together. The old scheme (per-bucket rwlock + g_lru_mutex +
+ * a count mutex) touched entries after dropping the lock that kept them
+ * alive — insert linked into the LRU after releasing the bucket, lookup
+ * touched the LRU after releasing it, eviction unlinked from the LRU before
+ * taking the bucket — and freed memory was reused under concurrent queries.
+ * Every critical section is a short chain walk, pointer updates or one deep
+ * copy; never hold it across Valkey/objectdb/upstream I/O. */
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_cache_total = 0; /* entries in the in-memory index */
 /* LRU list — head = most recently used, tail = eviction candidate */
 static cache_entry_t *g_lru_head = NULL, *g_lru_tail = NULL;
-static pthread_mutex_t g_lru_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Statistics */
 /* Counters are relaxed atomics: they are monotonic tallies with no
  * cross-counter invariant to protect, so a mutex around each ++ bought
@@ -3268,30 +3274,20 @@ static uint32_t entry_expired_for(const cache_entry_t *e) {
     return max_age > min_orig ? max_age - min_orig : 0;
 }
 
-static void lru_touch(cache_entry_t *e) {
-    pthread_mutex_lock(&g_lru_mutex);
-    /* Remove from current position */
+/* LRU primitives — the caller MUST hold g_cache_mutex. */
+static void lru_unlink_locked(cache_entry_t *e) {
     if (e->lru_prev)
         e->lru_prev->lru_next = e->lru_next;
-    else
+    else if (g_lru_head == e)
         g_lru_head = e->lru_next;
     if (e->lru_next)
         e->lru_next->lru_prev = e->lru_prev;
-    else
+    else if (g_lru_tail == e)
         g_lru_tail = e->lru_prev;
-    /* Insert at head */
-    e->lru_prev = NULL;
-    e->lru_next = g_lru_head;
-    if (g_lru_head)
-        g_lru_head->lru_prev = e;
-    g_lru_head = e;
-    if (!g_lru_tail)
-        g_lru_tail = e;
-    pthread_mutex_unlock(&g_lru_mutex);
+    e->lru_prev = e->lru_next = NULL;
 }
 
-static void lru_insert(cache_entry_t *e) {
-    pthread_mutex_lock(&g_lru_mutex);
+static void lru_insert_locked(cache_entry_t *e) {
     e->lru_prev = NULL;
     e->lru_next = g_lru_head;
     if (g_lru_head)
@@ -3299,7 +3295,11 @@ static void lru_insert(cache_entry_t *e) {
     g_lru_head = e;
     if (!g_lru_tail)
         g_lru_tail = e;
-    pthread_mutex_unlock(&g_lru_mutex);
+}
+
+static void lru_touch_locked(cache_entry_t *e) {
+    lru_unlink_locked(e);
+    lru_insert_locked(e);
 }
 
 static void cache_entry_free(cache_entry_t *e) {
@@ -3310,36 +3310,57 @@ static void cache_entry_free(cache_entry_t *e) {
     free(e);
 }
 
-/* Evict the LRU entry */
-static void cache_evict_one(void) {
-    pthread_mutex_lock(&g_lru_mutex);
-    cache_entry_t *victim = g_lru_tail;
-    if (!victim) {
-        pthread_mutex_unlock(&g_lru_mutex);
-        return;
-    }
-    /* Remove from LRU list */
-    if (victim->lru_prev)
-        victim->lru_prev->lru_next = NULL;
-    else
-        g_lru_head = NULL;
-    g_lru_tail = victim->lru_prev;
-    pthread_mutex_unlock(&g_lru_mutex);
-    /* Remove from hash bucket */
-    uint32_t bkt = cache_hash(victim->qname, victim->qtype);
-    pthread_rwlock_wrlock(&g_cache[bkt].lock);
+/* Unlink `e` from its hash chain (bucket `bkt`). Caller holds g_cache_mutex. */
+static void cache_hash_unlink_locked(cache_entry_t *e, uint32_t bkt) {
     cache_entry_t **pp = &g_cache[bkt].head;
-    while (*pp && *pp != victim)
+    while (*pp && *pp != e)
         pp = &(*pp)->hash_next;
-    if (*pp)
-        *pp = victim->hash_next;
-    g_cache[bkt].count--;
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
-    cache_entry_free(victim);
-    pthread_mutex_lock(&g_cache_count_mutex);
-    g_cache_total--;
-    pthread_mutex_unlock(&g_cache_count_mutex);
+    if (*pp) {
+        *pp = e->hash_next;
+        g_cache[bkt].count--;
+        g_cache_total--;
+    }
+    e->hash_next = NULL;
 }
+
+/* Evict the LRU tail. Caller holds g_cache_mutex. */
+static void cache_evict_one_locked(void) {
+    cache_entry_t *victim = g_lru_tail;
+    if (!victim)
+        return;
+    lru_unlink_locked(victim);
+    cache_hash_unlink_locked(victim, cache_hash(victim->qname, victim->qtype));
+    cache_entry_free(victim);
+}
+
+#ifdef DEBUG
+/* Debug-build invariant (caller holds g_cache_mutex): the LRU walk from head
+ * reaches tail and visits exactly g_cache_total entries, the bucket counts
+ * sum to g_cache_total, and the cache is within its configured size. */
+static void cache_check_invariant_locked(const char *where) {
+    int n = 0;
+    cache_entry_t *last = NULL;
+    for (cache_entry_t *e = g_lru_head; e; e = e->lru_next) {
+        if (e->lru_prev != last || ++n > g_cache_total + 1)
+            break;
+        last = e;
+    }
+    long sum = 0;
+    for (int b = 0; b < CACHE_BUCKETS; b++)
+        sum += g_cache[b].count;
+    if (n != g_cache_total || last != g_lru_tail || sum != g_cache_total ||
+        (g_cfg.cache_size > 0 && g_cache_total > g_cfg.cache_size)) {
+        fprintf(stderr,
+                "cache invariant violated in %s: lru=%d total=%d buckets=%ld tail_ok=%d "
+                "cap=%d\n",
+                where, n, g_cache_total, sum, last == g_lru_tail, g_cfg.cache_size);
+        abort();
+    }
+}
+#define CACHE_CHECK(where) cache_check_invariant_locked(where)
+#else
+#define CACHE_CHECK(where) ((void) 0)
+#endif
 
 /*
  * cache_insert — add or replace an entry.
@@ -3347,44 +3368,26 @@ static void cache_evict_one(void) {
  */
 static void cache_insert(cache_entry_t *e) {
     uint32_t bkt = cache_hash(e->qname, e->qtype);
-    pthread_rwlock_wrlock(&g_cache[bkt].lock);
-    /* Replace existing entry for same name+type */
-    cache_entry_t **pp = &g_cache[bkt].head;
-    while (*pp) {
-        if ((*pp)->qtype == e->qtype && strcasecmp((*pp)->qname, e->qname) == 0) {
-            cache_entry_t *old = *pp;
-            *pp = old->hash_next;
-            /* Remove from LRU */
-            pthread_mutex_lock(&g_lru_mutex);
-            if (old->lru_prev)
-                old->lru_prev->lru_next = old->lru_next;
-            else
-                g_lru_head = old->lru_next;
-            if (old->lru_next)
-                old->lru_next->lru_prev = old->lru_prev;
-            else
-                g_lru_tail = old->lru_prev;
-            pthread_mutex_unlock(&g_lru_mutex);
+    e->lru_prev = e->lru_next = e->hash_next = NULL;
+    pthread_mutex_lock(&g_cache_mutex);
+    /* Replace an existing entry for the same name+type */
+    for (cache_entry_t *old = g_cache[bkt].head; old; old = old->hash_next) {
+        if (old->qtype == e->qtype && strcasecmp(old->qname, e->qname) == 0) {
+            lru_unlink_locked(old);
+            cache_hash_unlink_locked(old, bkt);
             cache_entry_free(old);
-            g_cache[bkt].count--;
-            pthread_mutex_lock(&g_cache_count_mutex);
-            g_cache_total--;
-            pthread_mutex_unlock(&g_cache_count_mutex);
             break;
         }
-        pp = &(*pp)->hash_next;
     }
     e->hash_next = g_cache[bkt].head;
     g_cache[bkt].head = e;
     g_cache[bkt].count++;
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
-    lru_insert(e);
-    pthread_mutex_lock(&g_cache_count_mutex);
     g_cache_total++;
-    pthread_mutex_unlock(&g_cache_count_mutex);
-    /* Evict if over capacity */
-    if (g_cache_total > g_cfg.cache_size)
-        cache_evict_one();
+    lru_insert_locked(e);
+    while (g_cfg.cache_size > 0 && g_cache_total > g_cfg.cache_size && g_lru_tail)
+        cache_evict_one_locked();
+    CACHE_CHECK("cache_insert");
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 /*
@@ -3397,7 +3400,7 @@ static void cache_insert(cache_entry_t *e) {
  */
 static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_stale) {
     uint32_t bkt = cache_hash(qname, qtype);
-    pthread_rwlock_rdlock(&g_cache[bkt].lock);
+    pthread_mutex_lock(&g_cache_mutex);
     cache_entry_t *e = g_cache[bkt].head;
     while (e) {
         if (e->qtype == qtype && strcasecmp(e->qname, qname) == 0)
@@ -3405,13 +3408,13 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         e = e->hash_next;
     }
     if (!e) {
-        pthread_rwlock_unlock(&g_cache[bkt].lock);
+        pthread_mutex_unlock(&g_cache_mutex);
         return NULL;
     }
     int is_stale = 0;
     if (entry_remaining_ttl(e) == 0) {
         if (!allow_stale || entry_expired_for(e) > g_cfg.serve_stale_max) {
-            pthread_rwlock_unlock(&g_cache[bkt].lock);
+            pthread_mutex_unlock(&g_cache_mutex);
             if (allow_stale) {
                 STAT_INC(g_stat_expired);
             }
@@ -3420,19 +3423,20 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         is_stale = 1;
         STAT_INC(g_stat_expired);
     }
-    /* Deep copy */
+    /* Deep copy — the index entry must never be used once the lock drops. */
     cache_entry_t *copy = malloc(sizeof(cache_entry_t));
     if (!copy) {
-        pthread_rwlock_unlock(&g_cache[bkt].lock);
+        pthread_mutex_unlock(&g_cache_mutex);
         return NULL;
     }
     memcpy(copy, e, sizeof(cache_entry_t));
     copy->lru_prev = copy->lru_next = copy->hash_next = NULL;
+    copy->rrs = NULL;
     if (e->nrr > 0) {
         copy->rrs = malloc(e->nrr * sizeof(cache_rr_t));
         if (!copy->rrs) {
             free(copy);
-            pthread_rwlock_unlock(&g_cache[bkt].lock);
+            pthread_mutex_unlock(&g_cache_mutex);
             return NULL;
         }
         memcpy(copy->rrs, e->rrs, e->nrr * sizeof(cache_rr_t));
@@ -3446,8 +3450,8 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         }
     }
     copy->served_stale = is_stale;
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
-    lru_touch(e);
+    lru_touch_locked(e);
+    pthread_mutex_unlock(&g_cache_mutex);
     return copy;
 }
 
@@ -3591,34 +3595,23 @@ static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_re
 static int cache_flush(const char *qname, uint16_t qtype) {
     int count = 0;
     if (!qname) {
-        /* Flush all */
+        /* Flush all — the persistent tier is flushed after the lock drops. */
+        pthread_mutex_lock(&g_cache_mutex);
         for (int b = 0; b < CACHE_BUCKETS; b++) {
-            pthread_rwlock_wrlock(&g_cache[b].lock);
             cache_entry_t *e = g_cache[b].head, *nx;
             while (e) {
                 nx = e->hash_next;
-                pthread_mutex_lock(&g_lru_mutex);
-                if (e->lru_prev)
-                    e->lru_prev->lru_next = e->lru_next;
-                else
-                    g_lru_head = e->lru_next;
-                if (e->lru_next)
-                    e->lru_next->lru_prev = e->lru_prev;
-                else
-                    g_lru_tail = e->lru_prev;
-                pthread_mutex_unlock(&g_lru_mutex);
                 cache_entry_free(e);
                 count++;
                 e = nx;
             }
             g_cache[b].head = NULL;
             g_cache[b].count = 0;
-            pthread_rwlock_unlock(&g_cache[b].lock);
         }
-        pthread_mutex_lock(&g_cache_count_mutex);
+        g_lru_head = g_lru_tail = NULL;
         g_cache_total = 0;
-        pthread_mutex_unlock(&g_cache_count_mutex);
-        /* Also flush the persistent tier */
+        CACHE_CHECK("cache_flush(all)");
+        pthread_mutex_unlock(&g_cache_mutex);
         if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
             pog_cache_flush(NULL);
         } else if (g_cfg.cache_backend == CACHE_BACKEND_VALKEY && g_cfg.valkey_enabled) {
@@ -3630,33 +3623,18 @@ static int cache_flush(const char *qname, uint16_t qtype) {
         return count;
     }
     uint32_t bkt = cache_hash(qname, qtype);
-    pthread_rwlock_wrlock(&g_cache[bkt].lock);
-    cache_entry_t **pp = &g_cache[bkt].head;
-    while (*pp) {
-        cache_entry_t *e = *pp;
+    pthread_mutex_lock(&g_cache_mutex);
+    for (cache_entry_t *e = g_cache[bkt].head; e; e = e->hash_next) {
         if (e->qtype == qtype && strcasecmp(e->qname, qname) == 0) {
-            *pp = e->hash_next;
-            pthread_mutex_lock(&g_lru_mutex);
-            if (e->lru_prev)
-                e->lru_prev->lru_next = e->lru_next;
-            else
-                g_lru_head = e->lru_next;
-            if (e->lru_next)
-                e->lru_next->lru_prev = e->lru_prev;
-            else
-                g_lru_tail = e->lru_prev;
-            pthread_mutex_unlock(&g_lru_mutex);
+            lru_unlink_locked(e);
+            cache_hash_unlink_locked(e, bkt);
             cache_entry_free(e);
-            g_cache[bkt].count--;
-            pthread_mutex_lock(&g_cache_count_mutex);
-            g_cache_total--;
-            pthread_mutex_unlock(&g_cache_count_mutex);
             count++;
             break;
         }
-        pp = &(*pp)->hash_next;
     }
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
+    CACHE_CHECK("cache_flush");
+    pthread_mutex_unlock(&g_cache_mutex);
     if (g_cfg.cache_backend != CACHE_BACKEND_NONE) {
         char vk_key[600];
         snprintf(vk_key, sizeof(vk_key), "dnscache:%s:%s", qname, type2str(qtype));
@@ -5440,7 +5418,6 @@ static void cache_init(void) {
     for (int i = 0; i < CACHE_BUCKETS; i++) {
         g_cache[i].head = NULL;
         g_cache[i].count = 0;
-        pthread_rwlock_init(&g_cache[i].lock, NULL);
     }
 }
 
@@ -5493,7 +5470,10 @@ static void print_result(const char *qname, uint16_t qtype, const resolve_result
 
 static void print_stats(void) {
     printf("\n── Cache Statistics ─────────────────────────────\n");
-    printf("  Entries (in-memory):  %d / %d\n", g_cache_total, g_cfg.cache_size);
+    pthread_mutex_lock(&g_cache_mutex);
+    int total_now = g_cache_total;
+    pthread_mutex_unlock(&g_cache_mutex);
+    printf("  Entries (in-memory):  %d / %d\n", total_now, g_cfg.cache_size);
     printf("  Queries:              %llu\n", (unsigned long long) g_stat_queries);
     printf("  Cache hits:           %llu\n", (unsigned long long) g_stat_hits);
     printf("  Cache misses:         %llu\n", (unsigned long long) g_stat_misses);
@@ -5550,7 +5530,7 @@ static void dump_cache(void) {
     printf("%-40s %-8s %-8s %s\n", "NAME", "TYPE", "TTL", "RDATA");
     int total = 0;
     for (int b = 0; b < CACHE_BUCKETS; b++) {
-        pthread_rwlock_rdlock(&g_cache[b].lock);
+        pthread_mutex_lock(&g_cache_mutex);
         cache_entry_t *e = g_cache[b].head;
         while (e) {
             uint32_t rem = entry_remaining_ttl(e);
@@ -5571,7 +5551,7 @@ static void dump_cache(void) {
             }
             e = e->hash_next;
         }
-        pthread_rwlock_unlock(&g_cache[b].lock);
+        pthread_mutex_unlock(&g_cache_mutex);
     }
     printf("── %d live records ──────────────────────────────\n", total);
 }
