@@ -223,13 +223,13 @@ undiscovered bug: mdnsd's own copy sized its reply buffer at 4096 bytes
 (every other copy used 65536) — large enough to silently truncate a
 multi-intermediate-CA `cert:current` chain read through its own `vk_get`;
 confirmed live with a >4096-byte RSA chain before and after the repoint.
-**`resolverd.c` and `dns_server.c` still carry their own copies** — both are
-much larger (5755 / 11804 lines) than the four already repointed, and
-`dns_server.c` additionally has a thread-local connection-pooling pattern
-(`t_vk_conn`, lock-free per-UDP-worker access) the shared client has no
-special support for yet; repointing those two is an explicit, still-open
-follow-up (CLAUDE.md's security-sensitive-change gate applies to touching
-`dnsd`'s Valkey trust boundary), not assumed done by this pass.
+**`resolverd.c` and `dns_server.c` are repointed too** (2026-11-16,
+`CLAUDE-perf.md` P2): every daemon now uses the one shared client. dnsd keeps
+its thread-private UDP-worker connections (`t_vk_conn`, plain `vkc_conn_t`s)
+plus a small read pool for other threads. The same pass removed the PING
+before every command (a zero-RTT `poll` liveness check plus `vkc_call_to`'s
+retry-once take its place), the 64 KB reply memset, and a descriptor leak on
+every failure path (`vkc_drop` closes; `fd = -1` did not).
 
 ---
 
@@ -775,8 +775,8 @@ inert extensions. `eppd` is also the third daemon on `libsandbox` (after
 `dnsd`/`resolverd`) and was the first caller of a newly-hoisted shared Valkey
 RESP client (`vkc_*`/`keyspace_watch_loop`, `dns_wire.{c,h}`); `certd`/`apid`/
 `mdnsd`/`doqd` are now repointed at it too (2026-07-06, see the "Shared code"
-paragraph above) — only `resolverd.c` and `dns_server.c` still carry their
-own pre-hoist copies.
+paragraph above), and `resolverd.c` and `dns_server.c` followed on
+2026-11-16 (`CLAUDE-perf.md`) — no daemon carries its own copy any more.
 
 Verifying the new DS-at-cut signing surfaced an unrelated, pre-existing bug
 in `dnsd`'s core signer: `make_rrsig` used the RRset's own owner name for

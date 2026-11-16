@@ -46,6 +46,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-client-identity.md` | dnsd, apid, doqd (+libdnswire) | Audit fixes: real v4/v6 client, PROXY v2 from front-ends, RRL keying — **done 2026-11-15** |
 | `CLAUDE-medium-fixes.md` | dnsd, resolverd, apid, mdnsd, certd, doqd, dashboard, libsandbox | Audit fixes: Phase 0b step 7, the remaining Medium findings — **done 2026-11-15** |
 | `CLAUDE-low-fixes.md` | certd, dnsd, resolverd, dashboard, eppd | Audit fixes: Phase 0b step 8, the Low findings — **done 2026-11-16** |
+| `CLAUDE-perf.md` | libdnswire, dnsd, resolverd (+ sidecars' Valkey wrappers) | PERF-001..007 + the `vkc_` repoint of dnsd/resolverd — **done 2026-11-16** (PERF-004 decided against) |
 | `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
 
@@ -111,7 +112,7 @@ Step 9 (tooling), **done 2026-11-16**: `make fuzz-dnsd` (libFuzzer over
 out-of-bounds read in the UPDATE parser (RR header length check off by one);
 dnsd TSan under UPDATE + query + reload load (`check-reload-tsan`, in CI).
 
-Not yet specced (open in the ledger): PERF-001..007.
+Not yet specced (open in the ledger): none — PERF-001..007 are in `CLAUDE-perf.md`.
 
 Release notes required by these fixes: unsigned UPDATE stops working by
 default (update-auth Fix 1); `hmac-sha1`/`hmac-md5` TSIG clients are rejected

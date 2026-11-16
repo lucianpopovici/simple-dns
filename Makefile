@@ -130,7 +130,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-oob-reads check-dashboard-throttle check-notify-secondary check-reload-serial check-reload-tsan check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-dnsd fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-oob-reads check-dashboard-throttle check-notify-secondary check-reload-serial check-reload-tsan check-dnsd-serve-stale check-valkey-reconnect check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-dnsd fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -923,6 +923,73 @@ check-mdnsd-lookup: tests/test_mdnsd_lookup.c mdnsd.c $(WIRE_SRC) dns_wire.h | o
 	$(CC) $(CSTD) $(WARN) -Wno-unused-function $(DEBUG_FLAGS) $(INCLUDES) -I. \
 	      -o tests/test_mdnsd_lookup tests/test_mdnsd_lookup.c $(WIRE_SRC) $(LIBS)
 	./tests/test_mdnsd_lookup
+
+# PERF-001 (CLAUDE-perf.md P1): with no PING before each command, a Valkey
+# restart must still not cost a failed query — the zero-RTT liveness check or
+# the retry reconnects first — and failures must not leak descriptors (they
+# used to: `fd = -1` without close). dnsd reaches Valkey through
+# tests/tcp_proxy.py; restarting the proxy drops every connection, like a
+# Valkey restart. Needs Valkey + dig + python3.
+check-valkey-reconnect: $(BIN_DEBUG)
+	@echo "  CHECK  dnsd survives Valkey restarts without failed queries or fd leaks (Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 PP=16391; K=zone:example.local:A:reconnect.example.local;                         \
+	 $$VC set $$K "300|192.0.2.77" >/dev/null;                                         \
+	 px() { python3 tests/tcp_proxy.py $$PP 127.0.0.1 $${DNS_VALKEY_PORT:-6379} > /dev/null 2>&1 & PX=$$!; \
+	        for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$PP " && break; sleep 0.1; done; }; \
+	 px;                                                                               \
+	 DNS_VALKEY_PORT=$$PP ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) UDP_WORKERS=2 ./$(BIN_DEBUG) > /tmp/dnsd_reconn.log 2>&1 & DNS=$$!; \
+	 sleep 2.5;                                                                        \
+	 q() { dig +short +nocookie @127.0.0.1 -p $(TPORT) reconnect.example.local A +time=3 +tries=1; }; \
+	 for i in 1 2 3 4; do q >/dev/null; done;                                          \
+	 FD0=$$(ls /proc/$$DNS/fd | wc -l); BAD=0;                                         \
+	 for r in 1 2 3 4 5; do                                                            \
+	   kill $$PX; wait $$PX 2>/dev/null; px; sleep 0.3;                                \
+	   for i in 1 2 3 4; do A=$$(q); test "$$A" = 192.0.2.77 || BAD=$$((BAD + 1)); done; \
+	 done;                                                                             \
+	 FD1=$$(ls /proc/$$DNS/fd | wc -l);                                                \
+	 kill $$DNS $$PX 2>/dev/null || true; wait $$PX 2>/dev/null; sleep 0.3;            \
+	 $$VC del $$K >/dev/null;                                                          \
+	 echo "  5 Valkey restarts x 4 queries: wrong/failed answers=$$BAD | open fds before=$$FD0 after=$$FD1"; \
+	 test "$$BAD" = 0 || { echo "  FAIL  queries failed after a Valkey restart (stale connection not detected)"; exit 1; }; \
+	 test "$$FD1" -le "$$FD0" || { echo "  FAIL  descriptors leaked across reconnects ($$FD0 -> $$FD1)"; exit 1; }; \
+	 echo "  OK  reconnects transparently, no descriptor leak"
+
+# PERF-007 (CLAUDE-perf.md P6): dnsd keeps answering from its in-process RFC
+# 8767 stale copy while Valkey is unreachable, fails fast for names it never
+# saw, and never resurrects a record deleted before the outage. dnsd reaches
+# Valkey through tests/tcp_proxy.py; killing the proxy is the outage (the
+# shared Valkey stays up for everyone else). Needs Valkey + dig + python3.
+check-dnsd-serve-stale: $(BIN_DEBUG)
+	@echo "  CHECK  dnsd serve-stale during a Valkey outage (Valkey + dig + python3)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 PP=16390; K1=zone:example.local:A:stale-keep.example.local; K2=zone:example.local:A:stale-gone.example.local; \
+	 SAVE_SS=$$($$VC get config:stale_refresh_sample);                                 \
+	 $$VC set config:stale_refresh_sample 1 >/dev/null;                                \
+	 $$VC set $$K1 "300|192.0.2.55" >/dev/null; $$VC set $$K2 "300|192.0.2.66" >/dev/null; \
+	 python3 tests/tcp_proxy.py $$PP 127.0.0.1 $${DNS_VALKEY_PORT:-6379} > /dev/null 2>&1 & PX=$$!; \
+	 for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$PP " && break; sleep 0.1; done; \
+	 DNS_VALKEY_PORT=$$PP ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_stale.log 2>&1 & DNS=$$!; \
+	 sleep 2.5;                                                                        \
+	 q() { dig +short +nocookie @127.0.0.1 -p $(TPORT) $$1 A +time=3 +tries=1; };       \
+	 for i in 1 2 3 4; do q stale-keep.example.local >/dev/null; q stale-gone.example.local >/dev/null; done; \
+	 $$VC del $$K2 >/dev/null; sleep 0.5; G0=$$(q stale-gone.example.local);          \
+	 kill $$PX; wait $$PX 2>/dev/null; sleep 0.5;                                      \
+	 T0=$$(date +%s%N); A1=$$(q stale-keep.example.local); T1=$$(date +%s%N);         \
+	 A2=$$(q stale-gone.example.local); A3=$$(q stale-never.example.local); T2=$$(date +%s%N); \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 $$VC del $$K1 $$K2 >/dev/null;                                                    \
+	 if [ -n "$$SAVE_SS" ]; then $$VC set config:stale_refresh_sample "$$SAVE_SS" >/dev/null; else $$VC del config:stale_refresh_sample >/dev/null; fi; \
+	 MS1=$$(( (T1 - T0) / 1000000 )); MS2=$$(( (T2 - T1) / 1000000 ));                 \
+	 echo "  outage: primed name=[$$A1] in $${MS1}ms | deleted before outage=[$$A2] (live answer after delete: [$$G0]) | never seen=[$$A3] | last two in $${MS2}ms"; \
+	 test "$$A1" = 192.0.2.55 || { echo "  FAIL  primed record not served stale during the outage"; exit 1; }; \
+	 test "$$MS1" -lt 1000 || { echo "  FAIL  stale answer took $${MS1}ms (each query should fail over at once)"; exit 1; }; \
+	 test -z "$$G0" -a -z "$$A2" || { echo "  FAIL  a record deleted before the outage was served stale"; exit 1; }; \
+	 test -z "$$A3" || { echo "  FAIL  a never-seen name got an answer"; exit 1; };     \
+	 test "$$MS2" -lt 2000 || { echo "  FAIL  queries without a stale copy stalled ($${MS2}ms)"; exit 1; }; \
+	 echo "  OK  stale answers during the outage, fast, no resurrection"
 
 # CSA-MEM-002 (CLAUDE-low-fixes.md 8c): a TSIG whose algorithm name runs past
 # its RDATA is malformed (the UPDATE counts as unsigned -> REFUSED; the old

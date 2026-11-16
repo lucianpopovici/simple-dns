@@ -201,18 +201,7 @@ typedef struct {
     int count;
 } cache_bucket_t;
 
-/* Valkey RESP connection */
-typedef struct {
-    int fd;
-    char rbuf[RESP_BUF];
-    int rlen, rpos;
-} resp_conn_t;
-typedef struct {
-    int type;
-    long integer;
-    char str[RESP_BUF];
-    int count;
-} resp_reply_t;
+/* Valkey: libdnswire's shared vkc_* client (CLAUDE-perf.md P2). */
 
 /* Configuration */
 typedef struct {
@@ -351,7 +340,7 @@ static _Atomic uint64_t g_stat_udp_dropped = 0; /* UDP jobs dropped: queue full 
 static _Atomic uint64_t g_stat_vkw_dropped = 0; /* Valkey writes dropped: queue full */
 #define STAT_INC(c) atomic_fetch_add_explicit(&(c), 1, memory_order_relaxed)
 /* Valkey client (for persistent cache) */
-static resp_conn_t g_vk;
+static vkc_conn_t g_vk = {.fd = -1};
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* SSL context for DoT (client role — connecting to an upstream) */
 static SSL_CTX *g_dot_ctx = NULL;
@@ -439,287 +428,68 @@ static uint64_t siphash24(const uint8_t *in, int n, const uint8_t key[16]) {
 }
 
 /* =========================================================================
- * Valkey RESP client (minimal, same protocol as server)
+ * Valkey (libdnswire vkc_*). No PING per command; a stale connection is
+ * detected by vkc_ensure_to's zero-RTT liveness check or by the command
+ * failing, and vkc_call_to then reconnects and retries once. vkc_connect_to
+ * backs off for 1 s after a failed connect, so a black-holed Valkey no
+ * longer costs a blocking connect on every cache operation.
  * ======================================================================= */
-static int resp_fill(resp_conn_t *c) {
-    if (c->rpos > 0 && c->rlen > c->rpos) {
-        memmove(c->rbuf, c->rbuf + c->rpos, c->rlen - c->rpos);
-        c->rlen -= c->rpos;
-        c->rpos = 0;
-    } else if (c->rpos >= c->rlen) {
-        c->rlen = c->rpos = 0;
-    }
-    int room = RESP_BUF - c->rlen - 1;
-    if (room <= 0)
-        return -1;
-    int n = (int) recv(c->fd, c->rbuf + c->rlen, room, 0);
-    if (n <= 0)
-        return -1;
-    c->rlen += n;
-    c->rbuf[c->rlen] = 0;
-    return n;
-}
-static int resp_readline(resp_conn_t *c, char *out, int olen) {
-    for (;;) {
-        char *p = (char *) memchr(c->rbuf + c->rpos, '\n', c->rlen - c->rpos);
-        if (p) {
-            int len = (int) (p - (c->rbuf + c->rpos));
-            if (len > 0 && *(p - 1) == '\r')
-                len--;
-            if (len >= olen)
-                len = olen - 1;
-            memcpy(out, c->rbuf + c->rpos, len);
-            out[len] = 0;
-            c->rpos = (int) (p - c->rbuf) + 1;
-            return len;
-        }
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-}
-static int resp_readbytes(resp_conn_t *c, char *out, int n) {
-    int got = 0;
-    while (got < n) {
-        int have = c->rlen - c->rpos;
-        if (have <= 0) {
-            if (resp_fill(c) < 0)
-                return -1;
-            continue;
-        }
-        int take = (n - got < have) ? (n - got) : have;
-        memcpy(out + got, c->rbuf + c->rpos, take);
-        c->rpos += take;
-        got += take;
-    }
-    while (c->rlen - c->rpos < 2) {
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-    c->rpos += 2;
-    out[n] = 0;
-    return n;
-}
-static int resp_parse(resp_conn_t *c, resp_reply_t *r) {
-    char line[1024];
-    if (resp_readline(c, line, sizeof(line)) < 0)
-        return -1;
-    memset(r, 0, sizeof(*r));
-    switch (line[0]) {
-        case '+':
-            r->type = RESP_STR;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case '-':
-            r->type = RESP_ERR;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case ':':
-            r->type = RESP_INT;
-            r->integer = atol(line + 1);
-            return 0;
-        case '$': {
-            int bl = atoi(line + 1);
-            if (bl < 0) {
-                r->type = RESP_NIL;
-                return 0;
-            }
-            r->type = RESP_BULK;
-            int take = bl < RESP_BUF - 1 ? bl : RESP_BUF - 1;
-            if (resp_readbytes(c, r->str, take) < 0)
-                return -1;
-            int excess = bl - take;
-            while (excess > 0) {
-                char d[256];
-                int dk = excess > (int) sizeof(d) ? (int) sizeof(d) : excess;
-                if (resp_readbytes(c, d, dk) < 0)
-                    return -1;
-                excess -= dk;
-            }
-            r->str[take] = 0;
-            return 0;
-        }
-        case '*':
-            r->type = RESP_ARR;
-            r->count = atoi(line + 1);
-            return 0;
-        default:
-            return -1;
-    }
-}
-static int resp_send_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos >= (int) sizeof(buf) - 4)
-            break;
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    int sent = 0;
-    while (sent < pos) {
-        int n = (int) send(c->fd, buf + sent, pos - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-            return -1;
-        sent += n;
-    }
-    return resp_parse(c, r);
-}
-
-/* After a failed connect, skip Valkey entirely until this time. Without it, a
- * black-holed (packet-drop, not RST) Valkey costs a blocking connect() — up
- * to the 3s socket timeout — on every cache operation, on whatever thread is
- * resolving. */
-#define VK_DOWN_BACKOFF_SECS 3
-static _Atomic long g_vk_down_until = 0;
-
-static int vk_connect(resp_conn_t *c) {
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    long down_until = atomic_load_explicit(&g_vk_down_until, memory_order_relaxed);
-    if (down_until != 0 && (long) time(NULL) < down_until)
-        return -1;
-    c->rlen = c->rpos = 0;
-    c->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (c->fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 3};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(g_cfg.valkey_port)};
-    if (inet_pton(AF_INET, g_cfg.valkey_host, &sa.sin_addr) != 1) {
-        struct addrinfo h = {0}, *res;
-        char ps[8];
-        snprintf(ps, sizeof(ps), "%d", g_cfg.valkey_port);
-        h.ai_family = AF_INET;
-        h.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(g_cfg.valkey_host, ps, &h, &res) != 0) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-        memcpy(&sa, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
-    }
-    if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(c->fd);
-        c->fd = -1;
-        atomic_store_explicit(&g_vk_down_until, (long) time(NULL) + VK_DOWN_BACKOFF_SECS,
-                              memory_order_relaxed);
-        return -1;
-    }
-    if (g_cfg.valkey_pass[0]) {
-        resp_reply_t r;
-        if (resp_send_cmd(c, &r, 2, "AUTH", g_cfg.valkey_pass) < 0 || r.type == RESP_ERR) {
-            close(c->fd);
-            c->fd = -1;
-            atomic_store_explicit(&g_vk_down_until, (long) time(NULL) + VK_DOWN_BACKOFF_SECS,
-                                  memory_order_relaxed);
-            return -1;
-        }
-    }
-    atomic_store_explicit(&g_vk_down_until, 0, memory_order_relaxed);
-    return 0;
-}
-/* Connect only when there is no live fd. No PING probe: the old
- * PING-before-every-command doubled the round-trips of every cache
- * operation; a connection gone stale (Valkey restart) is detected by the
- * command itself failing, which the callers below handle by reconnecting
- * and retrying once. */
-static int vk_ensure(resp_conn_t *c) {
-    if (c->fd >= 0)
-        return 0;
-    return vk_connect(c);
-}
+#define VK_HOST g_cfg.valkey_host, g_cfg.valkey_port, g_cfg.valkey_pass
 
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
+    if (!g_cfg.valkey_enabled)
+        return 0;
     pthread_mutex_lock(&g_vk_mutex);
-    int good = 0;
-    resp_reply_t r;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
-            break;
-        int ok;
-        if (ttl > 0) {
-            char ts[16];
-            snprintf(ts, sizeof(ts), "%u", ttl);
-            ok = resp_send_cmd(&g_vk, &r, 5, "SET", key, val, "EX", ts);
-        } else
-            ok = resp_send_cmd(&g_vk, &r, 3, "SET", key, val);
-        if (ok >= 0) {
-            good = (r.type == RESP_STR);
-            break;
-        }
-        g_vk.fd = -1; /* stale/broken — reconnect and retry once */
+    vkc_reply_t r;
+    int rc;
+    if (ttl > 0) {
+        char ts[16];
+        snprintf(ts, sizeof(ts), "%u", ttl);
+        rc = vkc_call_to(&g_vk, VK_HOST, 1, &r, 5, "SET", key, val, "EX", ts);
+    } else {
+        rc = vkc_call_to(&g_vk, VK_HOST, 1, &r, 3, "SET", key, val);
     }
     pthread_mutex_unlock(&g_vk_mutex);
-    return good;
+    return rc == 0 && r.type == RESP_STR;
 }
 static int vk_get(const char *key, char *out, int olen) {
-    pthread_mutex_lock(&g_vk_mutex);
-    int good = 0;
-    resp_reply_t r;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
-            break;
-        if (resp_send_cmd(&g_vk, &r, 2, "GET", key) >= 0) {
-            good = 1; /* command succeeded; nil reply is a valid miss */
-            break;
-        }
-        g_vk.fd = -1;
-    }
-    pthread_mutex_unlock(&g_vk_mutex);
-    if (!good || r.type != RESP_BULK)
+    if (!g_cfg.valkey_enabled)
         return 0;
-    safe_strcpy(out, r.str, olen);
-    return 1;
+    pthread_mutex_lock(&g_vk_mutex);
+    vkc_reply_t r;
+    int rc = vkc_call_to(&g_vk, VK_HOST, 1, &r, 2, "GET", key);
+    int hit = rc == 0 && r.type == RESP_BULK;
+    if (hit)
+        safe_strcpy(out, r.str, olen);
+    pthread_mutex_unlock(&g_vk_mutex);
+    return hit;
 }
 static int vk_del(const char *key) {
+    if (!g_cfg.valkey_enabled)
+        return 0;
     pthread_mutex_lock(&g_vk_mutex);
-    int good = 0;
-    resp_reply_t r;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
-            break;
-        if (resp_send_cmd(&g_vk, &r, 2, "DEL", key) >= 0) {
-            good = 1;
-            break;
-        }
-        g_vk.fd = -1;
-    }
+    vkc_reply_t r;
+    int rc = vkc_call_to(&g_vk, VK_HOST, 1, &r, 2, "DEL", key);
     pthread_mutex_unlock(&g_vk_mutex);
-    return good && r.type == RESP_INT ? (int) r.integer : 0;
+    return rc == 0 && r.type == RESP_INT ? (int) r.integer : 0;
 }
 static int vk_keys_scan(const char *pattern, char keys[][512], int maxkeys) {
+    if (!g_cfg.valkey_enabled)
+        return 0;
     pthread_mutex_lock(&g_vk_mutex);
     int n = 0;
-    int good = 0;
-    resp_reply_t r;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (!g_cfg.valkey_enabled || vk_ensure(&g_vk) < 0)
-            break;
-        if (resp_send_cmd(&g_vk, &r, 2, "KEYS", pattern) >= 0) {
-            good = 1;
-            break;
-        }
-        g_vk.fd = -1;
-    }
-    if (!good || r.type != RESP_ARR) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
-    for (int i = 0; i < r.count && i < maxkeys; i++) {
-        resp_reply_t kr;
-        if (resp_parse(&g_vk, &kr) < 0)
-            break;
-        if (kr.type == RESP_BULK) {
-            safe_strcpy(keys[n], kr.str, sizeof(keys[n]));
-            n++;
+    vkc_reply_t r;
+    if (vkc_call_to(&g_vk, VK_HOST, 1, &r, 2, "KEYS", pattern) == 0 && r.type == RESP_ARR) {
+        for (int i = 0; i < r.count; i++) {
+            vkc_reply_t kr;
+            if (vkc_parse(&g_vk, &kr) < 0) {
+                vkc_drop(&g_vk);
+                break;
+            }
+            if (kr.type == RESP_BULK && n < maxkeys) {
+                safe_strcpy(keys[n], kr.str, sizeof(keys[n]));
+                n++;
+            }
         }
     }
     pthread_mutex_unlock(&g_vk_mutex);

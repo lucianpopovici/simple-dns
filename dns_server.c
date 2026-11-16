@@ -1731,313 +1731,67 @@ static void compute_server_cookie(const uint8_t *ccookie, const client_addr_t *c
 /* ==========================================================================
  * RESP / Valkey client (RFC 1459 RESP)
  * ======================================================================= */
-typedef struct {
-    int fd;
-    char rbuf[RESP_BUF];
-    int rlen, rpos;
-} resp_conn_t;
-static resp_conn_t vk;
+/* The RESP client is libdnswire's shared vkc_* (CLAUDE-perf.md P2); this file
+ * used to carry its own copy. */
+static vkc_conn_t vk = {.fd = -1};
 /* When non-NULL, vk_get() uses this thread-private connection instead of the
- * shared `vk` + g_vk_mutex, so a UDP worker's per-query GET (+ stale SET) runs
- * lock-free and overlaps with other workers. Set by udp_worker_thread(). */
-static __thread resp_conn_t *t_vk_conn = NULL;
+ * shared `vk` + g_vk_mutex, so a UDP worker's per-query GET runs lock-free and
+ * overlaps with other workers. Set by udp_worker_thread(). */
+static __thread vkc_conn_t *t_vk_conn = NULL;
 
-static int resp_fill(resp_conn_t *c) {
-    if (c->rpos > 0 && c->rlen > c->rpos) {
-        memmove(c->rbuf, c->rbuf + c->rpos, c->rlen - c->rpos);
-        c->rlen -= c->rpos;
-        c->rpos = 0;
-    } else if (c->rpos >= c->rlen) {
-        c->rlen = c->rpos = 0;
+/* PERF-005: threads without a private connection (TCP/DoT connection
+ * threads, the keyspace/rollover/NOTIFY threads, ...) used to serialise every
+ * read on the one shared `vk` under g_vk_mutex. Reads now take one of
+ * VK_POOL pooled connections; writes and transactions stay on `vk` +
+ * g_vk_mutex, whose ordering they rely on. */
+#define VK_POOL 8
+static struct {
+    vkc_conn_t c;
+    pthread_mutex_t m;
+} g_vk_pool[VK_POOL];
+static atomic_uint g_vk_pool_rr = 0;
+static pthread_once_t g_vk_pool_once = PTHREAD_ONCE_INIT;
+
+static void vk_pool_init(void) {
+    for (int i = 0; i < VK_POOL; i++) {
+        g_vk_pool[i].c.fd = -1;
+        pthread_mutex_init(&g_vk_pool[i].m, NULL);
     }
-    int room = RESP_BUF - c->rlen - 1;
-    if (room <= 0)
-        return -1;
-    int n = (int) recv(c->fd, c->rbuf + c->rlen, room, 0);
-    if (n <= 0)
-        return -1;
-    c->rlen += n;
-    c->rbuf[c->rlen] = 0;
-    return n;
-}
-static int resp_readline(resp_conn_t *c, char *out, int olen) {
-    for (;;) {
-        char *p = (char *) memchr(c->rbuf + c->rpos, '\n', c->rlen - c->rpos);
-        if (p) {
-            int len = (int) (p - (c->rbuf + c->rpos));
-            if (len > 0 && *(p - 1) == '\r')
-                len--;
-            if (len >= olen)
-                len = olen - 1;
-            memcpy(out, c->rbuf + c->rpos, len);
-            out[len] = 0;
-            c->rpos = (int) (p - c->rbuf) + 1;
-            return len;
-        }
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-}
-static int resp_readbytes(resp_conn_t *c, char *out, int n) {
-    int got = 0;
-    while (got < n) {
-        int have = c->rlen - c->rpos;
-        if (have <= 0) {
-            if (resp_fill(c) < 0)
-                return -1;
-            continue;
-        }
-        int take = (n - got < have) ? (n - got) : have;
-        memcpy(out + got, c->rbuf + c->rpos, take);
-        c->rpos += take;
-        got += take;
-    }
-    while (c->rlen - c->rpos < 2) {
-        if (resp_fill(c) < 0)
-            return -1;
-    }
-    c->rpos += 2;
-    out[n] = 0;
-    return n;
-}
-typedef struct {
-    int type;
-    long integer;
-    char str[MAX_PEM];
-    int count;
-} resp_reply_t;
-static int resp_parse(resp_conn_t *c, resp_reply_t *r) {
-    char line[512];
-    if (resp_readline(c, line, sizeof(line)) < 0)
-        return -1;
-    memset(r, 0, sizeof(*r));
-    switch (line[0]) {
-        case '+':
-            r->type = 0;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case '-':
-            r->type = 1;
-            safe_strcpy(r->str, line + 1, sizeof(r->str));
-            return 0;
-        case ':':
-            r->type = 3;
-            r->integer = atol(line + 1);
-            return 0;
-        case '$': {
-            int bl = atoi(line + 1);
-            if (bl < 0) {
-                r->type = 4;
-                return 0;
-            }
-            r->type = 2;
-            /* clamp bl so we never write past r->str */
-            int take = bl < (int) sizeof(r->str) - 1 ? bl : (int) sizeof(r->str) - 1;
-            if (resp_readbytes(c, r->str, take) < 0)
-                return -1;
-            /* if the server sent more bytes than we want, drain the remainder */
-            int excess = bl - take;
-            while (excess > 0) {
-                char drain[257];
-                int d = excess > (int) (sizeof(drain) - 1) ? (int) (sizeof(drain) - 1) : excess;
-                if (resp_readbytes(c, drain, d) < 0)
-                    return -1;
-                excess -= d;
-            }
-            r->str[take] = 0;
-            return 0;
-        }
-        case '*':
-            r->type = 5;
-            r->count = atoi(line + 1);
-            return 0;
-        default:
-            return -1;
-    }
-}
-static int resp_send(resp_conn_t *c, const char *cmd, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int n = (int) send(c->fd, cmd + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-            return -1;
-        sent += n;
-    }
-    return 0;
-}
-/* va_list body shared by resp_cmd() and resp_txn_queue() (ADR-004) — encodes
- * one RESP array command, sends it, and reads exactly one reply. */
-static int resp_cmd_v(resp_conn_t *c, resp_reply_t *r, int argc, va_list ap) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf))
-            return -1;
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    if (resp_send(c, buf, pos) < 0)
-        return -1;
-    return resp_parse(c, r);
-}
-static int resp_cmd(resp_conn_t *c, resp_reply_t *r, int argc, ...) {
-    va_list ap;
-    va_start(ap, argc);
-    int rc = resp_cmd_v(c, r, argc, ap);
-    va_end(ap);
-    return rc;
-}
-/* Send a command but do NOT read a reply — for (P)SUBSCRIBE, whose multi-bulk
- * replies and subsequent messages are consumed by the subscriber read loop
- * (resp_cmd would read only the array header and desync the stream). */
-static int resp_send_cmd(resp_conn_t *c, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
-    va_list ap;
-    va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
-    va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
-        return -1;
-    return resp_send(c, buf, pos);
 }
 
-/* ── MULTI/EXEC transactions (ADR-004: atomic zone writes + SOA serial bump)
- * ──────────────────────────────────────────────────────────────────────────
- * Caller must already hold g_vk_mutex and have called valkey_ensure(&vk) for
- * the WHOLE begin..commit sequence — the same precondition every vk_set/
- * vk_del/vk_incr call already has today, just widened from "per command" to
- * "per transaction" so a reader can never observe some queued writes applied
- * and others not (a torn zone). */
-typedef struct {
-    resp_conn_t *c;
-    int n;   /* commands successfully QUEUED so far */
-    int err; /* sticky: MULTI or a QUEUE send/parse failed */
-} resp_txn_t;
-
-static void resp_txn_begin(resp_txn_t *t, resp_conn_t *c) {
-    memset(t, 0, sizeof(*t));
-    t->c = c;
-    resp_reply_t r;
-    int rc = resp_cmd(c, &r, 1, "MULTI");
-    if (rc < 0) {
-        c->fd = -1;
-        t->err = 1;
-    } else if (r.type != 0) {
-        t->err = 1;
+/* A connection for one read: the thread's private one (*slot = -1, no
+ * lock), else a free pooled one, else wait on one. Pair with vk_read_give. */
+static vkc_conn_t *vk_read_take(int *slot) {
+    pthread_once(&g_vk_pool_once, vk_pool_init); /* also covers harnesses without main() */
+    if (t_vk_conn) {
+        *slot = -1;
+        return t_vk_conn;
     }
-}
-static void resp_txn_queue(resp_txn_t *t, int argc, ...) {
-    if (t->err)
-        return;
-    va_list ap;
-    va_start(ap, argc);
-    resp_reply_t r;
-    int rc = resp_cmd_v(t->c, &r, argc, ap);
-    va_end(ap);
-    if (rc < 0) {
-        t->c->fd = -1;
-        t->err = 1;
-    } else if (r.type != 0) { /* expect +QUEUED */
-        t->err = 1;
-    } else {
-        t->n++;
-    }
-}
-/* EXEC. On success returns the number of queued commands (== t->n) and fills
- * out[0..t->n) with each queued command's real reply, in queue order — out
- * must be sized >= t->n by the caller (every call site knows its own fixed
- * command count). Returns -1 on any failure (MULTI/a queued command failed,
- * EXEC itself failed, or a reply-count mismatch) — the caller must not trust
- * out[] and must assume nothing in the transaction was applied. */
-static int resp_txn_commit(resp_txn_t *t, resp_reply_t *out) {
-    if (t->err) {
-        if (t->c->fd >= 0) {
-            resp_reply_t d;
-            resp_cmd(t->c, &d, 1, "DISCARD");
-        }
-        return -1;
-    }
-    resp_reply_t r;
-    if (resp_cmd(t->c, &r, 1, "EXEC") < 0) {
-        t->c->fd = -1;
-        return -1;
-    }
-    if (r.type != 5 || r.count != t->n)
-        return -1; /* nil (aborted by the server) or reply-count mismatch */
-    for (int i = 0; i < t->n; i++) {
-        if (resp_parse(t->c, &out[i]) < 0) {
-            t->c->fd = -1;
-            return -1;
+    unsigned start = atomic_fetch_add(&g_vk_pool_rr, 1);
+    for (int k = 0; k < VK_POOL; k++) {
+        int i = (int) ((start + (unsigned) k) % VK_POOL);
+        if (pthread_mutex_trylock(&g_vk_pool[i].m) == 0) {
+            *slot = i;
+            return &g_vk_pool[i].c;
         }
     }
-    return t->n;
+    int i = (int) (start % VK_POOL);
+    pthread_mutex_lock(&g_vk_pool[i].m);
+    *slot = i;
+    return &g_vk_pool[i].c;
 }
 
-static int valkey_connect_to(resp_conn_t *c, const char *host, int port, const char *pass) {
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    c->rlen = c->rpos = 0;
-    c->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (c->fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 4};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(port)};
-    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        struct addrinfo hints = {0}, *res;
-        char ps[8];
-        snprintf(ps, sizeof(ps), "%d", port);
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(host, ps, &hints, &res) != 0) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-        memcpy(&sa, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
-    }
-    if (connect(c->fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(c->fd);
-        c->fd = -1;
-        return -1;
-    }
-    resp_reply_t r;
-    if (pass && pass[0]) {
-        if (resp_cmd(c, &r, 2, "AUTH", pass) < 0 || r.type == 1) {
-            close(c->fd);
-            c->fd = -1;
-            return -1;
-        }
-    }
-    resp_cmd(c, &r, 2, "SELECT", "0");
-    return 0;
+static void vk_read_give(int slot) {
+    if (slot >= 0)
+        pthread_mutex_unlock(&g_vk_pool[slot].m);
 }
-static int valkey_connect(resp_conn_t *c) {
-    return valkey_connect_to(c, g_valkey_host, g_valkey_port, g_valkey_pass);
+
+static int valkey_connect(vkc_conn_t *c) {
+    return vkc_connect_to(c, g_valkey_host, g_valkey_port, g_valkey_pass);
 }
-static int valkey_ensure(resp_conn_t *c) {
-    if (c->fd < 0)
-        return valkey_connect(c);
-    resp_reply_t r;
-    if (resp_cmd(c, &r, 1, "PING") < 0)
-        return valkey_connect(c);
-    return 0;
+/* Connect if needed; no PING per command any more (PERF-001). */
+static int valkey_ensure(vkc_conn_t *c) {
+    return vkc_ensure_to(c, g_valkey_host, g_valkey_port, g_valkey_pass);
 }
 
 /* ==========================================================================
@@ -2078,11 +1832,8 @@ static int g_rcache_ttl = 0;      /* seconds; 0 = disabled */
 static int g_rcache_size = 16384; /* requested entries when enabled */
 static pthread_mutex_t g_rcache_locks[RCACHE_LOCKS];
 
-/* RFC 8767 stale-shadow write throttle. The shadow (stale:<key>, 7-day TTL) only
- * needs to be recent-ish for outage survival, but it was rewritten on EVERY
- * successful GET — a Valkey write per read. Write it on ~1/N reads instead.
- * 1 = write every GET (legacy), 0 = never write shadows. Per-thread counter, so
- * each worker refreshes independently. */
+/* RFC 8767 serve-stale copy refresh throttle: copy a successful read into the
+ * stale table on ~1/N reads (1 = every read, 0 = never). Per-thread counter. */
 static int g_stale_sample = 16;
 static __thread unsigned t_stale_ctr = 0;
 
@@ -2173,6 +1924,103 @@ static void rcache_store(const char *key, const char *val, int hit) {
     victim->expiry_ms = now + (uint64_t) g_rcache_ttl * 1000;
     pthread_mutex_unlock(lk);
 }
+/* RFC 8767 serve-stale store (PERF-007). The old shadow copies (stale:<key>,
+ * 7-day TTL) lived in the very Valkey whose outage they were meant to cover,
+ * and reading them meant two more connect attempts per query. Successful
+ * zone:/ddns:/srp: reads are now copied (sampled, g_stale_sample) into this
+ * in-process table; vk_get answers from it while Valkey is unreachable. A
+ * key Valkey reports missing, or the keyspace subscriber sees change, is
+ * dropped, so an outage never resurrects a deleted record. Same
+ * set-associative layout as rcache; config:stale_cache_size entries
+ * (default 4096, 0 = off), entries older than STALE_MAX_AGE are not served. */
+#define STALE_MAX_AGE_MS (7ull * 86400 * 1000)
+static rcache_entry_t *g_stale = NULL;
+static int g_stale_buckets = 0;
+static int g_stale_size = 4096;
+static pthread_mutex_t g_stale_locks[RCACHE_LOCKS];
+
+static int stale_eligible(const char *key) {
+    return strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0 ||
+           strncmp(key, "srp:", 4) == 0;
+}
+
+static void stale_init(int cap) {
+    if (cap < RCACHE_WAYS)
+        return;
+    int buckets = cap / RCACHE_WAYS;
+    g_stale = calloc((size_t) buckets * RCACHE_WAYS, sizeof(rcache_entry_t));
+    if (!g_stale) {
+        dns_log(LOG_WARNING, "[stale] alloc failed — serve-stale disabled\n");
+        return;
+    }
+    g_stale_buckets = buckets;
+    for (int i = 0; i < RCACHE_LOCKS; i++)
+        pthread_mutex_init(&g_stale_locks[i], NULL);
+}
+
+static void stale_store(const char *key, const char *val) {
+    if (!g_stale || strlen(key) >= RCACHE_KEYLEN || strlen(val) >= RCACHE_VALLEN)
+        return;
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_stale_buckets);
+    rcache_entry_t *set = &g_stale[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_stale_locks[bucket % RCACHE_LOCKS];
+    uint64_t now = rcache_now_ms();
+    pthread_mutex_lock(lk);
+    rcache_entry_t *victim = &set[0];
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        rcache_entry_t *e = &set[w];
+        if (!e->used || strcmp(e->key, key) == 0) {
+            victim = e;
+            break;
+        }
+        if (e->expiry_ms < victim->expiry_ms)
+            victim = e; /* oldest copy goes */
+    }
+    safe_strcpy(victim->key, key, sizeof(victim->key));
+    safe_strcpy(victim->val, val, sizeof(victim->val));
+    victim->hit = 1;
+    victim->used = 1;
+    victim->expiry_ms = now; /* here: time stored */
+    pthread_mutex_unlock(lk);
+}
+
+static int stale_lookup(const char *key, char *out, int olen) {
+    if (!g_stale)
+        return 0;
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_stale_buckets);
+    rcache_entry_t *set = &g_stale[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_stale_locks[bucket % RCACHE_LOCKS];
+    uint64_t now = rcache_now_ms();
+    int found = 0;
+    pthread_mutex_lock(lk);
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        rcache_entry_t *e = &set[w];
+        if (e->used && now - e->expiry_ms < STALE_MAX_AGE_MS && strcmp(e->key, key) == 0) {
+            safe_strcpy(out, e->val, olen);
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(lk);
+    return found;
+}
+
+static void stale_forget(const char *key) {
+    if (!g_stale)
+        return;
+    int bucket = (int) (rcache_hash(key) % (uint64_t) g_stale_buckets);
+    rcache_entry_t *set = &g_stale[(size_t) bucket * RCACHE_WAYS];
+    pthread_mutex_t *lk = &g_stale_locks[bucket % RCACHE_LOCKS];
+    pthread_mutex_lock(lk);
+    for (int w = 0; w < RCACHE_WAYS; w++) {
+        if (set[w].used && strcmp(set[w].key, key) == 0) {
+            set[w].used = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(lk);
+}
+
 /* Invalidate one key — called by the keyspace subscriber on zone:/ddns: writes. */
 static void rcache_invalidate(const char *key) {
     if (!g_rcache)
@@ -2192,119 +2040,169 @@ static void rcache_invalidate(const char *key) {
 
 static int vk_set(const char *key, const char *val, uint32_t ttl) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
-    resp_reply_t r;
+    vkc_reply_t r;
     int ok;
     if (ttl > 0) {
         char ts[32];
         snprintf(ts, sizeof(ts), "%u", ttl);
-        ok = resp_cmd(&vk, &r, 5, "SET", key, val, "EX", ts);
+        ok = vkc_call_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 5, "SET", key,
+                         val, "EX", ts);
     } else
-        ok = resp_cmd(&vk, &r, 3, "SET", key, val);
-    if (ok < 0) {
-        vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
+        ok = vkc_call_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 3, "SET", key,
+                         val);
     pthread_mutex_unlock(&g_vk_mutex);
-    return r.type == 0;
+    return ok == 0 && r.type == 0;
 }
 /* Core GET on a specific connection — does NO locking. The caller supplies
  * either the shared `vk` (while holding g_vk_mutex) or a thread-private
  * connection (no lock needed). Behavior is identical to the historical vk_get:
  * GET, RFC 8767 stale-shadow read on Valkey-unreachable, stale-shadow write on
  * hit. */
-static int vk_get_conn(resp_conn_t *c, const char *key, char *out, int olen) {
-    if (valkey_ensure(c) < 0) {
-        /* Valkey unreachable — try RFC 8767 stale shadow key */
-        char skey[640];
-        snprintf(skey, sizeof(skey), "stale:%s", key);
-        if (valkey_ensure(c) >= 0) {
-            resp_reply_t rs;
-            if (resp_cmd(c, &rs, 2, "GET", skey) >= 0 && rs.type == 2) {
-                safe_strcpy(out, rs.str, olen);
-                dns_log(LOG_DEBUG, "[RFC8767] Serving stale data for %s\n", key);
-                return 1;
-            }
+static int vk_get_conn(vkc_conn_t *c, const char *key, char *out, int olen) {
+    vkc_reply_t r;
+    if (vkc_call_to(c, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 2, "GET", key) < 0) {
+        /* Valkey unreachable: RFC 8767 serve-stale from the in-process copy.
+         * vkc_connect_to's back-off makes this immediate during an outage. */
+        if (stale_eligible(key) && stale_lookup(key, out, olen)) {
+            dns_log(LOG_DEBUG, "[RFC8767] Serving stale data for %s\n", key);
+            return 1;
         }
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(c, &r, 2, "GET", key) < 0) {
-        c->fd = -1;
+    if (r.type != 2) {
+        if (stale_eligible(key))
+            stale_forget(key); /* gone from Valkey: never serve it stale later */
         return 0;
     }
-    if (r.type != 2)
-        return 0;
     safe_strcpy(out, r.str, olen);
-    /* Refresh the RFC 8767 stale shadow (7-day TTL) on ~1/g_stale_sample reads to
-     * avoid a Valkey write per read. The shadow only needs to be recent enough to
-     * serve during a Valkey outage; the read-side serve-stale path is unchanged. */
-    if (g_stale_sample > 0 && (++t_stale_ctr % (unsigned) g_stale_sample) == 0) {
-        char skey[640];
-        snprintf(skey, sizeof(skey), "stale:%s", key);
-        char ts[16];
-        snprintf(ts, sizeof(ts), "%u", 7u * 86400);
-        resp_reply_t sw;
-        resp_cmd(c, &sw, 5, "SET", skey, out, "EX", ts);
-    }
+    if (g_stale_sample > 0 && stale_eligible(key) &&
+        (++t_stale_ctr % (unsigned) g_stale_sample) == 0)
+        stale_store(key, out);
     return 1;
 }
+/* PERF-003: a query's record reads, issued as ONE pipelined round trip.
+ * build_query_resp prefetches the keys its resolution may read (delegation
+ * NS candidates; for A/AAAA the ddns/zone/srp address, CNAME and wildcard
+ * keys) into this per-thread table; vk_get answers from it first. The table
+ * belongs to one request: dns_process clears it on the way out, so nothing
+ * is ever served staler than the request that fetched it. */
+#define VK_PF_MAX 12
+typedef struct {
+    int n;
+    char key[VK_PF_MAX][RCACHE_KEYLEN];
+    char val[VK_PF_MAX][RCACHE_VALLEN];
+    signed char state[VK_PF_MAX]; /* 1 present, 0 absent, -1 not usable (too big) */
+} vk_prefetch_t;
+static __thread vk_prefetch_t t_pf;
+
+static void vk_prefetch_clear(void) {
+    t_pf.n = 0;
+}
+
+/* 1 if `key` was prefetched (sets *hit and, when present, out). */
+static int vk_prefetch_lookup(const char *key, char *out, int olen, int *hit) {
+    for (int i = 0; i < t_pf.n; i++) {
+        if (t_pf.state[i] >= 0 && strcmp(t_pf.key[i], key) == 0) {
+            *hit = t_pf.state[i];
+            if (*hit)
+                safe_strcpy(out, t_pf.val[i], olen);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* GET every key in one pipeline. On any failure the table stays empty and
+ * the ordinary per-key path (with its retry and serve-stale) takes over. */
+static void vk_prefetch(char keys[][RCACHE_KEYLEN], int n) {
+    t_pf.n = 0;
+    if (n <= 0 || n > VK_PF_MAX)
+        return;
+    char cmds[VK_PF_MAX * (RCACHE_KEYLEN + 32)];
+    int pos = 0;
+    for (int i = 0; i < n; i++) {
+        int kl = (int) strlen(keys[i]);
+        int w = snprintf(cmds + pos, sizeof(cmds) - (size_t) pos,
+                         "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", kl, keys[i]);
+        if (w < 0 || w >= (int) sizeof(cmds) - pos)
+            return;
+        pos += w;
+    }
+    int slot;
+    vkc_conn_t *c = vk_read_take(&slot);
+    int ok = valkey_ensure(c) == 0 && vkc_send(c, cmds, pos) == 0;
+    for (int i = 0; ok && i < n; i++) {
+        vkc_reply_t r;
+        if (vkc_parse(c, &r) < 0) {
+            ok = 0;
+            break;
+        }
+        safe_strcpy(t_pf.key[i], keys[i], sizeof(t_pf.key[i]));
+        if (r.type == 2 && strlen(r.str) < RCACHE_VALLEN) {
+            safe_strcpy(t_pf.val[i], r.str, sizeof(t_pf.val[i]));
+            t_pf.state[i] = 1;
+        } else if (r.type == 4) {
+            t_pf.state[i] = 0;
+        } else {
+            t_pf.state[i] = -1; /* oversized or unexpected: read it the normal way */
+        }
+    }
+    if (ok) {
+        t_pf.n = n;
+    } else {
+        vkc_drop(c);
+    }
+    vk_read_give(slot);
+}
+
 static int vk_get(const char *key, char *out, int olen) {
     /* In-process cache for the hot per-query record reads (zone:/ddns:). Config
      * reads (config:/cert:/dnssec:/acme:) are not cached — they are not on the
      * hot path and must stay strictly live. */
     int cacheable = (g_rcache && g_rcache_ttl > 0 &&
                      (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0));
+    int pfhit;
+    if (t_pf.n > 0 && vk_prefetch_lookup(key, out, olen, &pfhit)) {
+        if (stale_eligible(key)) {
+            if (!pfhit)
+                stale_forget(key);
+            else if (g_stale_sample > 0 && (++t_stale_ctr % (unsigned) g_stale_sample) == 0)
+                stale_store(key, out);
+        }
+        if (cacheable)
+            rcache_store(key, pfhit ? out : NULL, pfhit);
+        return pfhit;
+    }
     if (cacheable) {
         int hit = 0;
         if (rcache_lookup(key, out, olen, &hit))
             return hit;
     }
-    int rc;
-    /* Worker threads carry a private connection → lock-free, overlapping GETs. */
-    if (t_vk_conn) {
-        rc = vk_get_conn(t_vk_conn, key, out, olen);
-    } else {
-        pthread_mutex_lock(&g_vk_mutex);
-        rc = vk_get_conn(&vk, key, out, olen);
-        pthread_mutex_unlock(&g_vk_mutex);
-    }
+    /* UDP workers use their private connection; other threads a pooled one. */
+    int slot;
+    vkc_conn_t *c = vk_read_take(&slot);
+    int rc = vk_get_conn(c, key, out, olen);
+    vk_read_give(slot);
     if (cacheable)
         rcache_store(key, rc ? out : NULL, rc);
     return rc;
 }
 static int vk_del(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "DEL", key) < 0) {
-        vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
-        return 0;
-    }
+    vkc_reply_t r;
+    int rc = vkc_call_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 2, "DEL", key);
     pthread_mutex_unlock(&g_vk_mutex);
+    if (rc < 0)
+        return 0;
     return r.type == 3 ? (int) r.integer : 0;
 }
 static long vk_ttl(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "TTL", key) < 0) {
-        vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
+    vkc_reply_t r;
+    int rc = vkc_call_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 2, "TTL", key);
     pthread_mutex_unlock(&g_vk_mutex);
+    if (rc < 0)
+        return -1;
     return r.type == 3 ? r.integer : -1;
 }
 
@@ -2368,17 +2266,12 @@ static void zones_load_from_valkey(void) {
 /* Atomically increment and return new integer value */
 static long vk_incr(const char *key) {
     pthread_mutex_lock(&g_vk_mutex);
-    if (valkey_ensure(&vk) < 0) {
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
-    resp_reply_t r;
-    if (resp_cmd(&vk, &r, 2, "INCR", key) < 0) {
-        vk.fd = -1;
-        pthread_mutex_unlock(&g_vk_mutex);
-        return -1;
-    }
+    vkc_reply_t r;
+    int rc = vkc_call_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass, 0, &r, 2, "INCR",
+                         key); /* not retried: a lost reply may mean it ran */
     pthread_mutex_unlock(&g_vk_mutex);
+    if (rc < 0)
+        return -1;
     return r.type == 3 ? r.integer : -1;
 }
 
@@ -2565,6 +2458,7 @@ static void config_load_from_valkey(void) {
     }
     /* Stale-shadow write throttle (1 = every GET, N = ~1/N, 0 = off). */
     GI("stale_refresh_sample", g_stale_sample);
+    GI("stale_cache_size", g_stale_size); /* read at boot; resizing needs a restart */
     {
         const char *e = getenv("STALE_REFRESH_SAMPLE");
         if (e && e[0])
@@ -2608,15 +2502,18 @@ static void config_load_from_valkey(void) {
     }
     /* RRL */
     {
+        /* Write only on change (CSA-CONC-002): query threads read these. */
         char rrl_val[16];
-        if (vk_get("config:rrl_enabled", rrl_val, sizeof(rrl_val)))
-            g_rrl_enabled = atoi(rrl_val);
-        if (vk_get("config:rrl_rate", rrl_val, sizeof(rrl_val)))
-            g_rrl_rate = atoi(rrl_val);
-        if (vk_get("config:rrl_window", rrl_val, sizeof(rrl_val)))
-            g_rrl_window = atoi(rrl_val);
-        if (vk_get("config:rrl_slip", rrl_val, sizeof(rrl_val)))
-            g_rrl_slip = atoi(rrl_val);
+#define RRL_SET(k, g)                                                                              \
+    do {                                                                                           \
+        if (vk_get("config:" k, rrl_val, sizeof(rrl_val)) && atoi(rrl_val) != (g))                 \
+            (g) = atoi(rrl_val);                                                                   \
+    } while (0)
+        RRL_SET("rrl_enabled", g_rrl_enabled);
+        RRL_SET("rrl_rate", g_rrl_rate);
+        RRL_SET("rrl_window", g_rrl_window);
+        RRL_SET("rrl_slip", g_rrl_slip);
+#undef RRL_SET
     }
     /* Out-of-zone forwarding (CLAUDE-forwarder.md). */
     GSD("forwarders", g_forwarders, "");
@@ -2848,7 +2745,7 @@ static uint32_t serial_bump(zone_entry_t *z) {
  * transaction — the transactional sibling of serial_bump(), so a record
  * write and its serial bump commit as one atomic unit (no reader can ever
  * observe one without the other). The caller must call
- * serial_bump_txn_apply() with resp_txn_commit()'s reply for this command
+ * serial_bump_txn_apply() with vkc_txn_commit()'s reply for this command
  * (positionally) once the whole transaction has committed; queuing alone
  * changes no in-memory state. IXFR journal bookkeeping (ixfr_journal_append)
  * is deliberately NOT part of this transaction: a journal entry needs the
@@ -2857,20 +2754,20 @@ static uint32_t serial_bump(zone_entry_t *z) {
  * of a crash between the two is indistinguishable from today's existing
  * non-journaled-type gaps, already handled by ixfr_journal_fetch's
  * fall-back-to-AXFR. */
-static void serial_bump_txn_queue(resp_txn_t *t, zone_entry_t *z) {
+static void serial_bump_txn_queue(vkc_txn_t *t, zone_entry_t *z) {
     char ikey[320];
     int primary = (!z || strcasecmp(z->name, g_zone_name) == 0);
     if (primary)
         safe_strcpy(ikey, "config:zone_serial", sizeof(ikey));
     else
         snprintf(ikey, sizeof(ikey), "config:zone:%s:serial", z->name);
-    resp_txn_queue(t, 2, "INCR", ikey);
+    vkc_txn_queue(t, 2, "INCR", ikey);
 }
 /* Apply a committed serial INCR reply — mirrors serial_bump()'s success tail
  * (in-memory serial update + ZONEMD recompute). Returns the new serial, or 0
  * if the reply wasn't the expected integer (should not happen once commit()
  * itself returned success) — fails closed by leaving state untouched. */
-static uint32_t serial_bump_txn_apply(zone_entry_t *z, resp_reply_t *r) {
+static uint32_t serial_bump_txn_apply(zone_entry_t *z, vkc_reply_t *r) {
     if (r->type != 3)
         return 0;
     uint32_t ns = (uint32_t) r->integer;
@@ -2899,18 +2796,18 @@ static uint32_t txn_set_and_bump(zone_entry_t *z, const char *key, const char *v
         dns_log(LOG_ERR, "[UPDATE] %s: Valkey unreachable — not applied\n", log_ctx);
         return 0;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
     if (ttl > 0) {
         char ts[16];
         snprintf(ts, sizeof(ts), "%u", ttl);
-        resp_txn_queue(&t, 5, "SET", key, val, "EX", ts);
+        vkc_txn_queue(&t, 5, "SET", key, val, "EX", ts);
     } else {
-        resp_txn_queue(&t, 3, "SET", key, val);
+        vkc_txn_queue(&t, 3, "SET", key, val);
     }
     serial_bump_txn_queue(&t, z);
-    resp_reply_t out[2];
-    int ok = resp_txn_commit(&t, out) == 2;
+    vkc_reply_t out[2];
+    int ok = vkc_txn_commit(&t, out) == 2;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[UPDATE] %s: transaction failed — not applied\n", log_ctx);
@@ -2929,13 +2826,13 @@ static uint32_t txn_del_and_bump(zone_entry_t *z, const char *const *keys, int n
         dns_log(LOG_ERR, "[UPDATE] %s: Valkey unreachable — not applied\n", log_ctx);
         return 0;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
     for (int i = 0; i < n; i++)
-        resp_txn_queue(&t, 2, "DEL", keys[i]);
+        vkc_txn_queue(&t, 2, "DEL", keys[i]);
     serial_bump_txn_queue(&t, z);
-    resp_reply_t out[9]; /* worst case 4 DELs (TXT/CNAME/MX/SRV via ANY) + 1 INCR */
-    int ok = resp_txn_commit(&t, out) == n + 1;
+    vkc_reply_t out[9]; /* worst case 4 DELs (TXT/CNAME/MX/SRV via ANY) + 1 INCR */
+    int ok = vkc_txn_commit(&t, out) == n + 1;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[UPDATE] %s: transaction failed — not applied\n", log_ctx);
@@ -2945,36 +2842,36 @@ static uint32_t txn_del_and_bump(zone_entry_t *z, const char *const *keys, int n
 }
 
 /* ADR-004: a compact reply drain for bulk (potentially large-N) transactions
- * like AXFR's per-type GET batch — resp_reply_t's str[MAX_PEM] (64KB) makes
+ * like AXFR's per-type GET batch — vkc_reply_t's str[MAX_PEM] (64KB) makes
  * an array of N of them impractical once N reaches the thousands, so this
  * copies each reply into a small fixed LB_VAL_MAX buffer (the same size AXFR's
  * own per-record value buffer already uses) instead. Mirrors
- * resp_txn_commit's success/failure contract. */
+ * vkc_txn_commit's success/failure contract. */
 typedef struct {
-    int type; /* resp_reply_t.type: 2=bulk-string, 3=integer, 4=nil, ... */
+    int type; /* vkc_reply_t.type: 2=bulk-string, 3=integer, 4=nil, ... */
     long integer;
     char str[LB_VAL_MAX]; /* a full A/AAAA RRset value (LB_VAL_MAX) */
 } axfr_reply_t;
 
-static int resp_txn_commit_compact(resp_txn_t *t, axfr_reply_t *out, int n) {
+static int resp_txn_commit_compact(vkc_txn_t *t, axfr_reply_t *out, int n) {
     if (t->err) {
         if (t->c->fd >= 0) {
-            resp_reply_t d;
-            resp_cmd(t->c, &d, 1, "DISCARD");
+            vkc_reply_t d;
+            vkc_cmd(t->c, &d, 1, "DISCARD");
         }
         return 0;
     }
-    resp_reply_t r;
-    if (resp_cmd(t->c, &r, 1, "EXEC") < 0) {
-        t->c->fd = -1;
+    vkc_reply_t r;
+    if (vkc_cmd(t->c, &r, 1, "EXEC") < 0) {
+        vkc_drop(t->c);
         return 0;
     }
     if (r.type != 5 || r.count != n)
         return 0;
     for (int i = 0; i < n; i++) {
-        resp_reply_t item;
-        if (resp_parse(t->c, &item) < 0) {
-            t->c->fd = -1;
+        vkc_reply_t item;
+        if (vkc_parse(t->c, &item) < 0) {
+            vkc_drop(t->c);
             return 0;
         }
         out[i].type = item.type;
@@ -3114,14 +3011,14 @@ static void cert_publish_tlsa(const char *cert_pem) {
          * TLSA records already in place, or vice versa. */
         pthread_mutex_lock(&g_vk_mutex);
         if (valkey_ensure(&vk) >= 0) {
-            resp_txn_t t;
-            resp_txn_begin(&t, &vk);
-            resp_txn_queue(&t, 3, "SET", tkey_443, tval);
-            resp_txn_queue(&t, 3, "SET", tkey_dot, tval);
-            resp_txn_queue(&t, 3, "SET", tkey_doq, tval);
+            vkc_txn_t t;
+            vkc_txn_begin(&t, &vk);
+            vkc_txn_queue(&t, 3, "SET", tkey_443, tval);
+            vkc_txn_queue(&t, 3, "SET", tkey_dot, tval);
+            vkc_txn_queue(&t, 3, "SET", tkey_doq, tval);
             serial_bump_txn_queue(&t, z);
-            resp_reply_t out[4];
-            if (resp_txn_commit(&t, out) == 4) {
+            vkc_reply_t out[4];
+            if (vkc_txn_commit(&t, out) == 4) {
                 pthread_mutex_unlock(&g_vk_mutex);
                 serial_bump_txn_apply(z, &out[3]);
                 dns_log(LOG_NOTICE, "[PKI] TLSA 3 1 1 published for %s (zone %s)\n", domain, zn);
@@ -3314,16 +3211,16 @@ static void zidx_apply_key(const char *key) {
     strlower(zk);
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) >= 0) {
-        resp_reply_t r;
-        if (resp_cmd(&vk, &r, 2, "EXISTS", key) < 0) {
-            vk.fd = -1;
+        vkc_reply_t r;
+        if (vkc_cmd(&vk, &r, 2, "EXISTS", key) < 0) {
+            vkc_drop(&vk);
         } else if (r.type == 3) {
             if (r.integer > 0) {
-                if (resp_cmd(&vk, &r, 4, "ZADD", zk, "0", member) < 0)
-                    vk.fd = -1;
+                if (vkc_cmd(&vk, &r, 4, "ZADD", zk, "0", member) < 0)
+                    vkc_drop(&vk);
             } else {
-                if (resp_cmd(&vk, &r, 3, "ZREM", zk, member) < 0)
-                    vk.fd = -1;
+                if (vkc_cmd(&vk, &r, 3, "ZREM", zk, member) < 0)
+                    vkc_drop(&vk);
             }
         }
     }
@@ -3356,15 +3253,15 @@ static void zidx_rebuild_zone(const char *zone) {
     int cap = 0;
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) >= 0) {
-        resp_reply_t r;
-        if (resp_cmd(&vk, &r, 4, "ZRANGE", zk, "0", "-1") < 0) {
-            vk.fd = -1;
+        vkc_reply_t r;
+        if (vkc_cmd(&vk, &r, 4, "ZRANGE", zk, "0", "-1") < 0) {
+            vkc_drop(&vk);
         } else if (r.type == 5) {
             int total = r.count;
             for (int i = 0; i < total; i++) {
-                resp_reply_t el;
-                if (resp_parse(&vk, &el) < 0) {
-                    vk.fd = -1;
+                vkc_reply_t el;
+                if (vkc_parse(&vk, &el) < 0) {
+                    vkc_drop(&vk);
                     break;
                 }
                 if (el.type != 2)
@@ -3425,25 +3322,24 @@ static int zidx_name_exists(const char *zone, const char *name) {
     strlower(zk);
     snprintf(lo, sizeof(lo), "[%s" ZIDX_EXACT, rev);
     snprintf(hi, sizeof(hi), "(%s" ZIDX_END, rev);
-    resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
-    if (!t_vk_conn)
-        pthread_mutex_lock(&g_vk_mutex);
+    int slot;
+    vkc_conn_t *c = vk_read_take(&slot);
     int rc = -1;
-    resp_reply_t r;
-    if (valkey_ensure(c) >= 0 &&
-        resp_cmd(c, &r, 7, "ZRANGEBYLEX", zk, lo, hi, "LIMIT", "0", "1") >= 0 && r.type == 5) {
+    vkc_reply_t r;
+    if (vkc_call_to(c, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 7, "ZRANGEBYLEX", zk, lo,
+                    hi, "LIMIT", "0", "1") == 0 &&
+        r.type == 5) {
         rc = r.count > 0;
         for (int i = 0; i < r.count; i++) {
-            resp_reply_t el;
-            if (resp_parse(c, &el) < 0) {
+            vkc_reply_t el;
+            if (vkc_parse(c, &el) < 0) {
                 rc = -1;
-                c->fd = -1;
+                vkc_drop(c);
                 break;
             }
         }
     }
-    if (!t_vk_conn)
-        pthread_mutex_unlock(&g_vk_mutex);
+    vk_read_give(slot);
     return rc;
 }
 
@@ -3520,8 +3416,10 @@ static void keyspace_apply(const char *key) {
          * eviction (the event carries the precise key). No-op if cache disabled.
          * Note: "zone_table:" does not match "zone:" (5th char differs). */
         rcache_invalidate(key);
+        stale_forget(key);
         zidx_apply_key(key); /* set, del and TTL expiry alike */
     } else if (strncmp(key, "srp:", 4) == 0) {
+        stale_forget(key);
         zidx_apply_key(key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         /* dnssec:<zone>:... — reload that zone's key state live (current set +
@@ -3554,27 +3452,27 @@ static void keyspace_apply(const char *key) {
 
 static void *keyspace_watch_thread(void *arg) {
     (void) arg;
-    static resp_conn_t sub;
+    static vkc_conn_t sub;
     int backoff = 1;
     for (;;) {
         memset(&sub, 0, sizeof(sub));
         sub.fd = -1;
-        if (valkey_connect_to(&sub, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
+        if (vkc_connect_to(&sub, g_valkey_host, g_valkey_port, g_valkey_pass) < 0) {
             sleep(backoff);
             if (backoff < 30)
                 backoff *= 2;
             continue;
         }
         /* A subscriber blocks waiting for events, so drop the 4s read timeout
-         * valkey_connect_to set (else recv would time out and look like a
+         * vkc_connect_to set (else recv would time out and look like a
          * disconnect — a reconnect storm). */
         struct timeval no_to = {0};
         setsockopt(sub.fd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
 
         /* Enable keyspace notifications (idempotent). KEA = keyspace + keyevent
          * channels, all event classes — covers SET/DEL/EXPIRE on watched keys. */
-        resp_reply_t r;
-        if (resp_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
+        vkc_reply_t r;
+        if (vkc_cmd(&sub, &r, 4, "CONFIG", "SET", "notify-keyspace-events", "KEA") < 0 ||
             r.type == 1)
             dns_log(LOG_WARNING, "[Reload] could not enable keyspace notifications "
                                  "(CONFIG SET denied?) — boot/reconnect catch-up only\n");
@@ -3589,7 +3487,7 @@ static void *keyspace_watch_thread(void *arg) {
         for (int i = 0; prefixes[i]; i++) {
             char pat[160];
             snprintf(pat, sizeof(pat), "__keyspace@%d__:%s", KEYSPACE_DB, prefixes[i]);
-            if (resp_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
+            if (vkc_send_cmd(&sub, 2, "PSUBSCRIBE", pat) < 0) {
                 subok = 0;
                 break;
             }
@@ -3621,16 +3519,16 @@ static void *keyspace_watch_thread(void *arg) {
          * PSUBSCRIBE acks ("psubscribe", …) flow through here too and are
          * skipped. */
         for (;;) {
-            resp_reply_t hdr;
-            if (resp_parse(&sub, &hdr) < 0)
+            vkc_reply_t hdr;
+            if (vkc_parse(&sub, &hdr) < 0)
                 break; /* disconnect */
             if (hdr.type != 5 || hdr.count < 1)
                 continue;
             char kind[16] = "", channel[512] = "";
             int rderr = 0;
             for (int i = 0; i < hdr.count; i++) {
-                resp_reply_t el;
-                if (resp_parse(&sub, &el) < 0) {
+                vkc_reply_t el;
+                if (vkc_parse(&sub, &el) < 0) {
                     rderr = 1;
                     break;
                 }
@@ -4388,14 +4286,14 @@ static void rollover_start(zone_entry_t *z) {
         dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — not started\n", z->name);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
-    resp_txn_queue(&t, 3, "SET", k1, pem1);
-    resp_txn_queue(&t, 3, "SET", k2, pem2);
-    resp_txn_queue(&t, 3, "SET", k3, st);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
+    vkc_txn_queue(&t, 3, "SET", k1, pem1);
+    vkc_txn_queue(&t, 3, "SET", k2, pem2);
+    vkc_txn_queue(&t, 3, "SET", k3, st);
     serial_bump_txn_queue(&t, z);
-    resp_reply_t out[4];
-    int ok = resp_txn_commit(&t, out) == 4;
+    vkc_reply_t out[4];
+    int ok = vkc_txn_commit(&t, out) == 4;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[Rollover] %s: start transaction failed — not started\n", z->name);
@@ -4420,12 +4318,12 @@ static void rollover_to_commit(zone_entry_t *z) {
                 z->name);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
-    resp_txn_queue(&t, 3, "SET", k, st);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
+    vkc_txn_queue(&t, 3, "SET", k, st);
     serial_bump_txn_queue(&t, z);
-    resp_reply_t out[2];
-    int ok = resp_txn_commit(&t, out) == 2;
+    vkc_reply_t out[2];
+    int ok = vkc_txn_commit(&t, out) == 2;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[Rollover] %s: commit-phase transaction failed\n", z->name);
@@ -4461,29 +4359,29 @@ static void rollover_finish(zone_entry_t *z) {
         dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — not finished\n", z->name);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
     int n = 0;
     if (have1) {
-        resp_txn_queue(&t, 3, "SET", ck1, pem1);
+        vkc_txn_queue(&t, 3, "SET", ck1, pem1);
         n++;
     }
-    resp_txn_queue(&t, 2, "DEL", k1);
+    vkc_txn_queue(&t, 2, "DEL", k1);
     n++;
     if (have2) {
-        resp_txn_queue(&t, 3, "SET", ck2, pem2);
+        vkc_txn_queue(&t, 3, "SET", ck2, pem2);
         n++;
     }
-    resp_txn_queue(&t, 2, "DEL", k2);
+    vkc_txn_queue(&t, 2, "DEL", k2);
     n++;
-    resp_txn_queue(&t, 2, "DEL", k3);
+    vkc_txn_queue(&t, 2, "DEL", k3);
     n++;
-    resp_txn_queue(&t, 3, "SET", k4, now_s);
+    vkc_txn_queue(&t, 3, "SET", k4, now_s);
     n++;
     serial_bump_txn_queue(&t, z);
     n++;
-    resp_reply_t out[8];
-    int ok = resp_txn_commit(&t, out) == n;
+    vkc_reply_t out[8];
+    int ok = vkc_txn_commit(&t, out) == n;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[Rollover] %s: finish transaction failed\n", z->name);
@@ -4534,14 +4432,14 @@ static void ksk_rollover_start(zone_entry_t *z) {
         dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — KSK not started\n", z->name);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
-    resp_txn_queue(&t, 3, "SET", k1, pem1);
-    resp_txn_queue(&t, 3, "SET", k2, pem2);
-    resp_txn_queue(&t, 3, "SET", k3, st);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
+    vkc_txn_queue(&t, 3, "SET", k1, pem1);
+    vkc_txn_queue(&t, 3, "SET", k2, pem2);
+    vkc_txn_queue(&t, 3, "SET", k3, st);
     serial_bump_txn_queue(&t, z);
-    resp_reply_t out[4];
-    int ok = resp_txn_commit(&t, out) == 4;
+    vkc_reply_t out[4];
+    int ok = vkc_txn_commit(&t, out) == 4;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[Rollover] %s: KSK start transaction failed\n", z->name);
@@ -4572,12 +4470,12 @@ static void ksk_rollover_to_retire(zone_entry_t *z) {
         dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — KSK retire not advanced\n", z->name);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
-    resp_txn_queue(&t, 3, "SET", k, st);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
+    vkc_txn_queue(&t, 3, "SET", k, st);
     serial_bump_txn_queue(&t, z);
-    resp_reply_t out[2];
-    int ok = resp_txn_commit(&t, out) == 2;
+    vkc_reply_t out[2];
+    int ok = vkc_txn_commit(&t, out) == 2;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[Rollover] %s: KSK retire transaction failed\n", z->name);
@@ -4613,29 +4511,29 @@ static void ksk_rollover_finish(zone_entry_t *z) {
         dns_log(LOG_ERR, "[Rollover] %s: Valkey unreachable — KSK not finished\n", z->name);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
     int n = 0;
     if (have1) {
-        resp_txn_queue(&t, 3, "SET", ck1, pem1);
+        vkc_txn_queue(&t, 3, "SET", ck1, pem1);
         n++;
     }
-    resp_txn_queue(&t, 2, "DEL", k1);
+    vkc_txn_queue(&t, 2, "DEL", k1);
     n++;
     if (have2) {
-        resp_txn_queue(&t, 3, "SET", ck2, pem2);
+        vkc_txn_queue(&t, 3, "SET", ck2, pem2);
         n++;
     }
-    resp_txn_queue(&t, 2, "DEL", k2);
+    vkc_txn_queue(&t, 2, "DEL", k2);
     n++;
-    resp_txn_queue(&t, 2, "DEL", k3);
+    vkc_txn_queue(&t, 2, "DEL", k3);
     n++;
-    resp_txn_queue(&t, 3, "SET", k4, now_s);
+    vkc_txn_queue(&t, 3, "SET", k4, now_s);
     n++;
     serial_bump_txn_queue(&t, z);
     n++;
-    resp_reply_t out[8];
-    int ok = resp_txn_commit(&t, out) == n;
+    vkc_reply_t out[8];
+    int ok = vkc_txn_commit(&t, out) == n;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[Rollover] %s: KSK finish transaction failed\n", z->name);
@@ -6026,7 +5924,12 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
         compute_server_cookie(ei->client_cookie, cip, (uint32_t) time(NULL), sc);
     }
     int zv_labels = t_zone ? zone_label_count(t_zone->name) : -1;
-    uint32_t zv_serial = t_zone ? t_zone->soa_serial : 0;
+    uint32_t zv_serial = 0;
+    if (t_zone) {
+        pthread_mutex_lock(&g_soa_mutex); /* writers hold it (serial_bump, serial_key_apply) */
+        zv_serial = t_zone->soa_serial;
+        pthread_mutex_unlock(&g_soa_mutex);
+    }
     const char *report_agent = g_error_report_agent[0] ? g_error_report_agent : NULL;
     if (report_agent && t_zone && report_agent_is_subdomain_of(report_agent, t_zone->name))
         report_agent = NULL; /* fail closed on the RFC 9567 §4 MUST NOT */
@@ -7066,16 +6969,15 @@ static int name_types_present(const char *name, uint16_t *types, int max, int *e
             return -1;
         pos += w;
     }
-    resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
-    if (!t_vk_conn)
-        pthread_mutex_lock(&g_vk_mutex);
+    int slot;
+    vkc_conn_t *c = vk_read_take(&slot);
     int rc = 0;
-    if (valkey_ensure(c) < 0 || resp_send(c, cmds, pos) < 0) {
+    if (valkey_ensure(c) < 0 || vkc_send(c, cmds, pos) < 0) {
         rc = -1;
     } else {
         for (int i = 0; i < nk; i++) {
             char line[64];
-            if (resp_readline(c, line, sizeof(line)) < 0) {
+            if (vkc_readline(c, line, sizeof(line)) < 0) {
                 rc = -1;
                 break; /* stream lost — valkey_ensure reconnects next time */
             }
@@ -7089,7 +6991,7 @@ static int name_types_present(const char *name, uint16_t *types, int max, int *e
         if (ent && rc == 0) {
             /* ZRANGEBYLEX reply: "*0" or "*1" + one bulk member. */
             char line[64];
-            if (resp_readline(c, line, sizeof(line)) < 0 || line[0] != '*') {
+            if (vkc_readline(c, line, sizeof(line)) < 0 || line[0] != '*') {
                 rc = -1;
             } else {
                 int cnt = atoi(line + 1);
@@ -7097,9 +6999,9 @@ static int name_types_present(const char *name, uint16_t *types, int max, int *e
                     char bl[64];
                     char member[1300];
                     int len = -1;
-                    if (resp_readline(c, bl, sizeof(bl)) < 0 || bl[0] != '$' ||
+                    if (vkc_readline(c, bl, sizeof(bl)) < 0 || bl[0] != '$' ||
                         (len = atoi(bl + 1)) < 0 || len >= (int) sizeof(member) ||
-                        resp_readbytes(c, member, len) < 0)
+                        vkc_readbytes(c, member, len) < 0)
                         rc = -1;
                 }
                 if (rc == 0 && cnt > 0)
@@ -7107,12 +7009,9 @@ static int name_types_present(const char *name, uint16_t *types, int max, int *e
             }
         }
     }
-    if (rc < 0 && c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    if (!t_vk_conn)
-        pthread_mutex_unlock(&g_vk_mutex);
+    if (rc < 0)
+        vkc_drop(c);
+    vk_read_give(slot);
     return rc < 0 ? -1 : n;
 }
 
@@ -7320,6 +7219,30 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
      * unsigned referral below rather than the zone's-own-KSK DS synth
      * further down, which would be answering with the wrong key entirely. */
     if (t_zone) {
+        /* PERF-003: fetch what the steps below may read in one round trip. */
+        char pk[VK_PF_MAX][RCACHE_KEYLEN];
+        int pn = 0;
+        size_t zl = strlen(t_zone->name);
+        const char *cand = qname;
+        for (int d = 0; d < 4 && strlen(cand) > zl && pn < VK_PF_MAX; d++) {
+            snprintf(pk[pn++], RCACHE_KEYLEN, "zone:%s:NS:%s", t_zone->name, cand);
+            const char *dot = strchr(cand, '.');
+            if (!dot)
+                break;
+            cand = dot + 1;
+        }
+        if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_AAAA) {
+            const char *tn = type2str(qtype);
+            snprintf(pk[pn++], RCACHE_KEYLEN, "ddns:%s:%s:%s", t_zone->name, tn, qname);
+            snprintf(pk[pn++], RCACHE_KEYLEN, "zone:%s:%s:%s", t_zone->name, tn, qname);
+            snprintf(pk[pn++], RCACHE_KEYLEN, "srp:%s:%s:%s", t_zone->name, tn, qname);
+            snprintf(pk[pn++], RCACHE_KEYLEN, "zone:%s:CNAME:%s", t_zone->name, qname);
+            const char *parent = strchr(qname, '.');
+            if (parent && strlen(parent + 1) >= zl)
+                snprintf(pk[pn++], RCACHE_KEYLEN, "zone:%s:%s:*.%s", t_zone->name, tn, parent + 1);
+        }
+        if (pn > 1)
+            vk_prefetch(pk, pn);
         char cut[256], cutval[512];
         int at_cut = zone_delegation_cut(t_zone, qname, cut, sizeof(cut), cutval, sizeof(cutval));
         if (at_cut && qtype == DNS_TYPE_DS && streq_ci(qname, cut)) {
@@ -8175,22 +8098,22 @@ static void auto_ptr_apply(const char *fqdn, const char *ipstr, uint32_t ttl, in
         dns_log(LOG_ERR, "[auto-PTR] %s: Valkey unreachable — not applied\n", rev);
         return;
     }
-    resp_txn_t t;
-    resp_txn_begin(&t, &vk);
+    vkc_txn_t t;
+    vkc_txn_begin(&t, &vk);
     if (del) {
-        resp_txn_queue(&t, 2, "DEL", key);
+        vkc_txn_queue(&t, 2, "DEL", key);
     } else if (ttl) {
         char ts[16];
         snprintf(ts, sizeof(ts), "%u", ttl);
-        resp_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
+        vkc_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
     } else {
         char ts[16];
         snprintf(ts, sizeof(ts), "%u", (unsigned) DEFAULT_TTL);
-        resp_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
+        vkc_txn_queue(&t, 5, "SET", key, fqdn, "EX", ts);
     }
     serial_bump_txn_queue(&t, rz);
-    resp_reply_t out[2];
-    int ok = resp_txn_commit(&t, out) == 2;
+    vkc_reply_t out[2];
+    int ok = vkc_txn_commit(&t, out) == 2;
     pthread_mutex_unlock(&g_vk_mutex);
     if (!ok) {
         dns_log(LOG_ERR, "[auto-PTR] %s: transaction failed — not applied\n", rev);
@@ -9341,14 +9264,14 @@ static void ixfr_journal_append(const char *zone, uint32_t from_serial, uint32_t
     snprintf(entry, sizeof(entry), "%u|%u|%c|%s|%s", from_serial, to_serial, op, name, value);
     pthread_mutex_lock(&g_vk_mutex);
     if (valkey_ensure(&vk) >= 0) {
-        resp_reply_t r;
-        resp_cmd(&vk, &r, 3, "RPUSH", key, entry);
+        vkc_reply_t r;
+        vkc_cmd(&vk, &r, 3, "RPUSH", key, entry);
         /* Trim to the most-recent IXFR_JOURNAL_MAX entries. */
         if (r.type == 3 && r.integer > IXFR_JOURNAL_MAX) {
-            resp_reply_t r2;
+            vkc_reply_t r2;
             char ltrim_idx[32];
             snprintf(ltrim_idx, sizeof(ltrim_idx), "%d", -IXFR_JOURNAL_MAX);
-            resp_cmd(&vk, &r2, 4, "LTRIM", key, ltrim_idx, "-1");
+            vkc_cmd(&vk, &r2, 4, "LTRIM", key, ltrim_idx, "-1");
         }
     }
     pthread_mutex_unlock(&g_vk_mutex);
@@ -9369,8 +9292,8 @@ static int ixfr_journal_fetch(const char *zone, uint32_t from_serial, uint32_t c
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
     }
-    resp_reply_t r;
-    resp_cmd(&vk, &r, 4, "LRANGE", key, "0", "-1");
+    vkc_reply_t r;
+    vkc_cmd(&vk, &r, 4, "LRANGE", key, "0", "-1");
     if (r.type != 5 || r.count <= 0) {
         pthread_mutex_unlock(&g_vk_mutex);
         return -1;
@@ -9379,8 +9302,8 @@ static int ixfr_journal_fetch(const char *zone, uint32_t from_serial, uint32_t c
     char **all = calloc((size_t) count, sizeof(char *));
     int na = 0;
     for (int i = 0; i < count; i++) {
-        resp_reply_t er;
-        if (resp_parse(&vk, &er) < 0)
+        vkc_reply_t er;
+        if (vkc_parse(&vk, &er) < 0)
             break;
         if (er.type == 2 && all) {
             char *dup = strdup(er.str);
@@ -9485,30 +9408,30 @@ static int vk_keys_scan_impl(const char *pattern, char ***out) {
     int cap = 0, n = 0, ok = 1;
     char cursor[32] = "0";
     do {
-        resp_reply_t r;
-        if (resp_cmd(&vk, &r, 6, "SCAN", cursor, "MATCH", pattern, "COUNT", "500") < 0 ||
+        vkc_reply_t r;
+        if (vkc_cmd(&vk, &r, 6, "SCAN", cursor, "MATCH", pattern, "COUNT", "500") < 0 ||
             r.type != 5 || r.count != 2) {
-            vk.fd = -1;
+            vkc_drop(&vk);
             ok = 0;
             break;
         }
-        resp_reply_t cr;
-        if (resp_parse(&vk, &cr) < 0 || cr.type != 2) {
-            vk.fd = -1;
+        vkc_reply_t cr;
+        if (vkc_parse(&vk, &cr) < 0 || cr.type != 2) {
+            vkc_drop(&vk);
             ok = 0;
             break;
         }
         safe_strcpy(cursor, cr.str, sizeof(cursor));
-        resp_reply_t kr_arr;
-        if (resp_parse(&vk, &kr_arr) < 0 || kr_arr.type != 5) {
-            vk.fd = -1;
+        vkc_reply_t kr_arr;
+        if (vkc_parse(&vk, &kr_arr) < 0 || kr_arr.type != 5) {
+            vkc_drop(&vk);
             ok = 0;
             break;
         }
         for (int i = 0; i < kr_arr.count; i++) {
-            resp_reply_t kr;
-            if (resp_parse(&vk, &kr) < 0) {
-                vk.fd = -1;
+            vkc_reply_t kr;
+            if (vkc_parse(&vk, &kr) < 0) {
+                vkc_drop(&vk);
                 ok = 0;
                 break;
             }
@@ -9967,7 +9890,7 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
              * of this type reflects one consistent Valkey instant — a
              * concurrent UPDATE can no longer make this type's transfer
              * straddle two different zone states. Compact reply buffers
-             * (axfr_reply_t, 768B) rather than an array of full resp_reply_t
+             * (axfr_reply_t, 768B) rather than an array of full vkc_reply_t
              * (64KB each) — this type can have thousands of keys. */
             int per_key = 1; /* GET only: ddns leases carry DDNS_ZONE_TTL */
             axfr_reply_t *replies = calloc((size_t) nk * (size_t) per_key, sizeof(*replies));
@@ -9975,10 +9898,10 @@ static void axfr_send_runtime(int fd, SSL *ssl, uint16_t qid, const char *zname,
             if (replies) {
                 pthread_mutex_lock(&g_vk_mutex);
                 if (valkey_ensure(&vk) >= 0) {
-                    resp_txn_t t;
-                    resp_txn_begin(&t, &vk);
+                    vkc_txn_t t;
+                    vkc_txn_begin(&t, &vk);
                     for (int i = 0; i < nk; i++) {
-                        resp_txn_queue(&t, 2, "GET", keys[i]);
+                        vkc_txn_queue(&t, 2, "GET", keys[i]);
                     }
                     fetched = resp_txn_commit_compact(&t, replies, nk * per_key);
                 }
@@ -12074,8 +11997,12 @@ static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len
         return -1;
     const dns_hdr_t *h = (const dns_hdr_t *) pkt;
     uint16_t op = ntohs(h->flags) & DNS_OPCODE_MASK;
-    if (op == DNS_OPCODE_QUERY)
-        return build_query_resp(pkt, plen, resp, resp_len, is_tcp, cip);
+    if (op == DNS_OPCODE_QUERY) {
+        vk_prefetch_clear();
+        int rc = build_query_resp(pkt, plen, resp, resp_len, is_tcp, cip);
+        vk_prefetch_clear(); /* PERF-003: prefetched values belong to this request only */
+        return rc;
+    }
     if (op == DNS_OPCODE_UPDATE)
         return handle_update(pkt, plen, resp, cip);
     if (op == DNS_OPCODE_NOTIFY) {
@@ -12604,12 +12531,14 @@ static int make_reuseport_udp_socket(int port) {
 }
 
 /* ── UDP out-of-zone forwarding off the listener thread (CLAUDE-forwarder.md) ──
- * A forwardable UDP query is handed to a short-lived detached worker so the
- * upstream round-trip (up to forward_timeout_ms) never blocks the single-thread
- * select() loop (nor stalls a SO_REUSEPORT worker's recv queue). The worker
- * replies with sendto() on the shared listener fd — concurrent sendto on a UDP
- * socket is safe. The in-flight count is capped so a dead upstream cannot
- * accumulate threads. */
+ * A forwardable UDP query is queued for a forwarder thread so the upstream
+ * round-trip (up to forward_timeout_ms) never blocks a UDP worker's recv
+ * queue. The forwarder replies with sendto() on the shared listener fd —
+ * concurrent sendto on a UDP socket is safe. PERF-006: a fixed pool of
+ * FWD_WORKERS threads drains a bounded queue; it used to be one thread
+ * created per forwarded query. In-flight (queued + running) stays capped at
+ * FWD_MAX_INFLIGHT, past which the query is answered SERVFAIL. */
+#define FWD_WORKERS 32
 typedef struct {
     int sock;                    /* listener fd to reply on */
     struct sockaddr_storage cli; /* client to reply to (v4 or v6) */
@@ -12619,8 +12548,7 @@ typedef struct {
     uint8_t pkt[BUF_SIZE];
 } fwd_work_t;
 
-static void *fwd_worker_thread(void *arg) {
-    fwd_work_t *w = (fwd_work_t *) arg;
+static void fwd_handle(fwd_work_t *w) {
     uint8_t resp[BUF_SIZE];
     char cipstr[INET6_ADDRSTRLEN] = "?";
     char qn[256] = "?";
@@ -12676,7 +12604,42 @@ static void *fwd_worker_thread(void *arg) {
     g_fwd_inflight--;
     pthread_mutex_unlock(&g_fwd_mutex);
     free(w);
+}
+
+static fwd_work_t *g_fwd_q[FWD_MAX_INFLIGHT];
+static int g_fwd_qhead = 0;
+static int g_fwd_qlen = 0;
+static int g_fwd_workers = 0; /* started forwarder threads */
+static pthread_cond_t g_fwd_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_fwd_once = PTHREAD_ONCE_INIT;
+
+static void *fwd_pool_thread(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&g_fwd_mutex);
+        while (g_fwd_qlen == 0)
+            pthread_cond_wait(&g_fwd_cond, &g_fwd_mutex);
+        fwd_work_t *w = g_fwd_q[g_fwd_qhead];
+        g_fwd_qhead = (g_fwd_qhead + 1) % FWD_MAX_INFLIGHT;
+        g_fwd_qlen--;
+        pthread_mutex_unlock(&g_fwd_mutex);
+        fwd_handle(w);
+    }
     return NULL;
+}
+
+/* Started on the first forwarded query (forwarding is off by default). */
+static void fwd_pool_start(void) {
+    for (int i = 0; i < FWD_WORKERS; i++) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, fwd_pool_thread, NULL) != 0)
+            break;
+        pthread_detach(tid);
+        g_fwd_workers++;
+    }
+    if (g_fwd_workers == 0)
+        dns_log(LOG_ERR, "[FORWARD] could not start any forwarder thread — forwarding will "
+                         "answer SERVFAIL\n");
 }
 
 /* Reply SERVFAIL directly on the listener fd (used when we can't dispatch). */
@@ -12698,21 +12661,9 @@ static int forward_dispatch_udp(int sock, const uint8_t *pkt, int plen, const st
         return 0;
     if (plen > (int) BUF_SIZE)
         return 0; /* shouldn't happen; let the normal path REFUSE it */
-    pthread_mutex_lock(&g_fwd_mutex);
-    int over = (g_fwd_inflight >= FWD_MAX_INFLIGHT);
-    if (!over)
-        g_fwd_inflight++;
-    pthread_mutex_unlock(&g_fwd_mutex);
-    if (over) {
-        dns_log(LOG_WARNING, "[FORWARD] in-flight cap (%d) reached — SERVFAIL\n", FWD_MAX_INFLIGHT);
-        fwd_servfail_now(sock, pkt, plen, cli, clen);
-        return 1;
-    }
+    pthread_once(&g_fwd_once, fwd_pool_start);
     fwd_work_t *w = malloc(sizeof(*w));
     if (!w) {
-        pthread_mutex_lock(&g_fwd_mutex);
-        g_fwd_inflight--;
-        pthread_mutex_unlock(&g_fwd_mutex);
         fwd_servfail_now(sock, pkt, plen, cli, clen);
         return 1;
     }
@@ -12722,16 +12673,21 @@ static int forward_dispatch_udp(int sock, const uint8_t *pkt, int plen, const st
     w->cip = *cip;
     w->plen = plen;
     memcpy(w->pkt, pkt, (size_t) plen);
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, fwd_worker_thread, w) != 0) {
-        free(w);
-        pthread_mutex_lock(&g_fwd_mutex);
-        g_fwd_inflight--;
-        pthread_mutex_unlock(&g_fwd_mutex);
-        fwd_servfail_now(sock, pkt, plen, cli, clen);
-        return 1;
+    pthread_mutex_lock(&g_fwd_mutex);
+    /* in-flight counts queued + running, so the queue (same size) never overflows */
+    int over = g_fwd_workers == 0 || g_fwd_inflight >= FWD_MAX_INFLIGHT;
+    if (!over) {
+        g_fwd_inflight++;
+        g_fwd_q[(g_fwd_qhead + g_fwd_qlen) % FWD_MAX_INFLIGHT] = w;
+        g_fwd_qlen++;
+        pthread_cond_signal(&g_fwd_cond);
     }
-    pthread_detach(tid);
+    pthread_mutex_unlock(&g_fwd_mutex);
+    if (over) {
+        free(w);
+        dns_log(LOG_WARNING, "[FORWARD] in-flight cap (%d) reached — SERVFAIL\n", FWD_MAX_INFLIGHT);
+        fwd_servfail_now(sock, pkt, plen, cli, clen);
+    }
     return 1;
 }
 
@@ -12786,7 +12742,7 @@ static int udp_serve_one(const uint8_t *pkt, int nn, const client_addr_t *ca, ui
 static void *udp_worker_thread(void *arg) {
     udp_worker_t *w = (udp_worker_t *) arg;
     /* This worker's private Valkey connection — vk_get() now runs lock-free. */
-    resp_conn_t conn = {.fd = -1};
+    vkc_conn_t conn = {.fd = -1};
     t_vk_conn = &conn;
 
     int batch = g_udp_rx_batch;
@@ -12974,6 +12930,8 @@ int main(int argc, char **argv) {
     /* In-process record cache: allocate once here if enabled at boot. */
     if (g_rcache_ttl > 0)
         rcache_init(g_rcache_size);
+    if (g_stale_size > 0)
+        stale_init(g_stale_size);
 
     /* Phase 2b: Populate multi-zone table (primary seed + zone_table:*) */
     seed_primary_zone();

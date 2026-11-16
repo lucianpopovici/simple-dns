@@ -1,0 +1,5 @@
+positive-hot   79991.855100 qps
+positive-spread 64802.631612 qps
+nxdomain       34989.288086 qps
+nxdomain-do    13063.053307 qps
+mixed          39990.054258 qps
