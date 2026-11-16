@@ -214,7 +214,9 @@ are rejected (step 1); advertised KSK key tags change by +1 (step 3); online
 NSEC3 is no longer produced if D1 = Option A (step 3).
 
 **Performance observations (PERF-001..007, not security):** sequence after
-Phase 0b, not inside it. PERF-001 (PING before every Valkey command) and
+Phase 0b, not inside it. **DONE 2026-11-16 (except PERF-004, see
+`CLAUDE-perf.md` P7) together with the `vkc_` repoint of dnsd and resolverd —
+`CLAUDE-perf.md`; about 3–5× UDP and 14× TCP throughput.** PERF-001 (PING before every Valkey command) and
 PERF-002 (64 KB reply zeroing per command) are two small edits worth ~2× on
 dnsd, but both sit in `dns_server.c`'s private RESP client — fold them into
 the deferred `vkc_` repoint of `dns_server.c` rather than patching the copy

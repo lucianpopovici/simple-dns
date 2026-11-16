@@ -556,6 +556,20 @@ jobs:
           DNS_VALKEY_PORT: 6379
         run: make check-reload-tsan OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: dnsd serve-stale during a Valkey outage (PERF-007)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-dnsd-serve-stale OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: dnsd reconnects after Valkey restarts, no fd leak (PERF-001)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-valkey-reconnect OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: Daemon logs (on failure)
         if: failure()
         run: |

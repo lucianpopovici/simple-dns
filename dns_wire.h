@@ -598,6 +598,8 @@ typedef struct {
     int fd;
     char rbuf[VKC_BUF];
     int rlen, rpos;
+    long long retry_after_ms; /* after a failed connect: no new attempt before this
+                               * (CLOCK_MONOTONIC ms; 0 = no back-off) */
 } vkc_conn_t;
 
 typedef struct {
@@ -679,10 +681,23 @@ int vkc_scan_keys(vkc_conn_t *c, const char *pattern, char out[][256], int maxke
  * resolve, connect, or a rejected AUTH). */
 int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass);
 
-/* PING an existing connection; reconnect via vkc_connect_to on any failure
- * (including c->fd < 0, i.e. never connected). The common lazy-connect entry
- * point for a request/reply-style vk_get/vk_set pair. */
+/* Connect if there is no connection (c->fd < 0); an existing connection is
+ * trusted as-is — no PING round trip per command (PERF-001). A dead
+ * connection shows up as a failed command: use vkc_call_to, which reconnects,
+ * or vkc_drop it yourself. */
 int vkc_ensure_to(vkc_conn_t *c, const char *host, int port, const char *pass);
+
+/* Close the connection (if any) and mark it unconnected. Use this instead of
+ * `c->fd = -1`, which leaked the descriptor. */
+void vkc_drop(vkc_conn_t *c);
+
+/* One command with lazy connect: ensure, send, read the reply. On an I/O
+ * failure the connection is dropped and — only if `retry` is non-zero and the
+ * connection was not opened by this call — reopened and the command sent
+ * once more. Pass retry=1 only for idempotent commands (GET, SET, DEL, EXISTS,
+ * TTL, SCAN, ...): a lost reply to INCR may mean it ran. 0 / -1. */
+int vkc_call_to(vkc_conn_t *c, const char *host, int port, const char *pass, int retry,
+                vkc_reply_t *r, int argc, ...);
 
 /* Per-key callback for a live keyspace-notification pmessage. `key` has the
  * "__keyspace@<db>__:" channel prefix already stripped — just the Valkey key

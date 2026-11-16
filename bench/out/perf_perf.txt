@@ -1,0 +1,6 @@
+positive-hot     197272.511757 qps   NOERROR 1972994 (100.00%)
+positive-spread  132219.502924 qps   NOERROR 1322296 (99.99%), NXDOMAIN 132 (0.01%)
+nxdomain         50858.264639 qps   NXDOMAIN 508811 (100.00%)
+nxdomain-do      25850.511015 qps   NOERROR 258925 (100.00%)
+mixed            90936.127423 qps   NOERROR 454726 (49.99%), NXDOMAIN 454936 (50.01%)
+positive-tcp     237351.010868 qps   NOERROR 2383401 (100.00%)

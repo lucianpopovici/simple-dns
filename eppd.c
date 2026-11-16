@@ -122,8 +122,8 @@ static int vk_get(const char *key, char *out, int olen) {
         return 0;
     }
     vkc_reply_t r;
-    if (vkc_cmd(&g_vk, &r, 2, "GET", key) < 0) {
-        g_vk.fd = -1;
+    if (vkc_call_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 2, "GET", key) < 0) {
+        vkc_drop(&g_vk);
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }
@@ -141,7 +141,9 @@ static int vk_set(const char *key, const char *val) {
         return 0;
     }
     vkc_reply_t r;
-    int ok = vkc_cmd(&g_vk, &r, 3, "SET", key, val) == 0 && r.type == 0;
+    int ok = vkc_call_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 3, "SET", key,
+                         val) == 0 &&
+             r.type == 0;
     pthread_mutex_unlock(&g_vk_mutex);
     return ok;
 }
@@ -153,7 +155,8 @@ static int vk_incr(const char *key) {
         return -1;
     }
     vkc_reply_t r;
-    int ok = vkc_cmd(&g_vk, &r, 2, "INCR", key) == 0;
+    int ok =
+        vkc_call_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass, 0, &r, 2, "INCR", key) == 0;
     pthread_mutex_unlock(&g_vk_mutex);
     return ok ? 0 : -1;
 }
@@ -169,7 +172,8 @@ static int vk_del(const char *key) {
         return 0;
     }
     vkc_reply_t r;
-    int ok = vkc_cmd(&g_vk, &r, 2, "DEL", key) == 0;
+    int ok =
+        vkc_call_to(&g_vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 2, "DEL", key) == 0;
     pthread_mutex_unlock(&g_vk_mutex);
     return ok;
 }

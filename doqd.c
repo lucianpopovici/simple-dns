@@ -114,8 +114,8 @@ static int vk_get(const char *key, char *out, int olen) {
         return 0;
     }
     vkc_reply_t r;
-    if (vkc_cmd(&vk, &r, 2, "GET", key) < 0) {
-        vk.fd = -1;
+    if (vkc_call_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass, 1, &r, 2, "GET", key) < 0) {
+        vkc_drop(&vk);
         pthread_mutex_unlock(&g_vk_mutex);
         return 0;
     }

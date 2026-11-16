@@ -12,6 +12,11 @@
 #include <stdio.h>
 #include <stdarg.h> /* vkc_cmd/vkc_send_cmd varargs */
 #include <unistd.h> /* close, sleep */
+#include <time.h>   /* clock_gettime — vkc reconnect back-off */
+#include <poll.h>   /* vkc_ensure_to liveness check */
+#ifndef POLLRDHUP
+#define POLLRDHUP 0 /* without _GNU_SOURCE: EOF still shows as POLLIN */
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -2044,7 +2049,13 @@ int vkc_parse(vkc_conn_t *c, vkc_reply_t *r) {
     char line[512];
     if (vkc_readline(c, line, sizeof(line)) < 0)
         return -1;
-    memset(r, 0, sizeof(*r));
+    /* Reset the scalar fields only: zeroing the whole reply cost a 64 KB
+     * memset per command (PERF-002). Every branch below sets str's terminator
+     * whenever it sets str. */
+    r->type = 0;
+    r->integer = 0;
+    r->count = 0;
+    r->str[0] = 0;
     switch (line[0]) {
         case '+':
             r->type = 0;
@@ -2099,19 +2110,53 @@ int vkc_send(vkc_conn_t *c, const char *cmd, int len) {
     return 0;
 }
 
-int vkc_cmd_v(vkc_conn_t *c, vkc_reply_t *r, int argc, va_list ap) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+/* Encode one RESP array command. Uses `stackbuf` when it fits, else a heap
+ * buffer (returned; caller frees it when != stackbuf). NULL on failure. */
+static char *vkc_encode(int argc, va_list ap, char *stackbuf, size_t stackcap, int *len) {
+    va_list cp;
+    va_copy(cp, ap);
+    size_t need = 32;
+    for (int i = 0; i < argc; i++) {
+        const char *a = va_arg(cp, const char *);
+        need += strlen(a) + 32;
+    }
+    va_end(cp);
+    if (need > (size_t) 64 * 1024 * 1024) {
+        return NULL;
+    }
+    char *buf = need <= stackcap ? stackbuf : malloc(need);
+    if (!buf)
+        return NULL;
+    size_t pos = (size_t) snprintf(buf, need, "*%d\r\n", argc);
     for (int i = 0; i < argc; i++) {
         const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf))
-            return -1;
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
+        size_t al = strlen(a);
+        int n = snprintf(buf + pos, need - pos, "$%zu\r\n", al);
+        if (n < 0 || pos + (size_t) n + al + 2 >= need) {
+            if (buf != stackbuf)
+                free(buf);
+            return NULL;
+        }
+        pos += (size_t) n;
+        memcpy(buf + pos, a, al);
+        pos += al;
+        buf[pos++] = '\r';
+        buf[pos++] = '\n';
     }
-    if (pos < 0 || pos >= (int) sizeof(buf))
+    *len = (int) pos;
+    return buf;
+}
+
+int vkc_cmd_v(vkc_conn_t *c, vkc_reply_t *r, int argc, va_list ap) {
+    char sbuf[8192];
+    int len = 0;
+    char *buf = vkc_encode(argc, ap, sbuf, sizeof(sbuf), &len);
+    if (!buf)
         return -1;
-    if (vkc_send(c, buf, pos) < 0)
+    int rc = vkc_send(c, buf, len);
+    if (buf != sbuf)
+        free(buf);
+    if (rc < 0)
         return -1;
     return vkc_parse(c, r);
 }
@@ -2125,23 +2170,18 @@ int vkc_cmd(vkc_conn_t *c, vkc_reply_t *r, int argc, ...) {
 }
 
 int vkc_send_cmd(vkc_conn_t *c, int argc, ...) {
-    char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "*%d\r\n", argc);
+    char sbuf[8192];
+    int len = 0;
     va_list ap;
     va_start(ap, argc);
-    for (int i = 0; i < argc; i++) {
-        const char *a = va_arg(ap, const char *);
-        int al = (int) strlen(a);
-        if (pos < 0 || pos >= (int) sizeof(buf)) {
-            va_end(ap);
-            return -1;
-        }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "$%d\r\n%s\r\n", al, a);
-    }
+    char *buf = vkc_encode(argc, ap, sbuf, sizeof(sbuf), &len);
     va_end(ap);
-    if (pos < 0 || pos >= (int) sizeof(buf))
+    if (!buf)
         return -1;
-    return vkc_send(c, buf, pos);
+    int rc = vkc_send(c, buf, len);
+    if (buf != sbuf)
+        free(buf);
+    return rc;
 }
 
 void vkc_txn_begin(vkc_txn_t *t, vkc_conn_t *c) {
@@ -2150,7 +2190,7 @@ void vkc_txn_begin(vkc_txn_t *t, vkc_conn_t *c) {
     vkc_reply_t r;
     int rc = vkc_cmd(c, &r, 1, "MULTI");
     if (rc < 0) {
-        c->fd = -1;
+        vkc_drop(c);
         t->err = 1;
     } else if (r.type != 0) {
         t->err = 1;
@@ -2166,7 +2206,7 @@ void vkc_txn_queue(vkc_txn_t *t, int argc, ...) {
     int rc = vkc_cmd_v(t->c, &r, argc, ap);
     va_end(ap);
     if (rc < 0) {
-        t->c->fd = -1;
+        vkc_drop(t->c);
         t->err = 1;
     } else if (r.type != 0) { /* expect +QUEUED */
         t->err = 1;
@@ -2185,14 +2225,14 @@ int vkc_txn_commit(vkc_txn_t *t, vkc_reply_t *out) {
     }
     vkc_reply_t r;
     if (vkc_cmd(t->c, &r, 1, "EXEC") < 0) {
-        t->c->fd = -1;
+        vkc_drop(t->c);
         return -1;
     }
     if (r.type != 5 || r.count != t->n)
         return -1; /* nil (aborted by the server) or reply-count mismatch */
     for (int i = 0; i < t->n; i++) {
         if (vkc_parse(t->c, &out[i]) < 0) {
-            t->c->fd = -1;
+            vkc_drop(t->c);
             return -1;
         }
     }
@@ -2219,24 +2259,24 @@ int vkc_scan_keys(vkc_conn_t *c, const char *pattern, char out[][256], int maxke
         vkc_reply_t r;
         if (vkc_cmd(c, &r, 6, "SCAN", cursor, "MATCH", pattern, "COUNT", "500") < 0 ||
             r.type != 5 || r.count != 2) {
-            c->fd = -1;
+            vkc_drop(c);
             return -1;
         }
         vkc_reply_t cr;
         if (vkc_parse(c, &cr) < 0 || cr.type != 2) {
-            c->fd = -1;
+            vkc_drop(c);
             return -1;
         }
         vkc_bounded_copy(cursor, sizeof(cursor), cr.str);
         vkc_reply_t kr_arr;
         if (vkc_parse(c, &kr_arr) < 0 || kr_arr.type != 5) {
-            c->fd = -1;
+            vkc_drop(c);
             return -1;
         }
         for (int i = 0; i < kr_arr.count; i++) {
             vkc_reply_t kr;
             if (vkc_parse(c, &kr) < 0) {
-                c->fd = -1;
+                vkc_drop(c);
                 return -1;
             }
             if (kr.type == 2 && n < maxkeys) {
@@ -2250,18 +2290,41 @@ int vkc_scan_keys(vkc_conn_t *c, const char *pattern, char out[][256], int maxke
     return n;
 }
 
+static long long vkc_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+#define VKC_CONNECT_TIMEOUT_MS 1000
+#define VKC_RECONNECT_BACKOFF_MS 1000
+
+static int vkc_connect_once(vkc_conn_t *c, const char *host, int port, const char *pass);
+
+/* Wraps the connect with a back-off: after a failure, calls within
+ * VKC_RECONNECT_BACKOFF_MS fail at once instead of each paying a connect
+ * timeout (PERF-007: a Valkey outage stalled every query for seconds). */
 int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass) {
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
+    long long now = vkc_now_ms();
+    if (c->retry_after_ms && now < c->retry_after_ms) {
+        vkc_drop(c);
+        return -1;
     }
-    c->rlen = c->rpos = 0;
+    int rc = vkc_connect_once(c, host, port, pass);
+    c->retry_after_ms = rc == 0 ? 0 : now + VKC_RECONNECT_BACKOFF_MS;
+    return rc;
+}
+
+static int vkc_connect_once(vkc_conn_t *c, const char *host, int port, const char *pass) {
+    vkc_drop(c);
     c->fd = socket(AF_INET, SOCK_STREAM, 0);
     if (c->fd < 0)
         return -1;
+    /* On Linux SO_SNDTIMEO also bounds connect(); commands get 4 s after. */
+    struct timeval ctv = {.tv_sec = 0, .tv_usec = VKC_CONNECT_TIMEOUT_MS * 1000};
     struct timeval tv = {.tv_sec = 4};
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
     struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t) port)};
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
         struct addrinfo hints = {0}, *res;
@@ -2282,6 +2345,7 @@ int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass) 
         c->fd = -1;
         return -1;
     }
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     vkc_reply_t r;
     if (pass && pass[0]) {
         if (vkc_cmd(c, &r, 2, "AUTH", pass) < 0 || r.type == 1) {
@@ -2295,12 +2359,45 @@ int vkc_connect_to(vkc_conn_t *c, const char *host, int port, const char *pass) 
 }
 
 int vkc_ensure_to(vkc_conn_t *c, const char *host, int port, const char *pass) {
+    if (c->fd >= 0) {
+        /* Zero-RTT liveness check instead of a PING (PERF-001): an idle
+         * request/reply connection has nothing to read, so readable means the
+         * server closed it (EOF) or left stray bytes (desync), and HUP/ERR
+         * mean it is gone — reconnect in all of those cases. */
+        struct pollfd p = {.fd = c->fd, .events = POLLIN | POLLRDHUP};
+        if (c->rpos < c->rlen ||
+            (poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLRDHUP | POLLHUP | POLLERR))))
+            vkc_drop(c);
+    }
     if (c->fd < 0)
         return vkc_connect_to(c, host, port, pass);
-    vkc_reply_t r;
-    if (vkc_cmd(c, &r, 1, "PING") < 0)
-        return vkc_connect_to(c, host, port, pass);
     return 0;
+}
+
+void vkc_drop(vkc_conn_t *c) {
+    if (c->fd >= 0)
+        close(c->fd);
+    c->fd = -1;
+    c->rlen = c->rpos = 0;
+}
+
+int vkc_call_to(vkc_conn_t *c, const char *host, int port, const char *pass, int retry,
+                vkc_reply_t *r, int argc, ...) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int fresh = c->fd < 0;
+        if (vkc_ensure_to(c, host, port, pass) < 0)
+            return -1;
+        va_list ap;
+        va_start(ap, argc);
+        int rc = vkc_cmd_v(c, r, argc, ap);
+        va_end(ap);
+        if (rc == 0)
+            return 0;
+        vkc_drop(c);
+        if (!retry || fresh)
+            return -1; /* a fresh connection failing again is not stale-socket noise */
+    }
+    return -1;
 }
 
 /* Generic keyspace-notification subscriber loop — the shape shared by every
