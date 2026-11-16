@@ -2,7 +2,8 @@
  *
  * Terminates QUIC/UDP 853 and relays the framed DNS message to dnsd's
  * loopback DNS port (UDP, TCP retry when dnsd's reply is truncated) — the
- * exact pattern apid already uses for DoH (apid.c dns_forward/handle_doh).
+ * exact pattern apid already uses for DoH (libdnswire dns_relay_loopback,
+ * with a PROXY v2 header carrying the QUIC peer's address).
  * doqd never parses the DNS payload itself; it only understands RFC 9250's
  * stream framing (a 2-octet length prefix, identical to DoT/TCP framing).
  *
@@ -49,6 +50,7 @@
 #include <openssl/quic.h>
 
 #include "dns_wire.h"
+#include "sandbox.h"
 
 #define MAX_PEM 65536
 #define DOQ_MAX_MSG 65535 /* a DNS message's own 16-bit length ceiling */
@@ -122,71 +124,6 @@ static int vk_get(const char *key, char *out, int olen) {
         return 0;
     safe_strcpy(out, r.str, olen);
     return 1;
-}
-
-/* ── DNS forwarding to dnsd over loopback (lifted from apid.c dns_forward,
- * same contract: UDP first, TCP retry on TC, never parses the payload) ──── */
-static int dns_forward(const uint8_t *q, int qlen, uint8_t *resp, int rmax) {
-    if (qlen < 12)
-        return -1;
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t) g_dns_port)};
-    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = 3};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    int rlen = -1;
-    if (sendto(fd, q, (size_t) qlen, 0, (struct sockaddr *) &sa, sizeof(sa)) == qlen) {
-        ssize_t n = recv(fd, resp, (size_t) rmax, 0);
-        if (n >= 12)
-            rlen = (int) n;
-    }
-    close(fd);
-    if (rlen < 12)
-        return -1;
-    if (!(resp[2] & 0x02))
-        return rlen; /* no TC — done */
-    int tfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (tfd < 0)
-        return rlen;
-    setsockopt(tfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(tfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(tfd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
-        close(tfd);
-        return rlen;
-    }
-    uint8_t lp[2] = {(uint8_t) (qlen >> 8), (uint8_t) (qlen & 0xFF)};
-    if (send(tfd, lp, 2, MSG_NOSIGNAL) != 2 || send(tfd, q, (size_t) qlen, MSG_NOSIGNAL) != qlen) {
-        close(tfd);
-        return rlen;
-    }
-    uint8_t lr[2];
-    int got = 0;
-    while (got < 2) {
-        ssize_t n = recv(tfd, lr + got, (size_t) (2 - got), 0);
-        if (n <= 0) {
-            close(tfd);
-            return rlen;
-        }
-        got += (int) n;
-    }
-    int tlen = (lr[0] << 8) | lr[1];
-    if (tlen < 12 || tlen > rmax) {
-        close(tfd);
-        return rlen;
-    }
-    got = 0;
-    while (got < tlen) {
-        ssize_t n = recv(tfd, resp + got, (size_t) (tlen - got), 0);
-        if (n <= 0) {
-            close(tfd);
-            return rlen;
-        }
-        got += (int) n;
-    }
-    close(tfd);
-    return tlen;
 }
 
 /* ── RFC 9250 §4.2 stream framing — a pure function, fuzzed without a live
@@ -389,7 +326,7 @@ static void doqd_keyspace_on_key(const char *key, void *ctx) {
  * §4.2): read to the client's FIN, validate framing (doq_frame_next), fail
  * closed on anything malformed (reset the stream, never forward a partial/
  * extra message), otherwise forward to dnsd and relay the answer back. */
-static void doq_handle_stream(SSL *stream) {
+static void doq_handle_stream(SSL *stream, const struct sockaddr *peer) {
     int stype = SSL_get_stream_type(stream);
     if (stype != SSL_STREAM_TYPE_BIDI) {
         /* RFC 9250 §4.2: unidirectional streams are reserved. A peer that
@@ -444,7 +381,9 @@ static void doq_handle_stream(SSL *stream) {
     }
 
     uint8_t resp[DOQ_MAX_MSG];
-    int rlen = dns_forward(msg, msglen, resp, (int) sizeof(resp));
+    /* PROXY v2 header carries the QUIC peer so dnsd judges the real DoQ client
+     * (CSA-AUTH-006); relay shared with apid in libdnswire. */
+    int rlen = dns_relay_loopback(g_dns_port, peer, msg, msglen, resp, (int) sizeof(resp));
     free(buf);
     if (rlen < 0) {
         SSL_STREAM_RESET_ARGS rargs = {.quic_error_code = DOQ_INTERNAL_ERROR};
@@ -468,14 +407,48 @@ static void doq_handle_stream(SSL *stream) {
  * a later optimisation, not a correctness requirement (RFC 9250 doesn't
  * order streams, and OpenSSL's CCM/TACM concurrency model would allow it
  * without any protocol-level change). */
+/* The QUIC peer's address as a sockaddr (0 on failure). */
+static int doq_peer_sockaddr(SSL *conn, struct sockaddr_storage *ss) {
+    memset(ss, 0, sizeof(*ss));
+    BIO_ADDR *ba = BIO_ADDR_new();
+    if (!ba)
+        return 0;
+    int ok = 0;
+    if (SSL_get_peer_addr(conn, ba) == 1) {
+        int fam = BIO_ADDR_family(ba);
+        size_t alen = 0;
+        if (fam == AF_INET) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *) ss;
+            alen = sizeof(s4->sin_addr);
+            if (BIO_ADDR_rawaddress(ba, &s4->sin_addr, &alen) == 1) {
+                s4->sin_family = AF_INET;
+                s4->sin_port = BIO_ADDR_rawport(ba);
+                ok = 1;
+            }
+        } else if (fam == AF_INET6) {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *) ss;
+            alen = sizeof(s6->sin6_addr);
+            if (BIO_ADDR_rawaddress(ba, &s6->sin6_addr, &alen) == 1) {
+                s6->sin6_family = AF_INET6;
+                s6->sin6_port = BIO_ADDR_rawport(ba);
+                ok = 1;
+            }
+        }
+    }
+    BIO_ADDR_free(ba);
+    return ok;
+}
+
 static void *doq_conn_thread(void *arg) {
     SSL *conn = arg;
     SSL_set_incoming_stream_policy(conn, SSL_INCOMING_STREAM_POLICY_ACCEPT, 0);
+    struct sockaddr_storage peer;
+    int have_peer = doq_peer_sockaddr(conn, &peer);
     for (;;) {
         SSL *stream = SSL_accept_stream(conn, 0);
         if (!stream)
             break; /* connection closed/terminated */
-        doq_handle_stream(stream);
+        doq_handle_stream(stream, have_peer ? (struct sockaddr *) &peer : NULL);
     }
     SSL_free(conn);
     pthread_mutex_lock(&g_conn_count_mutex);
@@ -484,12 +457,13 @@ static void *doq_conn_thread(void *arg) {
     return NULL;
 }
 
-static void *doq_listen_thread(void *arg) {
-    (void) arg;
+/* Bound in main() before sandbox_apply() (853/udp needs root); the listener
+ * thread only serves it. Returns the socket or -1. */
+static int doq_bind(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         dns_log(LOG_ERR, "[DoQ] socket failed: %s\n", strerror(errno));
-        return NULL;
+        return -1;
     }
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -499,8 +473,13 @@ static void *doq_listen_thread(void *arg) {
     if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
         dns_log(LOG_ERR, "[DoQ] bind :%d/udp failed: %s\n", g_doq_port, strerror(errno));
         close(fd);
-        return NULL;
+        return -1;
     }
+    return fd;
+}
+
+static void *doq_listen_thread(void *arg) {
+    int fd = (int) (intptr_t) arg;
 
     pthread_mutex_lock(&g_tls_mutex);
     SSL_CTX *ctx = g_doq_ctx;
@@ -610,6 +589,22 @@ static int schema_gate(void) {
 }
 
 #ifndef UNIT_TEST
+/* CSA-SBX-002: doqd terminates untrusted QUIC/TLS, so it confines itself
+ * once its socket is bound: privilege drop (when started as root), optional
+ * chroot/mountns, seccomp. Config: config:doqd_{chroot_dir,isolation_mode,
+ * privdrop_user,privdrop_group,seccomp_mode}, env DOQD_{CHROOT,ISOLATION,
+ * USER,GROUP,SECCOMP}, read before confinement. seccomp defaults to audit
+ * until a syscall harvest validates enforce. */
+static void apply_doqd_sandbox(void) {
+    sandbox_config_t sb;
+    sandbox_config_load(&sb, "doqd", "DOQD", vk_get);
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* hostname DNS_VALKEY_HOST */
+    sb.log = dns_log;
+    sb.tag = "doqd";
+    sandbox_apply(&sb);
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -624,6 +619,11 @@ int main(int argc, char **argv) {
     }
     dns_log(LOG_NOTICE, "[doqd] Starting: DoQ :%d/udp, dnsd at 127.0.0.1:%d\n", g_doq_port,
             g_dns_port);
+    int doq_fd = doq_bind();
+    if (doq_fd < 0)
+        return 1;
+    /* Every thread starts after this, so all of them run confined. */
+    apply_doqd_sandbox();
     pthread_t kt, lt;
     static keyspace_watch_config_t kcfg;
     memset(&kcfg, 0, sizeof(kcfg));
@@ -641,7 +641,7 @@ int main(int argc, char **argv) {
     kcfg.tag = "doqd";
     if (pthread_create(&kt, NULL, keyspace_watch_loop, &kcfg) == 0)
         pthread_detach(kt);
-    if (pthread_create(&lt, NULL, doq_listen_thread, NULL) != 0) {
+    if (pthread_create(&lt, NULL, doq_listen_thread, (void *) (intptr_t) doq_fd) != 0) {
         dns_log(LOG_ERR, "[DoQ] failed to start listener thread\n");
         return 1;
     }

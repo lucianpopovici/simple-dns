@@ -1272,6 +1272,277 @@ void edns_parse(const uint8_t *pkt, int plen, edns_info_t *ei) {
     }
 }
 
+/* ── Client identity + PROXY v2 + loopback relay ────────────────────────── */
+static const uint8_t k_proxy_v2_sig[PROXY_V2_SIG_LEN] = {0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D,
+                                                         0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A};
+
+void client_from_sockaddr(client_addr_t *c, const struct sockaddr *sa) {
+    memset(c, 0, sizeof(*c));
+    if (!sa)
+        return;
+    if (sa->sa_family == AF_INET) {
+        c->family = AF_INET;
+        c->u.v4 = ((const struct sockaddr_in *) sa)->sin_addr;
+    } else if (sa->sa_family == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *) sa)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(a6)) {
+            c->family = AF_INET;
+            memcpy(&c->u.v4, a6->s6_addr + 12, 4);
+        } else {
+            c->family = AF_INET6;
+            c->u.v6 = *a6;
+        }
+    }
+}
+
+const char *client_ntop(const client_addr_t *c, char *buf, size_t n) {
+    if (!c || (c->family != AF_INET && c->family != AF_INET6) ||
+        !inet_ntop(c->family,
+                   c->family == AF_INET ? (const void *) &c->u.v4 : (const void *) &c->u.v6, buf,
+                   (socklen_t) n))
+        safe_strcpy(buf, "?", n);
+    return buf;
+}
+
+int client_is_loopback(const client_addr_t *c) {
+    if (!c)
+        return 0;
+    if (c->family == AF_INET)
+        return (ntohl(c->u.v4.s_addr) >> 24) == 127;
+    if (c->family == AF_INET6)
+        return IN6_IS_ADDR_LOOPBACK(&c->u.v6);
+    return 0;
+}
+
+/* Parse one ACL entry — "a.b.c.d[/N]" (N 0-32) or an IPv6 address
+ * "x::y[/N]" (N 0-128), surrounding spaces allowed — into family + network
+ * octets + prefix length. Returns 1 on success, 0 if malformed: a malformed
+ * entry matches nothing (fail closed; atoi used to turn "10.0.0.0/x" into
+ * /0 = "everyone", CSA-AUTH-005). Modifies tok. */
+int acl_entry_parse(char *tok, int *fam, uint8_t net[16], int *bits) {
+    while (*tok == ' ' || *tok == '\t')
+        tok++;
+    size_t tl = strlen(tok);
+    while (tl > 0 && (tok[tl - 1] == ' ' || tok[tl - 1] == '\t'))
+        tok[--tl] = 0;
+    int is6 = strchr(tok, ':') != NULL;
+    int maxbits = is6 ? 128 : 32;
+    *bits = maxbits;
+    char *slash = strchr(tok, '/');
+    if (slash) {
+        const char *ps = slash + 1;
+        int nd = 0;
+        int v = 0;
+        while (*ps >= '0' && *ps <= '9' && nd < 4) {
+            v = v * 10 + (*ps - '0');
+            ps++;
+            nd++;
+        }
+        if (nd == 0 || *ps != 0 || v > maxbits)
+            return 0;
+        *bits = v;
+        *slash = 0;
+    }
+    memset(net, 0, 16);
+    if (inet_pton(is6 ? AF_INET6 : AF_INET, tok, net) != 1)
+        return 0;
+    *fam = is6 ? AF_INET6 : AF_INET;
+    return 1;
+}
+
+/* Do the first `bits` bits of a and b agree? */
+static int acl_prefix_match(const uint8_t *a, const uint8_t *b, int bits) {
+    int full = bits / 8;
+    if (full && memcmp(a, b, (size_t) full) != 0)
+        return 0;
+    int rem = bits % 8;
+    if (rem) {
+        uint8_t m = (uint8_t) (0xFF << (8 - rem));
+        if ((a[full] & m) != (b[full] & m))
+            return 0;
+    }
+    return 1;
+}
+
+/* Returns 1 if client `c` matches any entry in a comma-separated list of IPv4
+ * and IPv6 addresses / prefixes ("10.0.0.0/8, 192.168.1.5, 2001:db8::/32").
+ * An entry only matches its own family (v4-mapped clients were normalised to
+ * v4). Shared by the AXFR ACL, the forwarder client ACL and the unsigned-
+ * UPDATE allow-list. An empty list, an unknown client and a malformed entry
+ * match nothing (fail closed). */
+int acl_allows(const char *list, const client_addr_t *c) {
+    if (!list || !list[0] || !c || (c->family != AF_INET && c->family != AF_INET6))
+        return 0;
+    const uint8_t *ca = c->family == AF_INET ? (const uint8_t *) &c->u.v4 : c->u.v6.s6_addr;
+    char allow[1024];
+    safe_strcpy(allow, list, sizeof(allow));
+    char *sp = NULL;
+    for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+        int fam = 0;
+        uint8_t net[16];
+        int bits = 0;
+        if (!acl_entry_parse(tok, &fam, net, &bits) || fam != c->family)
+            continue;
+        if (acl_prefix_match(ca, net, bits))
+            return 1;
+    }
+    return 0;
+}
+
+int proxy_v2_build(uint8_t *out, int cap, const struct sockaddr *src, int dgram) {
+    if (!src || cap < 16)
+        return -1;
+    memcpy(out, k_proxy_v2_sig, PROXY_V2_SIG_LEN);
+    out[12] = 0x21; /* version 2, command PROXY */
+    if (src->sa_family == AF_INET) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *) src;
+        if (cap < 16 + 12)
+            return -1;
+        out[13] = dgram ? 0x12 : 0x11;
+        out[14] = 0;
+        out[15] = 12;
+        memcpy(out + 16, &s4->sin_addr, 4);
+        uint32_t lo = htonl(INADDR_LOOPBACK);
+        memcpy(out + 20, &lo, 4);
+        memcpy(out + 24, &s4->sin_port, 2);
+        memset(out + 26, 0, 2);
+        return 16 + 12;
+    }
+    if (src->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *) src;
+        if (cap < 16 + 36)
+            return -1;
+        out[13] = dgram ? 0x22 : 0x21;
+        out[14] = 0;
+        out[15] = 36;
+        memcpy(out + 16, &s6->sin6_addr, 16);
+        memcpy(out + 32, &in6addr_loopback, 16);
+        memcpy(out + 48, &s6->sin6_port, 2);
+        memset(out + 50, 0, 2);
+        return 16 + 36;
+    }
+    return -1;
+}
+
+int proxy_v2_parse(const uint8_t *buf, int len, client_addr_t *src) {
+    memset(src, 0, sizeof(*src));
+    if (!buf || len < PROXY_V2_SIG_LEN || memcmp(buf, k_proxy_v2_sig, PROXY_V2_SIG_LEN) != 0)
+        return 0;
+    if (len < 16)
+        return -1;
+    uint8_t vc = buf[12];
+    if ((vc >> 4) != 2)
+        return -1; /* only version 2 */
+    int alen = (buf[14] << 8) | buf[15];
+    int total = 16 + alen;
+    if (total > PROXY_V2_MAX_HDR || total > len)
+        return -1;
+    uint8_t cmd = vc & 0x0F;
+    if (cmd == 0x0)
+        return total; /* LOCAL: no client address — keep the real source */
+    if (cmd != 0x1)
+        return -1;
+    uint8_t fam = buf[13] >> 4;
+    if (fam == 0x1) { /* AF_INET */
+        if (alen < 12)
+            return -1;
+        src->family = AF_INET;
+        memcpy(&src->u.v4, buf + 16, 4);
+    } else if (fam == 0x2) { /* AF_INET6 */
+        if (alen < 36)
+            return -1;
+        struct sockaddr_in6 s6;
+        memset(&s6, 0, sizeof(s6));
+        s6.sin6_family = AF_INET6;
+        memcpy(&s6.sin6_addr, buf + 16, 16);
+        client_from_sockaddr(src, (const struct sockaddr *) &s6); /* normalise v4-mapped */
+    }
+    /* AF_UNSPEC / AF_UNIX: no usable address, header still consumed */
+    return total; /* TLVs after the addresses are skipped */
+}
+
+int dns_relay_loopback(int port, const struct sockaddr *client, const uint8_t *q, int qlen,
+                       uint8_t *resp, int rmax) {
+    if (qlen < 12 || qlen > 65535)
+        return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t) port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    uint8_t hdr[64];
+    int hl = client ? proxy_v2_build(hdr, sizeof(hdr), client, 1) : 0;
+    if (hl < 0)
+        hl = 0;
+    uint8_t *dg = malloc((size_t) (hl + qlen));
+    if (!dg)
+        return -1;
+    memcpy(dg, hdr, (size_t) hl);
+    memcpy(dg + hl, q, (size_t) qlen);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        free(dg);
+        return -1;
+    }
+    struct timeval tv = {.tv_sec = 3};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int rlen = -1;
+    if (sendto(fd, dg, (size_t) (hl + qlen), 0, (struct sockaddr *) &sa, sizeof(sa)) == hl + qlen) {
+        ssize_t n = recv(fd, resp, (size_t) rmax, 0);
+        if (n >= 12)
+            rlen = (int) n;
+    }
+    close(fd);
+    free(dg);
+    if (rlen < 12)
+        return -1;
+    if (!(resp[2] & 0x02))
+        return rlen; /* no TC — done */
+    /* Truncated: retry over TCP; the PROXY header (TCP family) goes first. */
+    int tfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (tfd < 0)
+        return rlen;
+    setsockopt(tfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(tfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(tfd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
+        close(tfd);
+        return rlen;
+    }
+    int thl = client ? proxy_v2_build(hdr, sizeof(hdr), client, 0) : 0;
+    uint8_t lp[2] = {(uint8_t) (qlen >> 8), (uint8_t) (qlen & 0xFF)};
+    if ((thl > 0 && send(tfd, hdr, (size_t) thl, MSG_NOSIGNAL) != thl) ||
+        send(tfd, lp, 2, MSG_NOSIGNAL) != 2 || send(tfd, q, (size_t) qlen, MSG_NOSIGNAL) != qlen) {
+        close(tfd);
+        return rlen;
+    }
+    uint8_t lr[2];
+    int got = 0;
+    while (got < 2) {
+        ssize_t n = recv(tfd, lr + got, (size_t) (2 - got), 0);
+        if (n <= 0) {
+            close(tfd);
+            return rlen;
+        }
+        got += (int) n;
+    }
+    int tlen = (lr[0] << 8) | lr[1];
+    if (tlen < 12 || tlen > rmax) {
+        close(tfd);
+        return rlen;
+    }
+    got = 0;
+    while (got < tlen) {
+        ssize_t n = recv(tfd, resp + got, (size_t) (tlen - got), 0);
+        if (n <= 0) {
+            close(tfd);
+            return rlen;
+        }
+        got += (int) n;
+    }
+    close(tfd);
+    return tlen;
+}
+
 uint16_t dnskey_keytag(const uint8_t *rd, int rdlen) {
     uint32_t ac = 0;
     for (int i = 0; i < rdlen; i++)

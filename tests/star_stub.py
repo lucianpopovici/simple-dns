@@ -115,13 +115,24 @@ def main():
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length else b""
             payload = None
+            nonce = None
             if raw:
                 try:
                     jws = json.loads(raw.decode())
+                    prot = json.loads(b64url_decode(jws.get("protected", "")).decode())
+                    nonce = prot.get("nonce")
                     if jws.get("payload"):
                         payload = json.loads(b64url_decode(jws["payload"]).decode())
                 except Exception:
                     payload = None
+            # RFC 8555 §6.5: every JWS must carry a nonce this server issued.
+            # (certd once fetched nonces without its configured CA, so against
+            # a private CA it sent empty ones; this stub accepted them.)
+            if nonce != "testnonce":
+                bump("badNonce")
+                send_json(self, 400, {"type": "urn:ietf:params:acme:error:badNonce",
+                                      "detail": f"bad or missing nonce {nonce!r}"})
+                return
 
             if self.path == "/new-account":
                 bump("/new-account")

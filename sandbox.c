@@ -16,14 +16,48 @@
 #include <grp.h>
 #include <sys/prctl.h>
 #ifdef __linux__
-#include <sched.h>       /* unshare, CLONE_NEWNS */
-#include <sys/mount.h>   /* mount, umount2, MS_* */
-#include <sys/syscall.h> /* SYS_pivot_root */
+#include <sched.h>            /* unshare, CLONE_NEWNS */
+#include <sys/mount.h>        /* mount, umount2, MS_* */
+#include <sys/syscall.h>      /* SYS_pivot_root, SYS_capset */
+#include <linux/capability.h> /* CAP_NET_BIND_SERVICE, capset structs */
 #endif
+#include <stdio.h>  /* snprintf */
+#include <stddef.h> /* offsetof */
 #ifdef HAVE_SECCOMP
 #include <seccomp.h>
 #endif
 #include "dns_wire.h" /* safe_strcpy */
+
+void sandbox_config_load(sandbox_config_t *cfg, const char *daemon, const char *env_prefix,
+                         sandbox_kv_get get) {
+    static const struct {
+        const char *key; /* config:<daemon>_<key> */
+        const char *env; /* <env_prefix>_<env> */
+        size_t off;
+        size_t len;
+    } knobs[] = {
+        {"chroot_dir", "CHROOT", offsetof(sandbox_config_t, chroot_dir),
+         sizeof(((sandbox_config_t *) 0)->chroot_dir)},
+        {"isolation_mode", "ISOLATION", offsetof(sandbox_config_t, isolation_mode),
+         sizeof(((sandbox_config_t *) 0)->isolation_mode)},
+        {"privdrop_user", "USER", offsetof(sandbox_config_t, privdrop_user),
+         sizeof(((sandbox_config_t *) 0)->privdrop_user)},
+        {"privdrop_group", "GROUP", offsetof(sandbox_config_t, privdrop_group),
+         sizeof(((sandbox_config_t *) 0)->privdrop_group)},
+        {"seccomp_mode", "SECCOMP", offsetof(sandbox_config_t, seccomp_mode),
+         sizeof(((sandbox_config_t *) 0)->seccomp_mode)},
+    };
+    memset(cfg, 0, sizeof(*cfg));
+    for (size_t i = 0; i < sizeof(knobs) / sizeof(knobs[0]); i++) {
+        char *buf = (char *) cfg + knobs[i].off;
+        char name[96];
+        snprintf(name, sizeof(name), "config:%s_%s", daemon, knobs[i].key);
+        if (get && !get(name, buf, (int) knobs[i].len))
+            buf[0] = '\0';
+        snprintf(name, sizeof(name), "%s_%s", env_prefix, knobs[i].env);
+        sandbox_env_override(buf, (int) knobs[i].len, name);
+    }
+}
 
 void sandbox_env_override(char *buf, int len, const char *name) {
     const char *v = getenv(name);
@@ -197,11 +231,39 @@ static void drop_privileges(const privdrop_plan_t *p, const sandbox_config_t *cf
                  strerror(errno));
         exit(1);
     }
+#ifdef __linux__
+    /* Keep the permitted set across setuid so CAP_NET_BIND_SERVICE can be
+     * re-raised below; every other capability is cleared by the capset. */
+    if (cfg->keep_net_bind_service && prctl(PR_SET_KEEPCAPS, 1) != 0) {
+        cfg->log(LOG_ERR, "[%s/priv] FATAL: PR_SET_KEEPCAPS failed: %s\n", cfg->tag,
+                 strerror(errno));
+        exit(1);
+    }
+#endif
     if (setuid(p->uid) != 0) {
         cfg->log(LOG_ERR, "[%s/priv] FATAL: setuid(%u) failed: %s\n", cfg->tag, (unsigned) p->uid,
                  strerror(errno));
         exit(1);
     }
+#ifdef __linux__
+    if (cfg->keep_net_bind_service) {
+        struct __user_cap_header_struct hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+        struct __user_cap_data_struct data[2];
+        memset(data, 0, sizeof(data));
+        data[0].permitted = 1u << CAP_NET_BIND_SERVICE;
+        data[0].effective = 1u << CAP_NET_BIND_SERVICE;
+        if (syscall(SYS_capset, &hdr, data) != 0) {
+            cfg->log(LOG_ERR, "[%s/priv] FATAL: capset(CAP_NET_BIND_SERVICE) failed: %s\n",
+                     cfg->tag, strerror(errno));
+            exit(1);
+        }
+        if (prctl(PR_SET_KEEPCAPS, 0) != 0) {
+            cfg->log(LOG_ERR, "[%s/priv] FATAL: clearing PR_SET_KEEPCAPS failed: %s\n", cfg->tag,
+                     strerror(errno));
+            exit(1);
+        }
+    }
+#endif
     /* Verify the drop is irreversible: regaining root must fail. */
     if (setuid(0) == 0 || setgid(0) == 0) {
         cfg->log(LOG_ERR, "[%s/priv] FATAL: privileges not fully dropped (could regain root)\n",
@@ -213,14 +275,15 @@ static void drop_privileges(const privdrop_plan_t *p, const sandbox_config_t *cf
     if (prctl(PR_SET_DUMPABLE, 0) != 0)
         cfg->log(LOG_WARNING, "[%s/priv] PR_SET_DUMPABLE failed: %s\n", cfg->tag, strerror(errno));
 
-    cfg->log(LOG_NOTICE, "[%s/priv] dropped privileges to user '%s' (uid=%u gid=%u)\n", cfg->tag,
-             p->user, (unsigned) p->uid, (unsigned) p->gid);
+    cfg->log(LOG_NOTICE, "[%s/priv] dropped privileges to user '%s' (uid=%u gid=%u)%s\n", cfg->tag,
+             p->user, (unsigned) p->uid, (unsigned) p->gid,
+             cfg->keep_net_bind_service ? ", kept CAP_NET_BIND_SERVICE only" : "");
 }
 
 /* ==========================================================================
  * seccomp syscall filter (sandbox layer 2)
  *
- * Whitelist-based, applied to all threads (libseccomp loads with TSYNC). The
+ * Whitelist-based, applied to all threads (loaded with SCMP_FLTATR_CTL_TSYNC). The
  * base list below was audit-validated for dnsd (SCMP_ACT_LOG, syscall set
  * harvested with strace across UDP/TCP/DoT-TLS/metrics/Valkey/rollover); callers
  * add transport-specific groups via cfg->extra_syscall_groups.
@@ -394,6 +457,18 @@ static void seccomp_install(const sandbox_config_t *cfg) {
         }
     }
 
+    /* CSA-SBX-001: synchronise the filter onto EVERY thread of the process.
+     * Without TSYNC, seccomp_load filters only the calling thread, and any
+     * thread already running (dnsd's keyspace/NOTIFY/XFR threads, resolverd's
+     * workers) stayed unconfined while parsing network input. */
+    if (seccomp_attr_set(ctx, SCMP_FLTATR_CTL_TSYNC, 1) != 0) {
+        cfg->log(LOG_ERR, "[%s/seccomp] cannot enable TSYNC%s\n", cfg->tag,
+                 enforce ? " — refusing to serve with unfiltered threads" : "");
+        if (enforce) {
+            seccomp_release(ctx);
+            exit(1);
+        }
+    }
     if (seccomp_load(ctx) != 0) {
         cfg->log(LOG_ERR, "[%s/seccomp] seccomp_load failed: %s%s\n", cfg->tag, strerror(errno),
                  enforce ? " — refusing to serve without the filter" : " — running unconfined");

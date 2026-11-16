@@ -22,6 +22,9 @@ import time
 import json
 import socket
 import secrets
+import ipaddress
+import threading
+from collections import OrderedDict
 import urllib.request
 import urllib.error
 import argparse
@@ -56,13 +59,89 @@ EXPLORER_WRITE = os.getenv("DASHBOARD_ENABLE_EXPLORER_WRITE", "") in ("1", "true
 SECRET_KEY_RE  = re.compile(r"(^dnssec:|secret|cookie_secret|_key$|key_pem|tsig)", re.I)
 # Endpoints reachable without a session.
 PUBLIC_ENDPOINTS = {"login", "logout", "static", "healthz"}
-# Per-process brute-force throttle: client-ip -> (fail_count, not_before_epoch)
-_login_fails = {}
+
+# CSA-WEB-001: session cookie hardening. Secure unless explicitly disabled for
+# plain-HTTP local use (DASHBOARD_INSECURE_COOKIE=1) — a Secure cookie is not
+# sent back over http:// to anything but localhost.
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=os.getenv("DASHBOARD_INSECURE_COOKIE", "") not in ("1", "true", "yes"),
+)
+CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# Per-process brute-force throttle (CSA-WEB-002): client-ip ->
+# (fail_count, not_before_epoch, last_seen_epoch). Bounded and expiring, so a
+# client rotating addresses cannot grow it without limit.
+LOGIN_TABLE_MAX = int(os.getenv("DASHBOARD_LOGIN_TABLE_MAX", "10000"))
+LOGIN_ENTRY_TTL = 3600
+_login_fails = OrderedDict()
+_login_lock = threading.Lock()
+
+
+def _parse_proxies(spec):
+    nets = []
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            print(f"[dns-dashboard] WARNING: ignoring bad DASHBOARD_TRUSTED_PROXIES entry {tok!r}")
+    return nets
+
+
+# X-Forwarded-For is honoured only when the direct peer is one of these
+# (comma-separated IPs/CIDRs). Empty (the default) = never: any client could
+# otherwise rotate the header to dodge the login back-off.
+TRUSTED_PROXIES = _parse_proxies(os.getenv("DASHBOARD_TRUSTED_PROXIES", ""))
+
+
+def _is_trusted_proxy(addr):
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in n for n in TRUSTED_PROXIES)
 
 
 def _client_ip():
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return (fwd.split(",")[0].strip() if fwd else (request.remote_addr or "?"))
+    peer = request.remote_addr or "?"
+    if not TRUSTED_PROXIES or not _is_trusted_proxy(peer):
+        return peer
+    # Walk the chain right to left, skipping our own proxies: the first hop
+    # that is not a trusted proxy is the client as our proxy saw it.
+    hops = [h.strip() for h in request.headers.get("X-Forwarded-For", "").split(",") if h.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted_proxy(hop):
+            return hop
+    return peer
+
+
+def _throttle_get(ip):
+    with _login_lock:
+        e = _login_fails.get(ip)
+        return (e[0], e[1]) if e else (0, 0)
+
+
+def _throttle_fail(ip, fails, not_before):
+    now = time.time()
+    with _login_lock:
+        _login_fails[ip] = (fails, not_before, now)
+        _login_fails.move_to_end(ip)
+        # expire idle entries (oldest first), then enforce the bound
+        while _login_fails:
+            k, v = next(iter(_login_fails.items()))
+            if now - v[2] <= LOGIN_ENTRY_TTL:
+                break
+            _login_fails.popitem(last=False)
+        while len(_login_fails) > LOGIN_TABLE_MAX:
+            _login_fails.popitem(last=False)
+
+
+def _throttle_clear(ip):
+    with _login_lock:
+        _login_fails.pop(ip, None)
 
 
 def is_secret_key(key: str) -> bool:
@@ -96,6 +175,43 @@ def configure_auth(secret_key: str):
         return ("no dashboard password configured — set DASHBOARD_PASSWORD, "
                 "DASHBOARD_PASSWORD_HASH, or Valkey config:dashboard_password_hash")
     return None
+
+
+def csrf_token() -> str:
+    """Per-session CSRF token (CSA-WEB-001), created on first use."""
+    tok = session.get("_csrf")
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        session["_csrf"] = tok
+    return tok
+
+
+@app.context_processor
+def _csrf_context():
+    return {"csrf_token": csrf_token}
+
+
+_FORM_POST_RE = re.compile(r'(<form\b[^>]*\bmethod="POST"[^>]*>)', re.I)
+_CSRF_INPUT = '<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">'
+
+
+def with_csrf(tmpl: str) -> str:
+    """Add the hidden CSRF field to every POST form in a template string, so
+    no form can be added without it."""
+    return _FORM_POST_RE.sub(lambda m: m.group(1) + _CSRF_INPUT, tmpl)
+
+
+@app.before_request
+def _check_csrf():
+    """Reject a state-changing request whose token does not match the
+    session's (CSA-WEB-001). Runs before the auth gate, so the login form is
+    covered too (no login CSRF)."""
+    if request.method not in CSRF_METHODS:
+        return
+    sent = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
+    want = session.get("_csrf", "")
+    if not want or not sent or not secrets.compare_digest(sent, want):
+        abort(400, description="missing or invalid CSRF token")
 
 
 @app.before_request
@@ -877,7 +993,9 @@ BASE = r"""<!DOCTYPE html>
     {% if current_user %}
     <div class="sidebar-status" style="justify-content:space-between">
       <span style="color:var(--muted,#8a93a3);font-size:.8rem">&#128100; {{ current_user }}</span>
-      <a href="{{ url_for('logout') }}" style="color:var(--muted,#8a93a3);font-size:.8rem">Sign out</a>
+      <form method="POST" action="{{ url_for('logout') }}" style="margin:0">
+        <button type="submit" style="background:none;border:0;padding:0;cursor:pointer;color:var(--muted,#8a93a3);font-size:.8rem">Sign out</button>
+      </form>
     </div>
     {% endif %}
   </nav>
@@ -938,7 +1056,7 @@ function refreshMetrics() {
 def render(template_str: str, **kwargs):
     vk_ok = vk.ping()
     page_title = kwargs.pop("page_title", "DNS Dashboard")
-    return render_template_string(BASE + template_str, vk_ok=vk_ok, page_title=page_title,
+    return render_template_string(with_csrf(BASE + template_str), vk_ok=vk_ok, page_title=page_title,
                                   current_user=session.get("user"), **kwargs)
 
 
@@ -993,17 +1111,17 @@ def login():
     next_url = _safe_next(request.values.get("next", ""))
     if request.method == "POST":
         ip = _client_ip()
-        fails, not_before = _login_fails.get(ip, (0, 0))
+        fails, not_before = _throttle_get(ip)
         if time.time() < not_before:
             flash("Too many attempts — wait a moment and try again.", "error")
-            return render_template_string(LOGIN_TMPL, next_url=next_url), 429
+            return render_template_string(with_csrf(LOGIN_TMPL), next_url=next_url), 429
         user = request.form.get("username", "")
         pw   = request.form.get("password", "")
         ok = (DASH_PW_HASH is not None
               and secrets.compare_digest(user, DASH_USER)
               and check_password_hash(DASH_PW_HASH, pw))
         if ok:
-            _login_fails.pop(ip, None)
+            _throttle_clear(ip)
             session.clear()
             session["authed"] = True
             session["user"] = user
@@ -1013,14 +1131,14 @@ def login():
         # Failure: generic message + escalating backoff (constant-ish time).
         fails += 1
         delay = min(30, 2 ** min(fails, 5)) if fails > 2 else 0
-        _login_fails[ip] = (fails, time.time() + delay)
+        _throttle_fail(ip, fails, time.time() + delay)
         time.sleep(0.5)
         flash("Invalid credentials.", "error")
-        return render_template_string(LOGIN_TMPL, next_url=next_url), 401
-    return render_template_string(LOGIN_TMPL, next_url=next_url)
+        return render_template_string(with_csrf(LOGIN_TMPL), next_url=next_url), 401
+    return render_template_string(with_csrf(LOGIN_TMPL), next_url=next_url)
 
 
-@app.route("/logout", methods=["GET", "POST"])
+@app.route("/logout", methods=["POST"])  # POST + CSRF token: no forced logout via a link
 def logout():
     session.clear()
     flash("Signed out.", "success")

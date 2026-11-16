@@ -195,10 +195,9 @@ typedef struct cache_entry {
     struct cache_entry *hash_next;
 } cache_entry_t;
 
-/* Per-bucket lock */
+/* Hash bucket — guarded by g_cache_mutex (no per-bucket lock; see below) */
 typedef struct {
     cache_entry_t *head;
-    pthread_rwlock_t lock;
     int count;
 } cache_bucket_t;
 
@@ -276,6 +275,11 @@ typedef struct {
     /* Size of the UDP worker pool (RESOLVERD_UDP_WORKERS); resolves queries
      * off the select() loop so one slow miss cannot stall other clients. */
     int udp_workers;
+    /* CSA-AUTH-007: who may query (RESOLVERD_ALLOW / --allow); default
+     * loopback + RFC 1918 + RFC 4193 — never an open resolver by default. */
+    char client_allow[512];
+    int dnssec_enabled; /* --no-dnssec clears it: no validation at all */
+    int mdns_enabled;   /* --no-mdns clears it: .local goes to the upstream */
     /* Persistent cache tier backend (ADR-008 pilot). `valkey` keeps the
      * network cache tier; `objectdb` embeds a WAL-backed object store
      * (removes resolverd's Valkey dependency from the cache path);
@@ -321,11 +325,18 @@ static pthread_mutex_t g_route_mutex = PTHREAD_MUTEX_INITIALIZER;
  * ======================================================================= */
 static config_t g_cfg;
 static cache_bucket_t g_cache[CACHE_BUCKETS];
-static int g_cache_total = 0; /* total entries (approximate) */
-static pthread_mutex_t g_cache_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* CSA-CONC-001: ONE mutex guards the hash chains, the LRU list and
+ * g_cache_total together. The old scheme (per-bucket rwlock + g_lru_mutex +
+ * a count mutex) touched entries after dropping the lock that kept them
+ * alive — insert linked into the LRU after releasing the bucket, lookup
+ * touched the LRU after releasing it, eviction unlinked from the LRU before
+ * taking the bucket — and freed memory was reused under concurrent queries.
+ * Every critical section is a short chain walk, pointer updates or one deep
+ * copy; never hold it across Valkey/objectdb/upstream I/O. */
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_cache_total = 0; /* entries in the in-memory index */
 /* LRU list — head = most recently used, tail = eviction candidate */
 static cache_entry_t *g_lru_head = NULL, *g_lru_tail = NULL;
-static pthread_mutex_t g_lru_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Statistics */
 /* Counters are relaxed atomics: they are monotonic tallies with no
  * cross-counter invariant to protect, so a mutex around each ++ bought
@@ -2384,11 +2395,20 @@ static int response_opt_parse(const uint8_t *pkt, int plen, uint8_t *scookie, in
 /* CSPRNG 16-bit value for transaction IDs and source ports — the resolver's
  * primary anti-spoofing entropy (RFC 5452). rand()/srand(time()) is predictable;
  * fall back to it only if OpenSSL's RNG ever fails (it should not). */
-static uint16_t csprng_u16(void) {
-    uint16_t v;
-    if (RAND_bytes((unsigned char *) &v, sizeof(v)) == 1)
-        return v;
-    return (uint16_t) rand();
+/* A random 16-bit value for DNS message IDs / source ports. Fails closed:
+ * returns -1 when the CSPRNG fails, never a predictable fallback (a guessable
+ * ID or port is the cache-poisoning surface). Test hook: g_csprng_fail. */
+#ifdef UNIT_TEST
+static int g_csprng_fail = 0;
+#endif
+static int csprng_u16(uint16_t *out) {
+#ifdef UNIT_TEST
+    if (g_csprng_fail)
+        return -1;
+#endif
+    if (RAND_bytes((unsigned char *) out, sizeof(*out)) != 1)
+        return -1;
+    return 0;
 }
 
 /* Two DNS names equal ignoring case and a single trailing dot. */
@@ -3051,8 +3071,14 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
                 /* Random source port */
                 struct sockaddr_storage local = {0};
                 local.ss_family = (sa_family_t) res->ai_family;
+                int rng_ok = 1;
                 for (int a = 0; a < 16; a++) {
-                    uint16_t sp = (uint16_t) (1024 + (csprng_u16() % 64511));
+                    uint16_t r16;
+                    if (csprng_u16(&r16) != 0) {
+                        rng_ok = 0; /* fail closed: send nothing from a guessable port */
+                        break;
+                    }
+                    uint16_t sp = (uint16_t) (1024 + (r16 % 64511));
                     if (local.ss_family == AF_INET)
                         ((struct sockaddr_in *) &local)->sin_port = htons(sp);
                     else
@@ -3067,7 +3093,7 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
                 }
                 struct timeval tv2 = {.tv_sec = 3};
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
-                if (connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
+                if (rng_ok && connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
                     send(fd, query, qlen, 0) == qlen)
                     rlen = (int) recv(fd, resp, resp_sz, 0);
                 close(fd);
@@ -3083,7 +3109,12 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
 /* Send a query to one specific upstream (by index). Returns rlen or -1. */
 static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, int resp_sz,
                               int upstream_idx, long *rtt_us_out) {
-    uint16_t id = csprng_u16();
+    uint16_t id;
+    if (csprng_u16(&id) != 0) {
+        fprintf(stderr, "[resolverd] CSPRNG failure — refusing to send a query with a "
+                        "predictable ID\n");
+        return -1;
+    }
     uint8_t query[DNS_BUF];
     /* The chosen upstream is passed straight down the dispatch chain — no
      * more rewriting g_cfg slot 0 (an unlocked data race under concurrent
@@ -3121,7 +3152,8 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
         if (slen > 0)
             cookie_store_server(upstream_idx, scookie, slen);
         if (full_rcode == DNS_RCODE_BADCOOKIE && slen > 0) {
-            id = csprng_u16();
+            if (csprng_u16(&id) != 0)
+                return -1;
             if (use_0x20)
                 dns0x20_mix(qname, qname_sent, sizeof(qname_sent));
             qlen = build_query(query, sizeof(query), qname_sent, qtype, id, 1, upstream_idx);
@@ -3268,30 +3300,20 @@ static uint32_t entry_expired_for(const cache_entry_t *e) {
     return max_age > min_orig ? max_age - min_orig : 0;
 }
 
-static void lru_touch(cache_entry_t *e) {
-    pthread_mutex_lock(&g_lru_mutex);
-    /* Remove from current position */
+/* LRU primitives — the caller MUST hold g_cache_mutex. */
+static void lru_unlink_locked(cache_entry_t *e) {
     if (e->lru_prev)
         e->lru_prev->lru_next = e->lru_next;
-    else
+    else if (g_lru_head == e)
         g_lru_head = e->lru_next;
     if (e->lru_next)
         e->lru_next->lru_prev = e->lru_prev;
-    else
+    else if (g_lru_tail == e)
         g_lru_tail = e->lru_prev;
-    /* Insert at head */
-    e->lru_prev = NULL;
-    e->lru_next = g_lru_head;
-    if (g_lru_head)
-        g_lru_head->lru_prev = e;
-    g_lru_head = e;
-    if (!g_lru_tail)
-        g_lru_tail = e;
-    pthread_mutex_unlock(&g_lru_mutex);
+    e->lru_prev = e->lru_next = NULL;
 }
 
-static void lru_insert(cache_entry_t *e) {
-    pthread_mutex_lock(&g_lru_mutex);
+static void lru_insert_locked(cache_entry_t *e) {
     e->lru_prev = NULL;
     e->lru_next = g_lru_head;
     if (g_lru_head)
@@ -3299,7 +3321,11 @@ static void lru_insert(cache_entry_t *e) {
     g_lru_head = e;
     if (!g_lru_tail)
         g_lru_tail = e;
-    pthread_mutex_unlock(&g_lru_mutex);
+}
+
+static void lru_touch_locked(cache_entry_t *e) {
+    lru_unlink_locked(e);
+    lru_insert_locked(e);
 }
 
 static void cache_entry_free(cache_entry_t *e) {
@@ -3310,36 +3336,57 @@ static void cache_entry_free(cache_entry_t *e) {
     free(e);
 }
 
-/* Evict the LRU entry */
-static void cache_evict_one(void) {
-    pthread_mutex_lock(&g_lru_mutex);
-    cache_entry_t *victim = g_lru_tail;
-    if (!victim) {
-        pthread_mutex_unlock(&g_lru_mutex);
-        return;
-    }
-    /* Remove from LRU list */
-    if (victim->lru_prev)
-        victim->lru_prev->lru_next = NULL;
-    else
-        g_lru_head = NULL;
-    g_lru_tail = victim->lru_prev;
-    pthread_mutex_unlock(&g_lru_mutex);
-    /* Remove from hash bucket */
-    uint32_t bkt = cache_hash(victim->qname, victim->qtype);
-    pthread_rwlock_wrlock(&g_cache[bkt].lock);
+/* Unlink `e` from its hash chain (bucket `bkt`). Caller holds g_cache_mutex. */
+static void cache_hash_unlink_locked(cache_entry_t *e, uint32_t bkt) {
     cache_entry_t **pp = &g_cache[bkt].head;
-    while (*pp && *pp != victim)
+    while (*pp && *pp != e)
         pp = &(*pp)->hash_next;
-    if (*pp)
-        *pp = victim->hash_next;
-    g_cache[bkt].count--;
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
-    cache_entry_free(victim);
-    pthread_mutex_lock(&g_cache_count_mutex);
-    g_cache_total--;
-    pthread_mutex_unlock(&g_cache_count_mutex);
+    if (*pp) {
+        *pp = e->hash_next;
+        g_cache[bkt].count--;
+        g_cache_total--;
+    }
+    e->hash_next = NULL;
 }
+
+/* Evict the LRU tail. Caller holds g_cache_mutex. */
+static void cache_evict_one_locked(void) {
+    cache_entry_t *victim = g_lru_tail;
+    if (!victim)
+        return;
+    lru_unlink_locked(victim);
+    cache_hash_unlink_locked(victim, cache_hash(victim->qname, victim->qtype));
+    cache_entry_free(victim);
+}
+
+#ifdef DEBUG
+/* Debug-build invariant (caller holds g_cache_mutex): the LRU walk from head
+ * reaches tail and visits exactly g_cache_total entries, the bucket counts
+ * sum to g_cache_total, and the cache is within its configured size. */
+static void cache_check_invariant_locked(const char *where) {
+    int n = 0;
+    cache_entry_t *last = NULL;
+    for (cache_entry_t *e = g_lru_head; e; e = e->lru_next) {
+        if (e->lru_prev != last || ++n > g_cache_total + 1)
+            break;
+        last = e;
+    }
+    long sum = 0;
+    for (int b = 0; b < CACHE_BUCKETS; b++)
+        sum += g_cache[b].count;
+    if (n != g_cache_total || last != g_lru_tail || sum != g_cache_total ||
+        (g_cfg.cache_size > 0 && g_cache_total > g_cfg.cache_size)) {
+        fprintf(stderr,
+                "cache invariant violated in %s: lru=%d total=%d buckets=%ld tail_ok=%d "
+                "cap=%d\n",
+                where, n, g_cache_total, sum, last == g_lru_tail, g_cfg.cache_size);
+        abort();
+    }
+}
+#define CACHE_CHECK(where) cache_check_invariant_locked(where)
+#else
+#define CACHE_CHECK(where) ((void) 0)
+#endif
 
 /*
  * cache_insert — add or replace an entry.
@@ -3347,44 +3394,26 @@ static void cache_evict_one(void) {
  */
 static void cache_insert(cache_entry_t *e) {
     uint32_t bkt = cache_hash(e->qname, e->qtype);
-    pthread_rwlock_wrlock(&g_cache[bkt].lock);
-    /* Replace existing entry for same name+type */
-    cache_entry_t **pp = &g_cache[bkt].head;
-    while (*pp) {
-        if ((*pp)->qtype == e->qtype && strcasecmp((*pp)->qname, e->qname) == 0) {
-            cache_entry_t *old = *pp;
-            *pp = old->hash_next;
-            /* Remove from LRU */
-            pthread_mutex_lock(&g_lru_mutex);
-            if (old->lru_prev)
-                old->lru_prev->lru_next = old->lru_next;
-            else
-                g_lru_head = old->lru_next;
-            if (old->lru_next)
-                old->lru_next->lru_prev = old->lru_prev;
-            else
-                g_lru_tail = old->lru_prev;
-            pthread_mutex_unlock(&g_lru_mutex);
+    e->lru_prev = e->lru_next = e->hash_next = NULL;
+    pthread_mutex_lock(&g_cache_mutex);
+    /* Replace an existing entry for the same name+type */
+    for (cache_entry_t *old = g_cache[bkt].head; old; old = old->hash_next) {
+        if (old->qtype == e->qtype && strcasecmp(old->qname, e->qname) == 0) {
+            lru_unlink_locked(old);
+            cache_hash_unlink_locked(old, bkt);
             cache_entry_free(old);
-            g_cache[bkt].count--;
-            pthread_mutex_lock(&g_cache_count_mutex);
-            g_cache_total--;
-            pthread_mutex_unlock(&g_cache_count_mutex);
             break;
         }
-        pp = &(*pp)->hash_next;
     }
     e->hash_next = g_cache[bkt].head;
     g_cache[bkt].head = e;
     g_cache[bkt].count++;
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
-    lru_insert(e);
-    pthread_mutex_lock(&g_cache_count_mutex);
     g_cache_total++;
-    pthread_mutex_unlock(&g_cache_count_mutex);
-    /* Evict if over capacity */
-    if (g_cache_total > g_cfg.cache_size)
-        cache_evict_one();
+    lru_insert_locked(e);
+    while (g_cfg.cache_size > 0 && g_cache_total > g_cfg.cache_size && g_lru_tail)
+        cache_evict_one_locked();
+    CACHE_CHECK("cache_insert");
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 /*
@@ -3397,7 +3426,7 @@ static void cache_insert(cache_entry_t *e) {
  */
 static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_stale) {
     uint32_t bkt = cache_hash(qname, qtype);
-    pthread_rwlock_rdlock(&g_cache[bkt].lock);
+    pthread_mutex_lock(&g_cache_mutex);
     cache_entry_t *e = g_cache[bkt].head;
     while (e) {
         if (e->qtype == qtype && strcasecmp(e->qname, qname) == 0)
@@ -3405,13 +3434,13 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         e = e->hash_next;
     }
     if (!e) {
-        pthread_rwlock_unlock(&g_cache[bkt].lock);
+        pthread_mutex_unlock(&g_cache_mutex);
         return NULL;
     }
     int is_stale = 0;
     if (entry_remaining_ttl(e) == 0) {
         if (!allow_stale || entry_expired_for(e) > g_cfg.serve_stale_max) {
-            pthread_rwlock_unlock(&g_cache[bkt].lock);
+            pthread_mutex_unlock(&g_cache_mutex);
             if (allow_stale) {
                 STAT_INC(g_stat_expired);
             }
@@ -3420,19 +3449,20 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         is_stale = 1;
         STAT_INC(g_stat_expired);
     }
-    /* Deep copy */
+    /* Deep copy — the index entry must never be used once the lock drops. */
     cache_entry_t *copy = malloc(sizeof(cache_entry_t));
     if (!copy) {
-        pthread_rwlock_unlock(&g_cache[bkt].lock);
+        pthread_mutex_unlock(&g_cache_mutex);
         return NULL;
     }
     memcpy(copy, e, sizeof(cache_entry_t));
     copy->lru_prev = copy->lru_next = copy->hash_next = NULL;
+    copy->rrs = NULL;
     if (e->nrr > 0) {
         copy->rrs = malloc(e->nrr * sizeof(cache_rr_t));
         if (!copy->rrs) {
             free(copy);
-            pthread_rwlock_unlock(&g_cache[bkt].lock);
+            pthread_mutex_unlock(&g_cache_mutex);
             return NULL;
         }
         memcpy(copy->rrs, e->rrs, e->nrr * sizeof(cache_rr_t));
@@ -3446,8 +3476,8 @@ static cache_entry_t *cache_lookup(const char *qname, uint16_t qtype, int allow_
         }
     }
     copy->served_stale = is_stale;
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
-    lru_touch(e);
+    lru_touch_locked(e);
+    pthread_mutex_unlock(&g_cache_mutex);
     return copy;
 }
 
@@ -3591,34 +3621,23 @@ static int aggressive_nsec_answer(const char *qname, uint16_t qtype, agg_nsec_re
 static int cache_flush(const char *qname, uint16_t qtype) {
     int count = 0;
     if (!qname) {
-        /* Flush all */
+        /* Flush all — the persistent tier is flushed after the lock drops. */
+        pthread_mutex_lock(&g_cache_mutex);
         for (int b = 0; b < CACHE_BUCKETS; b++) {
-            pthread_rwlock_wrlock(&g_cache[b].lock);
             cache_entry_t *e = g_cache[b].head, *nx;
             while (e) {
                 nx = e->hash_next;
-                pthread_mutex_lock(&g_lru_mutex);
-                if (e->lru_prev)
-                    e->lru_prev->lru_next = e->lru_next;
-                else
-                    g_lru_head = e->lru_next;
-                if (e->lru_next)
-                    e->lru_next->lru_prev = e->lru_prev;
-                else
-                    g_lru_tail = e->lru_prev;
-                pthread_mutex_unlock(&g_lru_mutex);
                 cache_entry_free(e);
                 count++;
                 e = nx;
             }
             g_cache[b].head = NULL;
             g_cache[b].count = 0;
-            pthread_rwlock_unlock(&g_cache[b].lock);
         }
-        pthread_mutex_lock(&g_cache_count_mutex);
+        g_lru_head = g_lru_tail = NULL;
         g_cache_total = 0;
-        pthread_mutex_unlock(&g_cache_count_mutex);
-        /* Also flush the persistent tier */
+        CACHE_CHECK("cache_flush(all)");
+        pthread_mutex_unlock(&g_cache_mutex);
         if (g_cfg.cache_backend == CACHE_BACKEND_OBJECTDB) {
             pog_cache_flush(NULL);
         } else if (g_cfg.cache_backend == CACHE_BACKEND_VALKEY && g_cfg.valkey_enabled) {
@@ -3630,33 +3649,18 @@ static int cache_flush(const char *qname, uint16_t qtype) {
         return count;
     }
     uint32_t bkt = cache_hash(qname, qtype);
-    pthread_rwlock_wrlock(&g_cache[bkt].lock);
-    cache_entry_t **pp = &g_cache[bkt].head;
-    while (*pp) {
-        cache_entry_t *e = *pp;
+    pthread_mutex_lock(&g_cache_mutex);
+    for (cache_entry_t *e = g_cache[bkt].head; e; e = e->hash_next) {
         if (e->qtype == qtype && strcasecmp(e->qname, qname) == 0) {
-            *pp = e->hash_next;
-            pthread_mutex_lock(&g_lru_mutex);
-            if (e->lru_prev)
-                e->lru_prev->lru_next = e->lru_next;
-            else
-                g_lru_head = e->lru_next;
-            if (e->lru_next)
-                e->lru_next->lru_prev = e->lru_prev;
-            else
-                g_lru_tail = e->lru_prev;
-            pthread_mutex_unlock(&g_lru_mutex);
+            lru_unlink_locked(e);
+            cache_hash_unlink_locked(e, bkt);
             cache_entry_free(e);
-            g_cache[bkt].count--;
-            pthread_mutex_lock(&g_cache_count_mutex);
-            g_cache_total--;
-            pthread_mutex_unlock(&g_cache_count_mutex);
             count++;
             break;
         }
-        pp = &(*pp)->hash_next;
     }
-    pthread_rwlock_unlock(&g_cache[bkt].lock);
+    CACHE_CHECK("cache_flush");
+    pthread_mutex_unlock(&g_cache_mutex);
     if (g_cfg.cache_backend != CACHE_BACKEND_NONE) {
         char vk_key[600];
         snprintf(vk_key, sizeof(vk_key), "dnscache:%s:%s", qname, type2str(qtype));
@@ -4101,7 +4105,7 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
     STAT_INC(g_stat_queries);
 
     /* -1. mDNS for .local names (RFC 6762) — try multicast before unicast */
-    if (is_local_name(qname)) {
+    if (g_cfg.mdns_enabled && is_local_name(qname)) {
         uint8_t mresp[DNS_BUF * 2];
         int mrlen = mdns_query(qname, qtype, mresp, sizeof(mresp));
         if (mrlen > 0) {
@@ -4219,7 +4223,9 @@ static int dns_resolve_core(const char *qname_in, uint16_t qtype, resolve_result
     /* 4. Parse response + DNSSEC validation */
     ce = parse_response_to_entry(resp, rlen, qname, qtype);
     if (ce) {
-        if (ce->negative) {
+        if (!g_cfg.dnssec_enabled) {
+            ce->dnssec_status = (int) DNSSEC_UNCHECKED; /* --no-dnssec */
+        } else if (ce->negative) {
             nsec_proof_t proofs[MAX_NEG_PROOFS];
             int proof_n = 0;
             ce->dnssec_status =
@@ -4602,9 +4608,49 @@ static int build_dns_response(const uint8_t *pkt, int plen, int is_tcp, uint8_t 
 /* =========================================================================
  * Proxy mode: listen on local UDP, forward, respond from cache
  * ======================================================================= */
+/* CSA-AUTH-007: REFUSED (header + question) for a client outside
+ * g_cfg.client_allow. Returns the response length, or -1 to stay silent. */
+static int acl_refused_response(const uint8_t *pkt, int plen, uint8_t *resp, int cap) {
+    if (plen < 12 || (pkt[2] & 0x80))
+        return -1; /* not a query */
+    char qn[256];
+    int qa = name_from_wire(pkt, plen, 12, qn, sizeof(qn));
+    int qend = (qa > 0 && qa + 4 <= plen && get16(pkt, 4) == 1) ? qa + 4 : 12;
+    if (qend > cap)
+        return -1;
+    memcpy(resp, pkt, (size_t) qend);
+    resp[2] = (uint8_t) (0x80 | (pkt[2] & 0x79)); /* QR, keep opcode + RD */
+    resp[3] = 5;                                  /* RA=0, RCODE REFUSED */
+    put16(resp, 4, qend > 12 ? 1 : 0);
+    put16(resp, 6, 0);
+    put16(resp, 8, 0);
+    put16(resp, 10, 0);
+    return qend;
+}
+
+static int client_allowed_sa(const struct sockaddr *sa) {
+    client_addr_t c;
+    client_from_sockaddr(&c, sa);
+    return acl_allows(g_cfg.client_allow, &c);
+}
+
+static int client_allowed_fd(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *) &ss, &sl) != 0)
+        return 0;
+    return client_allowed_sa((struct sockaddr *) &ss);
+}
+
 static void proxy_handle(int srv_fd, const uint8_t *pkt, int plen, const struct sockaddr *src,
                          socklen_t srclen) {
     uint8_t resp[DNS_BUF * 2];
+    if (!client_allowed_sa(src)) {
+        int r = acl_refused_response(pkt, plen, resp, (int) sizeof(resp));
+        if (r > 0)
+            sendto(srv_fd, resp, r, 0, src, srclen);
+        return;
+    }
     int off = build_dns_response(pkt, plen, 0 /* is_tcp */, resp, (int) sizeof(resp));
     if (off < 0)
         return;
@@ -4722,7 +4768,9 @@ static void proxy_handle_tcp(int cfd) {
     if (pkt[2] & 0x80)
         goto done; /* ignore responses */
     uint8_t resp[DNS_BUF * 2];
-    int off = build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp));
+    int off = client_allowed_fd(cfd)
+                  ? build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp))
+                  : acl_refused_response(pkt, qlen, resp, (int) sizeof(resp));
     if (off < 0)
         goto done;
     /* Send with 2-byte length prefix */
@@ -4784,7 +4832,9 @@ static void proxy_handle_dot(int cfd) {
         if (pkt[2] & 0x80)
             goto done; /* ignore responses */
         uint8_t resp[DNS_BUF * 2];
-        int off = build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp));
+        int off = client_allowed_fd(cfd)
+                      ? build_dns_response(pkt, qlen, 1 /* is_tcp */, resp, (int) sizeof(resp))
+                      : acl_refused_response(pkt, qlen, resp, (int) sizeof(resp));
         if (off < 0)
             goto done;
         uint8_t hdr[2] = {(uint8_t) (off >> 8), (uint8_t) (off & 0xFF)};
@@ -4936,8 +4986,11 @@ static void *proxy_run(void *arg) {
      * user, so checkpoint's rename/reopen keeps working confined. */
     pog_cache_open();
 
-    /* Workers start after the sandbox so they inherit the dropped
-     * privileges (and, with a TSYNC seccomp filter, the syscall policy). */
+    /* Every worker — UDP pool, async cache writer, prefetcher — starts after
+     * the sandbox so it inherits the dropped privileges, the confined
+     * filesystem and the syscall filter (CSA-SBX-001). */
+    vkw_start();
+    prefetch_start();
     udp_workers_start(g_cfg.udp_workers);
 
     uint8_t buf[DNS_BUF];
@@ -5238,6 +5291,12 @@ static void config_load_env(void) {
     }
     safe_strcpy(g_cfg.dns64_exclude, getenv_or("DNS64_EXCLUDE", ""), sizeof(g_cfg.dns64_exclude));
     g_cfg.udp_workers = atoi(getenv_or("RESOLVERD_UDP_WORKERS", "8"));
+    safe_strcpy(g_cfg.client_allow,
+                getenv_or("RESOLVERD_ALLOW", "127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, "
+                                             "192.168.0.0/16, fc00::/7"),
+                sizeof(g_cfg.client_allow));
+    g_cfg.dnssec_enabled = 1;
+    g_cfg.mdns_enabled = 1;
     if (g_cfg.udp_workers < 1)
         g_cfg.udp_workers = 1;
     if (g_cfg.udp_workers > UDP_WORKERS_MAX)
@@ -5440,7 +5499,6 @@ static void cache_init(void) {
     for (int i = 0; i < CACHE_BUCKETS; i++) {
         g_cache[i].head = NULL;
         g_cache[i].count = 0;
-        pthread_rwlock_init(&g_cache[i].lock, NULL);
     }
 }
 
@@ -5493,7 +5551,10 @@ static void print_result(const char *qname, uint16_t qtype, const resolve_result
 
 static void print_stats(void) {
     printf("\n── Cache Statistics ─────────────────────────────\n");
-    printf("  Entries (in-memory):  %d / %d\n", g_cache_total, g_cfg.cache_size);
+    pthread_mutex_lock(&g_cache_mutex);
+    int total_now = g_cache_total;
+    pthread_mutex_unlock(&g_cache_mutex);
+    printf("  Entries (in-memory):  %d / %d\n", total_now, g_cfg.cache_size);
     printf("  Queries:              %llu\n", (unsigned long long) g_stat_queries);
     printf("  Cache hits:           %llu\n", (unsigned long long) g_stat_hits);
     printf("  Cache misses:         %llu\n", (unsigned long long) g_stat_misses);
@@ -5550,7 +5611,7 @@ static void dump_cache(void) {
     printf("%-40s %-8s %-8s %s\n", "NAME", "TYPE", "TTL", "RDATA");
     int total = 0;
     for (int b = 0; b < CACHE_BUCKETS; b++) {
-        pthread_rwlock_rdlock(&g_cache[b].lock);
+        pthread_mutex_lock(&g_cache_mutex);
         cache_entry_t *e = g_cache[b].head;
         while (e) {
             uint32_t rem = entry_remaining_ttl(e);
@@ -5571,7 +5632,7 @@ static void dump_cache(void) {
             }
             e = e->hash_next;
         }
-        pthread_rwlock_unlock(&g_cache[b].lock);
+        pthread_mutex_unlock(&g_cache_mutex);
     }
     printf("── %d live records ──────────────────────────────\n", total);
 }
@@ -5606,6 +5667,8 @@ static void usage(const char *prog) {
            "  --no-tcp-proxy             Disable TCP proxy listener\n"
            "  --no-dnssec                Disable DNSSEC validation\n"
            "  --no-mdns                  Disable mDNS for .local names\n"
+           "  --allow <list>             Clients allowed to query (IPv4/IPv6 prefixes)\n"
+           "                             [RESOLVERD_ALLOW; default loopback+RFC1918+fc00::/7]\n"
            "  --conf <path>              Load config from file\n"
            "\nExamples:\n"
            "  %s example.local A\n"
@@ -5829,8 +5892,12 @@ int main(int argc, char **argv) {
             /* alternative: --route suffix=host:port[:proto] */
             if (!parse_server_arg(argv[++i]))
                 fprintf(stderr, "[warn] --route: bad format: %s\n", argv[i]);
-        } else if (!strcmp(argv[i], "--no-dnssec")) { /* future flag */
-        } else if (!strcmp(argv[i], "--no-mdns")) {   /* future flag */
+        } else if (!strcmp(argv[i], "--no-dnssec")) {
+            g_cfg.dnssec_enabled = 0; /* CSA-AUTH-007: was parsed and ignored */
+        } else if (!strcmp(argv[i], "--no-mdns")) {
+            g_cfg.mdns_enabled = 0;
+        } else if (!strcmp(argv[i], "--allow") && i + 1 < argc) {
+            safe_strcpy(g_cfg.client_allow, argv[++i], sizeof(g_cfg.client_allow));
         } else if (!strcmp(argv[i], "--conf") && i + 1 < argc) {
             config_load_file(argv[++i]);
         } else if (argv[i][0] != '-' && !query_name[0]) {
@@ -5840,8 +5907,9 @@ int main(int argc, char **argv) {
         }
     }
     cache_init();
-    vkw_start();      /* async Valkey cache writer */
-    prefetch_start(); /* single prefetch worker (replaces thread-per-job) */
+    /* vkw/prefetch threads start where they are needed: the one-shot query
+     * below, or proxy_run AFTER apply_sandbox (CSA-SBX-001 — a thread started
+     * before the sandbox kept the original mount namespace in mountns mode). */
     if (g_cfg.proto == PROTO_DOT || g_cfg.proto == PROTO_DOH)
         dot_init();
     dot_server_init(); /* no-op unless DOT_SERVER_ENABLED=1; must run before apply_sandbox() */
@@ -5866,6 +5934,8 @@ int main(int argc, char **argv) {
     }
     if (query_name[0]) {
         /* One-shot query */
+        vkw_start();      /* async Valkey cache writer */
+        prefetch_start(); /* single prefetch worker */
         uint16_t qtype = str2type(query_type_s);
         if (!qtype) {
             fprintf(stderr, "Unknown type: %s\n", query_type_s);

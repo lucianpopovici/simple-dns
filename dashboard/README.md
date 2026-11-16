@@ -51,7 +51,12 @@ sessions reset.
 Other controls:
 - Every route requires a logged-in session; unauthenticated browser requests
   redirect to `/login`, API/XHR requests get `401`.
-- Failed logins are throttled per client IP with escalating backoff.
+- Failed logins are throttled per client IP with escalating backoff. The
+  client IP is the direct peer; `X-Forwarded-For` is used only when that peer
+  is listed in `DASHBOARD_TRUSTED_PROXIES` (comma-separated IPs/CIDRs, empty by
+  default), taking the right-most address that is not one of those proxies.
+  The throttle table holds at most `DASHBOARD_LOGIN_TABLE_MAX` (10000) entries
+  and forgets an address after an hour (CSA-WEB-002).
 - The **Valkey Explorer** is read-only unless `DASHBOARD_ENABLE_EXPLORER_WRITE=1`;
   even then it refuses to set/delete secret-bearing keys
   (`dnssec:*`, `*secret*`, `cookie_secret`, `*_key`, `*key_pem*`, `*tsig*`) and
@@ -60,6 +65,14 @@ Other controls:
 - Bind to localhost (default) or front with a TLS-terminating proxy; never run
   `--debug` on an exposed instance (it enables the Werkzeug debugger).
 - Session lifetime: `DASHBOARD_SESSION_HOURS` (default 12).
+- **CSRF** (CSA-WEB-001): every POST (login and sign-out included) must carry
+  the per-session `csrf_token` that each form embeds automatically; a request
+  without it gets `400`. Scripted clients send it as a `csrf_token` form field
+  or an `X-CSRF-Token` header.
+- The session cookie is `SameSite=Strict`, `HttpOnly` and `Secure`. Browsers
+  send a `Secure` cookie over plain `http://` only to localhost; for plain-HTTP
+  access from another host set `DASHBOARD_INSECURE_COOKIE=1` (better: put TLS
+  in front).
 
 ## Requirements
 

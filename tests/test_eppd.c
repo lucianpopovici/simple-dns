@@ -402,6 +402,57 @@ static void test_gen_authinfo(void) {
     CHECK(strcmp(a, b) != 0, "two calls produce different tokens (not a fixed/predictable value)");
 }
 
+/* CSA-CRYPTO-001 (CLAUDE-low-fixes.md 8f) */
+static void test_credentials(void) {
+    printf("== registrar credentials ==\n");
+    char h[256];
+    int legacy = -1;
+    CHECK(epp_pw_hash("s3cret-pw", h, sizeof(h)) == 0 && strncmp(h, EPP_PW_PREFIX, 14) == 0,
+          "hash has the pbkdf2-sha256$ form");
+    CHECK(epp_pw_verify(h, "s3cret-pw", &legacy) == 1 && legacy == 0, "hashed: right password");
+    CHECK(epp_pw_verify(h, "s3cret-pX", &legacy) == 0, "hashed: wrong password");
+    CHECK(epp_pw_verify(h, "", &legacy) == 0, "hashed: empty password");
+    char h2[256];
+    epp_pw_hash("s3cret-pw", h2, sizeof(h2));
+    CHECK(strcmp(h, h2) != 0, "two hashes of one password differ (random salt)");
+    CHECK(epp_pw_verify("plain-pw", "plain-pw", &legacy) == 1 && legacy == 1,
+          "plaintext store still accepted, flagged legacy");
+    CHECK(epp_pw_verify("plain-pw", "plain-p", &legacy) == 0, "plaintext: prefix is not a match");
+    CHECK(epp_pw_verify("pbkdf2-sha256$100$00$00", "x", &legacy) == 0 && legacy == 0,
+          "malformed hash never matches (and is not treated as plaintext)");
+    char bad[256];
+    snprintf(bad, sizeof(bad), "%s", h);
+    bad[strlen(bad) - 1] = bad[strlen(bad) - 1] == 0 ? 1 : 0;
+    CHECK(epp_pw_verify(bad, "s3cret-pw", &legacy) == 0, "one flipped hash digit fails");
+    CHECK(epp_secret_eq("abc", "abc") && !epp_secret_eq("abc", "abd") &&
+              !epp_secret_eq("abc", "ab"),
+          "secret compare: equal / differ / prefix");
+
+    char fp[65];
+    CHECK(epp_fp_normalise("AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:"
+                           "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89",
+                           fp) == 0 &&
+              strcmp(fp, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789") == 0,
+          "fingerprint with colons normalises to lowercase hex");
+    CHECK(epp_fp_normalise("abcd", fp) == -1, "short fingerprint rejected");
+    CHECK(epp_fp_normalise("zz", fp) == -1, "non-hex fingerprint rejected");
+
+    time_t t0 = 1000000;
+    for (int i = 0; i < 4; i++)
+        epp_lock_fail("lockme", t0);
+    CHECK(epp_lock_remaining("lockme", t0) == 0, "lockout: 4 failures do not lock");
+    epp_lock_fail("lockme", t0);
+    CHECK(epp_lock_remaining("lockme", t0) == 1, "lockout: 5th failure locks for 1 s");
+    epp_lock_fail("lockme", t0);
+    CHECK(epp_lock_remaining("lockme", t0) == 2, "lockout: 6th failure locks for 2 s");
+    for (int i = 0; i < 20; i++)
+        epp_lock_fail("lockme", t0);
+    CHECK(epp_lock_remaining("lockme", t0) == EPP_LOCK_MAX_SECS, "lockout: capped at 300 s");
+    CHECK(epp_lock_remaining("other", t0) == 0, "lockout: per clID");
+    epp_lock_clear("lockme");
+    CHECK(epp_lock_remaining("lockme", t0) == 0, "lockout: success clears it");
+}
+
 int main(void) {
     test_epp_frame_next();
     test_xml_tokenizer();
@@ -411,6 +462,7 @@ int main(void) {
     test_org_tlv_roundtrip();
     test_poll_tlv_roundtrip();
     test_gen_authinfo();
+    test_credentials();
     printf("\n%s: %d failure(s)\n", g_failures ? "FAIL" : "PASS", g_failures);
     return g_failures ? 1 : 0;
 }

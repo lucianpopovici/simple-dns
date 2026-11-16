@@ -81,7 +81,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 |---|---|
 | `dns_wire.{c,h}` | **`libdnswire`** — the single shared wire-format implementation (migration Step 1, done). Fix parser bugs here, never per-binary. |
 | `object_graph.{c,h}` | Vendored **objectdb** engine (pinned — see file headers; fix upstream, never here) backing `resolverd`'s optional embedded cache tier (ADR-008 pilot, `RESOLVERD_CACHE_BACKEND=objectdb`). |
-| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd`, `resolverd`, and `eppd`. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
+| `sandbox.{c,h}` | **`libsandbox`** — the single shared privilege-drop / chroot+mountns / seccomp implementation, linked by `dnsd`, `resolverd`, `eppd`, and (CSA-SBX-002) `apid`, `certd`, `mdnsd`, `doqd` — the last four seccomp `audit` by default. The caller fills a `sandbox_config_t` (daemon-scoped config + log callback + seccomp default + extra syscall groups) and calls `sandbox_apply()`. Fix sandbox bugs here, never per-binary. |
 | `dns_server.c` | **`dnsd`** — the authoritative core (~3600 lines). ACME/EST extracted in Step 2, mDNS in Step 3, the HTTP/DoH/portal surface in Step 4. Now: DNS/DoT + localhost `/health`+`/metrics` only. |
 | `certd.c` | **`certd`** — ACME + EST certificate sidecar (migration Step 2, done). Talks only to Valkey and the CA. |
 | `mdnsd.c` | **`mdnsd`** — mDNS/DNS-SD responder (migration Step 3, done). Link-local only; explicit interface allowlist via `config:mdns_interfaces`. |
@@ -91,7 +91,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | `eppd.c` | **`eppd`** — EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1+2 done; Phase 3 extensions open). Registrar mTLS sessions; writes `epp:*` + delegation `zone:*` (NS/A/AAAA/DS) records; RFC 3915 RGP lifecycle + RFC 5731 transfer. Own `make eppd`/`make check-eppd`/`make fuzz-eppd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
-| `fuzz/` | libFuzzer harness + corpus: `make fuzz-wire` (60s smoke; needs clang). |
+| `fuzz/` | libFuzzer harnesses + corpora: `make fuzz-wire` (`name_from_wire`), `make fuzz-dnsd` (dnsd's `dns_process` + TSIG/SIG(0) parsers), `make fuzz-response`, `fuzz-tlv`, `fuzz-doq`, `fuzz-eppd` (60s smokes; need clang). |
 | `dashboard/app.py` | Flask control-plane UI; talks to Valkey directly. |
 | `Makefile` | Build/sign/install. |
 | `keys/` | Code-signing key material. **Do not read, modify, or commit anything here.** |
@@ -366,7 +366,9 @@ authoritative zone.
   uses a small in-house front (decision recorded in `specs/CLAUDE-migration.md`).
   `apid` terminates HTTP/HTTPS, serves DoH by forwarding the DNS message to
   `dnsd`'s loopback DNS port (UDP, TCP retry on truncation — it never parses
-  DNS payloads), and serves the management API by writing **Valkey only**
+  DNS payloads; it prefixes a PROXY v2 header with the HTTP client's address,
+  shared relay `dns_relay_loopback` in libdnswire, so dnsd's RRL/cookies/ACLs
+  see the real client — CSA-AUTH-006; doqd does the same), and serves the management API by writing **Valkey only**
   (it calls nothing inside `dnsd`). This removed the hand-rolled
   HTTP/HTTPS/mTLS server, `url_decode`, `qs_get`, `handle_api`, `handle_doh`
   and the first-boot config portal from `dnsd`.
@@ -524,8 +526,11 @@ ported to a different libc/kernel.
 Config (Valkey): `config:eppd_enabled` (must be `"1"`, default off — never
 on by accident, same convention as `doqd`), `config:eppd_port` (RFC 5734
 default 700), `config:eppd_mtls_ca_pem` (required), `config:eppd_registrar_
-pw:<clID>` (per-registrar EPP login password — plaintext, gated by the same
-`config:*` trust boundary as `ddns_secret`/`tsig_secret`), `config:eppd_
+pw:<clID>` (per-registrar EPP login password — a PBKDF2-SHA256 hash from
+`eppd --hash-password`; plaintext still accepted with a warning; constant-time
+compare, per-clID lockout after 5 failures — CSA-CRYPTO-001),
+`config:eppd_registrar_cert:<clID>` (optional SHA-256 fingerprint binding the
+clID to its client certificate), `config:eppd_
 {chroot_dir,isolation_mode,privdrop_user,privdrop_group,seccomp_mode}`
 (sandbox knobs, resolverd-style, own prefix since `eppd`'s filesystem/
 syscall profile differs — inbound TLS only, no outbound network),
@@ -570,15 +575,17 @@ HTTP front-ends. Define and enforce this.
 | `cache:*` | resolverd | resolverd | Persisted resolver cache. ADR-008 pilot: with `RESOLVERD_CACHE_BACKEND=objectdb` this namespace moves out of Valkey into resolverd's embedded objectdb store (`object_graph.{c,h}`, vendored+pinned) — same single-owner contract, no bus change |
 | `epp:*` | eppd | eppd | RFC 5731/5732/5733 domain/host/contact object store (TLV-encoded, ADR-003; hex-encoded before storing) |
 | `metrics:*` (or live `/metrics`) | each daemon | dashboard | Observability |
-| `schema:version` | dnsd (seeds on absent) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | ADR-003 schema-version contract (`major.minor`) |
+| `schema:version` | dnsd (seeds on absent; raises an older minor) | dnsd, mdnsd, resolverd, certd, apid, doqd, eppd | ADR-003 schema-version contract (`major.minor`) |
+| `zidx:*` | dnsd (from zone:/ddns:/srp: keyspace events; reconciled on reconnect) | dnsd | Zone name index (schema 1.1): empty non-terminals answered NODATA (RFC 8020), wildcard never applied to an existing name (RFC 4592). Other writers do **not** maintain it — dnsd derives it from their writes |
 
 **Live reload (done — migration Step 6):** each daemon runs a subscriber on a
 dedicated Valkey connection, enables keyspace notifications
 (`notify-keyspace-events KEA`) and PSUBSCRIBEs to the prefixes it owns, so
 dashboard edits and `cert:current` updates take effect without a restart —
 no more SIGHUP / `POST /config`. `dnsd` watches `config:*`, `cert:current`,
-`zone_table:*`, and `dnssec:*` (reloads that zone's key state live — current set
-plus any rollover/next set); `apid` watches
+`zone_table:*`, `dnssec:*` (reloads that zone's key state live — current set
+plus any rollover/next set), and `zone:*`/`ddns:*`/`srp:*` (record-cache
+invalidation + the `zidx:*` name index); `apid` watches
 `cert:current` + the TLS config keys; `mdnsd` watches `mdns:*` + `config:mdns_*`
 and re-announces; `eppd` watches `cert:current` + its own TLS/CA config keys,
 via the same shared `keyspace_watch_loop` (`dns_wire.h`) every future adopter
@@ -593,7 +600,8 @@ storm.
 The Valkey bus is a **versioned contract**, not an ad-hoc set of strings
 (`CLAUDE-architecture.md` ADR-003, Accepted option C):
 
-- **Version key.** `schema:version` holds `major.minor` (current **1.0**). Every
+- **Version key.** `schema:version` holds `major.minor` (current **1.1** — adds
+  the dnsd-owned `zidx:*` name index). Every
   daemon compares it against its compiled `SCHEMA_VERSION` at startup via
   `schema_version_check()` (in `libdnswire`): a **major** mismatch is fatal —
   the daemon refuses to start; a **minor** mismatch warns and continues

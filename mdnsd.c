@@ -59,6 +59,7 @@
 #include <net/if.h>
 
 #include "dns_wire.h"
+#include "sandbox.h"
 
 #define MDNS_PORT 5353
 #define MDNS_MCAST4 "224.0.0.251"
@@ -179,20 +180,32 @@ static int vk_get(const char *key, char *out, int olen) {
  * Records are keyed zone:<zone>:<TYPE>:<name> (multi-zone, Step 7); mDNS shares
  * the unicast zone's records, so we glob the zone segment.  qname is fully
  * qualified, so at most one key matches. */
-static int zone_glob_get(const char *tname, const char *qname, char *out, int olen) {
-    char pat[600];
-    snprintf(pat, sizeof(pat), "zone:*:%s:%s", tname, qname);
-    char keys[4][256]; /* qname is fully qualified — at most one match expected */
-    int nk;
-    pthread_mutex_lock(&g_vk_mutex);
-    if (vkc_ensure_to(&vk, g_valkey_host, g_valkey_port, g_valkey_pass) >= 0)
-        nk = vkc_scan_keys(&vk, pat, keys, 4); /* SCAN, ADR-004 */
-    else
-        nk = -1;
-    pthread_mutex_unlock(&g_vk_mutex);
-    if (nk <= 0)
-        return 0;
-    return vk_get(keys[0], out, olen);
+/* Build the zone-record key for owner `qname` in candidate zone `zone`. The
+ * qname goes into a GET key, never a pattern, so '*', '?', '[' in a label are
+ * just bytes (CSA-INJ-001). Returns 1 if it fit. */
+static int zone_key_for(char *out, size_t cap, const char *zone, const char *tname,
+                        const char *qname) {
+    int n = snprintf(out, cap, "zone:%s:%s:%s", zone, tname, qname);
+    return n > 0 && (size_t) n < cap;
+}
+
+/* Shared zone records (zone:<zone>:<TYPE>:<name>, read-only). Tries each
+ * suffix of qname as the zone, longest first — direct GETs, at most
+ * ZONE_LOOKUP_MAX of them — instead of a SCAN of the whole keyspace with the
+ * qname as a glob (CSA-DOS-005 / CSA-INJ-001: up to 60 full SCANs per packet,
+ * and a crafted label matched records of any zone). */
+#define ZONE_LOOKUP_MAX 8
+static int zone_lookup_get(const char *tname, const char *qname, char *out, int olen) {
+    const char *z = qname;
+    for (int i = 0; z && *z && i < ZONE_LOOKUP_MAX; i++) {
+        char key[700];
+        if (zone_key_for(key, sizeof(key), z, tname, qname) && vk_get(key, out, olen))
+            return 1;
+        z = strchr(z, '.');
+        if (z)
+            z++;
+    }
+    return 0;
 }
 
 /* ── Wire-format helpers specific to mDNS ────────────────────────────────── */
@@ -337,7 +350,7 @@ static int mdns_lookup_records(uint8_t *buf, int off, int blen, const char *qnam
                 if (!vk_get(vkey, val, sizeof(val)))
                     continue;
             } else {
-                if (!zone_glob_get(tname, qname, val, sizeof(val)))
+                if (!zone_lookup_get(tname, qname, val, sizeof(val)))
                     continue;
             }
             /* Parse ttl|value */
@@ -1209,12 +1222,13 @@ static void dp_handle_query(int srv_fd, const uint8_t *pkt, int plen, const stru
             type2str(qtype), qname, ancount, mdns_qname, nresp);
 }
 
-static void *dp_listen_thread(void *arg) {
-    (void) arg;
+/* Bound in main() before sandbox_apply() (the DP port may be < 1024); the
+ * thread only serves it. Returns the socket or -1. */
+static int dp_bind(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         dns_log(LOG_ERR, "[DP] socket failed: %s\n", strerror(errno));
-        return NULL;
+        return -1;
     }
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1224,8 +1238,13 @@ static void *dp_listen_thread(void *arg) {
     if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
         dns_log(LOG_ERR, "[DP] bind :%d failed: %s\n", g_dp_port, strerror(errno));
         close(fd);
-        return NULL;
+        return -1;
     }
+    return fd;
+}
+
+static void *dp_listen_thread(void *arg) {
+    int fd = (int) (intptr_t) arg;
     dns_log(LOG_NOTICE, "[DP] Discovery Proxy listening on :%d for %d subdomain(s)\n", g_dp_port,
             g_dp_subdomain_count);
     uint8_t buf[MDNS_MAX_MSG];
@@ -1749,12 +1768,12 @@ done:
     return NULL;
 }
 
-static void *dso_listen_thread(void *arg) {
-    (void) arg;
+/* Bound in main() before sandbox_apply(), like dp_bind(). */
+static int dso_bind(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         dns_log(LOG_ERR, "[DSO] socket failed: %s\n", strerror(errno));
-        return NULL;
+        return -1;
     }
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1764,13 +1783,18 @@ static void *dso_listen_thread(void *arg) {
     if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
         dns_log(LOG_ERR, "[DSO] bind :%d failed: %s\n", g_dso_port, strerror(errno));
         close(fd);
-        return NULL;
+        return -1;
     }
     if (listen(fd, 16) < 0) {
         dns_log(LOG_ERR, "[DSO] listen failed: %s\n", strerror(errno));
         close(fd);
-        return NULL;
+        return -1;
     }
+    return fd;
+}
+
+static void *dso_listen_thread(void *arg) {
+    int fd = (int) (intptr_t) arg;
     dns_log(LOG_NOTICE, "[DSO] Push listener on :%d (TLS)\n", g_dso_port);
     for (;;) {
         struct sockaddr_in caddr;
@@ -1939,6 +1963,95 @@ static void mdns_keyspace_catchup(void *ctx) {
 
 /* ── Receive loop ───────────────────────────────────────────────────────── */
 
+/* RFC 6762 §11: mDNS is link-local. Accept a packet only from an on-link
+ * source — IPv6 link-local (fe80::/10), loopback, or an IPv4 address inside
+ * the subnet of one of our interfaces — and never send a legacy-unicast
+ * reply off-link (CSA-DOS-005: replies went to any source). The interface
+ * list is cached and refreshed every 30 s. */
+#define ONLINK_MAX 32
+static struct {
+    uint32_t net;
+    uint32_t mask;
+} g_onlink[ONLINK_MAX];
+static int g_onlink_n = 0;
+static time_t g_onlink_at = 0;
+
+static void onlink_refresh(void) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0)
+        return;
+    int n = 0;
+    for (struct ifaddrs *p = ifa; p && n < ONLINK_MAX; p = p->ifa_next) {
+        if (!p->ifa_addr || !p->ifa_netmask || p->ifa_addr->sa_family != AF_INET)
+            continue;
+        uint32_t a4 = ((struct sockaddr_in *) p->ifa_addr)->sin_addr.s_addr;
+        uint32_t m4 = ((struct sockaddr_in *) p->ifa_netmask)->sin_addr.s_addr;
+        g_onlink[n].net = a4 & m4;
+        g_onlink[n].mask = m4;
+        n++;
+    }
+    freeifaddrs(ifa);
+    g_onlink_n = n;
+    g_onlink_at = time(NULL);
+}
+
+static int source_is_onlink(int af, const void *src) {
+    if (af == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *) src)->sin6_addr;
+        return IN6_IS_ADDR_LINKLOCAL(a6) || IN6_IS_ADDR_LOOPBACK(a6);
+    }
+    uint32_t a4 = ((const struct sockaddr_in *) src)->sin_addr.s_addr;
+    if ((ntohl(a4) >> 24) == 127)
+        return 1;
+    if (time(NULL) - g_onlink_at > 30)
+        onlink_refresh();
+    for (int i = 0; i < g_onlink_n; i++)
+        if ((a4 & g_onlink[i].mask) == g_onlink[i].net)
+            return 1;
+    return 0;
+}
+
+/* RFC 6762 §6 response delay (20-120 ms for shared records) is scheduled,
+ * not slept: the old usleep() in this single-threaded loop stalled every
+ * other packet for up to 120 ms per query. */
+#define MDNS_PENDING_MAX 16
+static struct {
+    long long due_ms;
+    int len;
+    uint8_t buf[MDNS_MAX_MSG];
+} g_pending[MDNS_PENDING_MAX];
+static int g_pending_n = 0;
+
+static long long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void pending_flush(int force) {
+    long long now = mono_ms();
+    int w = 0;
+    for (int i = 0; i < g_pending_n; i++) {
+        if (force || g_pending[i].due_ms <= now) {
+            mdns_send(g_pending[i].buf, g_pending[i].len);
+        } else {
+            if (w != i)
+                g_pending[w] = g_pending[i];
+            w++;
+        }
+    }
+    g_pending_n = w;
+}
+
+static void pending_add(const uint8_t *resp, int rlen) {
+    if (g_pending_n >= MDNS_PENDING_MAX)
+        pending_flush(1); /* full: send what is queued rather than drop */
+    g_pending[g_pending_n].due_ms = mono_ms() + 20 + (rand() % 100);
+    g_pending[g_pending_n].len = rlen;
+    memcpy(g_pending[g_pending_n].buf, resp, (size_t) rlen);
+    g_pending_n++;
+}
+
 static void mdns_recv_loop(int fd4, int fd6) {
     for (;;) {
         fd_set fds;
@@ -1949,7 +2062,18 @@ static void mdns_recv_loop(int fd4, int fd6) {
             FD_SET(fd6, &fds);
         int maxfd = (fd4 > fd6 ? fd4 : fd6);
         struct timeval tv = {.tv_sec = 5};
+        if (g_pending_n > 0) {
+            long long wait = g_pending[0].due_ms - mono_ms();
+            for (int i = 1; i < g_pending_n; i++)
+                if (g_pending[i].due_ms - mono_ms() < wait)
+                    wait = g_pending[i].due_ms - mono_ms();
+            if (wait < 0)
+                wait = 0;
+            tv.tv_sec = (time_t) (wait / 1000);
+            tv.tv_usec = (suseconds_t) ((wait % 1000) * 1000);
+        }
         int r = select(maxfd + 1, &fds, NULL, NULL, &tv);
+        pending_flush(0);
         if (r <= 0)
             continue;
 
@@ -1970,6 +2094,10 @@ static void mdns_recv_loop(int fd4, int fd6) {
             ssize_t n = recvfrom(fd, pkt, sizeof(pkt), 0, (struct sockaddr *) &src, &srclen);
             if (n < 12)
                 continue;
+            if (!source_is_onlink(af, &src)) {
+                dns_log(LOG_DEBUG, "[mDNS] dropped packet from an off-link source\n");
+                continue; /* RFC 6762 §11 */
+            }
 
             /* RFC 8766 Discovery Proxy: buffer this packet if it's a
              * response and a collection window is open (dp_mdns_collect). */
@@ -1995,13 +2123,11 @@ static void mdns_recv_loop(int fd4, int fd6) {
             dns_log(LOG_DEBUG, "[mDNS] Query from %s → %d-byte response\n", src_str, rlen);
 
             if (is_legacy) {
-                /* Legacy unicast: respond directly to querier */
+                /* Legacy unicast: respond directly to the (on-link) querier */
                 sendto(fd, resp, rlen, 0, (struct sockaddr *) &src, srclen);
             } else {
-                /* Standard mDNS: multicast the response (RFC 6762 §6) */
-                /* Small random delay 20-120ms to reduce collisions */
-                usleep(20000 + (rand() % 100000));
-                mdns_send(resp, rlen);
+                /* Standard mDNS: multicast after a 20-120 ms delay (RFC 6762 §6) */
+                pending_add(resp, rlen);
             }
         }
     }
@@ -2131,6 +2257,23 @@ static int schema_gate(void) {
     }
 }
 
+#ifndef UNIT_TEST
+/* CSA-SBX-002: mdnsd parses untrusted link-local traffic, so it confines
+ * itself once its sockets are bound: privilege drop (when started as root),
+ * optional chroot/mountns, seccomp. Config: config:mdnsd_{chroot_dir,
+ * isolation_mode,privdrop_user,privdrop_group,seccomp_mode}, env
+ * MDNSD_{CHROOT,ISOLATION,USER,GROUP,SECCOMP}, read before confinement.
+ * seccomp defaults to audit until a syscall harvest validates enforce. */
+static void apply_mdnsd_sandbox(void) {
+    sandbox_config_t sb;
+    sandbox_config_load(&sb, "mdnsd", "MDNSD", vk_get);
+    sb.seccomp_default = SANDBOX_SECCOMP_AUDIT;
+    sb.extra_syscall_groups = SANDBOX_SYS_GETADDRINFO; /* hostname DNS_VALKEY_HOST */
+    sb.log = dns_log;
+    sb.tag = "mdnsd";
+    sandbox_apply(&sb);
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -2147,6 +2290,10 @@ int main(int argc, char **argv) {
     }
     dns_log(LOG_NOTICE, "[mDNS] Responder up: %s (IPv4 %s, IPv6 %s)\n", g_mdns_hostname,
             g_mdns4_sock >= 0 ? "up" : "down", g_mdns6_sock >= 0 ? "up" : "down");
+    int dp_fd = g_dp_enabled ? dp_bind() : -1;
+    int dso_fd = g_dso_enabled ? dso_bind() : -1;
+    /* Every thread starts after this, so all of them run confined. */
+    apply_mdnsd_sandbox();
     mdns_probe();
     mdns_announce();
     /* Live reload: re-announce when mdns: or config:mdns_ records change
@@ -2171,9 +2318,9 @@ int main(int argc, char **argv) {
         else
             dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
     }
-    if (g_dp_enabled) {
+    if (dp_fd >= 0) {
         pthread_t dpt;
-        if (pthread_create(&dpt, NULL, dp_listen_thread, NULL) == 0)
+        if (pthread_create(&dpt, NULL, dp_listen_thread, (void *) (intptr_t) dp_fd) == 0)
             pthread_detach(dpt);
         else
             dns_log(LOG_ERR, "[DP] Failed to start Discovery Proxy listener\n");
@@ -2188,7 +2335,8 @@ int main(int argc, char **argv) {
         }
         dso_tls_reload();
         pthread_t dsolt, dsopt;
-        if (pthread_create(&dsolt, NULL, dso_listen_thread, NULL) == 0)
+        if (dso_fd >= 0 &&
+            pthread_create(&dsolt, NULL, dso_listen_thread, (void *) (intptr_t) dso_fd) == 0)
             pthread_detach(dsolt);
         else
             dns_log(LOG_ERR, "[DSO] Failed to start Push listener\n");
@@ -2200,3 +2348,4 @@ int main(int argc, char **argv) {
     mdns_recv_loop(g_mdns4_sock, g_mdns6_sock);
     return 0;
 }
+#endif /* UNIT_TEST */

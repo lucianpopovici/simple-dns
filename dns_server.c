@@ -131,6 +131,12 @@
  *   config:nsid                NSID string             (default: hostname)
  *   config:cookie_secret       16-byte hex cookie secret
  *   config:axfr_allow          Comma-separated IPs/CIDRs allowed to do AXFR
+ *   config:tcp_max_conns       Cap on concurrent TCP + DoT connections (default
+ *                              256; over the cap new connections are closed).
+ *                              Each connection must finish its TLS handshake and
+ *                              first query within 5 s, then idles out after 30 s.
+ *                              Plain TCP on the DNS port is never TLS; the DoT
+ *                              port is TLS-only (closed when no cert is loaded).
  *   config:notify_targets      Comma-separated IP:port targets for NOTIFY
  *   config:forward_enabled     "1" to forward out-of-zone queries (default: 0).
  *                              OFF + ACL-gated: an open resolver is an abuse
@@ -236,8 +242,16 @@
  *                              soa_ttl is an optional additive trailing field
  *                              (ADR-003); absent → soa_minimum (RFC 9077).
  *   schema:version             ADR-003 inter-daemon schema contract "major.minor"
- *                              (current 1.0; dnsd seeds it, every daemon checks it
- *                              at startup — major mismatch is fatal, minor warns).
+ *                              (current 1.1; dnsd seeds it — and raises an older
+ *                              minor to its own — every daemon checks it at
+ *                              startup: major mismatch is fatal, minor warns).
+ *   zidx:<zone>                Zone name index (schema 1.1, written ONLY by dnsd):
+ *                              sorted set, one member per zone:/ddns:/srp: record
+ *                              key, "rev(owner)\x01<key>" (rev = labels reversed,
+ *                              joined by \x02). Answers "does anything exist at or
+ *                              below this name?" for empty non-terminals (NODATA,
+ *                              RFC 8020) and the RFC 4592 wildcard rule. Maintained
+ *                              from keyspace events + reconciled on (re)connect.
  *                              Simple values stay pipe-delimited; complex/extensible
  *                              values (SVCB, NAPTR, ZONEMD, ENUM, EPP) use the
  *                              versioned TLV codec (tlv_* in libdnswire). See the
@@ -307,6 +321,7 @@
 #define _GNU_SOURCE
 #endif
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -605,18 +620,35 @@ static int zone_upsert(const char *name, const char *mname, const char *rname, u
         idx = g_zone_count++;
     }
     zone_entry_t *z = &g_zones[idx];
-    safe_strcpy(z->name, name, sizeof(z->name));
-    safe_strcpy(z->soa_mname, mname && mname[0] ? mname : "", sizeof(z->soa_mname));
-    safe_strcpy(z->soa_rname, rname && rname[0] ? rname : "", sizeof(z->soa_rname));
-    z->soa_serial = serial;
-    z->soa_refresh = refresh;
-    z->soa_retry = retry;
-    z->soa_expire = expire;
-    z->soa_minimum = minimum;
-    z->soa_ttl = soa_ttl;
-    safe_strcpy(z->axfr_allow, axfr_allow ? axfr_allow : "127.0.0.1", sizeof(z->axfr_allow));
-    safe_strcpy(z->notify_targets, notify_targets ? notify_targets : "", sizeof(z->notify_targets));
-    z->active = 1; /* (re)affirm the slot; catalog_origin is preserved across upserts */
+    /* CSA-CONC-002: write a field only when it changes. Query threads read
+     * these without g_zones_mutex, and a reload re-upserts every zone with
+     * mostly identical values — rewriting them in place raced every reader
+     * for nothing. */
+#define ZU_STR(f, v)                                                                               \
+    do {                                                                                           \
+        const char *v_ = (v);                                                                      \
+        if (strcmp(z->f, v_) != 0)                                                                 \
+            safe_strcpy(z->f, v_, sizeof(z->f));                                                   \
+    } while (0)
+#define ZU_NUM(f, v)                                                                               \
+    do {                                                                                           \
+        if (z->f != (v))                                                                           \
+            z->f = (v);                                                                            \
+    } while (0)
+    ZU_STR(name, name);
+    ZU_STR(soa_mname, mname && mname[0] ? mname : "");
+    ZU_STR(soa_rname, rname && rname[0] ? rname : "");
+    ZU_NUM(soa_serial, serial);
+    ZU_NUM(soa_refresh, refresh);
+    ZU_NUM(soa_retry, retry);
+    ZU_NUM(soa_expire, expire);
+    ZU_NUM(soa_minimum, minimum);
+    ZU_NUM(soa_ttl, soa_ttl);
+    ZU_STR(axfr_allow, axfr_allow ? axfr_allow : "127.0.0.1");
+    ZU_STR(notify_targets, notify_targets ? notify_targets : "");
+    ZU_NUM(active, 1); /* (re)affirm the slot; catalog_origin is preserved across upserts */
+#undef ZU_STR
+#undef ZU_NUM
     pthread_mutex_unlock(&g_zones_mutex);
     return idx;
 }
@@ -809,17 +841,52 @@ static pthread_mutex_t g_qlog_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Format: {"ts":<unix>,"client":"<ip>","qname":"<n>","qtype":"<t>",
  *           "rcode":<r>,"answers":<n>,"rtt_us":<t>,"transport":"<udp|tcp|dot|doh>"}
  */
+/* RFC 8259 JSON string escape (CSA-INJ-002): a qname's label bytes are
+ * client-chosen — '"', '\\', newlines and any other byte. Quote and
+ * backslash are escaped, and every byte < 0x20, 0x7f or >= 0x80 becomes
+ * \\u00XX, so the output is plain ASCII and one log record stays one line.
+ * Always NUL-terminates; truncates rather than overflows. */
+static const char *json_escape(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *) (in ? in : ""); *p; p++) {
+        char tmp[8];
+        const char *e = tmp;
+        if (*p == '"')
+            e = "\\\"";
+        else if (*p == '\\')
+            e = "\\\\";
+        else if (*p < 0x20 || *p >= 0x7f)
+            snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
+        else {
+            tmp[0] = (char) *p;
+            tmp[1] = 0;
+        }
+        size_t el = strlen(e);
+        if (o + el + 1 > cap)
+            break;
+        memcpy(out + o, e, el);
+        o += el;
+    }
+    if (cap)
+        out[o < cap ? o : cap - 1] = 0;
+    return out;
+}
+
 static void qlog_write(const char *client_ip, const char *qname, uint16_t qtype, uint8_t rcode,
                        int answers, long rtt_us, const char *transport) {
     if (!g_query_log_fp && !g_query_log_path[0])
         return;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    char line[512];
+    char eqn[256 * 6 + 1];
+    char ecl[INET6_ADDRSTRLEN * 2];
+    json_escape(qname, eqn, sizeof(eqn));
+    json_escape(client_ip, ecl, sizeof(ecl));
+    char line[2048];
     snprintf(line, sizeof(line),
              "{\"ts\":%ld,\"client\":\"%s\",\"qname\":\"%s\",\"qtype\":\"%s\""
              ",\"rcode\":%u,\"answers\":%d,\"rtt_us\":%ld,\"transport\":\"%s\"}\n",
-             (long) ts.tv_sec, client_ip, qname, type2str(qtype), (unsigned) rcode, answers, rtt_us,
+             (long) ts.tv_sec, ecl, eqn, type2str(qtype), (unsigned) rcode, answers, rtt_us,
              transport);
     pthread_mutex_lock(&g_qlog_mutex);
     FILE *fp = g_query_log_fp ? g_query_log_fp : stderr;
@@ -828,14 +895,26 @@ static void qlog_write(const char *client_ip, const char *qname, uint16_t qtype,
     pthread_mutex_unlock(&g_qlog_mutex);
 }
 
+static void dns_log(int priority, const char *fmt, ...); /* defined below */
+
+/* Open the new file before closing the old one: if the open fails (e.g. the
+ * path is not writable by the unprivileged service user after the privilege
+ * drop) the current log stays in use instead of silently falling back to
+ * stderr. */
 static void qlog_open(void) {
-    pthread_mutex_lock(&g_qlog_mutex);
-    if (g_query_log_fp) {
-        fclose(g_query_log_fp);
-        g_query_log_fp = NULL;
+    FILE *nfp = NULL;
+    if (g_query_log_path[0] && strcmp(g_query_log_path, "stderr") != 0) {
+        nfp = fopen(g_query_log_path, "a");
+        if (!nfp) {
+            dns_log(LOG_ERR, "[QLog] cannot open query log %s: %s — keeping the current one\n",
+                    g_query_log_path, strerror(errno));
+            return;
+        }
     }
-    if (g_query_log_path[0] && strcmp(g_query_log_path, "stderr") != 0)
-        g_query_log_fp = fopen(g_query_log_path, "a");
+    pthread_mutex_lock(&g_qlog_mutex);
+    if (g_query_log_fp)
+        fclose(g_query_log_fp);
+    g_query_log_fp = nfp;
     pthread_mutex_unlock(&g_qlog_mutex);
 }
 
@@ -1084,11 +1163,20 @@ static void rsyslog_disconnect(void) {
 /* CSPRNG 16-bit value for outbound transaction IDs (CSA-RAND-002). rand() is
  * predictable; the recipient authenticates NOTIFY via TSIG/SOA so this is mostly
  * for consistency, but a CSPRNG is the right default. */
-static uint16_t csprng_u16(void) {
-    uint16_t v;
-    if (RAND_bytes((unsigned char *) &v, sizeof(v)) == 1)
-        return v;
-    return (uint16_t) rand();
+/* A random 16-bit value for DNS message IDs / source ports. Fails closed:
+ * returns -1 when the CSPRNG fails, never a predictable fallback (a guessable
+ * ID or port is the cache-poisoning surface). Test hook: g_csprng_fail. */
+#ifdef UNIT_TEST
+static int g_csprng_fail = 0;
+#endif
+static int csprng_u16(uint16_t *out) {
+#ifdef UNIT_TEST
+    if (g_csprng_fail)
+        return -1;
+#endif
+    if (RAND_bytes((unsigned char *) out, sizeof(*out)) != 1)
+        return -1;
+    return 0;
 }
 
 /* Bind the expected peer identity so the TLS handshake fails on a cert that does
@@ -1399,11 +1487,16 @@ static pthread_mutex_t g_zsk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_soa_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Query statistics (Prometheus) */
-static uint64_t g_stat_queries = 0;       /* total queries received */
-static uint64_t g_stat_noerror = 0;       /* NOERROR responses */
-static uint64_t g_stat_nxdomain = 0;      /* NXDOMAIN responses */
-static uint64_t g_stat_refused = 0;       /* REFUSED (out-of-zone) */
-static uint64_t g_stat_servfail = 0;      /* SERVFAIL responses */
+static uint64_t g_stat_queries = 0;  /* total queries received */
+static uint64_t g_stat_noerror = 0;  /* NOERROR responses */
+static uint64_t g_stat_nxdomain = 0; /* NXDOMAIN responses */
+static uint64_t g_stat_refused = 0;  /* REFUSED (out-of-zone) */
+static uint64_t g_stat_servfail = 0; /* SERVFAIL responses */
+/* CSA-DOS-002: stream (TCP/DoT) connections are one detached thread each;
+ * bound them. config:tcp_max_conns (default 256). */
+static atomic_int g_tcp_conns = 0;
+static int g_tcp_max_conns = 256;
+static uint64_t g_stat_tcp_rejected = 0;
 static uint64_t g_stat_rrl_drop = 0;      /* RRL: dropped */
 static uint64_t g_stat_rrl_tc = 0;        /* RRL: truncated */
 static uint64_t g_stat_axfr = 0;          /* AXFR transfers completed */
@@ -1476,58 +1569,10 @@ static int is_local_zone(const char *qname) {
  * a malformed entry matches nothing (fail closed). The prefix must be 1-2
  * decimal digits in 0..32: atoi() used to turn "10.0.0.0/x" into /0, i.e.
  * "match every address" (CSA-AUTH-005). Modifies tok. */
-static int ip_list_entry_parse(char *tok, struct in_addr *net, uint32_t *mask) {
-    while (*tok == ' ' || *tok == '\t')
-        tok++;
-    size_t tl = strlen(tok);
-    while (tl > 0 && (tok[tl - 1] == ' ' || tok[tl - 1] == '\t'))
-        tok[--tl] = 0;
-    int bits = 32;
-    char *slash = strchr(tok, '/');
-    if (slash) {
-        const char *ps = slash + 1;
-        int nd = 0;
-        bits = 0;
-        while (*ps >= '0' && *ps <= '9' && nd < 3) {
-            bits = bits * 10 + (*ps - '0');
-            ps++;
-            nd++;
-        }
-        if (nd == 0 || *ps != 0 || bits > 32)
-            return 0;
-        *slash = 0;
-    }
-    if (inet_pton(AF_INET, tok, net) != 1)
-        return 0;
-    if (bits == 0)
-        *mask = 0u;
-    else if (bits == 32)
-        *mask = 0xFFFFFFFFu;
-    else
-        *mask = htonl(~((1u << (32 - bits)) - 1));
-    return 1;
-}
-
-/* Returns 1 if IPv4 address `ip` matches any entry in a comma-separated list of
- * IPs and /0-/32 CIDRs (e.g. "10.0.0.0/8, 192.168.1.5"). Shared by the AXFR ACL,
- * the forwarder client ACL (CLAUDE-forwarder.md Gap 1) and the unsigned-UPDATE
- * allow-list. An empty/blank list matches nothing, and so does a malformed
- * entry (fail closed). */
-static int ip_list_allowed(const char *list, const struct in_addr *ip) {
-    if (!list || !list[0] || !ip)
-        return 0;
-    char allow[1024];
-    safe_strcpy(allow, list, sizeof(allow));
-    char *sp = NULL;
-    for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
-        struct in_addr net;
-        uint32_t mask = 0;
-        if (!ip_list_entry_parse(tok, &net, &mask))
-            continue;
-        if ((ip->s_addr & mask) == (net.s_addr & mask))
-            return 1;
-    }
-    return 0;
+/* The ACL matcher lives once in libdnswire (acl_allows), shared with
+ * resolverd's client ACL. */
+static int ip_list_allowed(const char *list, const client_addr_t *c) {
+    return acl_allows(list, c);
 }
 
 /* Log (once per config load) every malformed entry of an ACL list, so an
@@ -1541,9 +1586,10 @@ static void ip_list_check(const char *key, const char *list) {
     for (char *tok = strtok_r(allow, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
         char ent[128];
         safe_strcpy(ent, tok, sizeof(ent));
-        struct in_addr net;
-        uint32_t mask = 0;
-        if (!ip_list_entry_parse(tok, &net, &mask))
+        int fam = 0;
+        uint8_t net[16];
+        int bits = 0;
+        if (!acl_entry_parse(tok, &fam, net, &bits))
             dns_log(LOG_ERR, "[CONFIG] %s: malformed entry '%s' ignored (matches nothing)\n", key,
                     ent);
     }
@@ -1656,7 +1702,7 @@ static uint64_t siphash24(const uint8_t *in, int inlen, const uint8_t key[16]) {
  *   client_cookie(8) || version+reserved+timestamp(8) || client_ip(4)
  * keyed with the server's secret. Timestamp = Unix seconds; cookies are
  * accepted up to DNS_COOKIE_VALIDITY seconds old. */
-static void compute_server_cookie(const uint8_t *ccookie, const struct in_addr *cip,
+static void compute_server_cookie(const uint8_t *ccookie, const client_addr_t *cip,
                                   uint32_t timestamp, uint8_t out[DNS_COOKIE_SERVER_LEN]) {
     out[0] = 1;                   /* version */
     out[1] = out[2] = out[3] = 0; /* reserved */
@@ -1664,11 +1710,21 @@ static void compute_server_cookie(const uint8_t *ccookie, const struct in_addr *
     out[5] = (timestamp >> 16) & 0xFF;
     out[6] = (timestamp >> 8) & 0xFF;
     out[7] = timestamp & 0xFF;
-    uint8_t hin[8 + 8 + 4];
+    /* client_cookie(8) | header(8) | family(1) | address(4 or 16): the full
+     * address, v4 or v6 (CSA-NET-003 — every v6 client used to hash 0.0.0.0). */
+    uint8_t hin[8 + 8 + 1 + 16];
+    int hl = 17;
     memcpy(hin, ccookie, 8);
     memcpy(hin + 8, out, 8);
-    memcpy(hin + 16, &cip->s_addr, 4);
-    uint64_t h = siphash24(hin, sizeof(hin), g_cookie_secret);
+    hin[16] = (uint8_t) (cip ? cip->family : 0);
+    if (cip && cip->family == AF_INET) {
+        memcpy(hin + 17, &cip->u.v4, 4);
+        hl += 4;
+    } else if (cip && cip->family == AF_INET6) {
+        memcpy(hin + 17, &cip->u.v6, 16);
+        hl += 16;
+    }
+    uint64_t h = siphash24(hin, (size_t) hl, g_cookie_secret);
     memcpy(out + 8, &h, 8);
 }
 
@@ -2358,6 +2414,8 @@ static void boot_load(void) {
 /* ==========================================================================
  * Config: load all settings from Valkey
  * ======================================================================= */
+static void primary_addrs_refresh(void); /* NOTIFY source check (CSA-DOS-006) */
+
 static void config_load_from_valkey(void) {
     char val[MAX_PEM];
 #define G(k, d)                                                                                    \
@@ -2375,9 +2433,24 @@ static void config_load_from_valkey(void) {
         if (vk_get("config:" k, val, sizeof(val)) && val[0])                                       \
             d = (uint32_t) atol(val);                                                              \
     } while (0)
+    /* CSA-CONC-002: set-or-default with a single write. The old pattern
+     * (reset the global to its default, then G/GI it) let a request thread
+     * read the default in between — an empty forwarder list, a cleared ACL.
+     * GSD copies a string only when the value actually changed. */
+#define GSD(k, d, def)                                                                             \
+    do {                                                                                           \
+        const char *nv_ = (vk_get("config:" k, val, sizeof(val)) && val[0]) ? val : (def);         \
+        if (strcmp(d, nv_) != 0)                                                                   \
+            safe_strcpy(d, nv_, sizeof(d));                                                        \
+    } while (0)
+#define GID(k, d, def)                                                                             \
+    do {                                                                                           \
+        int nv_ = (vk_get("config:" k, val, sizeof(val)) && val[0]) ? atoi(val) : (def);           \
+        if ((d) != nv_)                                                                            \
+            (d) = nv_;                                                                             \
+    } while (0)
     G("ddns_secret", g_ddns_secret);
-    g_ddns_allow_suffix[0] = 0;
-    G("ddns_allow_suffix", g_ddns_allow_suffix);
+    GSD("ddns_allow_suffix", g_ddns_allow_suffix, "");
     /* CSA-AUTH-001: unsigned-UPDATE allow-list (empty = closed). Read into a
      * scratch buffer and only rewritten when it changed: config reloads run on
      * every SOA serial bump, and a reset-then-refill would briefly empty the
@@ -2391,94 +2464,105 @@ static void config_load_from_valkey(void) {
             /* DoH (apid) and DoQ (doqd) relay to dnsd over loopback, so their
              * clients arrive as 127.0.0.1 (CSA-AUTH-006): listing loopback
              * opens unsigned UPDATE to every DoH/DoQ client on this host. */
-            struct in_addr lo;
-            lo.s_addr = htonl(INADDR_LOOPBACK);
-            if (ip_list_allowed(ua, &lo))
+            client_addr_t lo4;
+            client_addr_t lo6;
+            memset(&lo4, 0, sizeof(lo4));
+            memset(&lo6, 0, sizeof(lo6));
+            lo4.family = AF_INET;
+            lo4.u.v4.s_addr = htonl(INADDR_LOOPBACK);
+            lo6.family = AF_INET6;
+            lo6.u.v6 = in6addr_loopback;
+            if (ip_list_allowed(ua, &lo4) || ip_list_allowed(ua, &lo6))
                 dns_log(LOG_WARNING,
-                        "[CONFIG] config:update_unsigned_allow matches 127.0.0.1 — any DoH/DoQ "
-                        "client relayed through apid/doqd on this host can send unsigned "
-                        "UPDATEs\n");
+                        "[CONFIG] config:update_unsigned_allow matches loopback — any local "
+                        "process can send unsigned UPDATEs (DoH/DoQ clients are judged by "
+                        "their own address via PROXY v2, not as loopback)\n");
         }
     }
-    g_ddns_auto_ptr = 0;
-    GI("ddns_auto_ptr", g_ddns_auto_ptr);
+    GID("ddns_auto_ptr", g_ddns_auto_ptr, 0);
     GI("ddns_sweep_secs", g_ddns_sweep_secs);
-    g_srp_enabled = 0;
-    GI("srp_enabled", g_srp_enabled);
+    GID("srp_enabled", g_srp_enabled, 0);
     GU("srp_max_lease_secs", g_srp_max_lease);
     GU("srp_max_key_lease_secs", g_srp_max_key_lease);
     GI("srp_sweep_secs", g_srp_sweep_secs);
     /* Role: a "secondary" is a read-only replica (hidden-master plan Gap 2). */
-    g_zone_secondary = 0;
     {
         char role[64] = "";
-        if (vk_get("config:zone_role", role, sizeof(role)) && strcasecmp(role, "secondary") == 0)
-            g_zone_secondary = 1;
+        int sec =
+            vk_get("config:zone_role", role, sizeof(role)) && strcasecmp(role, "secondary") == 0;
+        if (g_zone_secondary != sec)
+            g_zone_secondary = sec;
     }
     /* Secondary transfer-client config (hidden-master plan Gap 3). */
-    g_primary_host[0] = 0;
-    g_primary_port = 53;
-    g_primary_tls = 0;
-    g_xfr_ca_pem[0] = g_xfr_client_cert_pem[0] = g_xfr_client_key_pem[0] = 0;
-    G("primary_host", g_primary_host);
-    GI("primary_port", g_primary_port);
-    GI("primary_tls", g_primary_tls);
-    vk_get("config:xfr_ca_pem", g_xfr_ca_pem, sizeof(g_xfr_ca_pem));
-    vk_get("config:xfr_client_cert_pem", g_xfr_client_cert_pem, sizeof(g_xfr_client_cert_pem));
-    vk_get("config:xfr_client_key_pem", g_xfr_client_key_pem, sizeof(g_xfr_client_key_pem));
-    GI("dns_port", g_dns_port);
+    GSD("primary_host", g_primary_host, "");
+    primary_addrs_refresh();
+    GID("primary_port", g_primary_port, 53);
+    GID("primary_tls", g_primary_tls, 0);
+    GSD("xfr_ca_pem", g_xfr_ca_pem, "");
+    GSD("xfr_client_cert_pem", g_xfr_client_cert_pem, "");
+    GSD("xfr_client_key_pem", g_xfr_client_key_pem, "");
+    {
+        /* LISTEN_PORT env overrides config:dns_port (per-launch DNS port;
+         * documented in CLAUDE.md). Lets the test harness run dnsd off the mDNS
+         * port 5353 — which collides with a desktop avahi-daemon — without
+         * touching Valkey config. Computed first, written once. */
+        int dp = g_dns_port;
+        if (vk_get("config:dns_port", val, sizeof(val)) && val[0])
+            dp = atoi(val);
+        const char *lp = getenv("LISTEN_PORT");
+        if (lp && *lp && atoi(lp) > 0 && atoi(lp) <= 65535)
+            dp = atoi(lp);
+        if (g_dns_port != dp)
+            g_dns_port = dp;
+    }
     GI("dot_port", g_dot_port);
     GI("http_port", g_http_port);
     GI("https_port", g_https_port);
     GI("metrics_port", g_metrics_port);
-    /* LISTEN_PORT env overrides config:dns_port (per-launch DNS port; documented
-     * in CLAUDE.md). Lets the test harness run dnsd off the mDNS port 5353 — which
-     * collides with a desktop avahi-daemon — without touching Valkey config. */
     {
-        const char *lp = getenv("LISTEN_PORT");
-        if (lp && *lp) {
-            int p = atoi(lp);
-            if (p > 0 && p <= 65535)
-                g_dns_port = p;
-        }
+        /* config value, env override, clamp — computed, then written once */
+        int uw = g_udp_workers;
+        if (vk_get("config:udp_workers", val, sizeof(val)) && val[0])
+            uw = atoi(val);
+        const char *e = getenv("UDP_WORKERS");
+        if (e && e[0])
+            uw = atoi(e);
+        uw = uw < 1 ? 1 : (uw > 64 ? 64 : uw);
+        if (g_udp_workers != uw)
+            g_udp_workers = uw;
+        int rb = g_udp_rx_batch;
+        if (vk_get("config:udp_rx_batch", val, sizeof(val)) && val[0])
+            rb = atoi(val);
+        e = getenv("UDP_RX_BATCH");
+        if (e && e[0])
+            rb = atoi(e);
+        rb = rb < 1 ? 1 : (rb > UDP_BATCH_MAX ? UDP_BATCH_MAX : rb);
+        if (g_udp_rx_batch != rb)
+            g_udp_rx_batch = rb;
     }
-    GI("udp_workers", g_udp_workers);
-    {
-        const char *uw = getenv("UDP_WORKERS");
-        if (uw && uw[0])
-            g_udp_workers = atoi(uw);
-    }
-    if (g_udp_workers < 1)
-        g_udp_workers = 1;
-    if (g_udp_workers > 64)
-        g_udp_workers = 64;
-    GI("udp_rx_batch", g_udp_rx_batch);
-    {
-        const char *rb = getenv("UDP_RX_BATCH");
-        if (rb && rb[0])
-            g_udp_rx_batch = atoi(rb);
-    }
-    if (g_udp_rx_batch < 1)
-        g_udp_rx_batch = 1;
-    if (g_udp_rx_batch > UDP_BATCH_MAX)
-        g_udp_rx_batch = UDP_BATCH_MAX;
     /* In-process record cache (rcache). TTL/size re-read live; the table is
      * allocated once at startup (main) when enabled — toggling on requires a
      * restart, the TTL value itself can change live. */
-    GI("record_cache_ttl", g_rcache_ttl);
-    GI("record_cache_size", g_rcache_size);
     {
+        int ttl = g_rcache_ttl;
+        int size = g_rcache_size;
+        if (vk_get("config:record_cache_ttl", val, sizeof(val)) && val[0])
+            ttl = atoi(val);
+        if (vk_get("config:record_cache_size", val, sizeof(val)) && val[0])
+            size = atoi(val);
         const char *e = getenv("RECORD_CACHE_TTL");
         if (e && e[0])
-            g_rcache_ttl = atoi(e);
+            ttl = atoi(e);
         e = getenv("RECORD_CACHE_SIZE");
         if (e && e[0])
-            g_rcache_size = atoi(e);
+            size = atoi(e);
+        ttl = ttl < 0 ? 0 : ttl;
+        size = size < 0 ? 0 : size;
+        if (g_rcache_ttl != ttl)
+            g_rcache_ttl = ttl;
+        if (g_rcache_size != size)
+            g_rcache_size = size;
     }
-    if (g_rcache_ttl < 0)
-        g_rcache_ttl = 0;
-    if (g_rcache_size < 0)
-        g_rcache_size = 0;
     /* Stale-shadow write throttle (1 = every GET, N = ~1/N, 0 = off). */
     GI("stale_refresh_sample", g_stale_sample);
     {
@@ -2498,8 +2582,7 @@ static void config_load_from_valkey(void) {
     GU("zone_serial", g_soa_serial);
     G("tsig_key_name", g_tsig_key_name);
     G("nsid", g_nsid);
-    g_error_report_agent[0] = 0;
-    G("error_report_agent", g_error_report_agent);
+    GSD("error_report_agent", g_error_report_agent, "");
     G("axfr_allow", g_axfr_allow);
     {
         /* Log malformed ACL entries once per change, not on every reload. */
@@ -2514,7 +2597,11 @@ static void config_load_from_valkey(void) {
     /* Query log */
     {
         char qlpath[512];
-        if (vk_get("config:query_log_path", qlpath, sizeof(qlpath)) && qlpath[0]) {
+        /* Reopen only when the path changes: config_load runs on every serial
+         * bump, and a reopen after the privilege drop could fail on a file the
+         * root-started daemon created (the log then went to stderr). */
+        if (vk_get("config:query_log_path", qlpath, sizeof(qlpath)) && qlpath[0] &&
+            strcmp(qlpath, g_query_log_path) != 0) {
             safe_strcpy(g_query_log_path, qlpath, sizeof(g_query_log_path));
             qlog_open();
         }
@@ -2532,18 +2619,17 @@ static void config_load_from_valkey(void) {
             g_rrl_slip = atoi(rrl_val);
     }
     /* Out-of-zone forwarding (CLAUDE-forwarder.md). */
-    g_forward_enabled = 0;
-    g_forwarders[0] = 0;
-    g_forward_allow[0] = 0;
-    g_forward_timeout_ms = 1500;
-    GI("forward_enabled", g_forward_enabled);
-    G("forwarders", g_forwarders);
-    G("forward_allow", g_forward_allow);
-    GI("forward_timeout_ms", g_forward_timeout_ms);
-    if (g_forward_timeout_ms < 100)
-        g_forward_timeout_ms = 100;
-    if (g_forward_timeout_ms > 30000)
-        g_forward_timeout_ms = 30000;
+    GSD("forwarders", g_forwarders, "");
+    GSD("forward_allow", g_forward_allow, "");
+    {
+        int ft = 1500;
+        if (vk_get("config:forward_timeout_ms", val, sizeof(val)) && val[0])
+            ft = atoi(val);
+        ft = ft < 100 ? 100 : (ft > 30000 ? 30000 : ft);
+        if (g_forward_timeout_ms != ft)
+            g_forward_timeout_ms = ft;
+    }
+    GID("forward_enabled", g_forward_enabled, 0); /* last: lists are in place first */
     /* Guard rails (CLAUDE-forwarder.md Gap 3): make an open-resolver
      * misconfiguration impossible to enable silently. */
     if (g_forward_enabled && g_forward_allow[0]) {
@@ -2562,36 +2648,39 @@ static void config_load_from_valkey(void) {
                              "forwarding stays DISABLED (fail closed).\n");
     }
     /* Load-balancing rotation for A/AAAA RRsets (CLAUDE-loadbalance.md Gap 1). */
-    g_lb_mode = LB_NONE;
     {
+        int mode = LB_NONE;
         char lb[32] = "";
         if (vk_get("config:lb_mode", lb, sizeof(lb)) && lb[0]) {
             if (strcasecmp(lb, "rr") == 0)
-                g_lb_mode = LB_RR;
+                mode = LB_RR;
             else if (strcasecmp(lb, "random") == 0)
-                g_lb_mode = LB_RANDOM;
+                mode = LB_RANDOM;
             else if (strcasecmp(lb, "none") != 0)
                 dns_log(LOG_WARNING, "[LB] unknown lb_mode '%s' — rotation disabled\n", lb);
         }
+        if ((int) g_lb_mode != mode)
+            g_lb_mode = mode;
     }
     /* Load-balancing health checks (CLAUDE-loadbalance.md Gap 2). */
-    g_lb_health_enabled = 0;
-    GI("lb_health_enabled", g_lb_health_enabled);
-    g_lb_health_targets[0] = 0;
-    G("lb_health_targets", g_lb_health_targets);
-    g_lb_health_interval = 10;
-    GI("lb_health_interval", g_lb_health_interval);
-    g_lb_health_timeout_ms = 1000;
-    GI("lb_health_timeout_ms", g_lb_health_timeout_ms);
+    GSD("lb_health_targets", g_lb_health_targets, "");
+    GID("lb_health_interval", g_lb_health_interval, 10);
+    GID("lb_health_timeout_ms", g_lb_health_timeout_ms, 1000);
+    GID("lb_health_enabled", g_lb_health_enabled, 0);
     /* RFC 5782 DNSxL synthesis (config:dnsxl_zones, empty = disabled). */
-    g_dnsxl_zones[0] = 0;
-    G("dnsxl_zones", g_dnsxl_zones);
+    GSD("dnsxl_zones", g_dnsxl_zones, "");
     /* RFC 1794 per-name round-robin rotation (config:rr_rotate, default 0). */
-    g_rr_rotate = 0;
-    GI("rr_rotate", g_rr_rotate);
+    GID("rr_rotate", g_rr_rotate, 0);
+    {
+        int mc = 256;
+        if (vk_get("config:tcp_max_conns", val, sizeof(val)) && val[0])
+            mc = atoi(val);
+        mc = mc < 1 ? 1 : mc;
+        if (g_tcp_max_conns != mc)
+            g_tcp_max_conns = mc;
+    }
     /* RFC 6116 ENUM apex (config:enum_apex, e.g. "e164.arpa", empty = not set). */
-    g_enum_apex[0] = 0;
-    G("enum_apex", g_enum_apex);
+    GSD("enum_apex", g_enum_apex, "");
     /* TSIG secret (base64). Decoded into a scratch buffer first so a reload
      * never exposes a half-written secret. An absent key disables TSIG; a key
      * that is present but does not decode must not silently disable
@@ -2623,11 +2712,27 @@ static void config_load_from_valkey(void) {
             g_tsig_secret_invalid = 0;
         OPENSSL_cleanse(sec, sizeof(sec));
     }
-    /* Cookie secret (32 hex chars = 16 bytes) */
-    if (vk_get("config:cookie_secret", val, sizeof(val)) && val[0])
-        hex_dec(val, g_cookie_secret, 16);
-    else
-        RAND_bytes(g_cookie_secret, 16);
+    /* Cookie secret (32 hex chars = 16 bytes). Unset: a random one, generated
+     * ONCE per process — regenerating it on every reload (every serial bump,
+     * before CSA-CONC-002) invalidated every client's server cookie. */
+    {
+        static int s_cookie_random = 0;
+        uint8_t cs[16];
+        if (vk_get("config:cookie_secret", val, sizeof(val)) && val[0] &&
+            hex_dec(val, cs, sizeof(cs)) == (int) sizeof(cs)) {
+            if (memcmp(cs, g_cookie_secret, sizeof(cs)) != 0)
+                memcpy(g_cookie_secret, cs, sizeof(cs));
+            s_cookie_random = 0;
+        } else if (!s_cookie_random) {
+            if (RAND_bytes(cs, (int) sizeof(cs)) == 1) {
+                memcpy(g_cookie_secret, cs, sizeof(cs));
+                s_cookie_random = 1;
+            } else {
+                dns_log(LOG_ERR, "[CONFIG] cannot generate a cookie secret (RAND_bytes)\n");
+            }
+        }
+        OPENSSL_cleanse(cs, sizeof(cs));
+    }
     /* NSEC3 params */
     if (vk_get("config:nsec3_iters", val, sizeof(val)) && val[0])
         g_nsec3_iters = atoi(val);
@@ -2645,8 +2750,7 @@ static void config_load_from_valkey(void) {
     vk_get("config:tls_cert_pem", g_tls_cert_pem, sizeof(g_tls_cert_pem));
     vk_get("config:tls_key_pem", g_tls_key_pem, sizeof(g_tls_key_pem));
     vk_get("config:mtls_ca_pem", g_mtls_ca_pem, sizeof(g_mtls_ca_pem));
-    g_dot_require_client_cert = 0;
-    GI("dot_require_client_cert", g_dot_require_client_cert);
+    GID("dot_require_client_cert", g_dot_require_client_cert, 0);
     /* Console (stdout/stderr) level — env CONSOLE_LEVEL overrides config. */
     if (vk_get("config:console_level", val, sizeof(val)) && val[0])
         g_console_level = syslog_level_from_str(val);
@@ -3076,9 +3180,326 @@ static void cert_current_reload(void) {
  * while it was disconnected are not missed; reconnects use capped backoff so a
  * Valkey restart cannot cause a reconnect storm. */
 #define KEYSPACE_DB 0
+/* ==========================================================================
+ * Zone name index — zidx:<zone> (CSA-PROTO-001 Fix 2b, owner decision D2 = A)
+ *
+ * Empty non-terminals: "_tcp.example.com" has no records but
+ * "_sip._tcp.example.com" does, so it EXISTS (RFC 8020) and must be answered
+ * NODATA, never NXDOMAIN — a resolver applying RFC 8020 would otherwise
+ * treat everything below it (SRV, DKIM "_domainkey", ...) as nonexistent.
+ * The record schema can only answer "is anything below this name?" with a
+ * keyspace SCAN, so dnsd keeps an index:
+ *
+ *   zidx:<zone>   sorted set, every score 0, one member per record key:
+ *                   rev(owner) \x01 <record key>
+ *                 rev(owner) = the owner's labels, lowercased, in reverse
+ *                 order, joined by \x02 ("_sip._tcp.example.com" ->
+ *                 "com\x02example\x02_tcp\x02_sip").
+ *
+ * A name exists or is an empty non-terminal iff some member starts with
+ * rev(name)\x01 (records at the name) or rev(name)\x02 (records below it):
+ * one ZRANGEBYLEX [rev\x01 (rev\x03 LIMIT 0 1, sent in the same pipelined
+ * burst as the EXISTS probes. \x01/\x02 never occur in a label.
+ *
+ * Maintenance: dnsd is the only writer. It watches zone:*, ddns:* and srp:*
+ * keyspace events and, per event, re-checks EXISTS on that key and ZADDs or
+ * ZREMs its member — so every writer (apid, eppd, certd, the dashboard,
+ * dnsd's own UPDATE/SRP/XFR paths) and Valkey's own TTL expiry of ddns/srp
+ * leases are covered without any of them knowing the index exists. A full
+ * reconcile (zidx_rebuild_all) runs on every subscriber (re)connect and
+ * zone-table change, so missed events while disconnected self-heal.
+ * ======================================================================= */
+#define ZIDX_EXACT "\x01"
+#define ZIDX_CHILD '\x02'
+#define ZIDX_END "\x03"
+
+/* rev(name) as above. Returns its length, or -1 if it does not fit. */
+static int zidx_rev(const char *name, char *out, size_t cap) {
+    char tmp[256];
+    safe_strcpy(tmp, name, sizeof(tmp));
+    strlower(tmp);
+    size_t tl = strlen(tmp);
+    if (tl > 0 && tmp[tl - 1] == '.')
+        tmp[--tl] = 0;
+    size_t pos = 0;
+    int end = (int) tl;
+    while (end > 0) {
+        int start = end;
+        while (start > 0 && tmp[start - 1] != '.')
+            start--;
+        size_t ll = (size_t) (end - start);
+        if (pos + ll + 2 > cap)
+            return -1;
+        if (pos > 0)
+            out[pos++] = ZIDX_CHILD;
+        memcpy(out + pos, tmp + start, ll);
+        pos += ll;
+        end = start - 1;
+    }
+    if (pos >= cap)
+        return -1;
+    out[pos] = 0;
+    return (int) pos;
+}
+
+/* Split an indexable record key "zone|ddns|srp:<zone>:<TYPE>:<name>[:...]"
+ * into zone + owner. Returns 0 for keys that are not served records
+ * (srp OWNER bookkeeping, KEY trust anchors) or are malformed. */
+static int zidx_parse_key(const char *key, char *zone, size_t zc, char *owner, size_t oc) {
+    int is_srp = 0;
+    const char *p;
+    if (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0) {
+        p = key + 5;
+    } else if (strncmp(key, "srp:", 4) == 0) {
+        p = key + 4;
+        is_srp = 1;
+    } else {
+        return 0;
+    }
+    const char *c1 = strchr(p, ':');
+    if (!c1 || (size_t) (c1 - p) >= zc || c1 == p)
+        return 0;
+    memcpy(zone, p, (size_t) (c1 - p));
+    zone[c1 - p] = 0;
+    const char *t = c1 + 1;
+    const char *c2 = strchr(t, ':');
+    if (!c2 || c2 == t)
+        return 0;
+    size_t tlen = (size_t) (c2 - t);
+    if ((tlen == 3 && strncmp(t, "KEY", 3) == 0) || (tlen == 5 && strncmp(t, "OWNER", 5) == 0))
+        return 0;
+    const char *n = c2 + 1;
+    size_t nl = strlen(n);
+    if (is_srp && tlen == 3 && strncmp(t, "PTR", 3) == 0) {
+        const char *c3 = strchr(n, ':'); /* srp:<z>:PTR:<browse>:<instance> */
+        if (c3)
+            nl = (size_t) (c3 - n);
+    }
+    if (nl == 0 || nl >= oc)
+        return 0;
+    memcpy(owner, n, nl);
+    owner[nl] = 0;
+    strlower(owner);
+    return name_in_zone(owner, zone);
+}
+
+static int zidx_zone_configured(const char *zone) {
+    int found = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && !found; i++)
+        if (strcasecmp(g_zones[i].name, zone) == 0)
+            found = 1;
+    pthread_mutex_unlock(&g_zones_mutex);
+    return found;
+}
+
+/* Bring one record key's index member in line with whether the key exists
+ * right now. Idempotent; safe to call for any key. */
+static void zidx_apply_key(const char *key) {
+    char zone[256];
+    char owner[256];
+    if (!zidx_parse_key(key, zone, sizeof(zone), owner, sizeof(owner)))
+        return;
+    if (!zidx_zone_configured(zone))
+        return;
+    char rev[300];
+    if (zidx_rev(owner, rev, sizeof(rev)) < 0)
+        return;
+    char member[1200];
+    char zk[300];
+    int ml = snprintf(member, sizeof(member), "%s" ZIDX_EXACT "%s", rev, key);
+    if (ml < 0 || ml >= (int) sizeof(member))
+        return;
+    snprintf(zk, sizeof(zk), "zidx:%s", zone);
+    strlower(zk);
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) >= 0) {
+        resp_reply_t r;
+        if (resp_cmd(&vk, &r, 2, "EXISTS", key) < 0) {
+            vk.fd = -1;
+        } else if (r.type == 3) {
+            if (r.integer > 0) {
+                if (resp_cmd(&vk, &r, 4, "ZADD", zk, "0", member) < 0)
+                    vk.fd = -1;
+            } else {
+                if (resp_cmd(&vk, &r, 3, "ZREM", zk, member) < 0)
+                    vk.fd = -1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+}
+
+/* Reconcile zidx:<zone> with the keyspace: index every existing record key,
+ * then drop members whose key no longer exists. */
+static void zidx_rebuild_zone(const char *zone) {
+    static const char *nss[] = {"zone", "ddns", "srp"};
+    int added = 0;
+    for (int ni = 0; ni < 3; ni++) {
+        char pat[320];
+        snprintf(pat, sizeof(pat), "%s:%s:*", nss[ni], zone);
+        char **keys = NULL;
+        int nk = vk_list_keys(pat, &keys);
+        for (int i = 0; i < nk; i++) {
+            zidx_apply_key(keys[i]);
+            free(keys[i]);
+        }
+        free(keys);
+        added += nk;
+    }
+    char zk[300];
+    snprintf(zk, sizeof(zk), "zidx:%s", zone);
+    strlower(zk);
+    /* Collect members first (ZREM while walking ranges would shift indexes). */
+    char **mem = NULL;
+    int nm = 0;
+    int cap = 0;
+    pthread_mutex_lock(&g_vk_mutex);
+    if (valkey_ensure(&vk) >= 0) {
+        resp_reply_t r;
+        if (resp_cmd(&vk, &r, 4, "ZRANGE", zk, "0", "-1") < 0) {
+            vk.fd = -1;
+        } else if (r.type == 5) {
+            int total = r.count;
+            for (int i = 0; i < total; i++) {
+                resp_reply_t el;
+                if (resp_parse(&vk, &el) < 0) {
+                    vk.fd = -1;
+                    break;
+                }
+                if (el.type != 2)
+                    continue;
+                if (nm == cap) {
+                    int ncap = cap ? cap * 2 : 256;
+                    char **nmem = realloc(mem, (size_t) ncap * sizeof(*mem));
+                    if (!nmem)
+                        continue;
+                    mem = nmem;
+                    cap = ncap;
+                }
+                mem[nm] = strdup(el.str);
+                if (mem[nm])
+                    nm++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mutex);
+    int stale = 0;
+    for (int i = 0; i < nm; i++) {
+        const char *sep = strchr(mem[i], ZIDX_EXACT[0]);
+        if (sep)
+            zidx_apply_key(sep + 1); /* ZREMs if the key is gone */
+        else
+            stale++;
+        free(mem[i]);
+    }
+    free(mem);
+    dns_log(LOG_DEBUG, "[ZIDX] %s reconciled: %d record keys, %d members checked\n", zone, added,
+            nm);
+    (void) stale;
+}
+
+static void zidx_rebuild_all(void) {
+    char names[MAX_ZONES][256];
+    int n = 0;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count && n < MAX_ZONES; i++)
+        safe_strcpy(names[n++], g_zones[i].name, sizeof(names[0]));
+    pthread_mutex_unlock(&g_zones_mutex);
+    for (int i = 0; i < n; i++)
+        zidx_rebuild_zone(names[i]);
+}
+
+/* Does `name` (in zone `zone`) own a record or have one below it? 1 / 0;
+ * -1 if Valkey could not be asked. Used on the query path before wildcard
+ * synthesis: RFC 4592 §2.2.1 — a wildcard never applies to a name that
+ * exists, empty non-terminals included. */
+static int zidx_name_exists(const char *zone, const char *name) {
+    char rev[300];
+    if (zidx_rev(name, rev, sizeof(rev)) < 0)
+        return -1;
+    char zk[300];
+    char lo[320];
+    char hi[320];
+    snprintf(zk, sizeof(zk), "zidx:%s", zone);
+    strlower(zk);
+    snprintf(lo, sizeof(lo), "[%s" ZIDX_EXACT, rev);
+    snprintf(hi, sizeof(hi), "(%s" ZIDX_END, rev);
+    resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
+    if (!t_vk_conn)
+        pthread_mutex_lock(&g_vk_mutex);
+    int rc = -1;
+    resp_reply_t r;
+    if (valkey_ensure(c) >= 0 &&
+        resp_cmd(c, &r, 7, "ZRANGEBYLEX", zk, lo, hi, "LIMIT", "0", "1") >= 0 && r.type == 5) {
+        rc = r.count > 0;
+        for (int i = 0; i < r.count; i++) {
+            resp_reply_t el;
+            if (resp_parse(c, &el) < 0) {
+                rc = -1;
+                c->fd = -1;
+                break;
+            }
+        }
+    }
+    if (!t_vk_conn)
+        pthread_mutex_unlock(&g_vk_mutex);
+    return rc;
+}
+
+/* CSA-CONC-002: a zone's serial counter (config:zone_serial for the primary
+ * zone, config:zone:<z>:serial for the others) changes on every UPDATE and
+ * every apid/eppd write. Apply just that value instead of re-running the
+ * whole config load — which rewrote every config global under the request
+ * threads on each bump. Keeps what the full reload did for a serial change:
+ * the zone's in-memory serial, a stale ZONEMD re-seed, and the catalog scan
+ * (a catalog's membership changes arrive as a serial bump). Returns 1 if
+ * `key` was a serial key. */
+static int serial_key_apply(const char *key) {
+    char zn[256] = "";
+    if (strcmp(key, "config:zone_serial") == 0) {
+        safe_strcpy(zn, g_zone_name, sizeof(zn));
+    } else if (strncmp(key, "config:zone:", 12) == 0) {
+        const char *z = key + 12;
+        size_t kl = strlen(z);
+        if (kl <= 7 || strcmp(z + kl - 7, ":serial") != 0 || kl - 7 >= sizeof(zn))
+            return 0;
+        memcpy(zn, z, kl - 7);
+        zn[kl - 7] = 0;
+    } else {
+        return 0;
+    }
+    char v[32] = "";
+    if (!vk_get(key, v, sizeof(v)) || !v[0])
+        return 1; /* deleted / unreadable: keep the current serial */
+    uint32_t ns = (uint32_t) strtoul(v, NULL, 10);
+    int primary = strcasecmp(zn, g_zone_name) == 0;
+    zone_entry_t *z = NULL;
+    pthread_mutex_lock(&g_zones_mutex);
+    for (int i = 0; i < g_zone_count; i++)
+        if (strcasecmp(g_zones[i].name, zn) == 0) {
+            z = &g_zones[i];
+            break;
+        }
+    pthread_mutex_unlock(&g_zones_mutex);
+    pthread_mutex_lock(&g_soa_mutex);
+    if (z)
+        z->soa_serial = ns;
+    if (primary)
+        g_soa_serial = ns;
+    pthread_mutex_unlock(&g_soa_mutex);
+    if (z)
+        zonemd_seed_if_stale(z);
+    catalog_scan_all();
+    dns_log(LOG_DEBUG, "[Reload] serial of %s is now %u\n", zn, ns);
+    return 1;
+}
+
 static void keyspace_apply(const char *key) {
     if (strncmp(key, "cert:current", 12) == 0) {
         cert_current_reload();
+    } else if (serial_key_apply(key)) {
+        /* handled: no full config reload for a serial bump */
     } else if (strncmp(key, "config:", 7) == 0) {
         config_load_from_valkey();
         seed_primary_zone(); /* propagate SOA/zone config edits to the primary zone */
@@ -3091,6 +3512,7 @@ static void keyspace_apply(const char *key) {
         zones_load_from_valkey();
         zones_post_load();  /* apply per-zone config + load keys for any new zone */
         catalog_scan_all(); /* a new/removed zone_table entry may be a catalog */
+        zidx_rebuild_all(); /* a new zone's existing records join the name index */
         dns_log(LOG_INFO, "[Reload] zone table reloaded after %s change\n", key);
     } else if (strncmp(key, "zone:", 5) == 0 || strncmp(key, "ddns:", 5) == 0) {
         /* Record cache invalidation: a dynamic UPDATE or dashboard/apid edit to a
@@ -3098,6 +3520,9 @@ static void keyspace_apply(const char *key) {
          * eviction (the event carries the precise key). No-op if cache disabled.
          * Note: "zone_table:" does not match "zone:" (5th char differs). */
         rcache_invalidate(key);
+        zidx_apply_key(key); /* set, del and TTL expiry alike */
+    } else if (strncmp(key, "srp:", 4) == 0) {
+        zidx_apply_key(key);
     } else if (strncmp(key, "dnssec:", 7) == 0) {
         /* dnssec:<zone>:... — reload that zone's key state live (current set +
          * rollover/next set). Legacy un-prefixed keys (dnssec:zsk) belong to the
@@ -3156,13 +3581,10 @@ static void *keyspace_watch_thread(void *arg) {
 
         /* zone:* / ddns:* are watched only to invalidate the record cache, so
          * subscribe to them only when it is active (else they add no value). */
-        static const char *prefixes[] = {
-            "config:*", "cert:current", "zone_table:*", "dnssec:*", NULL, NULL, NULL};
-        if (g_rcache && g_rcache_ttl > 0) {
-            int n = 4;
-            prefixes[n++] = "zone:*";
-            prefixes[n++] = "ddns:*";
-        }
+        /* zone:* / ddns:* / srp:* feed the zone name index (zidx, always) and
+         * record-cache invalidation (when the cache is on). */
+        static const char *prefixes[] = {"config:*", "cert:current", "zone_table:*", "dnssec:*",
+                                         "zone:*",   "ddns:*",       "srp:*",        NULL};
         int subok = 1;
         for (int i = 0; prefixes[i]; i++) {
             char pat[160];
@@ -3191,6 +3613,7 @@ static void *keyspace_watch_thread(void *arg) {
         config_load_from_valkey();
         zones_load_from_valkey();
         cert_current_reload();
+        zidx_rebuild_all(); /* events missed while disconnected */
         dns_log(LOG_NOTICE, "[Reload] live reload active (keyspace notifications)\n");
 
         /* Each notification is a multi-bulk: ["pmessage", pattern, channel,
@@ -4759,18 +5182,22 @@ static const uint8_t *tsig_find(const uint8_t *pkt, int plen, tsig_rr_t *t) {
                 t->key_name[opos] = 0;
                 strlower(t->key_name);
             }
-            /* capture alg name */
+            /* capture alg name — CSA-MEM-002: each label must lie inside the
+             * TSIG RDATA and be a plain label (RFC 8945 §4.2: no compression) */
             int rp = rd_off;
+            const int rd_end = rd_off + rdlen;
             {
                 int apos = 0;
                 for (;;) {
-                    if (rp >= plen)
+                    if (rp >= rd_end)
                         return NULL;
                     uint8_t c = pkt[rp];
                     if (c == 0) {
                         rp++;
                         break;
                     }
+                    if (c > 63 || rp + 1 + c > rd_end)
+                        return NULL;
                     int dot = (apos > 0) ? 1 : 0;
                     if (apos + dot + (int) c < (int) sizeof(t->alg_name) - 1) {
                         if (dot)
@@ -5416,7 +5843,7 @@ static int tsig_axfr_last(uint8_t *buf, int off, int blen, uint16_t qid, const u
 #define RRL_BUCKET_MASK (RRL_BUCKETS - 1)
 
 typedef struct {
-    uint32_t key;          /* (src /24 addr) ^ (qname hash) */
+    uint64_t key;          /* hash of (client prefix, class, zone|qname+qtype) */
     int32_t tokens;        /* current token count */
     time_t last_refill;    /* last refill timestamp */
     uint32_t slip_counter; /* counts drops to implement slip */
@@ -5429,22 +5856,45 @@ static pthread_mutex_t g_rrl_mutex = PTHREAD_MUTEX_INITIALIZER;
  * rrl_check — returns 0 if the packet should be sent normally,
  *             1 if it should be dropped,
  *             2 if it should be sent as TC-only (truncated, no answers).
+ *
+ * CSA-DOS-004: keyed on the CLIENT PREFIX (IPv4 /24, IPv6 /56 — the v6
+ * client is real now, CSA-NET-003) plus, for negative answers (NXDOMAIN /
+ * NODATA) and referrals, the ZONE — so a random-subdomain flood shares one
+ * bucket instead of getting a fresh one per name — and for positive answers
+ * the qname + qtype. Called after the response is classified. A colliding
+ * key no longer resets a bucket whose window is still live (that let an
+ * attacker refill a victim's tokens): the newcomer shares the occupant's
+ * tokens until the window ends.
  */
-static int rrl_check(const struct in_addr *cip, const char *qname) {
+static int rrl_check(const client_addr_t *cip, const char *name, uint16_t qtype, int negative) {
     if (!g_rrl_enabled)
         return 0;
-    /* Key: hash of /24 address XOR djb2 hash of qname */
-    uint32_t addr24 = ntohl(cip->s_addr) & 0xFFFFFF00u;
-    uint32_t qhash = 5381u;
-    for (const char *p = qname; *p; p++)
-        qhash = ((qhash << 5) + qhash) + (uint8_t) *p;
-    uint32_t key = addr24 ^ qhash;
-    uint32_t idx = (key ^ (key >> 16)) & RRL_BUCKET_MASK;
+    uint64_t key = 1469598103934665603ULL; /* FNV-1a 64 */
+#define RRL_MIX(byte) (key = (key ^ (uint8_t) (byte)) * 1099511628211ULL)
+    int fam = cip ? cip->family : 0;
+    RRL_MIX(fam);
+    if (fam == AF_INET) {
+        const uint8_t *b4 = (const uint8_t *) &cip->u.v4;
+        for (int i = 0; i < 3; i++) /* /24 */
+            RRL_MIX(b4[i]);
+    } else if (fam == AF_INET6) {
+        for (int i = 0; i < 7; i++) /* /56 */
+            RRL_MIX(cip->u.v6.s6_addr[i]);
+    }
+    RRL_MIX(negative ? 'N' : 'P');
+    for (const char *p = name; p && *p; p++)
+        RRL_MIX(tolower((unsigned char) *p));
+    if (!negative) {
+        RRL_MIX(qtype >> 8);
+        RRL_MIX(qtype & 0xFF);
+    }
+#undef RRL_MIX
+    uint32_t idx = (uint32_t) (key ^ (key >> 32)) & RRL_BUCKET_MASK;
     pthread_mutex_lock(&g_rrl_mutex);
     rrl_entry_t *e = &g_rrl[idx];
     time_t now = time(NULL);
-    /* Collision: different key resets the bucket */
-    if (e->key != key) {
+    if (e->key != key && (e->last_refill == 0 || now - e->last_refill >= g_rrl_window)) {
+        /* Take over a bucket whose occupant's window has ended. */
         e->key = key;
         e->tokens = g_rrl_rate;
         e->last_refill = now;
@@ -5569,12 +6019,11 @@ static int report_agent_is_subdomain_of(const char *agent, const char *zone) {
  * zone matched, e.g. REFUSED).
  * ======================================================================= */
 static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit,
-                         uint16_t rcode_ext, const edns_info_t *ei, const struct in_addr *cip,
+                         uint16_t rcode_ext, const edns_info_t *ei, const client_addr_t *cip,
                          int ede_code, const char *ede_text) {
     uint8_t sc[DNS_COOKIE_SERVER_LEN];
     if (ei && ei->has_client_cookie) {
-        const struct in_addr zero = {0};
-        compute_server_cookie(ei->client_cookie, cip ? cip : &zero, (uint32_t) time(NULL), sc);
+        compute_server_cookie(ei->client_cookie, cip, (uint32_t) time(NULL), sc);
     }
     int zv_labels = t_zone ? zone_label_count(t_zone->name) : -1;
     uint32_t zv_serial = t_zone ? t_zone->soa_serial : 0;
@@ -5605,7 +6054,7 @@ static int dnsd_edns_opt(uint8_t *buf, int off, int blen, int is_tcp, int do_bit
  * replays with both halves and the server validates the MAC + timestamp.
  * Clients that don't send any cookie are unaffected.
  * ======================================================================= */
-static int cookie_verify(const edns_info_t *ei, const struct in_addr *cip) {
+static int cookie_verify(const edns_info_t *ei, const client_addr_t *cip) {
     if (!ei->has_client_cookie)
         return 1; /* no cookie, no requirement */
     if (!ei->has_server_cookie)
@@ -6435,7 +6884,7 @@ static int forward_query(const uint8_t *query, int qlen, uint8_t *resp, int resp
  * + name out-of-zone and not locally served). Mirrors the decision in
  * build_query_resp so a forwardable UDP query is dispatched to a worker thread
  * rather than blocking the listener. */
-static int forward_should(const uint8_t *pkt, int plen, const struct in_addr *cip) {
+static int forward_should(const uint8_t *pkt, int plen, const client_addr_t *cip) {
     if (!g_forward_enabled || !g_forward_allow[0])
         return 0; /* fail closed */
     if (plen < 12)
@@ -6558,8 +7007,19 @@ static void static_types_at(const char *name, uint16_t *types, int *n, int max) 
  * connection vk_get would use (CSA-PROTO-001 — NODATA vs NXDOMAIN must be
  * decided by name existence, not by whether the queried type was found).
  * Called only for negative answers. */
-static int name_types_present(const char *name, uint16_t *types, int max) {
+static int name_types_present(const char *name, uint16_t *types, int max, int *ent) {
     int n = 0;
+    if (ent) {
+        /* Empty non-terminal in the static zone: a static owner below `name`. */
+        *ent = 0;
+        size_t nl = strlen(name);
+        for (int i = 0; i < static_zone_sz && !*ent; i++) {
+            size_t sl = strlen(static_zone[i].name);
+            if (sl > nl + 1 && static_zone[i].name[sl - nl - 1] == '.' &&
+                strcasecmp(static_zone[i].name + sl - nl, name) == 0)
+                *ent = 1;
+        }
+    }
     static_types_at(name, types, &n, max);
     if (t_zone && streq_ci(name, t_zone->name)) {
         types_add(types, &n, max, DNS_TYPE_SOA);
@@ -6586,6 +7046,26 @@ static int name_types_present(const char *name, uint16_t *types, int max) {
             return -1;
         pos += w;
     }
+    /* D2 / Fix 2b: does any record exist AT or BELOW the name? (zidx) */
+    if (ent) {
+        char rev[300];
+        if (zidx_rev(name, rev, sizeof(rev)) < 0)
+            return -1;
+        char zk[300];
+        char lo[320];
+        char hi[320];
+        int zl = snprintf(zk, sizeof(zk), "zidx:%s", zn);
+        strlower(zk);
+        int ll = snprintf(lo, sizeof(lo), "[%s" ZIDX_EXACT, rev);
+        int hl = snprintf(hi, sizeof(hi), "(%s" ZIDX_END, rev);
+        int w = snprintf(cmds + pos, sizeof(cmds) - (size_t) pos,
+                         "*7\r\n$11\r\nZRANGEBYLEX\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n"
+                         "$5\r\nLIMIT\r\n$1\r\n0\r\n$1\r\n1\r\n",
+                         zl, zk, ll, lo, hl, hi);
+        if (zl < 0 || ll < 0 || hl < 0 || w < 0 || w >= (int) sizeof(cmds) - pos)
+            return -1;
+        pos += w;
+    }
     resp_conn_t *c = t_vk_conn ? t_vk_conn : &vk;
     if (!t_vk_conn)
         pthread_mutex_lock(&g_vk_mutex);
@@ -6606,6 +7086,26 @@ static int name_types_present(const char *name, uint16_t *types, int max) {
             if (atol(line + 1) > 0)
                 types_add(types, &n, max, k_served_types[i].type);
         }
+        if (ent && rc == 0) {
+            /* ZRANGEBYLEX reply: "*0" or "*1" + one bulk member. */
+            char line[64];
+            if (resp_readline(c, line, sizeof(line)) < 0 || line[0] != '*') {
+                rc = -1;
+            } else {
+                int cnt = atoi(line + 1);
+                for (int i = 0; i < cnt && rc == 0; i++) {
+                    char bl[64];
+                    char member[1300];
+                    int len = -1;
+                    if (resp_readline(c, bl, sizeof(bl)) < 0 || bl[0] != '$' ||
+                        (len = atoi(bl + 1)) < 0 || len >= (int) sizeof(member) ||
+                        resp_readbytes(c, member, len) < 0)
+                        rc = -1;
+                }
+                if (rc == 0 && cnt > 0)
+                    *ent = 1;
+            }
+        }
     }
     if (rc < 0 && c->fd >= 0) {
         close(c->fd);
@@ -6617,7 +7117,7 @@ static int name_types_present(const char *name, uint16_t *types, int max) {
 }
 
 static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int resp_len, int is_tcp,
-                            const struct in_addr *cip) {
+                            const client_addr_t *cip) {
     if (qlen < 12)
         return -1;
     compress_reset();
@@ -7349,7 +7849,14 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         }
     }
 
-    /* RFC 4592: wildcard lookup — if no exact match, try *.<parent> */
+    /* RFC 4592: wildcard lookup — if no exact match, try *.<parent>. A
+     * wildcard never applies to a name that exists (§2.2.1) — one with
+     * records of another type or an empty non-terminal — so the zone name
+     * index is consulted, lazily and only when a wildcard owner is found. */
+    int qname_exists = -1;
+#define QNAME_EXISTS()                                                                             \
+    (qname_exists < 0 ? (qname_exists = (t_zone && zidx_name_exists(t_zone->name, qname) == 1))    \
+                      : qname_exists)
     if (!found) {
         /* Build wildcard name: *.one-label-up */
         char *dot = strchr(qname, '.');
@@ -7361,6 +7868,8 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 dns_rec_t *r = &static_zone[i];
                 if (!streq_ci(r->name, wname))
                     continue;
+                if (QNAME_EXISTS())
+                    break; /* qname exists: the wildcard does not apply */
                 found = 1; /* wildcard owner exists */
                 if (r->type != qtype && qtype != DNS_TYPE_ANY)
                     continue;
@@ -7418,7 +7927,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 if (qtype == DNS_TYPE_A || qtype == DNS_TYPE_ANY) {
                     zkey(wk, sizeof(wk), "A", wname);
                     char wv[LB_VAL_MAX];
-                    if (vk_get(wk, wv, sizeof(wv))) {
+                    if (vk_get(wk, wv, sizeof(wv)) && !QNAME_EXISTS()) {
                         found = 1;
                         off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_A, wv, dnssec_ok,
                                               &answers);
@@ -7427,7 +7936,7 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
                 if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_ANY) {
                     zkey(wk, sizeof(wk), "AAAA", wname);
                     char wv[LB_VAL_MAX];
-                    if (vk_get(wk, wv, sizeof(wv))) {
+                    if (vk_get(wk, wv, sizeof(wv)) && !QNAME_EXISTS()) {
                         found = 1;
                         off = emit_addr_rrset(resp, off, resp_len, qname, DNS_TYPE_AAAA, wv,
                                               dnssec_ok, &answers);
@@ -7437,29 +7946,13 @@ static int build_query_resp(const uint8_t *query, int qlen, uint8_t *resp, int r
         }
     }
 
+#undef QNAME_EXISTS
 finish_answer:
     off = rrset_flush(resp, off, resp_len);
     rh->ancount = htons((uint16_t) answers);
     /* RFC 4035 §3.1.6: set AD bit when DO=1 and we returned signed answers */
     if (dnssec_ok && answers > 0 && g_zsk)
         rh->flags = htons(ntohs(rh->flags) | DNS_AD);
-    /* RRL: rate-limit before returning response to caller */
-    if (!is_tcp && g_rrl_enabled) {
-        int rrl_action = rrl_check(cip, qname);
-        if (rrl_action == 1) {
-            dns_log(LOG_DEBUG, "[RRL] DROP %s %s\n", type2str(qtype), qname);
-            STAT_INC(g_stat_rrl_drop);
-            return -1; /* caller discards — no response sent */
-        }
-        if (rrl_action == 2) {
-            /* Send truncated response — client should retry over TCP */
-            dns_log(LOG_DEBUG, "[RRL] TC %s %s\n", type2str(qtype), qname);
-            STAT_INC(g_stat_rrl_tc);
-            rh->flags = htons(ntohs(rh->flags) | DNS_TC);
-            rh->ancount = rh->nscount = rh->arcount = 0;
-            off = 12 + (after - 12) + 4; /* header + question only */
-        }
-    }
     /* NXDOMAIN/NODATA answered authoritatively from a configured zone are
      * normal, correct DNS answers, not errors — RFC 8914 EDE is for
      * surfacing failure causes, so neither branch attaches one (an actual
@@ -7472,7 +7965,8 @@ finish_answer:
          * exists (any type, any namespace, or the apex), not by whether the
          * queried type was found. One pipelined Valkey round trip. */
         uint16_t ptypes[NAME_TYPES_MAX];
-        int np = name_types_present(qname, ptypes, NAME_TYPES_MAX);
+        int ent = 0;
+        int np = name_types_present(qname, ptypes, NAME_TYPES_MAX, &ent);
         if (np < 0) {
             /* Cannot tell whether the name exists: fail closed. */
             rh->flags = htons(DNS_QR | DNS_RCODE_SERVFAIL);
@@ -7491,7 +7985,10 @@ finish_answer:
                 }
             }
             int is_apex = t_zone && streq_ci(qname, t_zone->name);
-            int exists = (np > 0 || found || is_apex);
+            /* An empty non-terminal (D2) exists: NODATA, and its compact-
+             * denial bitmap is RRSIG NSEC (NSEC) / empty (NSEC3), never
+             * NXNAME (RFC 9824 §3.2, §4). */
+            int exists = (np > 0 || found || is_apex || ent);
             int signed_denial = dnssec_ok && t_zone && t_zone->zsk;
             uint16_t rcode = DNS_RCODE_NOERROR;
             if (!exists) {
@@ -7513,6 +8010,26 @@ finish_answer:
                                          &auth_count);
             off = rrset_flush(resp, off, resp_len);
             rh->nscount = htons((uint16_t) auth_count);
+        }
+    }
+    /* RRL (CSA-DOS-004): after the response is classified. Negative answers
+     * and referrals are keyed on the zone, positive answers on qname+qtype. */
+    if (!is_tcp && g_rrl_enabled) {
+        int negative = (answers == 0) || is_referral;
+        const char *rkey = (negative && t_zone) ? t_zone->name : qname;
+        int rrl_action = rrl_check(cip, rkey, qtype, negative);
+        if (rrl_action == 1) {
+            dns_log(LOG_DEBUG, "[RRL] DROP %s %s\n", type2str(qtype), qname);
+            STAT_INC(g_stat_rrl_drop);
+            return -1; /* caller discards — no response sent */
+        }
+        if (rrl_action == 2) {
+            /* Send truncated response — client should retry over TCP */
+            dns_log(LOG_DEBUG, "[RRL] TC %s %s\n", type2str(qtype), qname);
+            STAT_INC(g_stat_rrl_tc);
+            rh->flags = htons(ntohs(rh->flags) | DNS_TC);
+            rh->ancount = rh->nscount = rh->arcount = 0;
+            off = 12 + (after - 12) + 4; /* header + question only */
         }
     }
     /* RFC 8482: set HINFO hint for ANY minimal responses */
@@ -7553,7 +8070,9 @@ finish_answer:
  * uses for NODATA vs NXDOMAIN (name_types_present). */
 static int prereq_name_exists(const char *name) {
     uint16_t t[NAME_TYPES_MAX];
-    int n = name_types_present(name, t, NAME_TYPES_MAX);
+    /* RFC 2136 §2.4.4 "name is in use" = an RR exists AT the name; an empty
+     * non-terminal is not in use, so the zidx probe is not asked for. */
+    int n = name_types_present(name, t, NAME_TYPES_MAX, NULL);
     return n < 0 ? -1 : (n > 0);
 }
 /* Returns 1 if at least one RR of type `rtype` exists for `name`. */
@@ -8422,7 +8941,7 @@ static int srp_handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const 
 /* ==========================================================================
  * RFC 2136 DNS UPDATE
  * ======================================================================= */
-static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const struct in_addr *cip) {
+static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const client_addr_t *cip) {
     if (plen < 12)
         return -1;
     const dns_hdr_t *h = (const dns_hdr_t *) pkt;
@@ -8489,11 +9008,11 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const stru
         } else {
             /* Every IPv6 client currently arrives as 0.0.0.0 (CSA-NET-003):
              * never let a 0.0.0.0/0 entry turn that into "allow all IPv6". */
-            int allowed = cip && cip->s_addr != 0 && ip_list_allowed(g_update_unsigned_allow, cip);
+            /* Unknown client (family 0) is never allowed. */
+            int allowed = cip && cip->family != 0 && ip_list_allowed(g_update_unsigned_allow, cip);
             if (!allowed) {
-                char cs[INET_ADDRSTRLEN] = "?";
-                if (cip)
-                    inet_ntop(AF_INET, cip, cs, sizeof(cs));
+                char cs[INET6_ADDRSTRLEN] = "?";
+                client_ntop(cip, cs, sizeof(cs));
                 dns_log(LOG_WARNING,
                         "[UPDATE] REFUSED unsigned update from %s (no TSIG/SIG(0); "
                         "client not in config:update_unsigned_allow)\n",
@@ -8556,7 +9075,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const stru
     for (int i = 0; i < ntohs(h->ancount); i++) {
         char nm[256];
         int a = name_from_wire(pkt, plen, off, nm, sizeof(nm));
-        if (a < 0 || a + 9 > plen)
+        if (a < 0 || a + 10 > plen) /* get16(a + 8) reads a+8..a+9 */
             goto formerr;
         uint16_t rtype = get16(pkt, a), rclass = get16(pkt, a + 2);
         uint16_t rdlen = get16(pkt, a + 8);
@@ -8595,7 +9114,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const stru
     for (int i = 0; i < ntohs(h->nscount); i++) {
         char un[256];
         int a = name_from_wire(pkt, plen, off, un, sizeof(un));
-        if (a < 0 || a + 9 > plen)
+        if (a < 0 || a + 10 > plen) /* get16(a + 8) reads a+8..a+9 */
             goto formerr;
         uint16_t ut = get16(pkt, a), uc = get16(pkt, a + 2);
         uint32_t uttl = get32(pkt, a + 4);
@@ -8914,7 +9433,7 @@ static int ixfr_journal_fetch(const char *zone, uint32_t from_serial, uint32_t c
 typedef struct {
     int fd;
     SSL *ssl;
-    struct sockaddr_in addr;
+    client_addr_t addr;
     int ixfr;
     uint32_t ixfr_serial;
     uint16_t query_id;
@@ -8923,7 +9442,7 @@ typedef struct {
 
 /* Thin wrapper kept for the AXFR call site; the matching logic lives once in
  * ip_list_allowed() (CLAUDE-forwarder.md Gap 1). */
-static int axfr_ip_allowed(const struct in_addr *cip, const char *allow_list) {
+static int axfr_ip_allowed(const client_addr_t *cip, const char *allow_list) {
     return ip_list_allowed(allow_list, cip);
 }
 
@@ -10320,6 +10839,64 @@ static void xfr_refresh_kick(void) {
  * immediately on a NOTIFY (Gap 5). The first pass loads every zone at startup.
  * Records the last successful contact per zone (xfr_last_ok) so the query path
  * can SERVFAIL a zone that has gone past its SOA expire (RFC 1035 §4.3.5). */
+/* CSA-DOS-006: the configured primary's addresses, resolved once at config
+ * load (and again only when config:primary_host changes) so the NOTIFY path
+ * never runs getaddrinfo on a query thread. */
+#define PRIMARY_ADDRS_MAX 8
+static client_addr_t g_primary_addrs[PRIMARY_ADDRS_MAX];
+static int g_primary_naddrs = 0;
+static char g_primary_resolved_for[256] = "";
+static pthread_mutex_t g_primary_addr_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void primary_addrs_refresh(void) {
+    char host[256];
+    safe_strcpy(host, g_primary_host, sizeof(host));
+    if (strcmp(host, g_primary_resolved_for) == 0)
+        return;
+    client_addr_t addrs[PRIMARY_ADDRS_MAX];
+    memset(addrs, 0, sizeof(addrs));
+    int n = 0;
+    if (host[0]) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(host, NULL, &hints, &res) == 0) {
+            for (struct addrinfo *p = res; p && n < PRIMARY_ADDRS_MAX; p = p->ai_next)
+                client_from_sockaddr(&addrs[n++], p->ai_addr);
+            freeaddrinfo(res);
+        } else {
+            dns_log(LOG_WARNING,
+                    "[NOTIFY] cannot resolve config:primary_host %s — NOTIFYs "
+                    "will be ignored until it resolves\n",
+                    host);
+        }
+    }
+    pthread_mutex_lock(&g_primary_addr_mutex);
+    memcpy(g_primary_addrs, addrs, sizeof(addrs[0]) * (size_t) n);
+    g_primary_naddrs = n;
+    /* an unresolvable host is retried on the next config load */
+    safe_strcpy(g_primary_resolved_for, n > 0 || !host[0] ? host : "",
+                sizeof(g_primary_resolved_for));
+    pthread_mutex_unlock(&g_primary_addr_mutex);
+}
+
+static int addr_is_primary(const client_addr_t *c) {
+    int hit = 0;
+    pthread_mutex_lock(&g_primary_addr_mutex);
+    for (int i = 0; i < g_primary_naddrs && !hit; i++) {
+        const client_addr_t *pa = &g_primary_addrs[i];
+        if (pa->family != c->family)
+            continue;
+        if (pa->family == AF_INET && pa->u.v4.s_addr == c->u.v4.s_addr)
+            hit = 1;
+        else if (pa->family == AF_INET6 && memcmp(&pa->u.v6, &c->u.v6, 16) == 0)
+            hit = 1;
+    }
+    pthread_mutex_unlock(&g_primary_addr_mutex);
+    return hit;
+}
+
 static void *xfr_refresh_thread(void *arg) {
     (void) arg;
     /* Seed the expire clock at boot: a secondary that can never reach its master
@@ -10332,7 +10909,14 @@ static void *xfr_refresh_thread(void *arg) {
                 g_zones[i].xfr_last_ok = boot;
         pthread_mutex_unlock(&g_zones_mutex);
     }
+    time_t last_pass = 0;
     for (;;) {
+        /* CSA-DOS-006: at most one pass per second. A NOTIFY flood only keeps
+         * next_check at 0; the kicks that arrive meanwhile are served by the
+         * next pass, so none is lost and the pull rate stays bounded. */
+        if (time(NULL) - last_pass < 1)
+            sleep(1);
+        last_pass = time(NULL);
         /* Snapshot zone names + timers; do the (slow) network pulls unlocked. */
         char names[MAX_ZONES][256];
         uint32_t refresh[MAX_ZONES], retry[MAX_ZONES];
@@ -10389,15 +10973,15 @@ static void *axfr_thread(void *arg) {
     axfr_conn_t c;
     memcpy(&c, arg, sizeof(c));
     free(arg);
-    char cip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &c.addr.sin_addr, cip, sizeof(cip));
+    char cip[INET6_ADDRSTRLEN];
+    client_ntop(&c.addr, cip, sizeof(cip));
     dns_log(LOG_NOTICE, "[%s] Transfer of %s to %s\n", c.ixfr ? "IXFR" : "AXFR", c.zone, cip);
 
     /* Select the requested zone; all SOA/keys/static records below are scoped
      * to t_zone.  Refuse if we are not authoritative for it. */
     t_zone = zone_for_qname(c.zone);
     const char *allow = (t_zone && t_zone->axfr_allow[0]) ? t_zone->axfr_allow : g_axfr_allow;
-    if (!t_zone || g_tsig_secret_invalid || !axfr_ip_allowed(&c.addr.sin_addr, allow)) {
+    if (!t_zone || g_tsig_secret_invalid || !axfr_ip_allowed(&c.addr, allow)) {
         dns_log(LOG_ERR, "[AXFR] REFUSED %s for %s\n", cip, c.zone);
         /* Send REFUSED response */
         uint8_t ref[12] = {0};
@@ -10898,9 +11482,15 @@ static void notify_enqueue(const char *zone, const struct sockaddr_in *dst, uint
         pthread_mutex_unlock(&g_notify_mutex);
         return;
     }
+    if (csprng_u16(&j->id) != 0) {
+        dns_log(LOG_ERR, "[NOTIFY] CSPRNG failure — not sending NOTIFY for %s\n", zone);
+        free(j);
+        close(fd);
+        pthread_mutex_unlock(&g_notify_mutex);
+        return;
+    }
     safe_strcpy(j->zone, zone, sizeof(j->zone));
     j->dst = *dst;
-    j->id = csprng_u16();
     j->qtype = qtype;
     j->tries = 0;
     j->next_at = 0; /* send on the next worker pass (immediately) */
@@ -11479,7 +12069,7 @@ static void *srp_sweeper_thread(void *arg) {
  * DNS packet dispatch (shared by UDP / DoT / DoH)
  * ======================================================================= */
 static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len, int is_tcp,
-                       const struct in_addr *cip) {
+                       const client_addr_t *cip) {
     if (plen < 12)
         return -1;
     const dns_hdr_t *h = (const dns_hdr_t *) pkt;
@@ -11499,24 +12089,41 @@ static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len
         rh->flags = htons(DNS_QR | DNS_OPCODE_NOTIFY | DNS_RCODE_NOERROR);
         rh->qdcount = rh->ancount = rh->nscount = rh->arcount = 0;
         if (g_zone_secondary && g_primary_host[0] && cip) {
-            int from_primary = 0;
-            struct addrinfo hints, *res = NULL;
-            memset(&hints, 0, sizeof(hints));
-            hints.ai_family = AF_INET;
-            if (getaddrinfo(g_primary_host, NULL, &hints, &res) == 0) {
-                for (struct addrinfo *p = res; p; p = p->ai_next)
-                    if (((struct sockaddr_in *) p->ai_addr)->sin_addr.s_addr == cip->s_addr) {
-                        from_primary = 1;
-                        break;
-                    }
-                freeaddrinfo(res);
+            /* CSA-DOS-006: with a TSIG key configured the NOTIFY must carry a
+             * TSIG that verifies (a UDP source address alone is spoofable) —
+             * same handling as UPDATE and transfers. */
+            int signed_ok = 0;
+            if (g_tsig_secret_invalid || g_tsig_secret_len > 0) {
+                tsig_rr_t treq;
+                memset(&treq, 0, sizeof(treq));
+                uint16_t qid = ntohs(h->id);
+                int has_tsig = tsig_find(pkt, plen, &treq) != NULL;
+                int trc = (has_tsig && !g_tsig_secret_invalid) ? tsig_verify(pkt, plen, &treq)
+                                                               : TSIG_BADKEY;
+                if (trc != TSIG_OK) {
+                    dns_log(LOG_WARNING,
+                            "[NOTIFY] NOTAUTH — %s NOTIFY while a TSIG key is "
+                            "configured; not refreshing\n",
+                            has_tsig ? "badly signed" : "unsigned");
+                    rh->flags = htons(DNS_QR | DNS_OPCODE_NOTIFY | DNS_RCODE_NOTAUTH);
+                    if (!has_tsig)
+                        return 12;
+                    if (trc == TSIG_BADTIME)
+                        return tsig_append_badtime(resp, 12, resp_len, qid, &treq);
+                    return tsig_append_error_unsigned(resp, 12, resp_len, qid, &treq,
+                                                      trc == TSIG_BADKEY ? TSIG_ERR_BADKEY
+                                                                         : TSIG_ERR_BADSIG);
+                }
+                signed_ok = 1;
             }
-            if (from_primary) {
+            if (addr_is_primary(cip)) {
                 dns_log(LOG_NOTICE, "[NOTIFY] from master — triggering refresh\n");
                 xfr_refresh_kick();
             } else {
                 dns_log(LOG_NOTICE, "[NOTIFY] ignored (source is not the configured master)\n");
             }
+            if (signed_ok)
+                return tsig_append(resp, 12, resp_len, ntohs(h->id), 0);
         } else {
             dns_log(LOG_NOTICE, "[NOTIFY] Received NOTIFY\n");
         }
@@ -11534,30 +12141,121 @@ static int dns_process(const uint8_t *pkt, int plen, uint8_t *resp, int resp_len
  * ======================================================================= */
 typedef struct {
     int fd;
-    struct sockaddr_in addr;
+    client_addr_t addr;
+    /* Set by the accepting listener (CSA-PROTO-002): 1 = DoT port, 0 = plain
+     * TCP on the DNS port. dot_thread used to wrap EVERY stream connection
+     * in TLS as soon as a certificate was loaded, so plain TCP/53 (every
+     * TC=1 retry) broke, and without a certificate the DoT port answered in
+     * cleartext. The listener knows; nothing is sniffed. */
+    int is_tls;
 } dot_conn_t;
+
+#define STREAM_HANDSHAKE_SECS 5 /* TLS handshake + first query */
+#define STREAM_IDLE_SECS 30     /* between queries afterwards */
+
+static void stream_set_timeouts(int fd, int secs) {
+    struct timeval tv = {.tv_sec = secs};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+        dns_log(LOG_WARNING, "[TCP] setsockopt timeout failed: %s\n", strerror(errno));
+}
+
+static void dot_thread_body(dot_conn_t *cp);
 static void *dot_thread(void *arg) {
     dot_conn_t c;
     memcpy(&c, arg, sizeof(c));
     free(arg);
+    dot_thread_body(&c); /* every exit path, incl. the AXFR hand-off, returns here */
+    atomic_fetch_sub(&g_tcp_conns, 1);
+    return NULL;
+}
+
+/* Hand an accepted stream connection to its own thread, bounded by
+ * config:tcp_max_conns (CSA-DOS-002). The fd gets the short handshake/first-
+ * query timeout before the thread starts, so a client that connects and
+ * sends nothing — over TLS or not — is dropped after STREAM_HANDSHAKE_SECS. */
+static void stream_accept(int cfd, const client_addr_t *addr, int is_tls) {
+    if (atomic_fetch_add(&g_tcp_conns, 1) >= g_tcp_max_conns) {
+        atomic_fetch_sub(&g_tcp_conns, 1);
+        STAT_INC(g_stat_tcp_rejected);
+        close(cfd);
+        return;
+    }
+    stream_set_timeouts(cfd, STREAM_HANDSHAKE_SECS);
+    dot_conn_t *c = malloc(sizeof(dot_conn_t));
+    if (!c) {
+        close(cfd);
+        atomic_fetch_sub(&g_tcp_conns, 1);
+        return;
+    }
+    c->fd = cfd;
+    c->addr = *addr;
+    c->is_tls = is_tls;
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, dot_thread, c) != 0) {
+        dns_log(LOG_WARNING, "[TCP] pthread_create failed — connection dropped\n");
+        free(c);
+        close(cfd);
+        atomic_fetch_sub(&g_tcp_conns, 1);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+static void dot_thread_body(dot_conn_t *cp) {
+    dot_conn_t c = *cp;
     SSL *ssl = NULL;
-    pthread_mutex_lock(&g_tls_mutex);
-    SSL_CTX *ctx = g_dot_ctx;
-    if (ctx) {
-        ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, c.fd);
+    if (c.is_tls) {
+        pthread_mutex_lock(&g_tls_mutex);
+        SSL_CTX *ctx = g_dot_ctx;
+        if (ctx)
+            ssl = SSL_new(ctx);
+        pthread_mutex_unlock(&g_tls_mutex); /* never held across SSL_accept */
+        if (!ssl) {
+            /* DoT port with no certificate loaded: refuse rather than speak
+             * cleartext on a port clients expect to be private. */
+            close(c.fd);
+            return;
+        }
+        if (SSL_set_fd(ssl, c.fd) != 1 || SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(c.fd);
+            return;
+        }
     }
-    pthread_mutex_unlock(&g_tls_mutex);
-    if (ssl && SSL_accept(ssl) <= 0) {
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        close(c.fd);
-        return NULL;
+    /* CSA-AUTH-006: apid/doqd prefix a PROXY v2 header carrying the real
+     * client. Honoured only on the plain listener and only from loopback; a
+     * malformed header from loopback closes the connection. */
+    if (!c.is_tls && client_is_loopback(&c.addr)) {
+        uint8_t ph[PROXY_V2_MAX_HDR];
+        ssize_t pk = recv(c.fd, ph, 16, MSG_PEEK | MSG_WAITALL);
+        if (pk < 16) {
+            /* Nothing usable within the handshake window (every DNS-over-TCP
+             * message is >= 19 octets): drop it now, as a silent client. */
+            close(c.fd);
+            return;
+        }
+        {
+            client_addr_t pc;
+            if (proxy_v2_parse(ph, PROXY_V2_SIG_LEN, &pc) != 0) { /* signature present */
+                int total = 16 + ((ph[14] << 8) | ph[15]);
+                if (total > (int) sizeof(ph) ||
+                    recv(c.fd, ph, (size_t) total, MSG_WAITALL) != total ||
+                    proxy_v2_parse(ph, total, &pc) != total) {
+                    close(c.fd);
+                    return;
+                }
+                if (pc.family)
+                    c.addr = pc;
+            }
+        }
     }
-    char cip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &c.addr.sin_addr, cip, sizeof(cip));
-    struct timeval tv = {.tv_sec = 30};
-    setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char cip[INET6_ADDRSTRLEN];
+    client_ntop(&c.addr, cip, sizeof(cip));
+    int first_msg = 1;
     for (;;) {
         uint8_t lb[2];
         int got = 0;
@@ -11579,6 +12277,13 @@ static void *dot_thread(void *arg) {
                 goto dot_done;
             got += n;
         }
+        if (first_msg) {
+            /* Past the handshake / first-query window: normal idle timeout. A
+             * transfer in progress is not idle (each send gets its own
+             * STREAM_IDLE_SECS budget). */
+            stream_set_timeouts(c.fd, STREAM_IDLE_SECS);
+            first_msg = 0;
+        }
         /* Check for AXFR */
         uint16_t qtype = 0;
         char axfr_qn[256] = "";
@@ -11595,7 +12300,7 @@ static void *dot_thread(void *arg) {
                     SSL_free(ssl);
                 }
                 close(c.fd);
-                return NULL;
+                return;
             }
             ac->fd = c.fd;
             ac->ssl = ssl;
@@ -11612,12 +12317,13 @@ static void *dot_thread(void *arg) {
                 if (sc > 0)
                     sc += 4; /* skip qtype+qclass */
                 /* skip answer section (ancount=0 for IXFR requests) */
-                /* scan authority for SOA */
-                int ns_count = (ml >= 6) ? ((pkt[8] << 8) | pkt[9]) : 0;
-                for (int i = 0; i < ns_count && sc + 10 < ml; i++) {
+                /* scan authority for SOA — CSA-MEM-002: stop on an unparseable
+                 * question and bounds-check each RR header before reading it */
+                int ns_count = (sc > 0 && ml >= 12) ? ((pkt[8] << 8) | pkt[9]) : 0;
+                for (int i = 0; i < ns_count && sc > 0 && sc < ml; i++) {
                     char rn2[256];
                     int ra = name_from_wire(pkt, ml, sc, rn2, sizeof(rn2));
-                    if (ra < 0)
+                    if (ra < 0 || ra + 10 > ml)
                         break;
                     uint16_t rt2 = get16(pkt, ra);
                     uint16_t rdl2 = get16(pkt, ra + 8);
@@ -11638,11 +12344,48 @@ static void *dot_thread(void *arg) {
                 }
             }
             ac->query_id = ntohs(((dns_hdr_t *) pkt)->id);
-            /* Result intentionally not enforced yet (CSA-AUTH-005, roadmap Phase 0b
-             * step 7); called to stash a verified request MAC for response signing. */
-            (void) tsig_verify(pkt, ml, NULL);
+            /* CSA-AUTH-005: with a TSIG key configured a transfer must carry a
+             * TSIG that verifies (key name, algorithm, MAC, time) — in addition
+             * to the IP ACL axfr_thread checks. Otherwise NOTAUTH with the TSIG
+             * error, exactly as for UPDATE, and the connection is closed.
+             * tsig_verify also stashes a verified request MAC for signing. */
+            tsig_rr_t treq;
+            int trc = tsig_verify(pkt, ml, &treq);
+            if (g_tsig_secret_invalid || (g_tsig_secret_len > 0 && trc != TSIG_OK)) {
+                uint8_t ref[BUF_SIZE];
+                int qsec = (int) (sizeof(dns_hdr_t));
+                {
+                    char qn2[256];
+                    int qa = name_from_wire(pkt, ml, 12, qn2, sizeof(qn2));
+                    if (qa > 0 && qa + 4 <= ml)
+                        qsec = qa + 4;
+                }
+                memcpy(ref, pkt, (size_t) qsec);
+                dns_hdr_t *rh = (dns_hdr_t *) ref;
+                rh->flags = htons(DNS_QR | DNS_RCODE_NOTAUTH);
+                rh->qdcount = htons(qsec > 12 ? 1 : 0);
+                rh->ancount = rh->nscount = rh->arcount = 0;
+                int rlen = qsec;
+                if (!g_tsig_secret_invalid) {
+                    if (trc == TSIG_BADTIME)
+                        rlen = tsig_append_badtime(ref, rlen, sizeof(ref), ac->query_id, &treq);
+                    else if (trc != TSIG_ABSENT)
+                        rlen = tsig_append_error_unsigned(
+                            ref, rlen, sizeof(ref), ac->query_id, &treq,
+                            trc == TSIG_BADKEY ? TSIG_ERR_BADKEY : TSIG_ERR_BADSIG);
+                }
+                char cs[INET6_ADDRSTRLEN];
+                dns_log(LOG_WARNING, "[AXFR] NOTAUTH %s for %s — %s\n",
+                        client_ntop(&c.addr, cs, sizeof(cs)), axfr_qn,
+                        g_tsig_secret_invalid ? "TSIG secret invalid"
+                        : trc == TSIG_ABSENT  ? "no TSIG (a key is configured)"
+                                              : "TSIG did not verify");
+                tcp_send_msg(c.fd, ssl, ref, rlen);
+                free(ac);
+                goto dot_done;
+            }
             axfr_thread(ac);
-            return NULL;
+            return;
         }
         char qn[256] = "?";
         uint16_t qt = 0;
@@ -11655,7 +12398,7 @@ static void *dot_thread(void *arg) {
         struct timespec _dt0, _dt1;
         clock_gettime(CLOCK_MONOTONIC, &_dt0);
         uint8_t resp[BUF_SIZE];
-        int rlen = dns_process(pkt, ml, resp, sizeof(resp), 1, &c.addr.sin_addr);
+        int rlen = dns_process(pkt, ml, resp, sizeof(resp), 1, &c.addr);
         clock_gettime(CLOCK_MONOTONIC, &_dt1);
         long _drtt =
             (long) ((_dt1.tv_sec - _dt0.tv_sec) * 1000000L + (_dt1.tv_nsec - _dt0.tv_nsec) / 1000L);
@@ -11683,7 +12426,7 @@ dot_done:
         SSL_free(ssl);
     }
     close(c.fd);
-    return NULL;
+    return;
 }
 
 /* pki_spki_sha256 — SHA-256 of SubjectPublicKeyInfo (for TLSA 3 1 1) */
@@ -11757,7 +12500,7 @@ static void handle_metrics(int fd) {
     uint64_t sq = g_stat_queries, sn = g_stat_noerror, snx = g_stat_nxdomain, sr = g_stat_refused,
              ss = g_stat_servfail, rd = g_stat_rrl_drop, rt = g_stat_rrl_tc, ax = g_stat_axfr,
              dd = g_stat_ddns, si = g_stat_signed, fw = g_stat_forwarded, ff = g_stat_forward_fail,
-             lbd = g_stat_lb_down_skips;
+             lbd = g_stat_lb_down_skips, tcr = g_stat_tcp_rejected;
     pthread_mutex_unlock(&g_stat_mutex);
     snprintf(body, sizeof(body),
              "# HELP dns_queries_total Total DNS queries received\n"
@@ -11800,13 +12543,20 @@ static void handle_metrics(int fd) {
              "dns_lb_down_skips_total %llu\n"
              "# HELP dns_lb_health_enabled Whether load-balancing health checks are active\n"
              "# TYPE dns_lb_health_enabled gauge\n"
-             "dns_lb_health_enabled %d\n",
+             "dns_lb_health_enabled %d\n"
+             "# HELP dns_tcp_rejected_total Stream connections refused at tcp_max_conns\n"
+             "# TYPE dns_tcp_rejected_total counter\n"
+             "dns_tcp_rejected_total %llu\n"
+             "# HELP dns_tcp_connections Open TCP/DoT connections\n"
+             "# TYPE dns_tcp_connections gauge\n"
+             "dns_tcp_connections %d\n",
              (unsigned long long) sq, (unsigned long long) sn, (unsigned long long) snx,
              (unsigned long long) sr, (unsigned long long) ss, (unsigned long long) rd,
              (unsigned long long) rt, (unsigned long long) ax, (unsigned long long) dd,
              (unsigned long long) si, (unsigned long long) fw, (unsigned long long) ff,
              g_soa_serial, g_rrl_enabled, (g_forward_enabled && g_forward_allow[0]) ? 1 : 0,
-             (unsigned long long) lbd, g_lb_health_enabled ? 1 : 0);
+             (unsigned long long) lbd, g_lb_health_enabled ? 1 : 0, (unsigned long long) tcr,
+             atomic_load(&g_tcp_conns));
     metrics_send(fd, 200, "text/plain; version=0.0.4", body);
 }
 
@@ -11864,7 +12614,7 @@ typedef struct {
     int sock;                    /* listener fd to reply on */
     struct sockaddr_storage cli; /* client to reply to (v4 or v6) */
     socklen_t clen;
-    struct in_addr cip; /* client v4 addr for RRL keying (0 = non-mapped v6) */
+    client_addr_t cip; /* client identity for RRL keying (v4 or v6) */
     int plen;
     uint8_t pkt[BUF_SIZE];
 } fwd_work_t;
@@ -11889,22 +12639,34 @@ static void *fwd_worker_thread(void *arg) {
     long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
     if (rlen > 0) {
         /* RRL covers forwarded responses too (Gap 3). */
-        int rrl_action = g_rrl_enabled ? rrl_check(&w->cip, qn) : 0;
+        int fneg = rlen >= 8 && get16(resp, 6) == 0; /* no answers: negative class */
+        int rrl_action = g_rrl_enabled ? rrl_check(&w->cip, qn, qt, fneg) : 0;
         if (rrl_action == 1) {
             dns_log(LOG_DEBUG, "[RRL] DROP fwd %s %s\n", type2str(qt), qn);
             STAT_INC(g_stat_rrl_drop);
         } else {
-            if (rrl_action == 2) {
-                /* Truncate to header+question so the client retries over TCP. */
+            if (rrl_action == 2 && rlen < 12) {
+                rlen = 0; /* too short to carry a header: drop (CSA-MEM-002) */
+            } else if (rrl_action == 2) {
+                /* Truncate to header+question so the client retries over TCP.
+                 * CSA-MEM-002: cut at the question end only if the reply really
+                 * holds it — never send bytes past what upstream returned. */
                 dns_log(LOG_DEBUG, "[RRL] TC fwd %s %s\n", type2str(qt), qn);
                 STAT_INC(g_stat_rrl_tc);
                 dns_hdr_t *rh = (dns_hdr_t *) resp;
                 rh->flags = htons(ntohs(rh->flags) | DNS_TC);
                 rh->ancount = rh->nscount = rh->arcount = 0;
-                int qa = name_from_wire(resp, rlen, 12, qn, sizeof(qn));
-                rlen = (qa > 0) ? 12 + (qa - 12) + 4 : 12;
+                char tq[256];
+                int qa = name_from_wire(resp, rlen, 12, tq, sizeof(tq));
+                if (qa > 0 && qa + 4 <= rlen) {
+                    rlen = qa + 4;
+                } else {
+                    rh->qdcount = 0;
+                    rlen = 12;
+                }
             }
-            sendto(w->sock, resp, (size_t) rlen, 0, (struct sockaddr *) &w->cli, w->clen);
+            if (rlen > 0)
+                sendto(w->sock, resp, (size_t) rlen, 0, (struct sockaddr *) &w->cli, w->clen);
             uint8_t rc = rlen >= 4 ? (get16(resp, 2) & 0xF) : 2;
             int an = rlen >= 8 ? get16(resp, 6) : 0;
             qlog_write(cipstr, qn, qt, rc, an, rtt, "fwd");
@@ -11931,7 +12693,7 @@ static void fwd_servfail_now(int sock, const uint8_t *pkt, int plen, const struc
  * answer SERVFAIL when over the in-flight cap / on failure) and return 1. Return
  * 0 when the caller should keep handling the query normally. */
 static int forward_dispatch_udp(int sock, const uint8_t *pkt, int plen, const struct sockaddr *cli,
-                                socklen_t clen, const struct in_addr *cip) {
+                                socklen_t clen, const client_addr_t *cip) {
     if (!forward_should(pkt, plen, cip))
         return 0;
     if (plen > (int) BUF_SIZE)
@@ -11973,12 +12735,35 @@ static int forward_dispatch_udp(int sock, const uint8_t *pkt, int plen, const st
     return 1;
 }
 
-/* Parse, log, resolve one IPv4 UDP query. Returns response length (0 = drop).
+/* Who sent this datagram? The socket source — unless it is loopback and the
+ * payload starts with a PROXY v2 header from apid/doqd (CSA-AUTH-006), in
+ * which case the header's client is used and the header is stripped
+ * (pkt and nn advanced past it). Returns 0, or -1 to drop (malformed header from
+ * loopback). The reply still goes to the socket source. */
+static int udp_client_resolve(const uint8_t **pkt, int *nn, const struct sockaddr *src,
+                              client_addr_t *out) {
+    client_from_sockaddr(out, src);
+    if (!client_is_loopback(out))
+        return 0;
+    client_addr_t pc;
+    int hl = proxy_v2_parse(*pkt, *nn, &pc);
+    if (hl < 0)
+        return -1;
+    if (hl > 0) {
+        *pkt += hl;
+        *nn -= hl;
+        if (pc.family)
+            *out = pc;
+    }
+    return 0;
+}
+
+/* Parse, log, resolve one UDP query. Returns response length (0 = drop).
  * Shared by the per-packet and the recvmmsg/sendmmsg worker loops. */
-static int udp_serve_one(const uint8_t *pkt, int nn, const struct sockaddr_in *cli, uint8_t *resp,
+static int udp_serve_one(const uint8_t *pkt, int nn, const client_addr_t *ca, uint8_t *resp,
                          int resp_cap) {
-    char cip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &cli->sin_addr, cip, sizeof(cip));
+    char cip[INET6_ADDRSTRLEN];
+    client_ntop(ca, cip, sizeof(cip));
     char qn[256] = "?";
     uint16_t qt = 0;
     int a = name_from_wire(pkt, nn, 12, qn, sizeof(qn));
@@ -11987,7 +12772,7 @@ static int udp_serve_one(const uint8_t *pkt, int nn, const struct sockaddr_in *c
     dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip, type2str(qt), qn);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rlen = dns_process(pkt, nn, resp, resp_cap, 0, &cli->sin_addr);
+    int rlen = dns_process(pkt, nn, resp, resp_cap, 0, ca);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long rtt = (long) ((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
     if (rlen > 0) {
@@ -12011,15 +12796,19 @@ static void *udp_worker_thread(void *arg) {
         for (;;) {
             struct sockaddr_in cli;
             socklen_t clen = sizeof(cli);
-            ssize_t nn = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
-            if (nn <= 0)
+            ssize_t nr = recvfrom(w->sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
+            if (nr <= 0)
+                continue;
+            const uint8_t *qp = pkt;
+            int nn = (int) nr;
+            client_addr_t ca;
+            if (udp_client_resolve(&qp, &nn, (struct sockaddr *) &cli, &ca) < 0)
                 continue;
             /* Out-of-zone forward → off-thread, so a slow upstream cannot stall
              * this worker's recv queue. */
-            if (forward_dispatch_udp(w->sock, pkt, (int) nn, (struct sockaddr *) &cli, clen,
-                                     &cli.sin_addr))
+            if (forward_dispatch_udp(w->sock, qp, nn, (struct sockaddr *) &cli, clen, &ca))
                 continue;
-            int rlen = udp_serve_one(pkt, (int) nn, &cli, resp, sizeof(resp));
+            int rlen = udp_serve_one(qp, nn, &ca, resp, sizeof(resp));
             if (rlen > 0)
                 sendto(w->sock, resp, rlen, 0, (struct sockaddr *) &cli, clen);
         }
@@ -12068,12 +12857,16 @@ static void *udp_worker_thread(void *arg) {
             int nn = (int) rxmsgs[i].msg_len;
             if (nn <= 0)
                 continue;
+            const uint8_t *qp = rxbuf[i];
+            client_addr_t ca;
+            if (udp_client_resolve(&qp, &nn, (struct sockaddr *) &addrs[i], &ca) < 0)
+                continue;
             /* Forwardable queries are dispatched off-thread (they reply
              * themselves) and excluded from this sendmmsg batch. */
-            if (forward_dispatch_udp(w->sock, rxbuf[i], nn, (struct sockaddr *) &addrs[i],
-                                     sizeof(addrs[i]), &addrs[i].sin_addr))
+            if (forward_dispatch_udp(w->sock, qp, nn, (struct sockaddr *) &addrs[i],
+                                     sizeof(addrs[i]), &ca))
                 continue;
-            int rlen = udp_serve_one(rxbuf[i], nn, &addrs[i], txbuf[nt], BUF_SIZE);
+            int rlen = udp_serve_one(qp, nn, &ca, txbuf[nt], BUF_SIZE);
             if (rlen <= 0)
                 continue;
             txiov[nt].iov_base = txbuf[nt];
@@ -12109,11 +12902,25 @@ static int schema_gate(void) {
     switch (schema_version_check(sv)) {
         case SCHEMA_OK:
             return 0;
-        case SCHEMA_MINOR_DIFF:
+        case SCHEMA_MINOR_DIFF: {
+            /* As the seeder, dnsd raises an OLDER minor to its own: minors are
+             * additive (1.1 adds zidx:*, which dnsd itself builds), so every
+             * other daemon can then stop warning. A NEWER stored minor is left
+             * alone — another component knows something this dnsd does not. */
+            int smaj = 0;
+            int smin = 0;
+            if (sscanf(sv, "%d.%d", &smaj, &smin) == 2 && smaj == SCHEMA_VERSION_MAJOR &&
+                smin < SCHEMA_VERSION_MINOR) {
+                vk_set("schema:version", SCHEMA_VERSION_STR, 0);
+                dns_log(LOG_INFO, "[Schema] upgraded schema:version %s -> %s (additive)\n", sv,
+                        SCHEMA_VERSION_STR);
+                return 0;
+            }
             dns_log(LOG_WARNING,
                     "[Schema] schema:version %s differs in minor from compiled %s — continuing\n",
                     sv, SCHEMA_VERSION_STR);
             return 0;
+        }
         case SCHEMA_ABSENT:
             vk_set("schema:version", SCHEMA_VERSION_STR, 0);
             dns_log(LOG_INFO, "[Schema] seeded schema:version=%s\n", SCHEMA_VERSION_STR);
@@ -12127,6 +12934,7 @@ static int schema_gate(void) {
     }
 }
 
+#ifndef UNIT_TEST /* tests and fuzz harnesses #include this file and supply main */
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -12183,79 +12991,6 @@ int main(int argc, char **argv) {
      * by pki_renewal_thread after DNS sockets are open (DNS-01 requires the
      * server to be listening before Let's Encrypt can validate the challenge). */
     tls_reload();
-
-    /* Phase 5: live-reload subscriber — applies config:*, cert:current,
-     * zone_table:* edits via Valkey keyspace notifications, no restart needed
-     * (migration Step 6). Also does the boot catch-up for cert:current, so it
-     * subsumes the old polling cert watcher. ACME/EST live in certd. */
-    {
-        pthread_t ctid;
-        if (pthread_create(&ctid, NULL, keyspace_watch_thread, NULL) == 0)
-            pthread_detach(ctid);
-        else
-            dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
-    }
-
-    /* Per-zone ZSK rollover engine (RFC 6781 Pre-Publish). */
-    {
-        pthread_t rtid;
-        if (pthread_create(&rtid, NULL, rollover_thread, NULL) == 0)
-            pthread_detach(rtid);
-        else
-            dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
-    }
-
-    /* NOTIFY sender: background worker that TSIG-signs + retries master→secondary
-     * NOTIFYs (RFC 1996 §3.6). Idle until a zone change enqueues a job. */
-    {
-        pthread_t ntid;
-        if (pthread_create(&ntid, NULL, notify_thread, NULL) == 0)
-            pthread_detach(ntid);
-        else
-            dns_log(LOG_ERR, "[NOTIFY] Failed to start NOTIFY sender thread\n");
-    }
-
-    /* Primary: DDNS lease-expiry sweeper — replays silent ddns:* expiries as
-     * replicated deletions so secondaries converge (CLAUDE-discovery.md Gap 2). */
-    if (!g_zone_secondary) {
-        pthread_t stid;
-        if (pthread_create(&stid, NULL, ddns_sweeper_thread, NULL) == 0)
-            pthread_detach(stid);
-        else
-            dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
-    }
-
-    /* Primary: RFC 9665/9664 SRP lease-expiry sweeper — same role as the DDNS
-     * sweeper above, for srp:* registrations. Idle (just sleeps) unless
-     * config:srp_enabled is set. */
-    if (!g_zone_secondary) {
-        pthread_t srtid;
-        if (pthread_create(&srtid, NULL, srp_sweeper_thread, NULL) == 0)
-            pthread_detach(srtid);
-        else
-            dns_log(LOG_ERR, "[SRP] Failed to start lease-expiry sweeper\n");
-    }
-
-    /* Load-balancing health-check probe thread (CLAUDE-loadbalance.md Gap 2).
-     * Idle (just sleeps) until config:lb_health_enabled is set. */
-    {
-        pthread_t htid;
-        if (pthread_create(&htid, NULL, lb_health_thread, NULL) == 0)
-            pthread_detach(htid);
-        else
-            dns_log(LOG_ERR, "[LB] Failed to start health-check thread\n");
-    }
-
-    /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry
-     * timers + NOTIFY-triggered re-pull (hidden-master plan Gap 6/5). Detached so
-     * an unreachable master never blocks the server. */
-    if (g_zone_secondary && g_primary_host[0]) {
-        pthread_t xtid;
-        if (pthread_create(&xtid, NULL, xfr_refresh_thread, NULL) == 0)
-            pthread_detach(xtid);
-        else
-            dns_log(LOG_ERR, "[XFR] Failed to start transfer-client thread\n");
-    }
 
     /* (mDNS moved to the mdnsd daemon — migration Step 3.) */
 
@@ -12387,8 +13122,12 @@ int main(int argc, char **argv) {
     dns_log(LOG_INFO, "\n╔═══════════════════════════════════════════════════════════════════╗\n");
     dns_log(LOG_INFO, "║  DNS  UDP plain + RFC2136 UPDATE + NOTIFY  :%d                   ║\n",
             g_dns_port);
-    dns_log(LOG_INFO, "║  DoT  TCP DNS-over-TLS + AXFR              :%d  %s           ║\n",
+    dns_log(LOG_INFO, "║  TCP  plain DNS (TC retry) + AXFR          :%d                   ║\n",
+            g_dns_port);
+    dns_log(LOG_INFO, "║  DoT  TCP DNS-over-TLS + XoT               :%d  %s           ║\n",
             g_dot_port, g_dot_ctx ? "TLS " : "----");
+    dns_log(LOG_INFO, "║  Stream connection cap (tcp_max_conns)      %-6d                     ║\n",
+            g_tcp_max_conns);
     dns_log(LOG_INFO, "║  DoT client-cert (mTLS) required            %-20s       ║\n",
             (g_dot_require_client_cert && g_mtls_ca_pem[0]) ? "yes" : "no");
     dns_log(LOG_INFO, "║  Zone role                                  %-20s       ║\n",
@@ -12461,6 +13200,82 @@ int main(int argc, char **argv) {
     sb.log = dns_log;
     sb.tag = "dnsd";
     sandbox_apply(&sb);
+    /* CSA-SBX-001: background threads start only now, under the sandbox — in
+     * mountns mode unshare() moves only the calling thread, so a thread started
+     * earlier would keep the original filesystem view (seccomp itself now
+     * syncs onto every thread via TSYNC). */
+    /* Phase 5: live-reload subscriber — applies config:*, cert:current,
+     * zone_table:* edits via Valkey keyspace notifications, no restart needed
+     * (migration Step 6). Also does the boot catch-up for cert:current, so it
+     * subsumes the old polling cert watcher. ACME/EST live in certd. */
+    {
+        pthread_t ctid;
+        if (pthread_create(&ctid, NULL, keyspace_watch_thread, NULL) == 0)
+            pthread_detach(ctid);
+        else
+            dns_log(LOG_ERR, "[Reload] Failed to start keyspace watcher\n");
+    }
+
+    /* Per-zone ZSK rollover engine (RFC 6781 Pre-Publish). */
+    {
+        pthread_t rtid;
+        if (pthread_create(&rtid, NULL, rollover_thread, NULL) == 0)
+            pthread_detach(rtid);
+        else
+            dns_log(LOG_ERR, "[Rollover] Failed to start rollover engine\n");
+    }
+
+    /* NOTIFY sender: background worker that TSIG-signs + retries master→secondary
+     * NOTIFYs (RFC 1996 §3.6). Idle until a zone change enqueues a job. */
+    {
+        pthread_t ntid;
+        if (pthread_create(&ntid, NULL, notify_thread, NULL) == 0)
+            pthread_detach(ntid);
+        else
+            dns_log(LOG_ERR, "[NOTIFY] Failed to start NOTIFY sender thread\n");
+    }
+
+    /* Primary: DDNS lease-expiry sweeper — replays silent ddns:* expiries as
+     * replicated deletions so secondaries converge (CLAUDE-discovery.md Gap 2). */
+    if (!g_zone_secondary) {
+        pthread_t stid;
+        if (pthread_create(&stid, NULL, ddns_sweeper_thread, NULL) == 0)
+            pthread_detach(stid);
+        else
+            dns_log(LOG_ERR, "[DDNS] Failed to start lease-expiry sweeper\n");
+    }
+
+    /* Primary: RFC 9665/9664 SRP lease-expiry sweeper — same role as the DDNS
+     * sweeper above, for srp:* registrations. Idle (just sleeps) unless
+     * config:srp_enabled is set. */
+    if (!g_zone_secondary) {
+        pthread_t srtid;
+        if (pthread_create(&srtid, NULL, srp_sweeper_thread, NULL) == 0)
+            pthread_detach(srtid);
+        else
+            dns_log(LOG_ERR, "[SRP] Failed to start lease-expiry sweeper\n");
+    }
+
+    /* Load-balancing health-check probe thread (CLAUDE-loadbalance.md Gap 2).
+     * Idle (just sleeps) until config:lb_health_enabled is set. */
+    {
+        pthread_t htid;
+        if (pthread_create(&htid, NULL, lb_health_thread, NULL) == 0)
+            pthread_detach(htid);
+        else
+            dns_log(LOG_ERR, "[LB] Failed to start health-check thread\n");
+    }
+
+    /* Secondary: zone-maintenance thread — startup pull, then SOA refresh/retry
+     * timers + NOTIFY-triggered re-pull (hidden-master plan Gap 6/5). Detached so
+     * an unreachable master never blocks the server. */
+    if (g_zone_secondary && g_primary_host[0]) {
+        pthread_t xtid;
+        if (pthread_create(&xtid, NULL, xfr_refresh_thread, NULL) == 0)
+            pthread_detach(xtid);
+        else
+            dns_log(LOG_ERR, "[XFR] Failed to start transfer-client thread\n");
+    }
 
     /* Spawn IPv4 UDP worker threads (workers>1) on the pre-bound REUSEPORT
      * sockets. Post-sandbox is fine: dnsd already pthread_create()s DoT threads
@@ -12539,22 +13354,27 @@ int main(int argc, char **argv) {
             uint8_t pkt[BUF_SIZE], resp[BUF_SIZE];
             struct sockaddr_in cli;
             socklen_t clen = sizeof(cli);
-            ssize_t nn = recvfrom(dns_sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
-            if (nn > 0 && forward_dispatch_udp(dns_sock, pkt, (int) nn, (struct sockaddr *) &cli,
-                                               clen, &cli.sin_addr)) {
+            ssize_t nr = recvfrom(dns_sock, pkt, sizeof(pkt), 0, (struct sockaddr *) &cli, &clen);
+            const uint8_t *qp = pkt;
+            int nn = (int) nr;
+            client_addr_t ca;
+            if (nr > 0 && udp_client_resolve(&qp, &nn, (struct sockaddr *) &cli, &ca) < 0)
+                nn = 0; /* malformed PROXY header from loopback: drop */
+            if (nn > 0 &&
+                forward_dispatch_udp(dns_sock, qp, nn, (struct sockaddr *) &cli, clen, &ca)) {
                 /* forwarded off-thread; nothing more to do in the select loop */
             } else if (nn > 0) {
-                char cip2[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &cli.sin_addr, cip2, sizeof(cip2));
+                char cip2[INET6_ADDRSTRLEN];
+                client_ntop(&ca, cip2, sizeof(cip2));
                 char qn[256] = "?";
                 uint16_t qt = 0;
-                int a = name_from_wire(pkt, nn, 12, qn, sizeof(qn));
+                int a = name_from_wire(qp, nn, 12, qn, sizeof(qn));
                 if (a >= 0 && a + 1 < nn)
-                    qt = get16(pkt, a);
+                    qt = get16(qp, a);
                 dns_log(LOG_DEBUG, "[DNS ] %s  %s %s\n", cip2, type2str(qt), qn);
                 struct timespec _qt0, _qt1;
                 clock_gettime(CLOCK_MONOTONIC, &_qt0);
-                int rlen = dns_process(pkt, (int) nn, resp, sizeof(resp), 0, &cli.sin_addr);
+                int rlen = dns_process(qp, nn, resp, sizeof(resp), 0, &ca);
                 clock_gettime(CLOCK_MONOTONIC, &_qt1);
                 long _rtt = (long) ((_qt1.tv_sec - _qt0.tv_sec) * 1000000L +
                                     (_qt1.tv_nsec - _qt0.tv_nsec) / 1000L);
@@ -12572,30 +13392,27 @@ int main(int argc, char **argv) {
             uint8_t pkt6[BUF_SIZE], resp6[BUF_SIZE];
             struct sockaddr_in6 cli6;
             socklen_t cl6 = sizeof(cli6);
-            ssize_t nn6 =
+            ssize_t nr6 =
                 recvfrom(dns6_sock, pkt6, sizeof(pkt6), 0, (struct sockaddr *) &cli6, &cl6);
+            const uint8_t *qp6 = pkt6;
+            int nn6 = (int) nr6;
+            client_addr_t ca6; /* the real v6 client (CSA-NET-003: was 0.0.0.0) */
+            if (nr6 > 0 && udp_client_resolve(&qp6, &nn6, (struct sockaddr *) &cli6, &ca6) < 0)
+                nn6 = 0;
             if (nn6 > 0) {
                 char cip6[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET6, &cli6.sin6_addr, cip6, sizeof(cip6));
+                client_ntop(&ca6, cip6, sizeof(cip6));
                 char qn6[256] = "?";
                 uint16_t qt6 = 0;
-                int a6 = name_from_wire(pkt6, nn6, 12, qn6, sizeof(qn6));
-                if (a6 >= 0 && a6 + 1 < (int) nn6)
-                    qt6 = get16(pkt6, a6);
+                int a6 = name_from_wire(qp6, nn6, 12, qn6, sizeof(qn6));
+                if (a6 >= 0 && a6 + 1 < nn6)
+                    qt6 = get16(qp6, a6);
                 dns_log(LOG_DEBUG, "[DNS6] %s  %s %s\n", cip6, type2str(qt6), qn6);
-                /* Map IPv4-mapped addresses for cookie/logging/ACL. The forward
-                 * ACL is IPv4-only, so a non-mapped v6 client (dummy4 == 0) will
-                 * never match it and falls through to the normal path (fail
-                 * closed). */
-                struct in_addr dummy4 = {.s_addr = 0};
-                if (IN6_IS_ADDR_V4MAPPED(&cli6.sin6_addr))
-                    memcpy(&dummy4, ((uint8_t *) &cli6.sin6_addr) + 12, 4);
-                if (forward_dispatch_udp(dns6_sock, pkt6, (int) nn6, (struct sockaddr *) &cli6, cl6,
-                                         &dummy4))
+                if (forward_dispatch_udp(dns6_sock, qp6, nn6, (struct sockaddr *) &cli6, cl6, &ca6))
                     continue;
                 struct timespec _t0, _t1;
                 clock_gettime(CLOCK_MONOTONIC, &_t0);
-                int rlen6 = dns_process(pkt6, (int) nn6, resp6, sizeof(resp6), 0, &dummy4);
+                int rlen6 = dns_process(qp6, nn6, resp6, sizeof(resp6), 0, &ca6);
                 clock_gettime(CLOCK_MONOTONIC, &_t1);
                 long _rtt6 = (long) ((_t1.tv_sec - _t0.tv_sec) * 1000000L +
                                      (_t1.tv_nsec - _t0.tv_nsec) / 1000L);
@@ -12614,20 +13431,9 @@ int main(int argc, char **argv) {
             socklen_t clen = sizeof(cli);
             int cfd = accept(tcp_dns_sock, (struct sockaddr *) &cli, &clen);
             if (cfd >= 0) {
-                dot_conn_t *c = malloc(sizeof(dot_conn_t));
-                if (!c) {
-                    close(cfd);
-                } else {
-                    c->fd = cfd;
-                    c->addr = cli;
-                    /* dot_thread handles ssl==NULL via plain send/recv */
-                    pthread_t tid;
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                    pthread_create(&tid, &attr, dot_thread, c);
-                    pthread_attr_destroy(&attr);
-                }
+                client_addr_t ca;
+                client_from_sockaddr(&ca, (struct sockaddr *) &cli);
+                stream_accept(cfd, &ca, 0); /* plain listener: is_tls = 0, never TLS */
             }
         }
 
@@ -12637,19 +13443,9 @@ int main(int argc, char **argv) {
             socklen_t clen = sizeof(cli);
             int cfd = accept(dot_sock, (struct sockaddr *) &cli, &clen);
             if (cfd >= 0) {
-                dot_conn_t *c = malloc(sizeof(dot_conn_t));
-                if (!c) {
-                    close(cfd);
-                } else {
-                    c->fd = cfd;
-                    c->addr = cli;
-                    pthread_t tid;
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                    pthread_create(&tid, &attr, dot_thread, c);
-                    pthread_attr_destroy(&attr);
-                }
+                client_addr_t ca;
+                client_from_sockaddr(&ca, (struct sockaddr *) &cli);
+                stream_accept(cfd, &ca, 1); /* DoT listener: TLS only */
             }
         }
 
@@ -12659,23 +13455,9 @@ int main(int argc, char **argv) {
             socklen_t cl6 = sizeof(cli6);
             int cfd6 = accept(dot6_sock, (struct sockaddr *) &cli6, &cl6);
             if (cfd6 >= 0) {
-                dot_conn_t *c6 = malloc(sizeof(dot_conn_t));
-                if (!c6) {
-                    close(cfd6);
-                } else {
-                    c6->fd = cfd6;
-                    memset(&c6->addr, 0, sizeof(c6->addr));
-                    c6->addr.sin_family = AF_INET;
-                    if (IN6_IS_ADDR_V4MAPPED(&cli6.sin6_addr))
-                        memcpy(&c6->addr.sin_addr, ((uint8_t *) &cli6.sin6_addr) + 12, 4);
-                    c6->addr.sin_port = cli6.sin6_port;
-                    pthread_t tid6;
-                    pthread_attr_t attr6;
-                    pthread_attr_init(&attr6);
-                    pthread_attr_setdetachstate(&attr6, PTHREAD_CREATE_DETACHED);
-                    pthread_create(&tid6, &attr6, dot_thread, c6);
-                    pthread_attr_destroy(&attr6);
-                }
+                client_addr_t ca; /* the real v6 client (was collapsed to 0.0.0.0) */
+                client_from_sockaddr(&ca, (struct sockaddr *) &cli6);
+                stream_accept(cfd6, &ca, 1); /* DoT listener: TLS only */
             }
         }
 
@@ -12727,3 +13509,4 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&g_log_mutex);
     return 0;
 }
+#endif /* UNIT_TEST */

@@ -145,7 +145,8 @@ availability, then defense-in-depth.
    NXDOMAIN), CSA-DNSSEC-002 (invalid denial proof → RFC 9824 compact denial,
    promotes batch3 Add 11). **DONE 2026-11-15** (Fix 1, 2a, 3; D1 = keep
    the `dnssec_nsec_mode` selector, both forms implemented) —
-   `make check-dnssec-validate` (in CI). Fix 2b still waits on **D2**.
+   `make check-dnssec-validate` (in CI). Fix 2b **DONE 2026-11-15** (D2 = A:
+   dnsd-owned `zidx:*` name index, schema 1.1, `make check-ent`).
    Verifying surfaced pre-existing defects, all fixed in the follow-up
    commit: multi-RR RRsets signed per record, DNSKEY/CDS/DS answered at any
    name, resolverd picking the first DNSKEY for every RRSIG (now SECURE
@@ -154,14 +155,19 @@ availability, then defense-in-depth.
    flake). CI blockers (cppcheck, clang-format) cleared in their own commits.
 4. **Transport confusion** — `CLAUDE-tcp-transport.md` Fix 1 (CSA-PROTO-002,
    *High*, plain TCP/53 speaks TLS once a cert loads) + Fix 2 (CSA-DOS-002,
-   connection cap / handshake timeout / checked `pthread_create`). *Specced.*
+   connection cap / handshake timeout / checked `pthread_create`). **DONE
+   2026-11-15** — `make check-tcp-plain` (in CI).
 5. **resolverd cache UAF** — `CLAUDE-resolverd-cache.md` Fix 1 (CSA-CONC-001,
-   *High*, reproduced) + Fix 2 (TSan build + stress target in CI). *Specced.*
+   *High*, reproduced) + Fix 2 (TSan build + stress target in CI). **DONE
+   2026-11-15** — `make check-resolverd-stress` + `check-resolverd-tsan`
+   (blocking in CI); dnsd's TSan run recorded the CSA-CONC-002 reload races
+   for step 8.
 6. **Client identity** — CSA-NET-003 (*High*, IPv6 client address collapses to
    0.0.0.0 — RRL, cookies, ACLs all key on it), with CSA-AUTH-006 (DoH/DoQ
    clients reach dnsd as 127.0.0.1) and CSA-DOS-004 (RRL keyed on qname)
-   because all three change what dnsd treats as "the client". *Not yet
-   specced.*
+   because all three change what dnsd treats as "the client". **DONE
+   2026-11-15** — `CLAUDE-client-identity.md`, `make check-client-identity`
+   (in CI).
 7. **Remaining Medium** — CSA-AUTH-005 (transfers without TSIG, fail-open
    CIDR; `CLAUDE-update-auth.md` Fix 3, *Complementary*), CSA-AUTH-007
    (resolverd no client ACL; `--no-dnssec`/`--no-mdns` no-ops), CSA-DOS-003
@@ -170,7 +176,8 @@ availability, then defense-in-depth.
    (raw qname in JSON log), CSA-SBX-001 (seccomp without TSYNC; threads start
    before the filter — `libsandbox`, all three callers), CSA-SBX-002 (apid/
    certd/mdnsd/doqd unsandboxed — extend `libsandbox`), CSA-WEB-001 (dashboard
-   CSRF). *Not yet specced, except AUTH-005.*
+   CSRF). **DONE 2026-11-15** — `CLAUDE-medium-fixes.md` (7a–7h), one
+   `make check-*` per item, all in CI.
 8. **Low** — CSA-MEM-001 (certd EST-202 double free — small, do early if
    convenient), CSA-MEM-002 (OOB reads: TSIG alg-name, IXFR authority scan,
    forwarder RRL truncation), CSA-CONC-002 (config reload races workers),
@@ -179,11 +186,27 @@ availability, then defense-in-depth.
    password/authInfo plaintext + `strcmp`), and the Phase-0 residual:
    `csprng_u16` falling back to `rand()` when `RAND_bytes` fails
    (`dns_server.c:1054`, `resolverd.c:2281`) — fail closed instead.
+   **DONE 2026-11-16** — `CLAUDE-low-fixes.md` (8a–8g), each with a check in
+   CI; CI scan-build now also covers certd/apid/mdnsd/eppd.
 9. **Tooling the audit asked for** — a libFuzzer harness over `dns_process`
    (QUERY + UPDATE + `tsig_find`/`sig0_find`); a TSan CI job for resolverd
    **and** dnsd (step 5 covers resolverd); a CI step validating dnsd's positive
    and negative answers with an independent validator (would have caught
-   DNSSEC-001/002 and PROTO-001 — land it with step 3).
+   DNSSEC-001/002 and PROTO-001 — land it with step 3). **DONE 2026-11-16**:
+   - `make fuzz-dnsd` (`fuzz/fuzz_dnsd.c`, CI job "Fuzz smoke (dnsd …)"):
+     libFuzzer over `dns_process` (QUERY/UPDATE/NOTIFY over UDP and TCP
+     framing, EDNS, cookies) plus `tsig_find`/`tsig_verify`/`sig0_present`;
+     dnsd's Valkey client points at a closed port so no input reaches Valkey.
+     Seeds from `fuzz/gen_corpus_dnsd.py`, minimised corpus in
+     `fuzz/corpus_dnsd`. Its first minute found an out-of-bounds read in the
+     UPDATE parser (prerequisite and update sections checked `a + 9 > plen`
+     before reading the RR header's RDLENGTH at `a + 8..a + 9`); fixed, input
+     kept as `fuzz/corpus_dnsd/regress-update-prereq-rr-header`. 5.3 M further
+     runs (120 s) found nothing.
+   - dnsd TSan in CI: `check-reload-tsan` (step 8) now also drives a stream of
+     dynamic UPDATEs alongside UDP queries, serial bumps and a config edit;
+     resolverd's TSan job is `check-resolverd-tsan` (step 5).
+   - Independent validator: `check-dnssec-validate` (step 3), in CI.
 
 **Release notes these fixes require** (breaking for operators): unsigned
 UPDATE stops working by default (step 1); `hmac-sha1`/`hmac-md5` TSIG clients
@@ -202,7 +225,7 @@ inputs. PERF-006 (thread per forwarded query) is standalone.
 
 **Decision (sequencing):** Phase 0b blocks the remaining Phase 2 items (ENUM
 deployment/ops, ADR-005/006/007, `vkc_` repoint of dnsd/resolverd). Open
-owner decisions: D1, D2 (step 3).
+owner decisions: none (D1 = keep the NSEC/NSEC3 selector, D2 = Option A — both done).
 
 ---
 

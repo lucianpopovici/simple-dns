@@ -64,6 +64,8 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 
 #include "dns_wire.h"
 #include "sandbox.h"
@@ -811,6 +813,7 @@ static int xml_text_decode(const char *buf, int start, int end, char *out, int o
 typedef struct {
     char clid[64];
     int logged_in;
+    char cert_fp[65]; /* SHA-256 of the registrar's client cert, lowercase hex */
 } epp_session_t;
 
 static atomic_uint g_svtrid_counter = 0;
@@ -886,6 +889,177 @@ static int epp_build_result(char *out, int outcap, int code, const char *msg, co
                     code, msg, extra ? extra : "", cltrid_xml, svtrid);
 }
 
+/* ── Registrar credentials (CSA-CRYPTO-001) ─────────────────────────────
+ * config:eppd_registrar_pw:<clID> holds "pbkdf2-sha256$<iter>$<salt hex>$<hash
+ * hex>" (eppd --hash-password prints one) or, for existing deployments, the
+ * plaintext password (accepted with a warning). Every secret comparison goes
+ * through SHA-256 + CRYPTO_memcmp, so its time depends on neither the
+ * length nor the content of either side. */
+#define EPP_PW_PREFIX "pbkdf2-sha256$"
+#define EPP_PW_ITER_DEFAULT 200000
+#define EPP_PW_ITER_MIN 10000
+#define EPP_PW_ITER_MAX 10000000
+#define EPP_PW_SALT_LEN 16
+#define EPP_PW_HASH_LEN 32
+#define EPP_LOCK_THRESHOLD 5  /* failures before a clID is locked out */
+#define EPP_LOCK_MAX_SECS 300 /* longest lockout */
+#define EPP_LOCK_SLOTS 256
+
+static int epp_secret_eq(const char *a, const char *b) {
+    unsigned char da[SHA256_DIGEST_LENGTH];
+    unsigned char db[SHA256_DIGEST_LENGTH];
+    if (!a || !b)
+        return 0;
+    SHA256((const unsigned char *) a, strlen(a), da);
+    SHA256((const unsigned char *) b, strlen(b), db);
+    return CRYPTO_memcmp(da, db, sizeof(da)) == 0;
+}
+
+/* Strict hex decode of exactly `n` bytes; -1 on any non-hex or wrong length. */
+static int epp_hex_exact(const char *in, size_t inlen, uint8_t *out, size_t n) {
+    if (inlen != 2 * n)
+        return -1;
+    for (size_t i = 0; i < n; i++) {
+        int v = 0;
+        for (int k = 0; k < 2; k++) {
+            char c = in[2 * i + (size_t) k];
+            int d;
+            if (c >= '0' && c <= '9')
+                d = c - '0';
+            else if (c >= 'a' && c <= 'f')
+                d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F')
+                d = c - 'A' + 10;
+            else
+                return -1;
+            v = v * 16 + d;
+        }
+        out[i] = (uint8_t) v;
+    }
+    return 0;
+}
+
+/* 1 = password matches. *legacy is set when `stored` is plaintext. A
+ * malformed hash string never matches (fail closed). */
+static int epp_pw_verify(const char *stored, const char *pw, int *legacy) {
+    *legacy = 0;
+    if (!stored || !stored[0] || !pw)
+        return 0;
+    if (strncmp(stored, EPP_PW_PREFIX, strlen(EPP_PW_PREFIX)) != 0) {
+        *legacy = 1;
+        return epp_secret_eq(stored, pw);
+    }
+    const char *p = stored + strlen(EPP_PW_PREFIX);
+    char *end = NULL;
+    long iter = strtol(p, &end, 10);
+    if (!end || *end != '$' || iter < EPP_PW_ITER_MIN || iter > EPP_PW_ITER_MAX)
+        return 0;
+    const char *salt_hex = end + 1;
+    const char *hash_hex = strchr(salt_hex, '$');
+    if (!hash_hex)
+        return 0;
+    uint8_t salt[EPP_PW_SALT_LEN];
+    uint8_t want[EPP_PW_HASH_LEN];
+    uint8_t got[EPP_PW_HASH_LEN];
+    if (epp_hex_exact(salt_hex, (size_t) (hash_hex - salt_hex), salt, sizeof(salt)) < 0 ||
+        epp_hex_exact(hash_hex + 1, strlen(hash_hex + 1), want, sizeof(want)) < 0)
+        return 0;
+    if (PKCS5_PBKDF2_HMAC(pw, (int) strlen(pw), salt, (int) sizeof(salt), (int) iter, EVP_sha256(),
+                          (int) sizeof(got), got) != 1)
+        return 0;
+    return CRYPTO_memcmp(got, want, sizeof(got)) == 0;
+}
+
+/* Format a new PBKDF2 hash of `pw` into out. Returns 0, or -1 on failure. */
+static int epp_pw_hash(const char *pw, char *out, size_t cap) {
+    uint8_t salt[EPP_PW_SALT_LEN];
+    uint8_t h[EPP_PW_HASH_LEN];
+    if (RAND_bytes(salt, (int) sizeof(salt)) != 1)
+        return -1;
+    if (PKCS5_PBKDF2_HMAC(pw, (int) strlen(pw), salt, (int) sizeof(salt), EPP_PW_ITER_DEFAULT,
+                          EVP_sha256(), (int) sizeof(h), h) != 1)
+        return -1;
+    char sh[2 * EPP_PW_SALT_LEN + 1];
+    char hh[2 * EPP_PW_HASH_LEN + 1];
+    hex_enc(salt, (int) sizeof(salt), sh);
+    hex_enc(h, (int) sizeof(h), hh);
+    int n = snprintf(out, cap, EPP_PW_PREFIX "%d$%s$%s", EPP_PW_ITER_DEFAULT, sh, hh);
+    return (n > 0 && (size_t) n < cap) ? 0 : -1;
+}
+
+/* Normalise a certificate fingerprint ("AB:CD:..." or "abcd...") to 64
+ * lowercase hex chars. Returns 0, or -1 if it is not a SHA-256 fingerprint. */
+static int epp_fp_normalise(const char *in, char out[65]) {
+    int n = 0;
+    for (const char *p = in; *p; p++) {
+        if (*p == ':' || *p == ' ')
+            continue;
+        if (!isxdigit((unsigned char) *p) || n >= 64)
+            return -1;
+        out[n++] = (char) tolower((unsigned char) *p);
+    }
+    out[n] = 0;
+    return n == 64 ? 0 : -1;
+}
+
+/* Per-clID failed-login lockout. */
+static struct {
+    char clid[64];
+    int fails;
+    time_t until;
+} g_epp_lock[EPP_LOCK_SLOTS];
+static pthread_mutex_t g_epp_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int epp_lock_slot(const char *clid, int create) {
+    int freeslot = -1;
+    int oldest = 0;
+    for (int i = 0; i < EPP_LOCK_SLOTS; i++) {
+        if (g_epp_lock[i].clid[0] && strcmp(g_epp_lock[i].clid, clid) == 0)
+            return i;
+        if (!g_epp_lock[i].clid[0] && freeslot < 0)
+            freeslot = i;
+        if (g_epp_lock[i].until < g_epp_lock[oldest].until)
+            oldest = i;
+    }
+    if (!create)
+        return -1;
+    int i = freeslot >= 0 ? freeslot : oldest;
+    memset(&g_epp_lock[i], 0, sizeof(g_epp_lock[i]));
+    safe_strcpy(g_epp_lock[i].clid, clid, sizeof(g_epp_lock[i].clid));
+    return i;
+}
+
+/* Seconds this clID must still wait (0 = may try now). */
+static long epp_lock_remaining(const char *clid, time_t now) {
+    pthread_mutex_lock(&g_epp_lock_mutex);
+    int i = epp_lock_slot(clid, 0);
+    long rem = (i >= 0 && g_epp_lock[i].until > now) ? (long) (g_epp_lock[i].until - now) : 0;
+    pthread_mutex_unlock(&g_epp_lock_mutex);
+    return rem;
+}
+
+static void epp_lock_fail(const char *clid, time_t now) {
+    pthread_mutex_lock(&g_epp_lock_mutex);
+    int i = epp_lock_slot(clid, 1);
+    g_epp_lock[i].fails++;
+    if (g_epp_lock[i].fails >= EPP_LOCK_THRESHOLD) {
+        int k = g_epp_lock[i].fails - EPP_LOCK_THRESHOLD;
+        long secs = k >= 9 ? EPP_LOCK_MAX_SECS : (1L << k);
+        if (secs > EPP_LOCK_MAX_SECS)
+            secs = EPP_LOCK_MAX_SECS;
+        g_epp_lock[i].until = now + secs;
+    }
+    pthread_mutex_unlock(&g_epp_lock_mutex);
+}
+
+static void epp_lock_clear(const char *clid) {
+    pthread_mutex_lock(&g_epp_lock_mutex);
+    int i = epp_lock_slot(clid, 0);
+    if (i >= 0)
+        memset(&g_epp_lock[i], 0, sizeof(g_epp_lock[i]));
+    pthread_mutex_unlock(&g_epp_lock_mutex);
+}
+
 /* RFC 5730 §2.9.1.1 login. Phase 1 credential store: config:eppd_registrar_pw:<clID>
  * in Valkey (plaintext, gated by the same config:* trust boundary as
  * ddns_secret/tsig_secret — only the authenticated control plane can write
@@ -906,12 +1080,56 @@ static int epp_handle_login(epp_session_t *sess, const char *xml, int len, int c
     if (xml_find_child(xml, cstart, cend, "pw", &pwc_s, &pwc_e, &np) != 1 ||
         xml_text_decode(xml, pwc_s, pwc_e, pw, sizeof(pw)) < 0)
         return epp_build_result(resp, rcap, 2001, "Command syntax error: missing pw", NULL, cltrid);
-    char vkey[128], expected[256] = "";
+    time_t now = time(NULL);
+    long wait = epp_lock_remaining(clid, now);
+    if (wait > 0) {
+        dns_log(LOG_WARNING,
+                "[eppd] login refused for clID=%s: locked out for %lds after "
+                "repeated failures\n",
+                clid, wait);
+        return epp_build_result(
+            resp, rcap, 2200, "Authentication error: too many failures, retry later", NULL, cltrid);
+    }
+    /* Optional clID <-> client certificate binding. */
+    char vkey[128];
+    char bound[160] = "";
+    snprintf(vkey, sizeof(vkey), "config:eppd_registrar_cert:%s", clid);
+    if (vk_get(vkey, bound, sizeof(bound)) && bound[0]) {
+        char want[65];
+        if (epp_fp_normalise(bound, want) < 0 || !sess->cert_fp[0] ||
+            CRYPTO_memcmp(want, sess->cert_fp, 64) != 0) {
+            dns_log(LOG_WARNING,
+                    "[eppd] login refused for clID=%s: client certificate does not "
+                    "match config:eppd_registrar_cert:%s\n",
+                    clid, clid);
+            epp_lock_fail(clid, now);
+            return epp_build_result(resp, rcap, 2200, "Authentication error", NULL, cltrid);
+        }
+    } else {
+        dns_log(LOG_WARNING,
+                "[eppd] clID=%s is not bound to a client certificate (set "
+                "config:eppd_registrar_cert:%s to its SHA-256 fingerprint)\n",
+                clid, clid);
+    }
+    char expected[256] = "";
     snprintf(vkey, sizeof(vkey), "config:eppd_registrar_pw:%s", clid);
-    if (!vk_get(vkey, expected, sizeof(expected)) || !expected[0] || strcmp(expected, pw) != 0) {
+    int legacy = 0;
+    int have = vk_get(vkey, expected, sizeof(expected)) && expected[0];
+    int ok = have && epp_pw_verify(expected, pw, &legacy);
+    OPENSSL_cleanse(expected, sizeof(expected));
+    if (!ok) {
+        OPENSSL_cleanse(pw, sizeof(pw));
         dns_log(LOG_WARNING, "[eppd] login failed for clID=%s\n", clid);
+        epp_lock_fail(clid, now);
         return epp_build_result(resp, rcap, 2200, "Authentication error", NULL, cltrid);
     }
+    OPENSSL_cleanse(pw, sizeof(pw));
+    epp_lock_clear(clid);
+    if (legacy)
+        dns_log(LOG_WARNING,
+                "[eppd] config:eppd_registrar_pw:%s is plaintext — store a hash "
+                "(eppd --hash-password)\n",
+                clid);
     safe_strcpy(sess->clid, clid, sizeof(sess->clid));
     sess->logged_in = 1;
     dns_log(LOG_NOTICE, "[eppd] registrar %s logged in\n", clid);
@@ -3726,7 +3944,7 @@ static int epp_domain_transfer(epp_session_t *sess, const char *xml, int cmd_s, 
             xml_text_decode(xml, pws, pwe, pw, sizeof(pw)) < 0)
             return epp_build_result(resp, rcap, 2003,
                                     "Required parameter missing: domain:authInfo/pw", NULL, cltrid);
-        if (!d.authinfo[0] || strcmp(d.authinfo, pw) != 0)
+        if (!d.authinfo[0] || !epp_secret_eq(d.authinfo, pw))
             return epp_build_result(resp, rcap, 2200, "Authentication error: authInfo mismatch",
                                     NULL, cltrid);
 
@@ -4113,16 +4331,20 @@ static int listen_on(int port) {
  * registrar logs in once and issues many commands before logout, unlike
  * DoH/mgmt's one-shot request/response). */
 static void handle_session(SSL *ssl) {
+    epp_session_t sess;
+    memset(&sess, 0, sizeof(sess));
     X509 *peer = SSL_get_peer_certificate(ssl);
     char subject[256] = "(no client certificate)";
     if (peer) {
         X509_NAME_oneline(X509_get_subject_name(peer), subject, sizeof(subject));
+        unsigned char md[EVP_MAX_MD_SIZE];
+        unsigned int mdlen = 0;
+        if (X509_digest(peer, EVP_sha256(), md, &mdlen) == 1 && mdlen == 32)
+            hex_enc(md, (int) mdlen, sess.cert_fp);
         X509_free(peer);
     }
-    dns_log(LOG_INFO, "[eppd] session from registrar cert: %s\n", subject);
-
-    epp_session_t sess;
-    memset(&sess, 0, sizeof(sess));
+    dns_log(LOG_INFO, "[eppd] session from registrar cert: %s (sha256 %s)\n", subject,
+            sess.cert_fp[0] ? sess.cert_fp : "-");
 
     static __thread uint8_t acc[4 + EPP_MAX_FRAME];
     int acclen = 0;
@@ -4262,8 +4484,33 @@ static int schema_gate(void) {
 }
 
 int main(int argc, char **argv) {
-    (void) argc;
-    (void) argv;
+    /* eppd --hash-password: read a password from stdin, print the value to
+     * store in config:eppd_registrar_pw:<clID> (CSA-CRYPTO-001). */
+    if (argc == 2 && strcmp(argv[1], "--hash-password") == 0) {
+        char pw[256];
+        if (!fgets(pw, sizeof(pw), stdin)) {
+            fprintf(stderr, "eppd: no password on stdin\n");
+            return 2;
+        }
+        pw[strcspn(pw, "\r\n")] = 0;
+        if (!pw[0]) {
+            fprintf(stderr, "eppd: empty password\n");
+            return 2;
+        }
+        char out[256];
+        int rc = epp_pw_hash(pw, out, sizeof(out));
+        OPENSSL_cleanse(pw, sizeof(pw));
+        if (rc != 0) {
+            fprintf(stderr, "eppd: hashing failed\n");
+            return 1;
+        }
+        printf("%s\n", out);
+        return 0;
+    }
+    if (argc > 1) {
+        fprintf(stderr, "usage: %s [--hash-password < password]\n", argv[0]);
+        return 2;
+    }
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();

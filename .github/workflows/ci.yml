@@ -37,18 +37,24 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+    # Check steps carry `if: !cancelled()` so one run reports every failing
+    # check instead of stopping at the first; the job still fails.
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev libseccomp-dev clang dnsutils python3 python3-dnspython python3-cryptography
+          sudo apt-get install -y build-essential libssl-dev libseccomp-dev clang dnsutils python3 python3-dnspython python3-cryptography redis-tools curl
+          # redis-cli: nearly every integration check gates on valkey-cli|redis-cli and
+          # SKIPs (exit 0) without one — they all silently skipped here until this line.
+          redis-cli -h 127.0.0.1 ping
 
       - name: Build debug (ASan + UBSan) — compile/link check
         run: make debug OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Build production binaries (unsigned)
+        if: ${{ !cancelled() }}
         # Build the binary targets directly, not `prod`, to skip GPG signing
         # (no signing key in CI; signing belongs to the release pipeline).
         # Every daemon split out by the migration is built here.
@@ -60,6 +66,7 @@ jobs:
           make resolverd  OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Unit tests (DNSSEC known-answer/negative + name parser + wire conformance)
+        if: ${{ !cancelled() }}
         run: |
           make check-dnssec           OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
           make check-wire             OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
@@ -68,99 +75,116 @@ jobs:
           make check-aggressive-nsec  OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 8976 ZONEMD (codec KAT + independent AXFR digest recompute)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-zonemd OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 7477 CSYNC (codec KAT + dnsd serves type 62)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-csync OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 5782 DNSxL synthesis (listed→A 127.0.0.x + TXT; unlisted→NXDOMAIN)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dnsxl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 1794 per-name round-robin rotation (RRSIGs intact)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-rr-rotate OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 6116/6117/6118 ENUM NAPTR (ordered rules, '|' in regexp, RRSIG)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-enum OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: apid authorisation — /list + /zone mTLS-only, DDNS suffix ACL (CSA-AUTH-003/004)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-apid-auth OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 2317 classless in-addr.arpa delegation (CNAME chain + RRSIG)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-2317 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9660 ZONEVERSION EDNS option (echoes zone SOA serial)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-zoneversion OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9103 XoT — 'dot' ALPN actually selected on the DoT/XFR listener
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-xot OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9859 generalized NOTIFY (CDS/CDNSKEY to a parent on KSK rollover)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-parent-notify OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9567 DNS Error Reporting (EDNS0 Report-Channel option)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-error-reporting OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 3258/4892 CHAOS id.server/hostname.bind (anycast debugging aid)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-id-server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9773 ACME Renewal Information (ARI) drives certd's renewal decision
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ari OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 8737 TLS-ALPN-01 + RFC 8738 IP identifiers (certd optional Add 2/Add 3)
+        if: ${{ !cancelled() }}
         run: make check-acme-challenges OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 8659 CAA pre-flight gates certd's cert request
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-caa OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 8739 STAR recurrent-order renewal
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-star OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Smoke test against Valkey
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
@@ -172,208 +196,372 @@ jobs:
           kill "$SRV" 2>/dev/null || true
 
       - name: Live DNSSEC DO-bit regression
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dnssec-live OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 7344 CDS/CDNSKEY regression (CDS==DS, CDNSKEY==KSK)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-cds OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd caching proxy → dnsd
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-resolverd OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: "resolverd Valkey cache-load path (regression: NULL e->rrs crash)"
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-resolverd-cache OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd RFC 7873 DNS cookie exchange (BADCOOKIE retry)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-resolverd-cookie OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd RFC 5452 0x20 QNAME case randomization
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dns0x20 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd RFC 8767 serve-stale + RFC 9520 SERVFAIL caching
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-serve-stale OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd RFC 8914 Extended DNS Errors (KAT + live)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ede OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd RFC 7858 DoT server + RFC 9462 DDR
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ddr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: resolverd RFC 6147 DNS64 (KAT + live)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dns64 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: mdnsd RFC 8766 Discovery Proxy
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dp OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: mdnsd RFC 8490 DSO + RFC 8765 Push Notifications
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dso OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Out-of-zone forwarding (failover + TC→TCP + RFC 5452 anti-spoof)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-forwarder OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: A/AAAA load-balancing rotation
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-lb OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: A/AAAA load-balancing health checks (drop down addr, fail-open)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-lb-health OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: AXFR completeness (runtime zone:* / ddns:* records)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-axfr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 1995 server IXFR (incremental diff framing + AXFR fallback)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ixfr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 1982 serial-wrap IXFR decision (serial_lt, not raw <)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ixfr-wrap OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 1995 secondary IXFR (incremental apply via NOTIFY re-pull)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ixfr-client OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: mTLS on the DoT/transfer listener
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dot-mtls OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: DDNS suffix ACL + serial-churn skip
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ddns-acl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: PTR / reverse zones (serve + auto-PTR + AXFR + retract)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ptr OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9715 UDP fragmentation avoidance (1232 cap + TC fallback)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-frag OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 9077 negative-response TTL = min(SOA.MINIMUM, SOA-TTL)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-negttl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: DDNS lease-expiry sweeper (silent expiry → serial bump + IXFR delete)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-ddns-sweeper OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: NOTIFY sender (TSIG-signed + retried until ACK)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-notify OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Secondary-role guards (UPDATE→NOTAUTH + no DNSSEC keygen)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-role OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: RFC 2931 SIG(0) transaction signatures (KAT + negatives)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-sig0 OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: UPDATE authentication — fail-closed default + TSIG time/key/alg (CSA-AUTH-001/002)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-update-auth OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Independent DNSSEC validation — KSK tags, NODATA, RFC 9824 compact denial (CSA-DNSSEC-001/002, CSA-PROTO-001)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-dnssec-validate OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
+      - name: Empty non-terminals — zidx name index, NODATA not NXDOMAIN (CSA-PROTO-001 Fix 2b)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-ent OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Plain TCP vs DoT per listener + stream connection bounds (CSA-PROTO-002, CSA-DOS-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-tcp-plain OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Client identity — IPv6, PROXY v2 from apid/doqd, RRL keying (CSA-NET-003, CSA-AUTH-006, CSA-DOS-004)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-client-identity OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Transfers require TSIG when a key is configured (CSA-AUTH-005)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-xfr-tsig-required OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Query log escapes qnames (CSA-INJ-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-qlog-escape OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: seccomp on every dnsd/resolverd thread (CSA-SBX-001)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-sandbox-threads OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: apid/mdnsd/certd sandboxed (CSA-SBX-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-sidecar-sandbox OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: resolverd client ACL + --no-mdns/--no-dnssec (CSA-AUTH-007)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-resolverd-acl OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: apid serves connections concurrently (CSA-DOS-003)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-apid-concurrency OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: mdnsd direct lookups + on-link check (CSA-DOS-005, CSA-INJ-001)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-mdnsd-lookup OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: dashboard CSRF + cookie flags (CSA-WEB-001)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: |
+          python3 -m venv /tmp/dashvenv
+          /tmp/dashvenv/bin/pip install -q -r dashboard/requirements.txt
+          make check-dashboard-csrf DASH_PY=/tmp/dashvenv/bin/python3
+          make check-dashboard-throttle DASH_PY=/tmp/dashvenv/bin/python3
+
+      - name: resolverd cache under concurrent load — ASan (CSA-CONC-001)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-resolverd-stress OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: resolverd cache under concurrent load — ThreadSanitizer (CSA-CONC-001)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-resolverd-tsan OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
       - name: RFC 9665 SRP + RFC 9664 Update Leases (register/refresh/conflict/expiry)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-srp OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Zone transfer client (secondary AXFR pull)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-xfr-client OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Secondary refresh (NOTIFY re-pull + SOA expire)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-xfr-refresh OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Transfer TSIG (sign request + verify chained response)
+        if: ${{ !cancelled() }}
         env:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-xfr-tsig OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Out-of-bounds reads — malformed TSIG / IXFR (CSA-MEM-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-oob-reads OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Secondary NOTIFY needs TSIG, refresh rate-limited (CSA-DOS-006)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-notify-secondary OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Serial bumps skip the full reload; cookie secret stable (CSA-CONC-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-reload-serial OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Config reload vs. query threads — ThreadSanitizer (CSA-CONC-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-reload-tsan OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Daemon logs (on failure)
+        if: failure()
+        run: |
+          ss -lunpt || true
+          ps -ef | grep -E 'dns_server|resolverd|apid|mdnsd|certd|eppd|python3' | grep -v grep || true
+          for f in /tmp/*.log; do echo "===== $f"; tail -n 40 "$f"; done
 
   warnings:
     name: Warnings as errors
@@ -416,7 +604,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-tools clang-tidy cppcheck libssl-dev libseccomp-dev
       - name: clang static analyzer (scan-build)
-        run: scan-build --status-bugs make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+        # resolverd is not listed: its remaining reports are all in the vendored
+        # object_graph.c, which is fixed upstream only (see CLAUDE.md). certd was
+        # added after its EST double free (CSA-MEM-001) went unflagged here.
+        run: |
+          for t in dns_server certd apid mdnsd eppd; do
+            scan-build --status-bugs make $t OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB || exit 1
+          done
       - name: cppcheck
         run: cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 *.c
 
@@ -489,6 +683,20 @@ jobs:
         run: |
           mkdir -p fuzz/corpus_response
           ASAN_OPTIONS=detect_leaks=1 ./fuzz_response -max_total_time=60 fuzz/corpus_response
+
+  fuzz-dnsd-smoke:
+    name: Fuzz smoke (dnsd dns_process + TSIG/SIG(0))
+    runs-on: ubuntu-latest
+    # libFuzzer over dnsd's request entry point (QUERY/UPDATE/NOTIFY, EDNS,
+    # cookies) and its TSIG / SIG(0) RR parsers (Phase 0b step 9). The harness
+    # #includes dns_server.c and points its Valkey client at a closed port, so
+    # it needs no service. Replays fuzz/corpus_dnsd (regression inputs included).
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + OpenSSL/libseccomp headers
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libseccomp-dev pkg-config
+      - name: Build + 60s smoke + corpus replay
+        run: make fuzz-dnsd OSSL_INC=/usr/include OSSL_LIB=/usr/lib/x86_64-linux-gnu
 
   fuzz-tlv-smoke:
     name: Fuzz smoke (TLV codec)
