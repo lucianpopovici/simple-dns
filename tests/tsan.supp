@@ -11,3 +11,10 @@
 # publication is invisible to TSan and every concurrent DNSSEC verify is
 # reported as a race on the hashtable's key buffer.
 race:ossl_ht_get
+#
+# Same race when libcrypto has no symbols (the CI runner): the frames inside
+# libcrypto print as <null>, so the name above cannot match and the report
+# halted resolverd mid-run (CI #43821003735). Suppress interceptor reports
+# (memcmp/memcpy) made from inside libcrypto itself; a race in project code
+# is still reported, since its accesses are not made from libcrypto.
+called_from_lib:libcrypto.so

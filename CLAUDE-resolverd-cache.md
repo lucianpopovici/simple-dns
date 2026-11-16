@@ -34,7 +34,7 @@ grep -n "g_lru_mutex\|g_cache_count_mutex\|g_cache\[.*\]\.lock\|lru_touch(\|lru_
 ## TSan findings (filed, per the Fix 2 guardrail)
 
 1. **OpenSSL RCU hashtable — suppressed (third-party, uninstrumented).**
-   `race:ossl_ht_get` in `tests/tsan.supp`, the only entry. Report:
+   `race:ossl_ht_get` in `tests/tsan.supp` (plus `called_from_lib:libcrypto.so`, below). Report:
    ```
    WARNING: ThreadSanitizer: data race
      Read of size 5 ... by thread T9:
@@ -48,6 +48,12 @@ grep -n "g_lru_mutex\|g_cache_count_mutex\|g_cache\[.*\]\.lock\|lru_touch(\|lru_
    libcrypto is not built with `-fsanitize=thread`, so TSan cannot see the
    RCU publication. Not a resolverd defect; `--no-dnssec` could not be used to
    sidestep it because that flag is still a no-op (CSA-AUTH-007).
+   On a host without libcrypto symbols (the GitHub runner) the same race
+   shows `#2 <null> (libcrypto.so.3)` instead of `ossl_ht_get`, so the
+   name-based entry missed it and the TSan stress check failed whenever the
+   race happened (memcmp/memcpy from libcrypto under `dnssec_verify_rrset`,
+   CI run 43821003735). Second entry, `called_from_lib:libcrypto.so`, covers
+   it by library rather than by symbol.
 2. **dnsd (`dns_server_tsan`, non-blocking, recorded):** a 15 s load run
    reports 12 races, all in the config/zone reload path —
    `config_load_from_valkey` (`:2597`, `:2601`) and `zone_upsert`
