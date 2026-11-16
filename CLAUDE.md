@@ -526,8 +526,11 @@ ported to a different libc/kernel.
 Config (Valkey): `config:eppd_enabled` (must be `"1"`, default off — never
 on by accident, same convention as `doqd`), `config:eppd_port` (RFC 5734
 default 700), `config:eppd_mtls_ca_pem` (required), `config:eppd_registrar_
-pw:<clID>` (per-registrar EPP login password — plaintext, gated by the same
-`config:*` trust boundary as `ddns_secret`/`tsig_secret`), `config:eppd_
+pw:<clID>` (per-registrar EPP login password — a PBKDF2-SHA256 hash from
+`eppd --hash-password`; plaintext still accepted with a warning; constant-time
+compare, per-clID lockout after 5 failures — CSA-CRYPTO-001),
+`config:eppd_registrar_cert:<clID>` (optional SHA-256 fingerprint binding the
+clID to its client certificate), `config:eppd_
 {chroot_dir,isolation_mode,privdrop_user,privdrop_group,seccomp_mode}`
 (sandbox knobs, resolverd-style, own prefix since `eppd`'s filesystem/
 syscall profile differs — inbound TLS only, no outbound network),

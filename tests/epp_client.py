@@ -570,5 +570,14 @@ send_frame(
 check('code="1500"' in recv_frame(s), "registrar1 logout -> 1500")
 s.close()
 
+# CSA-CRYPTO-001: the Makefile binds registrar1 to its own certificate
+# (config:eppd_registrar_cert:registrar1), so registrar1's correct password
+# over registrar2's certificate must be refused.
+s3 = connect(CERT2, KEY2)
+recv_frame(s3)  # greeting
+check('code="2200"' in login(s3, CLID1, PW1, "T-031"),
+      "registrar1 login over another registrar's certificate -> 2200 (clID bound to cert)")
+s3.close()
+
 print("ALL TESTS PASSED" if _ok else "SOME TESTS FAILED")
 sys.exit(0 if _ok else 1)

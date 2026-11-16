@@ -186,6 +186,8 @@ availability, then defense-in-depth.
    password/authInfo plaintext + `strcmp`), and the Phase-0 residual:
    `csprng_u16` falling back to `rand()` when `RAND_bytes` fails
    (`dns_server.c:1054`, `resolverd.c:2281`) — fail closed instead.
+   **DONE 2026-11-16** — `CLAUDE-low-fixes.md` (8a–8g), each with a check in
+   CI; CI scan-build now also covers certd/apid/mdnsd/eppd.
 9. **Tooling the audit asked for** — a libFuzzer harness over `dns_process`
    (QUERY + UPDATE + `tsig_find`/`sig0_find`); a TSan CI job for resolverd
    **and** dnsd (step 5 covers resolverd); a CI step validating dnsd's positive

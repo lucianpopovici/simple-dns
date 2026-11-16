@@ -22,6 +22,9 @@ import time
 import json
 import socket
 import secrets
+import ipaddress
+import threading
+from collections import OrderedDict
 import urllib.request
 import urllib.error
 import argparse
@@ -66,13 +69,79 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.getenv("DASHBOARD_INSECURE_COOKIE", "") not in ("1", "true", "yes"),
 )
 CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-# Per-process brute-force throttle: client-ip -> (fail_count, not_before_epoch)
-_login_fails = {}
+# Per-process brute-force throttle (CSA-WEB-002): client-ip ->
+# (fail_count, not_before_epoch, last_seen_epoch). Bounded and expiring, so a
+# client rotating addresses cannot grow it without limit.
+LOGIN_TABLE_MAX = int(os.getenv("DASHBOARD_LOGIN_TABLE_MAX", "10000"))
+LOGIN_ENTRY_TTL = 3600
+_login_fails = OrderedDict()
+_login_lock = threading.Lock()
+
+
+def _parse_proxies(spec):
+    nets = []
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            print(f"[dns-dashboard] WARNING: ignoring bad DASHBOARD_TRUSTED_PROXIES entry {tok!r}")
+    return nets
+
+
+# X-Forwarded-For is honoured only when the direct peer is one of these
+# (comma-separated IPs/CIDRs). Empty (the default) = never: any client could
+# otherwise rotate the header to dodge the login back-off.
+TRUSTED_PROXIES = _parse_proxies(os.getenv("DASHBOARD_TRUSTED_PROXIES", ""))
+
+
+def _is_trusted_proxy(addr):
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in n for n in TRUSTED_PROXIES)
 
 
 def _client_ip():
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return (fwd.split(",")[0].strip() if fwd else (request.remote_addr or "?"))
+    peer = request.remote_addr or "?"
+    if not TRUSTED_PROXIES or not _is_trusted_proxy(peer):
+        return peer
+    # Walk the chain right to left, skipping our own proxies: the first hop
+    # that is not a trusted proxy is the client as our proxy saw it.
+    hops = [h.strip() for h in request.headers.get("X-Forwarded-For", "").split(",") if h.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted_proxy(hop):
+            return hop
+    return peer
+
+
+def _throttle_get(ip):
+    with _login_lock:
+        e = _login_fails.get(ip)
+        return (e[0], e[1]) if e else (0, 0)
+
+
+def _throttle_fail(ip, fails, not_before):
+    now = time.time()
+    with _login_lock:
+        _login_fails[ip] = (fails, not_before, now)
+        _login_fails.move_to_end(ip)
+        # expire idle entries (oldest first), then enforce the bound
+        while _login_fails:
+            k, v = next(iter(_login_fails.items()))
+            if now - v[2] <= LOGIN_ENTRY_TTL:
+                break
+            _login_fails.popitem(last=False)
+        while len(_login_fails) > LOGIN_TABLE_MAX:
+            _login_fails.popitem(last=False)
+
+
+def _throttle_clear(ip):
+    with _login_lock:
+        _login_fails.pop(ip, None)
 
 
 def is_secret_key(key: str) -> bool:
@@ -1042,7 +1111,7 @@ def login():
     next_url = _safe_next(request.values.get("next", ""))
     if request.method == "POST":
         ip = _client_ip()
-        fails, not_before = _login_fails.get(ip, (0, 0))
+        fails, not_before = _throttle_get(ip)
         if time.time() < not_before:
             flash("Too many attempts — wait a moment and try again.", "error")
             return render_template_string(with_csrf(LOGIN_TMPL), next_url=next_url), 429
@@ -1052,7 +1121,7 @@ def login():
               and secrets.compare_digest(user, DASH_USER)
               and check_password_hash(DASH_PW_HASH, pw))
         if ok:
-            _login_fails.pop(ip, None)
+            _throttle_clear(ip)
             session.clear()
             session["authed"] = True
             session["user"] = user
@@ -1062,7 +1131,7 @@ def login():
         # Failure: generic message + escalating backoff (constant-ish time).
         fails += 1
         delay = min(30, 2 ** min(fails, 5)) if fails > 2 else 0
-        _login_fails[ip] = (fails, time.time() + delay)
+        _throttle_fail(ip, fails, time.time() + delay)
         time.sleep(0.5)
         flash("Invalid credentials.", "error")
         return render_template_string(with_csrf(LOGIN_TMPL), next_url=next_url), 401

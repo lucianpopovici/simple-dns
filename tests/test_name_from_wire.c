@@ -284,6 +284,19 @@ int main(void) {
         check(dns_name_in_suffix(NULL, "dyn.example.local") == 0, "suffix: NULL name rejected");
     }
 
+    /* ── csprng_u16 fails closed (CLAUDE-low-fixes.md 8b) ───────────────────── */
+    {
+        uint16_t v = 0;
+        check(csprng_u16(&v) == 0, "csprng: normal draw succeeds");
+        g_csprng_fail = 1;
+        check(csprng_u16(&v) == -1, "csprng: RAND_bytes failure is reported, no fallback value");
+        uint8_t resp[512];
+        long rtt = 0;
+        check(upstream_query_one("example.com", 1, resp, sizeof(resp), 0, &rtt) == -1,
+              "csprng: failure means no upstream query is sent");
+        g_csprng_fail = 0;
+    }
+
     printf("%s\n", g_fail ? "FAILURES" : "ALL TESTS PASSED");
     return g_fail;
 }

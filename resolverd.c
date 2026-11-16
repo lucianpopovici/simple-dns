@@ -2395,11 +2395,20 @@ static int response_opt_parse(const uint8_t *pkt, int plen, uint8_t *scookie, in
 /* CSPRNG 16-bit value for transaction IDs and source ports — the resolver's
  * primary anti-spoofing entropy (RFC 5452). rand()/srand(time()) is predictable;
  * fall back to it only if OpenSSL's RNG ever fails (it should not). */
-static uint16_t csprng_u16(void) {
-    uint16_t v;
-    if (RAND_bytes((unsigned char *) &v, sizeof(v)) == 1)
-        return v;
-    return (uint16_t) rand();
+/* A random 16-bit value for DNS message IDs / source ports. Fails closed:
+ * returns -1 when the CSPRNG fails, never a predictable fallback (a guessable
+ * ID or port is the cache-poisoning surface). Test hook: g_csprng_fail. */
+#ifdef UNIT_TEST
+static int g_csprng_fail = 0;
+#endif
+static int csprng_u16(uint16_t *out) {
+#ifdef UNIT_TEST
+    if (g_csprng_fail)
+        return -1;
+#endif
+    if (RAND_bytes((unsigned char *) out, sizeof(*out)) != 1)
+        return -1;
+    return 0;
 }
 
 /* Two DNS names equal ignoring case and a single trailing dot. */
@@ -3062,8 +3071,14 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
                 /* Random source port */
                 struct sockaddr_storage local = {0};
                 local.ss_family = (sa_family_t) res->ai_family;
+                int rng_ok = 1;
                 for (int a = 0; a < 16; a++) {
-                    uint16_t sp = (uint16_t) (1024 + (csprng_u16() % 64511));
+                    uint16_t r16;
+                    if (csprng_u16(&r16) != 0) {
+                        rng_ok = 0; /* fail closed: send nothing from a guessable port */
+                        break;
+                    }
+                    uint16_t sp = (uint16_t) (1024 + (r16 % 64511));
                     if (local.ss_family == AF_INET)
                         ((struct sockaddr_in *) &local)->sin_port = htons(sp);
                     else
@@ -3078,7 +3093,7 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
                 }
                 struct timeval tv2 = {.tv_sec = 3};
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
-                if (connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
+                if (rng_ok && connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
                     send(fd, query, qlen, 0) == qlen)
                     rlen = (int) recv(fd, resp, resp_sz, 0);
                 close(fd);
@@ -3094,7 +3109,12 @@ static int upstream_dispatch(const uint8_t *query, int qlen, uint8_t *resp, int 
 /* Send a query to one specific upstream (by index). Returns rlen or -1. */
 static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, int resp_sz,
                               int upstream_idx, long *rtt_us_out) {
-    uint16_t id = csprng_u16();
+    uint16_t id;
+    if (csprng_u16(&id) != 0) {
+        fprintf(stderr, "[resolverd] CSPRNG failure — refusing to send a query with a "
+                        "predictable ID\n");
+        return -1;
+    }
     uint8_t query[DNS_BUF];
     /* The chosen upstream is passed straight down the dispatch chain — no
      * more rewriting g_cfg slot 0 (an unlocked data race under concurrent
@@ -3132,7 +3152,8 @@ static int upstream_query_one(const char *qname, uint16_t qtype, uint8_t *resp, 
         if (slen > 0)
             cookie_store_server(upstream_idx, scookie, slen);
         if (full_rcode == DNS_RCODE_BADCOOKIE && slen > 0) {
-            id = csprng_u16();
+            if (csprng_u16(&id) != 0)
+                return -1;
             if (use_0x20)
                 dns0x20_mix(qname, qname_sent, sizeof(qname_sent));
             qlen = build_query(query, sizeof(query), qname_sent, qtype, id, 1, upstream_idx);

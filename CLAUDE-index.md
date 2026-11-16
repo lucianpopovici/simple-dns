@@ -45,6 +45,7 @@ reference-only RFCs. Keep this in sync when adding or promoting items.
 | `CLAUDE-resolverd-cache.md` | resolverd | Audit fixes: cache/LRU locking, TSan build + stress target — **done 2026-11-15** |
 | `CLAUDE-client-identity.md` | dnsd, apid, doqd (+libdnswire) | Audit fixes: real v4/v6 client, PROXY v2 from front-ends, RRL keying — **done 2026-11-15** |
 | `CLAUDE-medium-fixes.md` | dnsd, resolverd, apid, mdnsd, certd, doqd, dashboard, libsandbox | Audit fixes: Phase 0b step 7, the remaining Medium findings — **done 2026-11-15** |
+| `CLAUDE-low-fixes.md` | certd, dnsd, resolverd, dashboard, eppd | Audit fixes: Phase 0b step 8, the Low findings — **done 2026-11-16** |
 | `SECURITY_AUDIT.md` | all | Finding ledger (stable `CSA-*` IDs); latest section 2026-11-15 @ `b0a6b32` |
 | `CLAUDE-index.md` | (this file) | The map |
 
@@ -89,8 +90,23 @@ stderr after the first config reload when started as root; and CI had no
 `valkey-cli`, so ~50 integration checks had been skipping (see
 `CLAUDE-medium-fixes.md`).
 
-Not yet specced (open in the ledger): CSA-DOS-006, CSA-WEB-002,
-CSA-CONC-002, CSA-MEM-001/-002, CSA-CRYPTO-001, and PERF-001..007.
+| Finding | Sev | Fix | Status | File |
+|---------|-----|-----|--------|------|
+| CSA-MEM-001 | Low | certd EST 202 retry double free | **Done** 2026-11-16 | low-fixes 8a |
+| — | Phase-0 residual | `csprng_u16` fails closed (no `rand()` fallback) | **Done** 2026-11-16 | low-fixes 8b |
+| CSA-MEM-002 | Low | TSIG alg name / IXFR authority / forwarder TC bounds | **Done** 2026-11-16 | low-fixes 8c |
+| CSA-WEB-002 | Low | Login throttle: trusted proxies only, bounded table | **Done** 2026-11-16 | low-fixes 8d |
+| CSA-DOS-006 | Low | Secondary NOTIFY: cached primary, TSIG, rate limit | **Done** 2026-11-16 | low-fixes 8e |
+| CSA-CRYPTO-001 | Low | EPP: hashed passwords, constant-time compare, cert binding, lockout | **Done** 2026-11-16 | low-fixes 8f |
+| CSA-CONC-002 | Low | No full reload on serial bumps; reset-free config load | **Done** 2026-11-16 (struct swap not done — see 8g) | low-fixes 8g |
+
+Also found while fixing step 8, **fixed**: dnsd regenerated an unset cookie
+secret on every reload (BADCOOKIE after any UPDATE); `zone_upsert` rewrote
+unchanged fields under query threads; certd crashed on a STAR refresh in a
+fresh process (NULL account key) and sent empty ACME nonces to a private CA
+(see `CLAUDE-low-fixes.md`).
+
+Not yet specced (open in the ledger): PERF-001..007.
 
 Release notes required by these fixes: unsigned UPDATE stops working by
 default (update-auth Fix 1); `hmac-sha1`/`hmac-md5` TSIG clients are rejected

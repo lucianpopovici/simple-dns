@@ -558,9 +558,11 @@ static void handle_doh(int fd, SSL *ssl, const uint8_t *pkt, int plen) {
         SSL_write(ssl, hdr, hl);
         SSL_write(ssl, resp, rlen);
     } else {
-        ssize_t w = write(fd, hdr, hl);
-        w = write(fd, resp, rlen);
-        (void) w;
+        /* body only after the whole header went out */
+        if (write(fd, hdr, hl) == (ssize_t) hl) {
+            ssize_t w = write(fd, resp, rlen);
+            (void) w;
+        }
     }
 }
 
@@ -1011,9 +1013,9 @@ static void handle_api(int fd, SSL *ssl, int is_mgmt) {
                                    vr.type == 2 ? vr.str : "?");
                 }
             } else
-                bp += snprintf(body + bp, sizeof(body) - bp, "zones: 0\n");
+                snprintf(body + bp, sizeof(body) - bp, "zones: 0\n");
         } else
-            bp += snprintf(body + bp, sizeof(body) - bp, "valkey unavailable\n");
+            snprintf(body + bp, sizeof(body) - bp, "valkey unavailable\n");
         pthread_mutex_unlock(&g_vk_mutex);
         api_send(fd, ssl, 200, body);
         return;

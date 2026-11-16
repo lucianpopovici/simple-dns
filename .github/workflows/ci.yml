@@ -484,6 +484,7 @@ jobs:
           python3 -m venv /tmp/dashvenv
           /tmp/dashvenv/bin/pip install -q -r dashboard/requirements.txt
           make check-dashboard-csrf DASH_PY=/tmp/dashvenv/bin/python3
+          make check-dashboard-throttle DASH_PY=/tmp/dashvenv/bin/python3
 
       - name: resolverd cache under concurrent load — ASan (CSA-CONC-001)
         if: ${{ !cancelled() }}
@@ -526,6 +527,34 @@ jobs:
           DNS_VALKEY_HOST: 127.0.0.1
           DNS_VALKEY_PORT: 6379
         run: make check-xfr-tsig OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Out-of-bounds reads — malformed TSIG / IXFR (CSA-MEM-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-oob-reads OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Secondary NOTIFY needs TSIG, refresh rate-limited (CSA-DOS-006)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-notify-secondary OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Serial bumps skip the full reload; cookie secret stable (CSA-CONC-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-reload-serial OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+
+      - name: Config reload vs. query threads — ThreadSanitizer (CSA-CONC-002)
+        if: ${{ !cancelled() }}
+        env:
+          DNS_VALKEY_HOST: 127.0.0.1
+          DNS_VALKEY_PORT: 6379
+        run: make check-reload-tsan OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
 
       - name: Daemon logs (on failure)
         if: failure()
@@ -575,7 +604,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-tools clang-tidy cppcheck libssl-dev libseccomp-dev
       - name: clang static analyzer (scan-build)
-        run: scan-build --status-bugs make dns_server OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB
+        # resolverd is not listed: its remaining reports are all in the vendored
+        # object_graph.c, which is fixed upstream only (see CLAUDE.md). certd was
+        # added after its EST double free (CSA-MEM-001) went unflagged here.
+        run: |
+          for t in dns_server certd apid mdnsd eppd; do
+            scan-build --status-bugs make $t OSSL_INC=$OSSL_INC OSSL_LIB=$OSSL_LIB || exit 1
+          done
       - name: cppcheck
         run: cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 *.c
 

@@ -574,24 +574,30 @@ static char *acme_jws(EVP_PKEY *key, const char *url, const char *nonce, const c
         strcpy(pb, "");
     char si[8192];
     snprintf(si, sizeof(si), "%s.%s", hb, pb);
-    EVP_MD_CTX *mc = EVP_MD_CTX_new();
-    EVP_DigestSignInit(mc, NULL, EVP_sha256(), NULL, key);
-    EVP_DigestSignUpdate(mc, si, strlen(si));
-    size_t sl = 0;
-    EVP_DigestSignFinal(mc, NULL, &sl);
-    if (sl == 0) {
+    /* Fail closed: with no key, or a failed init, the update/final calls
+     * would run on an unset context (a NULL method call). */
+    EVP_MD_CTX *mc = key ? EVP_MD_CTX_new() : NULL;
+    if (!mc || EVP_DigestSignInit(mc, NULL, EVP_sha256(), NULL, key) != 1 ||
+        EVP_DigestSignUpdate(mc, si, strlen(si)) != 1) {
         EVP_MD_CTX_free(mc);
-        char *jws = malloc(16);
-        if (jws)
-            strcpy(jws, "{}");
-        return jws;
+        dns_log(LOG_ERR, "[ACME] cannot sign the request (no account key?)\n");
+        return NULL;
+    }
+    size_t sl = 0;
+    if (EVP_DigestSignFinal(mc, NULL, &sl) != 1 || sl == 0) {
+        EVP_MD_CTX_free(mc);
+        return NULL; /* never send an unsigned body in place of a JWS */
     }
     uint8_t *der = malloc(sl);
     if (!der) {
         EVP_MD_CTX_free(mc);
         return NULL;
     }
-    EVP_DigestSignFinal(mc, der, &sl);
+    if (EVP_DigestSignFinal(mc, der, &sl) != 1) {
+        EVP_MD_CTX_free(mc);
+        free(der);
+        return NULL;
+    }
     EVP_MD_CTX_free(mc);
     uint8_t raw[64];
     ecdsa_der_to_raw(der, sl, raw);
@@ -612,17 +618,73 @@ static int acme_nonce_fetch(const char *host, int port) {
     parse_url(g_acme_dir_newnonce, h2, &p2, path, sizeof(path));
     char hdrs[4096] = {0};
     int code = 0;
-    char *b = https_req_mtls(h2, p2, "HEAD", path, NULL, NULL, NULL, NULL, NULL, &code, hdrs,
-                             sizeof(hdrs));
+    /* Same trust settings as acme_post: a private ACME CA (config:acme_ca_pem)
+     * failed verification here, so every JWS went out with an empty nonce. */
+    char *b = https_req_mtls(
+        h2, p2, "HEAD", path, NULL, g_acme_client_cert_pem[0] ? g_acme_client_cert_pem : NULL,
+        g_acme_client_key_pem[0] ? g_acme_client_key_pem : NULL,
+        g_acme_ca_pem[0] ? g_acme_ca_pem : NULL, NULL, &code, hdrs, sizeof(hdrs));
     free(b);
     hdr_val(hdrs, "Replay-Nonce", g_acme_nonce, sizeof(g_acme_nonce));
     return g_acme_nonce[0] ? 0 : -1;
     (void) host;
     (void) port;
 }
+/* Load the ACME account key from acme:account_key, or create and persist a
+ * new P-256 key. Every signed request needs it: a fresh `certd --once` whose
+ * STAR refresh or cancel ran acme_post before anything loaded the key used to
+ * sign with a NULL key and crash. Returns 0, or -1 if no key is available. */
+static int acme_account_key_ensure(void) {
+    if (g_acme_key)
+        return 0;
+    char pem[MAX_PEM] = {0};
+    if (vk_get("acme:account_key", pem, sizeof(pem)) && strlen(pem) > 10) {
+        BIO *b = BIO_new_mem_buf(pem, -1);
+        g_acme_key = b ? PEM_read_bio_PrivateKey(b, NULL, NULL, NULL) : NULL;
+        BIO_free(b);
+    }
+    OPENSSL_cleanse(pem, sizeof(pem));
+    if (g_acme_key)
+        return 0;
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    if (!kctx || EVP_PKEY_keygen_init(kctx) != 1 ||
+        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1) != 1 ||
+        EVP_PKEY_keygen(kctx, &g_acme_key) != 1) {
+        EVP_PKEY_CTX_free(kctx);
+        dns_log(LOG_ERR, "[ACME] cannot create an account key\n");
+        return -1;
+    }
+    EVP_PKEY_CTX_free(kctx);
+    BIO *b = BIO_new(BIO_s_mem());
+    if (b && PEM_write_bio_PrivateKey(b, g_acme_key, NULL, NULL, 0, NULL, NULL) == 1) {
+        char *pp;
+        long pl = BIO_get_mem_data(b, &pp);
+        char p2[MAX_PEM];
+        int nn = (int) (pl < MAX_PEM - 1 ? pl : MAX_PEM - 1);
+        memcpy(p2, pp, nn);
+        p2[nn] = 0;
+        vk_set("acme:account_key", p2, 0);
+        OPENSSL_cleanse(p2, sizeof(p2));
+    }
+    BIO_free(b);
+    return 0;
+}
+
+static int acme_directory(const char *host, int port);
+
 static char *acme_post(const char *url, const char *payload, const char *host, int port, int *code,
                        char *rh, int rhl) {
-    acme_nonce_fetch(host, port);
+    if (acme_account_key_ensure() != 0)
+        return NULL;
+    /* A fresh `certd --once` doing a STAR refresh/cancel has not read the
+     * directory yet: without newNonce there is no nonce to sign with. */
+    if (!g_acme_dir_newnonce[0] && acme_directory(host, port) != 0)
+        return NULL;
+    if (acme_nonce_fetch(host, port) != 0) {
+        dns_log(LOG_ERR, "[ACME] no Replay-Nonce from %s — not sending the request\n",
+                g_acme_dir_newnonce);
+        return NULL;
+    }
     char *jws = acme_jws(g_acme_key, url, g_acme_nonce, payload);
     if (!jws)
         return NULL;
@@ -1134,31 +1196,8 @@ static int acme_issue(void) {
         if (caa < 0)
             dns_log(LOG_DEBUG, "[ACME] CAA pre-flight check skipped (no owning zone found)\n");
     }
-    if (!g_acme_key) {
-        char pem[MAX_PEM] = {0};
-        if (vk_get("acme:account_key", pem, sizeof(pem)) && strlen(pem) > 10) {
-            BIO *b = BIO_new_mem_buf(pem, -1);
-            g_acme_key = PEM_read_bio_PrivateKey(b, NULL, NULL, NULL);
-            BIO_free(b);
-        }
-        if (!g_acme_key) {
-            EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
-            EVP_PKEY_keygen_init(kctx);
-            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1);
-            EVP_PKEY_keygen(kctx, &g_acme_key);
-            EVP_PKEY_CTX_free(kctx);
-            BIO *b = BIO_new(BIO_s_mem());
-            PEM_write_bio_PrivateKey(b, g_acme_key, NULL, NULL, 0, NULL, NULL);
-            char *pp;
-            long pl = BIO_get_mem_data(b, &pp);
-            char p2[MAX_PEM];
-            int nn = (int) (pl < MAX_PEM - 1 ? pl : MAX_PEM - 1);
-            memcpy(p2, pp, nn);
-            p2[nn] = 0;
-            vk_set("acme:account_key", p2, 0);
-            BIO_free(b);
-        }
-    }
+    if (acme_account_key_ensure() != 0)
+        return -1;
     if (acme_directory(achost, acport) < 0) {
         dns_log(LOG_ERR, "[ACME] Directory failed\n");
         return -1;
@@ -1274,7 +1313,6 @@ static int acme_issue(void) {
                 safe_strcpy(ch_tok, tok2, sizeof(ch_tok));
                 safe_strcpy(ch_url, uv, sizeof(ch_url));
             }
-            p += strlen(needle);
             break;
         }
     }
@@ -1791,25 +1829,25 @@ static char *est_enroll(const char *host, int port, const char *domain, const ch
             delay = 120;
         dns_log(LOG_NOTICE, "[EST] Deferred — retrying in %ds\n", delay);
         free(body);
+        body = NULL; /* CSA-MEM-001: a failed retry below must not free it again */
         sleep(delay);
-        int b64bsz = (derlen / 3 + 1) * 4 + 2;
-        char *b64b = malloc(b64bsz);
+        uint8_t *csr2 = make_csr_der(domain, 0 /* EST enrolls DNS names only */, &dk, &derlen);
+        /* Size from the new CSR: an ECDSA signature's length varies. */
+        int b64bsz = csr2 ? (derlen / 3 + 1) * 4 + 2 : 0;
+        char *b64b = csr2 ? malloc(b64bsz) : NULL;
         if (b64b) {
-            uint8_t *csr2 = make_csr_der(domain, 0 /* EST enrolls DNS names only */, &dk, &derlen);
-            if (csr2) {
-                b64url_enc(csr2, derlen, b64b, b64bsz);
-                free(csr2);
-                for (char *p = b64b; *p; p++) {
-                    if (*p == '-')
-                        *p = '+';
-                    else if (*p == '_')
-                        *p = '/';
-                }
-                body = https_req_mtls(host, port, "POST", path, b64b, cc, ck, ca,
-                                      "application/pkcs10", &code, NULL, 0);
+            b64url_enc(csr2, derlen, b64b, b64bsz);
+            for (char *p = b64b; *p; p++) {
+                if (*p == '-')
+                    *p = '+';
+                else if (*p == '_')
+                    *p = '/';
             }
+            body = https_req_mtls(host, port, "POST", path, b64b, cc, ck, ca, "application/pkcs10",
+                                  &code, NULL, 0);
             free(b64b);
         }
+        free(csr2);
     }
     if (!body || (code != 200 && code != 201)) {
         dns_log(LOG_ERR, "[EST] Enrollment failed HTTP %d\n", code);

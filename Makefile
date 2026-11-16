@@ -130,7 +130,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-oob-reads check-dashboard-throttle check-notify-secondary check-reload-serial check-reload-tsan check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -923,6 +923,131 @@ check-mdnsd-lookup: tests/test_mdnsd_lookup.c mdnsd.c $(WIRE_SRC) dns_wire.h | o
 	$(CC) $(CSTD) $(WARN) -Wno-unused-function $(DEBUG_FLAGS) $(INCLUDES) -I. \
 	      -o tests/test_mdnsd_lookup tests/test_mdnsd_lookup.c $(WIRE_SRC) $(LIBS)
 	./tests/test_mdnsd_lookup
+
+# CSA-MEM-002 (CLAUDE-low-fixes.md 8c): a TSIG whose algorithm name runs past
+# its RDATA is malformed (the UPDATE counts as unsigned -> REFUSED; the old
+# parser read the fields from beyond the RR -> NOTAUTH), and an IXFR with a
+# truncated authority RR does not take dnsd down. Needs Valkey + python3.
+check-oob-reads: $(BIN_DEBUG)
+	@echo "  CHECK  malformed TSIG / IXFR authority read within bounds (CSA-MEM-002)"
+	@ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_oob.log 2>&1 & DNS=$$!; \
+	 sleep 2;                                                                          \
+	 python3 tests/oob_probe.py 127.0.0.1 $(TPORT) example.local; RC=$$?;              \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 if grep -q 'ERROR: AddressSanitizer\|runtime error' /tmp/dnsd_oob.log; then echo "  FAIL  sanitizer report in /tmp/dnsd_oob.log"; exit 1; fi; \
+	 test $$RC = 0 || { echo "  FAIL  see probe output above"; exit 1; };              \
+	 echo "  OK  malformed TSIG rejected, truncated IXFR authority survived"
+
+# CSA-WEB-002 (CLAUDE-low-fixes.md 8d): the dashboard login throttle keys on
+# the real client (X-Forwarded-For only from DASHBOARD_TRUSTED_PROXIES) and
+# its table is bounded. Same DASH_PY / skip rules as check-dashboard-csrf.
+check-dashboard-throttle:
+	@echo "  CHECK  dashboard login throttle (Valkey + Flask)"
+	@$(DASH_PY) tests/dashboard_throttle.py; rc=$$?;                                   \
+	 if [ $$rc = 77 ]; then echo "  SKIP  set DASH_PY to a python with dashboard/requirements.txt"; exit 0; fi; \
+	 exit $$rc
+
+# CSA-CONC-002 (CLAUDE-low-fixes.md 8g): dnsd under ThreadSanitizer with query
+# load, 50 serial bumps and a real config edit reports no data race (it
+# reported ~10 through config_load_from_valkey and zone_upsert before).
+check-reload-tsan: dns_server_tsan tests/udp_stress
+	@echo "  CHECK  config reload vs. query threads under TSan (Valkey)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 LOG=/tmp/tsan_reload_$$$$; SAVE_RR=$$($$VC get config:rr_rotate);                      \
+	 TSAN_OPTIONS="halt_on_error=0 report_signal_unsafe=0 suppressions=$(CURDIR)/tests/tsan.supp log_path=$$LOG" \
+	   DNS_SECCOMP=off LISTEN_PORT=$(TPORT) ./dns_server_tsan > /tmp/dnsd_tsan_reload.log 2>&1 & DNS=$$!; \
+	 sleep 4;                                                                          \
+	 ./tests/udp_stress $(TPORT) 4 12 a www example.local > /dev/null 2>&1 & Q=$$!;    \
+	 for i in $$(seq 1 50); do $$VC incr config:zone_serial >/dev/null; sleep 0.2; done; \
+	 $$VC set config:rr_rotate 1 >/dev/null; sleep 0.5;                                \
+	 if [ -n "$$SAVE_RR" ]; then $$VC set config:rr_rotate "$$SAVE_RR" >/dev/null; else $$VC del config:rr_rotate >/dev/null; fi; \
+	 wait $$Q; sleep 1; kill $$DNS 2>/dev/null || true; sleep 1;                       \
+	 N=$$(cat $$LOG.* 2>/dev/null | grep -c 'WARNING: ThreadSanitizer: data race');    \
+	 echo "  data races reported: $$N";                                                \
+	 if [ "$$N" != 0 ]; then cat $$LOG.* | grep -A12 'WARNING: ThreadSanitizer' | head -60; fi; \
+	 test "$$N" = 0 || { echo "  FAIL  data race between config reload and query threads (CSA-CONC-002)"; exit 1; }; \
+	 echo "  OK  no data race under reload + query load"
+
+# CSA-CONC-002 (CLAUDE-low-fixes.md 8g): a serial bump (config:zone_serial,
+# written on every UPDATE / apid write) updates the zone's serial without a
+# full config reload, and a reload never regenerates an unset cookie secret
+# (it did on every bump, so a client's server cookie stopped validating:
+# BADCOOKIE — dig retries that silently, so the check greps for it). Bumps the serial the way apid does (INCR), then checks the
+# log, the served serial, and a server cookie issued before the bumps.
+check-reload-serial: $(BIN_DEBUG)
+	@echo "  CHECK  serial bumps skip the full reload; cookie secret survives (Valkey + dig)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 command -v dig >/dev/null || { echo "  SKIP  no dig on PATH"; exit 0; };          \
+	 ZN=$$($$VC get config:zone_name); test -n "$$ZN" || ZN=example.local;            \
+	 SAVE_CS=$$($$VC get config:cookie_secret); $$VC del config:cookie_secret >/dev/null; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_reload.log 2>&1 & DNS=$$!; \
+	 sleep 2;                                                                          \
+	 CK=$$(dig +cookie +nocrypto @127.0.0.1 -p $(TPORT) "$$ZN" SOA +time=2 +tries=1 | sed -n 's/.*COOKIE: \([0-9a-fA-F]*\).*/\1/p' | head -1); \
+	 S0=$$(dig +short @127.0.0.1 -p $(TPORT) "$$ZN" SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 for i in 1 2 3 4 5; do $$VC incr config:zone_serial >/dev/null; sleep 0.2; done; \
+	 sleep 1;                                                                          \
+	 S1=$$(dig +short @127.0.0.1 -p $(TPORT) "$$ZN" SOA +time=2 +tries=1 | awk '{print $$3}'); \
+	 OUT=$$(dig +cookie=$$CK @127.0.0.1 -p $(TPORT) "$$ZN" SOA +time=2 +tries=1);   \
+	 ST=$$(echo "$$OUT" | grep -q BADCOOKIE && echo BADCOOKIE || echo "$$OUT" | sed -n 's/.*status: \([A-Z]*\).*/\1/p'); \
+	 RL=$$(grep -c 'config applied after config:zone_serial' /tmp/dnsd_reload.log);    \
+	 kill $$DNS 2>/dev/null || true; sleep 0.3;                                        \
+	 if [ -n "$$SAVE_CS" ]; then $$VC set config:cookie_secret "$$SAVE_CS" >/dev/null; fi; \
+	 echo "  serial $$S0 -> $$S1 after 5 bumps | full reloads on serial bumps: $$RL | old server cookie after bumps: $$ST"; \
+	 test -n "$$S0" -a -n "$$S1" && test "$$S1" -eq $$((S0 + 5)) || { echo "  FAIL  the bumped serial was not applied"; exit 1; }; \
+	 test "$$RL" -eq 0 || { echo "  FAIL  a serial bump still triggers a full config reload (CSA-CONC-002)"; exit 1; }; \
+	 test -n "$$CK" -a "$$ST" = NOERROR || { echo "  FAIL  a server cookie stopped validating after serial bumps (secret regenerated)"; exit 1; }; \
+	 echo "  OK  serial bumps applied without a full reload; cookie secret stable"
+
+# CSA-DOS-006 (CLAUDE-low-fixes.md 8e): a secondary with a TSIG key accepts
+# only TSIG-signed NOTIFYs from its master (unsigned / wrong key -> NOTAUTH,
+# no pull), and a NOTIFY burst is coalesced to about one pull per second.
+# The stub master logs one line per transfer connection; the check counts
+# them. Needs Valkey + python3-dnspython.
+check-notify-secondary: $(BIN_DEBUG)
+	@echo "  CHECK  secondary NOTIFY: TSIG required, refresh rate-limited (Valkey + dnspython)"
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
+	 python3 -c 'import dns.tsig' 2>/dev/null || { echo "  SKIP  python3 dnspython not installed"; exit 0; }; \
+	 Z=notifysec.test; P=5393; B64=$$(printf '0123456789abcdef0123456789abcdef' | base64); \
+	 SAVE_TS=$$($$VC get config:tsig_secret_b64); SAVE_KN=$$($$VC get config:tsig_key_name); \
+	 SAVE_ROLE=$$($$VC get config:zone_role); SAVE_PH=$$($$VC get config:primary_host);\
+	 SAVE_PP=$$($$VC get config:primary_port); SAVE_PT=$$($$VC get config:primary_tls);\
+	 $$VC set config:tsig_secret_b64 "$$B64" >/dev/null;                               \
+	 $$VC set config:tsig_key_name tsig-key >/dev/null;                                \
+	 $$VC set zone_table:$$Z "ns1.$$Z|hostmaster.$$Z|1|3600|900|604800|300|127.0.0.1|" >/dev/null; \
+	 $$VC set config:zone_role secondary >/dev/null;                                   \
+	 $$VC set config:primary_host 127.0.0.1 >/dev/null;                                \
+	 $$VC set config:primary_port $$P >/dev/null;                                      \
+	 $$VC set config:primary_tls 0 >/dev/null;                                         \
+	 python3 tests/axfr_master_tsig.py 127.0.0.1 $$P $$Z "$$B64" ok >/tmp/notifysec_m.log 2>&1 & M=$$!; \
+	 for w in $$(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$$P " && break; sleep 0.1; done; \
+	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=$(TPORT) ./$(BIN_DEBUG) > /tmp/dnsd_notifysec.log 2>&1 & DNS=$$!; \
+	 sleep 3;                                                                          \
+	 pulls() { grep -c "serving $$Z" /tmp/notifysec_m.log; };                         \
+	 N0=$$(pulls);                                                                     \
+	 R1=$$(python3 tests/notify_probe.py 127.0.0.1 $(TPORT) $$Z tsig-key "$$B64" unsigned); sleep 1.5; N1=$$(pulls); \
+	 R2=$$(python3 tests/notify_probe.py 127.0.0.1 $(TPORT) $$Z tsig-key "$$B64" wrongkey); sleep 1.5; N2=$$(pulls); \
+	 R3=$$(python3 tests/notify_probe.py 127.0.0.1 $(TPORT) $$Z tsig-key "$$B64" signed);   sleep 2;   N3=$$(pulls); \
+	 R4=$$(python3 tests/notify_probe.py 127.0.0.1 $(TPORT) $$Z tsig-key "$$B64" burst 20 | tr ' ' '\n' | sort | uniq -c | tr '\n' ' '); \
+	 sleep 3; N4=$$(pulls);                                                            \
+	 kill $$DNS $$M 2>/dev/null || true; sleep 0.3;                                    \
+	 $$VC del zone_table:$$Z config:primary_host config:primary_port config:primary_tls config:zone:$$Z:serial >/dev/null; \
+	 for k in $$($$VC --scan --pattern "zone:$$Z:*") $$($$VC --scan --pattern "dnssec:$$Z:*"); do $$VC del "$$k" >/dev/null; done; \
+	 if [ -n "$$SAVE_TS" ]; then $$VC set config:tsig_secret_b64 "$$SAVE_TS" >/dev/null; else $$VC del config:tsig_secret_b64 >/dev/null; fi; \
+	 if [ -n "$$SAVE_KN" ]; then $$VC set config:tsig_key_name "$$SAVE_KN" >/dev/null; else $$VC del config:tsig_key_name >/dev/null; fi; \
+	 if [ -n "$$SAVE_ROLE" ]; then $$VC set config:zone_role "$$SAVE_ROLE" >/dev/null; else $$VC del config:zone_role >/dev/null; fi; \
+	 if [ -n "$$SAVE_PH" ]; then $$VC set config:primary_host "$$SAVE_PH" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PP" ]; then $$VC set config:primary_port "$$SAVE_PP" >/dev/null; fi; \
+	 if [ -n "$$SAVE_PT" ]; then $$VC set config:primary_tls "$$SAVE_PT" >/dev/null; fi; \
+	 echo "  startup pulls=$$N0 | unsigned: $$R1 pulls=$$N1 | wrong key: $$R2 pulls=$$N2 | signed: $$R3 pulls=$$N3 | burst of 20: [$$R4] pulls=$$N4"; \
+	 test "$$N0" -ge 1 || { echo "  FAIL  the secondary never pulled at startup"; exit 1; }; \
+	 test "$$R1" = NOTAUTH -a "$$N1" = "$$N0" || { echo "  FAIL  unsigned NOTIFY accepted while a TSIG key is configured"; exit 1; }; \
+	 test "$$R2" != NOERROR -a "$$N2" = "$$N0" || { echo "  FAIL  NOTIFY signed with the wrong key accepted"; exit 1; }; \
+	 test "$$R3" = NOERROR -a "$$N3" -gt "$$N2" || { echo "  FAIL  a correctly signed NOTIFY did not trigger a pull"; exit 1; }; \
+	 test $$((N4 - N3)) -ge 1 -a $$((N4 - N3)) -le 5 || { echo "  FAIL  NOTIFY burst not coalesced ($$((N4 - N3)) pulls for 20 NOTIFYs)"; exit 1; }; \
+	 echo "  OK  NOTIFY needs a valid TSIG when a key is configured; bursts coalesce"
 
 # CSA-SBX-002 (CLAUDE-medium-fixes.md 7h): apid, mdnsd and certd confine
 # themselves via libsandbox — every thread runs under the seccomp filter
@@ -3621,6 +3746,7 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 SAVE_CERT=$$($$VC get config:eppd_tls_cert_pem); SAVE_KEY=$$($$VC get config:eppd_tls_key_pem); \
 	 SAVE_CA=$$($$VC get config:eppd_mtls_ca_pem); SAVE_PW=$$($$VC get config:eppd_registrar_pw:registrar1); \
 	 SAVE_PW2=$$($$VC get config:eppd_registrar_pw:registrar2); \
+	 SAVE_RC1=$$($$VC get config:eppd_registrar_cert:registrar1); \
 	 SAVE_AGS=$$($$VC get config:eppd_add_grace_secs); \
 	 SAVE_ARS=$$($$VC get config:eppd_autorenew_grace_secs); \
 	 SAVE_TGS=$$($$VC get config:eppd_transfer_grace_secs); \
@@ -3632,7 +3758,8 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 $$VC set config:eppd_tls_key_pem "$$(cat $$D/srv.key)" >/dev/null; \
 	 $$VC set config:eppd_mtls_ca_pem "$$(cat $$D/ca.pem)" >/dev/null; \
 	 $$VC set config:eppd_registrar_pw:registrar1 "test-pw-correct" >/dev/null; \
-	 $$VC set config:eppd_registrar_pw:registrar2 "test-pw2-correct" >/dev/null; \
+	 $$VC set config:eppd_registrar_pw:registrar2 "$$(echo test-pw2-correct | ./eppd_debug --hash-password)" >/dev/null; \
+	 $$VC set config:eppd_registrar_cert:registrar1 "$$(openssl x509 -in $$D/cli.pem -noout -fingerprint -sha256 | cut -d= -f2)" >/dev/null; \
 	 $$VC set config:eppd_add_grace_secs 0 >/dev/null; \
 	 $$VC set config:eppd_autorenew_grace_secs 0 >/dev/null; \
 	 $$VC set config:eppd_transfer_grace_secs 0 >/dev/null; \
@@ -3662,6 +3789,7 @@ check-eppd: $(BIN_DEBUG) eppd_debug
 	 if [ -n "$$SAVE_CA" ]; then $$VC set config:eppd_mtls_ca_pem "$$SAVE_CA" >/dev/null; else $$VC del config:eppd_mtls_ca_pem >/dev/null; fi; \
 	 if [ -n "$$SAVE_PW" ]; then $$VC set config:eppd_registrar_pw:registrar1 "$$SAVE_PW" >/dev/null; else $$VC del config:eppd_registrar_pw:registrar1 >/dev/null; fi; \
 	 if [ -n "$$SAVE_PW2" ]; then $$VC set config:eppd_registrar_pw:registrar2 "$$SAVE_PW2" >/dev/null; else $$VC del config:eppd_registrar_pw:registrar2 >/dev/null; fi; \
+	 if [ -n "$$SAVE_RC1" ]; then $$VC set config:eppd_registrar_cert:registrar1 "$$SAVE_RC1" >/dev/null; else $$VC del config:eppd_registrar_cert:registrar1 >/dev/null; fi; \
 	 if [ -n "$$SAVE_AGS" ]; then $$VC set config:eppd_add_grace_secs "$$SAVE_AGS" >/dev/null; else $$VC del config:eppd_add_grace_secs >/dev/null; fi; \
 	 if [ -n "$$SAVE_ARS" ]; then $$VC set config:eppd_autorenew_grace_secs "$$SAVE_ARS" >/dev/null; else $$VC del config:eppd_autorenew_grace_secs >/dev/null; fi; \
 	 if [ -n "$$SAVE_TGS" ]; then $$VC set config:eppd_transfer_grace_secs "$$SAVE_TGS" >/dev/null; else $$VC del config:eppd_transfer_grace_secs >/dev/null; fi; \
