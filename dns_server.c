@@ -9075,7 +9075,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const clie
     for (int i = 0; i < ntohs(h->ancount); i++) {
         char nm[256];
         int a = name_from_wire(pkt, plen, off, nm, sizeof(nm));
-        if (a < 0 || a + 9 > plen)
+        if (a < 0 || a + 10 > plen) /* get16(a + 8) reads a+8..a+9 */
             goto formerr;
         uint16_t rtype = get16(pkt, a), rclass = get16(pkt, a + 2);
         uint16_t rdlen = get16(pkt, a + 8);
@@ -9114,7 +9114,7 @@ static int handle_update(const uint8_t *pkt, int plen, uint8_t *resp, const clie
     for (int i = 0; i < ntohs(h->nscount); i++) {
         char un[256];
         int a = name_from_wire(pkt, plen, off, un, sizeof(un));
-        if (a < 0 || a + 9 > plen)
+        if (a < 0 || a + 10 > plen) /* get16(a + 8) reads a+8..a+9 */
             goto formerr;
         uint16_t ut = get16(pkt, a), uc = get16(pkt, a + 2);
         uint32_t uttl = get32(pkt, a + 4);
@@ -12934,6 +12934,7 @@ static int schema_gate(void) {
     }
 }
 
+#ifndef UNIT_TEST /* tests and fuzz harnesses #include this file and supply main */
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -13508,3 +13509,4 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&g_log_mutex);
     return 0;
 }
+#endif /* UNIT_TEST */

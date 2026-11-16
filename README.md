@@ -72,7 +72,7 @@ linked by every binary.
 | `object_graph.{c,h}` | Vendored [objectdb](https://github.com/lucianpopovici/objectdb) engine (pinned; see the file headers) backing `resolverd`'s optional embedded cache tier (`RESOLVERD_CACHE_BACKEND=objectdb`, ADR-008 pilot). |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire`. |
 | `dashboard/` | Flask control-plane UI (see [Dashboard](#dashboard)). |
-| `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`, `make check-eppd`) and libFuzzer harnesses (`make fuzz-wire`, `make fuzz-eppd`, …). |
+| `tests/`, `fuzz/` | Unit tests (`make check-dnssec`, `make check-wire`, `make check-eppd`) and libFuzzer harnesses (`make fuzz-wire`, `make fuzz-dnsd` — dnsd's whole request path —, `make fuzz-eppd`, …). |
 | `Makefile` | Per-binary production + debug builds, GPG/OpenSSL signing, install. |
 
 ## Quick start

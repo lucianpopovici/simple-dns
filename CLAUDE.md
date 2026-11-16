@@ -91,7 +91,7 @@ unreachable the server opens a config portal on `CONFIG_PORT` (default 8080).
 | `eppd.c` | **`eppd`** — EPP registry front-end (RFC 5730/5734/5731/5732/5733, Phase 1+2 done; Phase 3 extensions open). Registrar mTLS sessions; writes `epp:*` + delegation `zone:*` (NS/A/AAAA/DS) records; RFC 3915 RGP lifecycle + RFC 5731 transfer. Own `make eppd`/`make check-eppd`/`make fuzz-eppd`. |
 | `simple_dns.c` | Smaller reference implementation; links `libdnswire` (Step 1 decision), uses non-compressing `append_rr_plain`. |
 | `tests/` | Unit tests: `make check-dnssec` (DNSSEC known-answer + negative), `make check-wire` (name parser). |
-| `fuzz/` | libFuzzer harness + corpus: `make fuzz-wire` (60s smoke; needs clang). |
+| `fuzz/` | libFuzzer harnesses + corpora: `make fuzz-wire` (`name_from_wire`), `make fuzz-dnsd` (dnsd's `dns_process` + TSIG/SIG(0) parsers), `make fuzz-response`, `fuzz-tlv`, `fuzz-doq`, `fuzz-eppd` (60s smokes; need clang). |
 | `dashboard/app.py` | Flask control-plane UI; talks to Valkey directly. |
 | `Makefile` | Build/sign/install. |
 | `keys/` | Code-signing key material. **Do not read, modify, or commit anything here.** |

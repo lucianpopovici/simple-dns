@@ -47,6 +47,7 @@ fuzz/fuzz_name_from_wire
 fuzz/fuzz_response
 fuzz/fuzz_tlv
 fuzz/fuzz_doq
+fuzz/fuzz_dnsd
 
 # Local Claude Code state and build artifacts (not shared)
 .claude/settings.local.json

@@ -684,6 +684,20 @@ jobs:
           mkdir -p fuzz/corpus_response
           ASAN_OPTIONS=detect_leaks=1 ./fuzz_response -max_total_time=60 fuzz/corpus_response
 
+  fuzz-dnsd-smoke:
+    name: Fuzz smoke (dnsd dns_process + TSIG/SIG(0))
+    runs-on: ubuntu-latest
+    # libFuzzer over dnsd's request entry point (QUERY/UPDATE/NOTIFY, EDNS,
+    # cookies) and its TSIG / SIG(0) RR parsers (Phase 0b step 9). The harness
+    # #includes dns_server.c and points its Valkey client at a closed port, so
+    # it needs no service. Replays fuzz/corpus_dnsd (regression inputs included).
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + OpenSSL/libseccomp headers
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libseccomp-dev pkg-config
+      - name: Build + 60s smoke + corpus replay
+        run: make fuzz-dnsd OSSL_INC=/usr/include OSSL_LIB=/usr/lib/x86_64-linux-gnu
+
   fuzz-tlv-smoke:
     name: Fuzz smoke (TLV codec)
     runs-on: ubuntu-latest

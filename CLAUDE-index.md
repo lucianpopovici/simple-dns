@@ -106,6 +106,11 @@ unchanged fields under query threads; certd crashed on a STAR refresh in a
 fresh process (NULL account key) and sent empty ACME nonces to a private CA
 (see `CLAUDE-low-fixes.md`).
 
+Step 9 (tooling), **done 2026-11-16**: `make fuzz-dnsd` (libFuzzer over
+`dns_process` + TSIG/SIG(0) parsers, in CI) — it found and we fixed an
+out-of-bounds read in the UPDATE parser (RR header length check off by one);
+dnsd TSan under UPDATE + query + reload load (`check-reload-tsan`, in CI).
+
 Not yet specced (open in the ledger): PERF-001..007.
 
 Release notes required by these fixes: unsigned UPDATE stops working by

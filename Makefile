@@ -130,7 +130,7 @@ VERSION_FLAGS := -DBUILD_VERSION='"$(GIT_SHA)"' -DBUILD_DATE='"$(BUILD_DATE)"'
 # Phony targets
 # =============================================================================
 .PHONY: all prod debug clean sign sign-openssl verify install uninstall \
-        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-oob-reads check-dashboard-throttle check-notify-secondary check-reload-serial check-reload-tsan check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
+        check check-cds check-catalog check-scan-equivalence check-axfr-concurrency check-resolverd check-resolverd-cache check-resolverd-pog check-resolverd-cookie check-dnssec check-dnssec-live check-dnssec-validate check-ent check-tcp-plain check-resolverd-stress check-resolverd-tsan check-client-identity check-xfr-tsig-required check-qlog-escape check-sandbox-threads check-resolverd-acl check-apid-concurrency check-mdnsd-lookup check-dashboard-csrf check-sidecar-sandbox check-oob-reads check-dashboard-throttle check-notify-secondary check-reload-serial check-reload-tsan check-rrsig-signer check-axfr check-ixfr check-ixfr-wrap check-ixfr-client check-xfr-client check-xfr-refresh check-xfr-tsig check-dot-mtls check-ddns-acl check-ddns-sweeper check-notify check-ptr check-role check-sig0 check-update-auth check-srp check-forwarder check-lb check-lb-health check-wire check-conformance check-frag check-negttl check-svcb check-zonemd check-csync check-dnsxl check-rr-rotate check-enum check-enum-provision check-apid-auth check-classless-atomic check-rollover-txn check-txn-atomicity check-2317 check-zoneversion check-xot check-parent-notify check-error-reporting check-id-server check-ari check-acme-challenges check-caa check-star check-dns0x20 check-serve-stale check-aggressive-nsec check-ede check-ddr check-dns64 check-dp check-dso check-doq check-eppd fuzz-wire fuzz-response fuzz-dnsd fuzz-tlv fuzz-doq fuzz-eppd gen-signing-key help ossl-sanity doqd-ossl-sanity \
         certd certd_debug mdnsd mdnsd_debug apid apid_debug resolverd resolverd_debug doqd doqd_debug eppd eppd_debug
 
 # Fail fast, with an actionable message, if the OpenSSL paths are wrong —
@@ -947,24 +947,34 @@ check-dashboard-throttle:
 	 if [ $$rc = 77 ]; then echo "  SKIP  set DASH_PY to a python with dashboard/requirements.txt"; exit 0; fi; \
 	 exit $$rc
 
-# CSA-CONC-002 (CLAUDE-low-fixes.md 8g): dnsd under ThreadSanitizer with query
-# load, 50 serial bumps and a real config edit reports no data race (it
-# reported ~10 through config_load_from_valkey and zone_upsert before).
+# CSA-CONC-002 (CLAUDE-low-fixes.md 8g) + Phase 0b step 9 (a TSan CI job for
+# dnsd): dnsd under ThreadSanitizer with UDP query load, a stream of dynamic
+# UPDATEs (each one bumps the serial and journals), 50 external serial bumps
+# and a real config edit reports no data race (it reported ~10 through
+# config_load_from_valkey and zone_upsert before). Needs python3-dnspython
+# for the UPDATE half.
 check-reload-tsan: dns_server_tsan tests/udp_stress
 	@echo "  CHECK  config reload vs. query threads under TSan (Valkey)"
 	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
 	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 LOG=/tmp/tsan_reload_$$$$; SAVE_RR=$$($$VC get config:rr_rotate);                      \
+	 SAVE_UA=$$($$VC get config:update_unsigned_allow);                                \
+	 $$VC set config:update_unsigned_allow 127.0.0.1 >/dev/null;                       \
 	 TSAN_OPTIONS="halt_on_error=0 report_signal_unsafe=0 suppressions=$(CURDIR)/tests/tsan.supp log_path=$$LOG" \
 	   DNS_SECCOMP=off LISTEN_PORT=$(TPORT) ./dns_server_tsan > /tmp/dnsd_tsan_reload.log 2>&1 & DNS=$$!; \
 	 sleep 4;                                                                          \
 	 ./tests/udp_stress $(TPORT) 4 12 a www example.local > /dev/null 2>&1 & Q=$$!;    \
+	 UPD=skipped; U=; if python3 -c 'import dns.update' 2>/dev/null; then              \
+	   python3 tests/update_flood.py 127.0.0.1 $(TPORT) example.local 60 > /tmp/tsan_upd.out 2>&1 & U=$$!; \
+	 fi;                                                                               \
 	 for i in $$(seq 1 50); do $$VC incr config:zone_serial >/dev/null; sleep 0.2; done; \
 	 $$VC set config:rr_rotate 1 >/dev/null; sleep 0.5;                                \
 	 if [ -n "$$SAVE_RR" ]; then $$VC set config:rr_rotate "$$SAVE_RR" >/dev/null; else $$VC del config:rr_rotate >/dev/null; fi; \
-	 wait $$Q; sleep 1; kill $$DNS 2>/dev/null || true; sleep 1;                       \
+	 wait $$Q; if [ -n "$$U" ]; then wait $$U; UPD=$$(cat /tmp/tsan_upd.out); fi;      \
+	 sleep 1; kill $$DNS 2>/dev/null || true; sleep 1;                                 \
+	 if [ -n "$$SAVE_UA" ]; then $$VC set config:update_unsigned_allow "$$SAVE_UA" >/dev/null; else $$VC del config:update_unsigned_allow >/dev/null; fi; \
 	 N=$$(cat $$LOG.* 2>/dev/null | grep -c 'WARNING: ThreadSanitizer: data race');    \
-	 echo "  data races reported: $$N";                                                \
+	 echo "  UPDATE stream: $$UPD | data races reported: $$N";                         \
 	 if [ "$$N" != 0 ]; then cat $$LOG.* | grep -A12 'WARNING: ThreadSanitizer' | head -60; fi; \
 	 test "$$N" = 0 || { echo "  FAIL  data race between config reload and query threads (CSA-CONC-002)"; exit 1; }; \
 	 echo "  OK  no data race under reload + query load"
@@ -2031,6 +2041,21 @@ fuzz-wire: fuzz/fuzz_name_from_wire.c $(WIRE_SRC) dns_wire.h | ossl-sanity
 # (response_opt_parse / response_matches_query / parse_response_to_entry). The
 # harness #includes resolverd.c (its main() is gated by UNIT_TEST) so it can
 # reach those statics and the g_cfg state they read; libFuzzer supplies main.
+# libFuzzer over dnsd's dns_process (QUERY/UPDATE/NOTIFY, EDNS, cookies) and the
+# TSIG / SIG(0) RR parsers — Phase 0b step 9. The harness #includes
+# dns_server.c (main gated by UNIT_TEST) and points dnsd's Valkey client at a
+# closed port, so no input can reach a real Valkey. Seeds: fuzz/corpus_dnsd
+# (fuzz/gen_corpus_dnsd.py). FUZZ_SECS (default 60).
+FUZZ_SECS ?= 60
+fuzz-dnsd: fuzz/fuzz_dnsd.c dns_server.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
+	@echo "  CC [FUZZ]  fuzz_dnsd (dnsd dns_process + TSIG/SIG(0); clang, ASan+UBSan+libFuzzer)"
+	clang -g -O1 -fsanitize=fuzzer,address,undefined -DUNIT_TEST -D_GNU_SOURCE -I. -I$(OSSL_INC) \
+	      $(SECCOMP_CFLAGS) -Wno-unused-function -Wno-unused-variable \
+	      -o fuzz/fuzz_dnsd fuzz/fuzz_dnsd.c $(WIRE_SRC) $(SANDBOX_SRC) \
+	      -L$(OSSL_LIB) -lssl -lcrypto -lpthread $(SECCOMP_LIBS) -Wl,-rpath,$(OSSL_LIB)
+	mkdir -p fuzz/corpus_dnsd
+	ASAN_OPTIONS=detect_leaks=0 ./fuzz/fuzz_dnsd -max_total_time=$(FUZZ_SECS) -rss_limit_mb=4096 fuzz/corpus_dnsd
+
 fuzz-response: fuzz/fuzz_response.c resolverd.c $(WIRE_SRC) $(SANDBOX_SRC) dns_wire.h sandbox.h | ossl-sanity
 	@echo "  CC [FUZZ]  fuzz_response (resolverd response parser; clang, ASan+UBSan+libFuzzer)"
 	clang -g -O1 -fsanitize=fuzzer,address,undefined -DUNIT_TEST -I. -I$(OSSL_INC) \

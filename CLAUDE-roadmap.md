@@ -192,7 +192,21 @@ availability, then defense-in-depth.
    (QUERY + UPDATE + `tsig_find`/`sig0_find`); a TSan CI job for resolverd
    **and** dnsd (step 5 covers resolverd); a CI step validating dnsd's positive
    and negative answers with an independent validator (would have caught
-   DNSSEC-001/002 and PROTO-001 — land it with step 3).
+   DNSSEC-001/002 and PROTO-001 — land it with step 3). **DONE 2026-11-16**:
+   - `make fuzz-dnsd` (`fuzz/fuzz_dnsd.c`, CI job "Fuzz smoke (dnsd …)"):
+     libFuzzer over `dns_process` (QUERY/UPDATE/NOTIFY over UDP and TCP
+     framing, EDNS, cookies) plus `tsig_find`/`tsig_verify`/`sig0_present`;
+     dnsd's Valkey client points at a closed port so no input reaches Valkey.
+     Seeds from `fuzz/gen_corpus_dnsd.py`, minimised corpus in
+     `fuzz/corpus_dnsd`. Its first minute found an out-of-bounds read in the
+     UPDATE parser (prerequisite and update sections checked `a + 9 > plen`
+     before reading the RR header's RDLENGTH at `a + 8..a + 9`); fixed, input
+     kept as `fuzz/corpus_dnsd/regress-update-prereq-rr-header`. 5.3 M further
+     runs (120 s) found nothing.
+   - dnsd TSan in CI: `check-reload-tsan` (step 8) now also drives a stream of
+     dynamic UPDATEs alongside UDP queries, serial bumps and a config edit;
+     resolverd's TSan job is `check-resolverd-tsan` (step 5).
+   - Independent validator: `check-dnssec-validate` (step 3), in CI.
 
 **Release notes these fixes require** (breaking for operators): unsigned
 UPDATE stops working by default (step 1); `hmac-sha1`/`hmac-md5` TSIG clients
