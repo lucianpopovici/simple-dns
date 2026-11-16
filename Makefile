@@ -3244,11 +3244,12 @@ check-resolverd: $(BIN_DEBUG) resolverd_debug
 # Valkey cache hit after an in-memory miss (e.g. a freshly restarted resolverd).
 check-resolverd-cache: resolverd_debug
 	@echo "  CHECK  resolverd Valkey cache-load path (regression: NULL e->rrs)"
-	@command -v valkey-cli >/dev/null 2>&1 || { echo "  SKIP  valkey-cli not found"; exit 0; }; \
+	@VC=$$(command -v valkey-cli || command -v redis-cli);                             \
+	 test -n "$$VC" || { echo "  SKIP  no valkey-cli/redis-cli on PATH"; exit 0; };    \
 	 KEY=dnscache:cacheregress.test:A; NOW=$$(date +%s);                               \
-	 valkey-cli del $$KEY >/dev/null 2>&1 || true;                                     \
-	 valkey-cli set $$KEY "1|0|0|0|$$NOW|1:300:4:5db8d822|" >/dev/null;                \
-	 valkey-cli expire $$KEY 300 >/dev/null;                                           \
+	 $$VC del $$KEY >/dev/null 2>&1 || true;                                     \
+	 $$VC set $$KEY "1|0|0|0|$$NOW|1:300:4:5db8d822|" >/dev/null;                \
+	 $$VC expire $$KEY 300 >/dev/null;                                           \
 	 ASAN_OPTIONS=detect_leaks=0 LISTEN_PORT=5358                                      \
 	     ./resolverd_debug --upstream 127.0.0.1:1 > /tmp/resolverd_cache.log 2>&1 &    \
 	 RD_PID=$$!;                                                                       \
@@ -3256,7 +3257,7 @@ check-resolverd-cache: resolverd_debug
 	 A=$$(dig @127.0.0.1 -p 5358 cacheregress.test A +short +time=2 +tries=1);         \
 	 ALIVE=0; kill -0 $$RD_PID 2>/dev/null && ALIVE=1;                                 \
 	 kill $$RD_PID 2>/dev/null || true;                                               \
-	 valkey-cli del $$KEY >/dev/null 2>&1 || true;                                     \
+	 $$VC del $$KEY >/dev/null 2>&1 || true;                                     \
 	 echo "  cache-hit A=[$$A] daemon_alive=$$ALIVE";                                  \
 	 test "$$ALIVE" = 1 || { echo "  FAIL  resolverd crashed serving a Valkey cache hit"; cat /tmp/resolverd_cache.log; exit 1; }; \
 	 test "$$A" = "93.184.216.34" || { echo "  FAIL  cache-load path returned wrong/empty answer"; exit 1; }; \
