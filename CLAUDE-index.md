@@ -84,8 +84,10 @@ validator and resolver sees, then availability).
 Found while fixing, not in the ledger, **fixed 2026-11-15**: multi-RR RRsets signed per record; DNSKEY/CDS/DS answered at any name; resolverd validator picked the first DNSKEY for every RRSIG; ZONEMD drift with live ddns leases; non-primary zone serial reset on reload (see `CLAUDE-dnssec-denial.md` implementation notes).
 
 Also found while fixing step 7, **fixed**: the dashboard's Valkey client hung on
-any bulk reply already buffered with its header (see `CLAUDE-medium-fixes.md`
-implementation notes).
+any bulk reply already buffered with its header; dnsd's query log moved to
+stderr after the first config reload when started as root; and CI had no
+`valkey-cli`, so ~50 integration checks had been skipping (see
+`CLAUDE-medium-fixes.md`).
 
 Not yet specced (open in the ledger): CSA-DOS-006, CSA-WEB-002,
 CSA-CONC-002, CSA-MEM-001/-002, CSA-CRYPTO-001, and PERF-001..007.

@@ -138,3 +138,26 @@ sandbox state; the existing per-daemon checks still pass.
   task: give each daemon its own Valkey user limited to the key patterns in
   the CLAUDE.md ownership table (`ACL SETUSER certd on >… ~cert:current
   ~acme:* ~zone:*:TXT:_acme-challenge.* %R~config:* %R~zone:*:CAA:* …`).
+
+### After step 7: CI was not running the integration checks
+
+The CI runner had the Valkey service container but no `valkey-cli`/`redis-cli`,
+and nearly every integration check SKIPs (exit 0) without one, so about 50
+checks, every audit-fix check among them, had been reporting success
+without running. Fixed: CI installs `redis-tools`; check steps run with
+`if: !cancelled()` so one run reports every failure; a failure-only step dumps
+the daemon logs. Turning them on surfaced:
+
+- `check-zoneversion` / `check-error-reporting`: the runner ships dig 9.20,
+  which prints ZONEVERSION / Report-Channel by name instead of `OPT=19:` /
+  `OPT=18:`. Tests now accept both; dnsd was correct.
+- `check-ixfr-client` / `check-xfr-client` / `check-xfr-refresh`: dnsd could
+  start its startup pull before the stub master listened (retry timer 900 s).
+  Recipes now wait for the listener. `check-xfr-tsig` polls instead of a fixed
+  2.2 s sleep, and its stub logs why it refuses a request.
+- **dnsd bug:** `config_load` reopened the query log on every reload (every
+  serial bump), closing it first; a root-started dnsd then failed the reopen
+  as the unprivileged user and the query log silently went to stderr. Now
+  reopened only when `config:query_log_path` changes, new file opened before
+  the old one is closed, error logged on failure. Found running
+  `check-qlog-escape` as root in an ubuntu:24.04 container.
